@@ -4,19 +4,35 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
-Current attempt:
+Latest Hermes retest result:
 
-- Addressing Hermes retest feedback before the next research-agent run.
-- Added `WWW-Authenticate: Basic realm="gh-agent-broker"` on agent auth failures so Git credential helpers and `GIT_ASKPASS` can respond naturally.
-- Updated `policy.dry-run` to accept `repo`, `repository`, or `owner`+`repo`, and to simulate broker-owned metadata injection before evaluating `pr_body` and `comment_body` assertions.
-- Expanded `/openapi.json` with request/response schemas and examples for dry-run, PR create, comment create, GitHub result, and error responses.
+- GO for the first controlled research-agent project using `BROKER_AGENT_ID=hermes-coder-01` and `grubbyhacker/research`.
+- Hermes focused v1 REST/readiness suite passed: 24 pass, 0 fail.
+- Dry-run shape tests passed for `repo`, `repository`, and `owner`+`repo` forms.
+- Git `GIT_ASKPASS` works after the `WWW-Authenticate` fix.
+- Git clone/fetch, allowed branch push, unauthorized branch denial, repo probe, PR creation, and issue comment creation all pass through the broker.
+- Latest Hermes readiness side effects:
+  - Branch: `agent/hermes-coder-01/research-agent-readiness-20260512-014725`
+  - Pull request: `#5`
+  - Comment: created on PR `#5` through broker `issue.comment`.
 
 Remaining after this attempt:
 
 - Decide whether to enforce `Hermes-Run-Id` on Git `receive-pack` for stronger audit metadata.
-- Decide when to move `issue.comment` metadata assertions from warn mode to enforce mode for autonomous research usage.
+- Move `issue.comment` metadata assertions from warn mode to enforce mode before broader autonomous usage.
 - Design multi-principal or delegated scoped credentials for subagents with different permission sets.
 - Replace VPS source-build deployment with CI-published container images and pinned image tags.
+
+Tonight's recommended research-agent pattern:
+
+- Broker URL: `http://gh-agent-broker:8080`
+- Git remote: `http://gh-agent-broker:8080/git/grubbyhacker/research.git`
+- Branches: `agent/hermes-coder-01/<task-slug>`
+- Base branch: `main`
+- Start each run with `GET /readyz` and authenticated `GET /whoami`.
+- Before PR creation, run `POST /v1/policy/dry-run` with `operation: pull.create`, `owner: grubbyhacker`, `repo: research`, `branch`, `base_branch: main`, and metadata fields `Agent-Id` and `Hermes-Run-Id`.
+- Use one broker identity only for same-permission subagents; distinguish them with `Hermes-Run-Id` suffixes such as `research-run-001:planner`.
+- Use separate broker identities, and preferably separate sandbox containers, for subagents with different permission sets.
 
 Public repo:
 
