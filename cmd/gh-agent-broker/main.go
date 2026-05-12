@@ -45,6 +45,8 @@ func main() {
 		cmdConfigCheck(os.Args[2:])
 	case "configure":
 		cmdConfigure(os.Args[2:])
+	case "credential-helper":
+		cmdCredentialHelper(os.Args[2:])
 	case "probe":
 		cmdProbe(os.Args[2:])
 	case "dry-run":
@@ -121,7 +123,76 @@ func cmdConfigure(args []string) {
 	if err := cmd.Run(); err != nil {
 		fatal(err)
 	}
+	if err := configureCredentialHelper(url); err != nil {
+		fatal(err)
+	}
 	fmt.Println(url)
+}
+
+func configureCredentialHelper(url string) error {
+	helper := credentialHelperCommand()
+	configs := [][2]string{
+		{"credential." + url + ".helper", helper},
+		{"credential." + url + ".useHttpPath", "true"},
+	}
+	for _, cfg := range configs {
+		// #nosec G204 -- git config keys are derived from a broker URL constructed by this CLI.
+		cmd := exec.Command("git", "config", "--local", cfg[0], cfg[1])
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func credentialHelperCommand() string {
+	exe, err := os.Executable()
+	if err != nil || exe == "" {
+		exe = "gh-agent-broker-cli"
+	}
+	return "!" + shellQuote(exe) + " credential-helper"
+}
+
+func shellQuote(s string) string {
+	if regexp.MustCompile(`^[A-Za-z0-9_./:-]+$`).MatchString(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func cmdCredentialHelper(args []string) {
+	operation := ""
+	if len(args) > 0 {
+		operation = args[0]
+	}
+	if err := runCredentialHelper(operation, os.Stdin, os.Stdout, os.Getenv); err != nil {
+		fatal(err)
+	}
+}
+
+func runCredentialHelper(operation string, stdin io.Reader, stdout io.Writer, getenv func(string) string) error {
+	if _, err := io.Copy(io.Discard, stdin); err != nil {
+		return err
+	}
+	if operation != "get" {
+		return nil
+	}
+	agentID := getenv("BROKER_AGENT_ID")
+	secret := getenv("BROKER_AGENT_SECRET")
+	var missing []string
+	if agentID == "" {
+		missing = append(missing, "BROKER_AGENT_ID")
+	}
+	if secret == "" {
+		missing = append(missing, "BROKER_AGENT_SECRET")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("credential helper requires %s", strings.Join(missing, " and "))
+	}
+	_, err := fmt.Fprintf(stdout, "username=%s\npassword=%s\n\n", agentID, secret)
+	return err
 }
 
 func cmdProbe(args []string) {
