@@ -124,5 +124,15 @@ Code hygiene baseline:
   `hermes-agent` and `hermes-gateway` services. `hermes-gateway` runs
   `gateway run` through `/opt/hermes/docker/entrypoint.sh`, has no published
   port, and reports `Gateway is running`.
+- `gh-agent-broker-cli` was extracted from the pinned broker image to
+  `/docker/gh-agent-broker/bin/gh-agent-broker-cli` and bind-mounted read-only
+  into both Hermes services at `/usr/local/bin/gh-agent-broker-cli`.
+- The generic `gh-agent-broker` skill is installed at
+  `/docker/hermes-agent-6aso/data/skills/gh-agent-broker` and `hermes skills
+  list` reports it as a local enabled skill.
+- Verified from both `hermes-agent` and `hermes-gateway`:
+  `gh-agent-broker-cli health` returns `ok`, and
+  `gh-agent-broker-cli probe -repo grubbyhacker/research` succeeds through the
+  broker.
 - Secrets were not committed; VPS private config/key/env live outside git under `/docker/gh-agent-broker`.
 - Hermes session `20260512_005558_19ac2d` discussed broker usage and recommended a Hermes skill/runbook for broker remotes, metadata, branch rules, subagent identity, and secret safety.
