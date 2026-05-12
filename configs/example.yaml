@@ -1,0 +1,61 @@
+server:
+  listen: "127.0.0.1:8080"
+  admin_secret_env: "BROKER_ADMIN_SECRET"
+
+audit:
+  path: "/var/log/gh-agent-broker/audit.jsonl"
+
+github:
+  app_id: 123456
+  private_key_path: "/run/secrets/github-app.pem"
+  api_base_url: "https://api.github.com"
+  git_base_url: "https://github.com"
+  installations:
+    example-org/example-repo: 12345678
+
+agents:
+  - id: "hermes-coder-01"
+    enabled: true
+    secret_env: "HERMES_CODER_01_BROKER_SECRET"
+    repositories:
+      - "example-org/example-repo"
+    operations:
+      - "repo.probe"
+      - "git.upload-pack"
+      - "git.receive-pack"
+      - "pull.create"
+      - "issue.comment"
+    branch_patterns:
+      - "^refs/heads/agent/hermes-coder-01/.+$"
+      - "^agent/hermes-coder-01/.+$"
+    base_branches:
+      - "main"
+    permissions:
+      - "contents:read"
+      - "contents:write"
+      - "pull_requests:write"
+      - "issues:write"
+    metadata_assertions:
+      pull.create:
+        mode: "enforce"
+        fields:
+          - name: "Agent-Id"
+            required: true
+            value: "hermes-coder-01"
+            locations: ["request", "pr_body"]
+          - name: "Hermes-Run-Id"
+            required: true
+            pattern: "^[A-Za-z0-9_.:-]+$"
+            locations: ["request", "pr_body"]
+          - name: "Broker-Operation-Id"
+            required: true
+            locations: ["pr_body"]
+          - name: "GitHub-App-Installation-Id"
+            required: true
+            locations: ["pr_body"]
+      issue.comment:
+        mode: "warn"
+        fields:
+          - name: "Agent-Id"
+            required: true
+            locations: ["request", "comment_body"]

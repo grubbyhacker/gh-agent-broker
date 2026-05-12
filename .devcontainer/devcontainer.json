@@ -1,0 +1,32 @@
+{
+  "name": "gh-agent-broker",
+  "image": "mcr.microsoft.com/devcontainers/go:1.26-bookworm",
+  "features": {
+    "ghcr.io/devcontainers-extra/features/mise:1": {
+      "version": "latest",
+      "activate": true
+    },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "editorconfig.editorconfig",
+        "GitHub.vscode-github-actions"
+      ],
+      "settings": {
+        "go.toolsManagement.autoUpdate": false,
+        "go.useLanguageServer": true,
+        "go.lintTool": "golangci-lint",
+        "go.lintOnSave": "package",
+        "go.formatTool": "gofumpt",
+        "go.testFlags": ["-count=1"]
+      }
+    }
+  },
+  "postCreateCommand": "mise trust --yes . && mise install && make tools && make check",
+  "remoteEnv": {
+    "GOFLAGS": "-mod=readonly"
+  }
+}

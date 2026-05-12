@@ -1,0 +1,18 @@
+services:
+  broker:
+    build: .
+    command: ["-config", "/etc/gh-agent-broker/config.yaml"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      BROKER_ADMIN_SECRET: "replace-me-admin-secret"
+      HERMES_CODER_01_BROKER_SECRET: "replace-me-agent-secret"
+    volumes:
+      - ./configs/example.yaml:/etc/gh-agent-broker/config.yaml:ro
+      - ./secrets/github-app.pem:/run/secrets/github-app.pem:ro
+      - ./audit:/var/log/gh-agent-broker
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gh-agent-broker-cli", "health", "-broker", "http://127.0.0.1:8080"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

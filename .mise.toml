@@ -1,0 +1,29 @@
+[tools]
+go = "1.26.3"
+
+[env]
+GOFLAGS = "-mod=readonly"
+
+[tasks.fmt]
+description = "Format Go sources"
+run = "make fmt"
+
+[tasks.check]
+description = "Run the full local hygiene gate"
+run = "make check"
+
+[tasks.ci]
+description = "Run the CI hygiene gate"
+run = "make ci"
+
+[tasks.test]
+description = "Run unit tests"
+run = "make test"
+
+[tasks.race]
+description = "Run race-enabled tests"
+run = "make race"
+
+[tasks.vuln]
+description = "Run vulnerability scan"
+run = "make vuln"
