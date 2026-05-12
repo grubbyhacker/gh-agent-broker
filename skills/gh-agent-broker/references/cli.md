@@ -10,10 +10,14 @@ gh-agent-broker-cli configure -repo OWNER/REPO -remote origin
 git remote -v
 ```
 
+`configure` installs a repo-local Git credential helper for the broker remote.
+The helper reads `BROKER_AGENT_ID` and `BROKER_AGENT_SECRET` when Git asks for
+credentials and does not store the broker secret in Git config.
+
 After the remote points at the broker, use normal Git commands:
 
 ```sh
-git fetch origin
+GIT_TERMINAL_PROMPT=0 git fetch origin
 git push origin HEAD:agent/AGENT_ID/TASK_SLUG
 ```
 

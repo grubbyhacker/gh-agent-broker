@@ -26,6 +26,8 @@ credentials.
 ## Default Workflow
 
 1. Use broker Git remotes for normal `git clone`, `git fetch`, and `git push`.
+   Run `gh-agent-broker-cli configure -repo OWNER/REPO -remote origin` to set
+   the broker remote and repo-local Git credential helper.
 2. Use `gh-agent-broker-cli probe` to confirm repository access.
 3. Use `gh-agent-broker-cli dry-run` before creating a pull request or comment
    when policy metadata or branch rules may matter.

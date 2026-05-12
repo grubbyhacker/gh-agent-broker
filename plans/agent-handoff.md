@@ -7,6 +7,14 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 Latest Hermes retest result:
 
 - GO for the first controlled research-agent project using `BROKER_AGENT_ID=hermes-coder-01` and `grubbyhacker/research`.
+- Issue `#13` is fixed locally: `gh-agent-broker-cli configure` now writes a
+  repo-local URL-scoped Git credential helper so non-interactive
+  `git fetch`/`git push` can read `BROKER_AGENT_ID` and `BROKER_AGENT_SECRET`
+  from the environment without storing broker secrets in Git config. Verified
+  with `mise exec -- make check` and a temporary Git credential-flow smoke test.
+- Current integration branch also takes the pending Dependabot updates for
+  `actions/checkout@v6`, `actions/setup-go@v6`, and
+  `github.com/golang-jwt/jwt/v4@v4.5.2` before the next VPS/container bounce.
 - Hermes focused v1 REST/readiness suite passed: 24 pass, 0 fail.
 - Dry-run shape tests passed for `repo`, `repository`, and `owner`+`repo` forms.
 - Git `GIT_ASKPASS` works after the `WWW-Authenticate` fix.
@@ -124,23 +132,28 @@ Code hygiene baseline:
   `ghcr.io/grubbyhacker/gh-agent-broker:sha-14f02d5de334f8f54123edcff934466631b9306e`.
 - Broker health is reachable from the host at `http://127.0.0.1:8080/healthz` and from the Hermes Docker network at `http://gh-agent-broker:8080/healthz`.
 - Hermes container env now includes `BROKER_URL`, `BROKER_AGENT_ID`, and `BROKER_AGENT_SECRET`.
-- Hermes Compose project at `/docker/hermes-agent-6aso` now has separate
-  `hermes-agent` and `hermes-gateway` services. `hermes-gateway` runs
-  `gateway run` through `/opt/hermes/docker/entrypoint.sh`, has no published
-  port, and reports `Gateway is running`.
+- Hermes Compose project at `/docker/hermes-agent-6aso` now has only
+  `hermes-gateway` and `hermes-dashboard` services; the old `hermes-agent`
+  service was removed with `docker compose up -d --remove-orphans`.
+  `hermes-gateway` runs `gateway run` through
+  `/opt/hermes/docker/entrypoint.sh` with no published port.
+  `hermes-dashboard` runs `dashboard --host 0.0.0.0 --port 9119 --no-open
+  --insecure` and publishes only `127.0.0.1:9119:9119` on the VPS.
+  Both services have Compose healthchecks and were healthy after restart on
+  2026-05-12.
 - `gh-agent-broker-cli` was extracted from the pinned broker image to
   `/docker/gh-agent-broker/bin/gh-agent-broker-cli` and bind-mounted read-only
   into both Hermes services at `/usr/local/bin/gh-agent-broker-cli`.
 - The generic `gh-agent-broker` skill is installed at
   `/docker/hermes-agent-6aso/data/skills/gh-agent-broker` and `hermes skills
   list` reports it as a local enabled skill.
-- Verified from both `hermes-agent` and `hermes-gateway`:
-  `gh-agent-broker-cli health` returns `ok`, and
-  `gh-agent-broker-cli probe -repo grubbyhacker/research` succeeds through the
+- Verified from both `hermes-gateway` and `hermes-dashboard`:
+  `gh-agent-broker-cli health` returns `ok`. Earlier readiness testing also
+  verified `gh-agent-broker-cli probe -repo grubbyhacker/research` through the
   broker.
 - Repaired `/docker/hermes-agent-6aso/data` ownership to `10000:10000` after
   root-owned memory files blocked Hermes from writing
   `/opt/data/memories/USER.md.lock`. Verified write access as the `hermes`
-  user in both Hermes services.
+  user in the Hermes services.
 - Secrets were not committed; VPS private config/key/env live outside git under `/docker/gh-agent-broker`.
 - Hermes session `20260512_005558_19ac2d` discussed broker usage and recommended a Hermes skill/runbook for broker remotes, metadata, branch rules, subagent identity, and secret safety.

@@ -121,7 +121,12 @@ http://127.0.0.1:8080/git/example-org/example-repo.git
 
 Use the agent ID and broker secret for Git HTTP basic auth. Do not place GitHub tokens in the agent container.
 
-Unauthenticated broker responses include `WWW-Authenticate: Basic realm="gh-agent-broker"` so standard Git credential helpers and `GIT_ASKPASS` can provide broker credentials.
+`gh-agent-broker-cli configure` also installs a repo-local Git credential helper
+for the broker remote. The helper reads `BROKER_AGENT_ID` and
+`BROKER_AGENT_SECRET` at fetch/push time and does not store the broker secret in
+Git config. Unauthenticated broker responses include
+`WWW-Authenticate: Basic realm="gh-agent-broker"` so other standard Git
+credential helpers and `GIT_ASKPASS` can still provide broker credentials.
 
 For Hermes agents on the same deployment host, prefer a dedicated broker Compose project and point the agent at the broker over `127.0.0.1` or a private Docker network. A production-oriented config template is available at `configs/production.example.yaml`; copy it to a private path and replace all placeholders before use. The coder GitHub App needs repository permissions for Contents read/write, Pull requests read/write, Issues read/write, and Metadata read. The reporter GitHub App should be separate and limited to Issues read/write plus Metadata read.
 
@@ -138,6 +143,7 @@ Configure a repository remote through the broker:
 ```sh
 gh-agent-broker-cli configure -repo OWNER/REPO -remote origin
 git remote -v
+GIT_TERMINAL_PROMPT=0 git fetch origin main
 ```
 
 The broker also exposes unauthenticated discovery routes so agents can find the raw REST API:
