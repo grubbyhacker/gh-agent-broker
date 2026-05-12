@@ -134,5 +134,9 @@ Code hygiene baseline:
   `gh-agent-broker-cli health` returns `ok`, and
   `gh-agent-broker-cli probe -repo grubbyhacker/research` succeeds through the
   broker.
+- Repaired `/docker/hermes-agent-6aso/data` ownership to `10000:10000` after
+  root-owned memory files blocked Hermes from writing
+  `/opt/data/memories/USER.md.lock`. Verified write access as the `hermes`
+  user in both Hermes services.
 - Secrets were not committed; VPS private config/key/env live outside git under `/docker/gh-agent-broker`.
 - Hermes session `20260512_005558_19ac2d` discussed broker usage and recommended a Hermes skill/runbook for broker remotes, metadata, branch rules, subagent identity, and secret safety.
