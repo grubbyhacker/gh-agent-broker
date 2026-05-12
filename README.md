@@ -103,6 +103,24 @@ gh-agent-broker-cli configure -repo OWNER/REPO -remote origin
 git remote -v
 ```
 
+The broker also exposes unauthenticated discovery routes so agents can find the raw REST API:
+
+```text
+GET /docs
+GET /operations
+GET /openapi.json
+GET /whoami
+```
+
+The raw REST routes use the `/v1` prefix and broker agent basic auth:
+
+```text
+GET  /v1/repos/OWNER/REPO/probe
+POST /v1/policy/dry-run
+POST /v1/repos/OWNER/REPO/pulls
+POST /v1/repos/OWNER/REPO/issues/NUMBER/comments
+```
+
 Create PRs and comments with metadata fields that match the configured policy. The names below are examples from the sample config, not hard-coded broker fields:
 
 ```sh

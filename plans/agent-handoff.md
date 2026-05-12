@@ -53,6 +53,7 @@ Code hygiene baseline:
 - First Hermes VPS integration is documented as a separate Docker Compose broker project, not a Hermes sidecar or systemd-managed container.
 - Git policy denials default to a Git-friendly plain-text response with operation ID and safe self-correction details; explicit `Accept: application/json` still returns structured JSON.
 - Hermes agreed that same-permission subagents can share a broker identity with distinct `Hermes-Run-Id` values, while different permission sets should become separate broker principals and preferably separate containers.
+- Hermes discovered that raw REST routes were not self-describing; discovery endpoints now document the `/v1` routes at `/`, `/docs`, `/operations`, `/api/operations`, `/openapi.json`, `/whoami`, and `/api/whoami`.
 
 ## Next Agent Checklist
 
