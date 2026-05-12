@@ -31,6 +31,35 @@ go run ./cmd/broker -config configs/example.yaml
 
 The example config reads agent/admin secrets from environment variables.
 
+## Container Artifacts And Deploy
+
+CI publishes the primary deploy artifact as an OCI image at:
+
+```text
+ghcr.io/grubbyhacker/gh-agent-broker
+```
+
+Images are tagged with immutable commit tags such as `sha-fcd5400...`, the `main` convenience tag for main-branch builds, and semver tags such as `v0.1.0` for intentional releases. Production should pin a SHA or semver tag, not `main` or `latest`.
+
+Semver tag builds also publish GitHub Release binaries:
+
+- `gh-agent-broker-linux-amd64`
+- `gh-agent-broker-cli-linux-amd64`
+- `SHA256SUMS`
+
+Use the OCI image for the broker service. Use the CLI binary as an agent runtime artifact when an agent container should call stable broker commands instead of constructing raw REST requests.
+
+For production deployment, keep private config, `.env`, and PEM files outside git. Use `.env.example` only as a variable-name template, then deploy with the production Compose template:
+
+```sh
+BROKER_IMAGE=ghcr.io/grubbyhacker/gh-agent-broker:sha-REPLACE_WITH_COMMIT_SHA \
+  docker compose -f docker-compose.production.example.yml pull
+BROKER_IMAGE=ghcr.io/grubbyhacker/gh-agent-broker:sha-REPLACE_WITH_COMMIT_SHA \
+  docker compose -f docker-compose.production.example.yml up -d
+```
+
+Rollback is the same command sequence with the previous known-good image tag.
+
 ## Code Hygiene
 
 This repo uses a strict local and CI gate:
@@ -67,6 +96,10 @@ The dev container runs `mise install`, installs repo tools, and runs `make check
 
 ## Agent CLI Examples
 
+Agents should prefer `gh-agent-broker-cli` for broker REST workflows. A reusable
+agent skill is available at `skills/gh-agent-broker`; install or copy that skill
+into compatible agent runtimes so agents use the broker CLI consistently.
+
 ```sh
 export BROKER_URL=http://127.0.0.1:8080
 export BROKER_AGENT_ID=hermes-coder-01
@@ -88,7 +121,7 @@ Use the agent ID and broker secret for Git HTTP basic auth. Do not place GitHub 
 
 Unauthenticated broker responses include `WWW-Authenticate: Basic realm="gh-agent-broker"` so standard Git credential helpers and `GIT_ASKPASS` can provide broker credentials.
 
-For Hermes agents on a VPS, prefer a dedicated broker Compose project and point the agent at the broker over `127.0.0.1` or a private Docker network. A production-oriented config template is available at `configs/production.example.yaml`; copy it to a private path and replace all placeholders before use. The GitHub App needs repository permissions for Contents read/write, Pull requests read/write, Issues read/write, and Metadata read.
+For Hermes agents on the same deployment host, prefer a dedicated broker Compose project and point the agent at the broker over `127.0.0.1` or a private Docker network. A production-oriented config template is available at `configs/production.example.yaml`; copy it to a private path and replace all placeholders before use. The GitHub App needs repository permissions for Contents read/write, Pull requests read/write, Issues read/write, and Metadata read.
 
 Hermes should provide only broker credentials:
 
@@ -146,7 +179,7 @@ gh-agent-broker-cli comment \
 
 Hermes subagents that use the same GitHub permission set can share the same broker identity, but should use distinct `Hermes-Run-Id` values for auditability. Subagents that need different repository access, branch rules, or GitHub permissions should be modeled as separate broker agents with separate secrets and policy blocks; for stronger runtime isolation, run those subagents in separate containers. A future broker delegated-credential flow may make same-container scoped delegation safer, but V1 keeps the boundary at the broker principal.
 
-See `plans/hermes-vps-integration.md` for the sanitized VPS topology, volume, secret, and rollback runbook.
+See `plans/compose-production-deploy.md` for the sanitized Compose topology, volume, secret, and rollback runbook.
 
 ## Notes
 

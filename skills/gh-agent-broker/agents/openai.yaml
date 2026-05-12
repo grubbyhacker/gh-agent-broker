@@ -1,0 +1,7 @@
+interface:
+  display_name: "GitHub Agent Broker"
+  short_description: "Use broker CLI for GitHub agent access"
+  default_prompt: "Use $gh-agent-broker to work with GitHub through the broker CLI."
+
+policy:
+  allow_implicit_invocation: true

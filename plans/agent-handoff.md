@@ -21,7 +21,9 @@ Remaining after this attempt:
 - Decide whether to enforce `Hermes-Run-Id` on Git `receive-pack` for stronger audit metadata.
 - Move `issue.comment` metadata assertions from warn mode to enforce mode before broader autonomous usage.
 - Design multi-principal or delegated scoped credentials for subagents with different permission sets.
-- Replace VPS source-build deployment with CI-published container images and pinned image tags.
+- Confirm the first GHCR image publish after this workflow lands on `main`, then switch the production Compose project to the pinned image template.
+- Confirm the GHCR package is public after first publish if deployment hosts should pull without registry credentials.
+- Confirm the first semver release uploads standalone Linux binaries and `SHA256SUMS`.
 
 Tonight's recommended research-agent pattern:
 
@@ -51,7 +53,7 @@ Implemented plan target:
 - GitHub App installation token minting inside the broker.
 - HTTP Git smart proxy for clone/fetch/push.
 - REST endpoints for repo probe, PR creation, comments, policy dry-run, health, readiness, and config reload.
-- Sanitized Hermes VPS integration runbook, production config example, container smoke target, and fake GitHub REST/Git smart-HTTP integration tests.
+- Sanitized Compose production deployment runbook, production config example, container smoke target, and fake GitHub REST/Git smart-HTTP integration tests.
 
 Real GitHub e2e status:
 
@@ -71,6 +73,9 @@ Code hygiene baseline:
 - Gate includes format check, `go mod tidy` drift check, `golangci-lint`, unit tests, race tests, `govulncheck`, and builds.
 - CI runs `make ci` on pushes to `main` and pull requests.
 - Dependabot tracks Go modules and GitHub Actions.
+- CI now runs the Go hygiene gate, a Docker container smoke test, and publishes the primary deploy artifact to GHCR after successful `main` or semver tag pushes.
+- Published image tags are immutable `sha-<commit>`, the `main` convenience tag, and semver release tags; production deployments should pin SHA or semver tags, not `main` or `latest`.
+- Semver tag builds also publish `gh-agent-broker-linux-amd64`, `gh-agent-broker-cli-linux-amd64`, and `SHA256SUMS` as GitHub Release artifacts.
 
 ## Important Design Choices
 
@@ -80,7 +85,7 @@ Code hygiene baseline:
 - V1 enforces metadata assertions on broker REST operations and dry-runs.
 - Server-side rejection of pushed commits based on commit trailers is deferred because it requires broker-terminated Git receive for strong enforcement.
 - Hermes-specific metadata is represented in example config only.
-- First Hermes VPS integration is documented as a separate Docker Compose broker project, not a Hermes sidecar or systemd-managed container.
+- The first Hermes integration is documented as a separate Docker Compose broker project, not a Hermes sidecar or systemd-managed container.
 - Git policy denials default to a Git-friendly plain-text response with operation ID and safe self-correction details; explicit `Accept: application/json` still returns structured JSON.
 - Hermes agreed that same-permission subagents can share a broker identity with distinct `Hermes-Run-Id` values, while different permission sets should become separate broker principals and preferably separate containers.
 - Hermes discovered that raw REST routes were not self-describing; discovery endpoints now document the `/v1` routes at `/`, `/docs`, `/operations`, `/api/operations`, `/openapi.json`, `/whoami`, and `/api/whoami`.
@@ -94,15 +99,18 @@ Code hygiene baseline:
 - Run `make smoke-container` when Docker is available; the broker image runs as UID 65532, so mounted audit directories must be writable by that UID.
 - Update this handoff before ending work.
 
-## Hermes VPS Integration Prep
+## Compose Deployment Prep
 
-- `plans/hermes-vps-integration.md` now documents topology, ports, volumes, secrets, first install, and rollback with public-safe placeholders.
+- `plans/compose-production-deploy.md` now documents topology, ports, volumes, secrets, first install, and rollback with public-safe placeholders.
+- Production Compose deployment should use `docker-compose.production.example.yml` with `BROKER_IMAGE=ghcr.io/grubbyhacker/gh-agent-broker:sha-COMMIT`; local development can keep using the source-build `docker-compose.example.yml`.
+- The production Compose template reads host-owned secrets from `.env` by default and keeps private config/key mounts outside git; `.env` is ignored by git and excluded from the Docker build context.
+- Agent runtimes should install or bind-mount `gh-agent-broker-cli`; compatible agents can use the generic `skills/gh-agent-broker` skill to prefer CLI commands over raw REST calls.
 - `configs/production.example.yaml` documents required GitHub App permissions and keeps Hermes metadata names as config examples only.
 - README now includes Hermes CLI usage for remotes, broker env vars, PRs, comments, and metadata.
 - Dockerfile now creates `/var/log/gh-agent-broker` owned by UID 65532, and the Compose example uses a named audit volume by default.
 - `internal/server/integration_test.go` covers fake GitHub REST operations, fake Git smart-HTTP proxying, auth-header filtering, and Git denial UX.
 - `make smoke-container` builds the image, validates config-check failure behavior, starts the broker with generated test key/config, and checks health.
-- Latest verification in this handoff: `mise exec -- go test ./...`, `mise exec -- make check`, and `make smoke-container` passed.
+- Latest verification in this handoff: `git diff --check`, production Compose config rendering with a dummy pinned image, `mise exec -- make ci`, and `make smoke-container` passed. Plain `make ci` with the system `go1.18.1` fails before tests because the repo requires the `.mise.toml` Go toolchain.
 
 ## VPS Deployment Status
 

@@ -2,3 +2,4 @@ secrets/
 configs/e2e.local.yaml
 /audit/
 .tools/
+.env
