@@ -31,7 +31,9 @@ type Metadata map[string]string
 
 type DryRunRequest struct {
 	AgentID     string   `json:"agent_id,omitempty"`
+	Owner       string   `json:"owner,omitempty"`
 	Repo        string   `json:"repo"`
+	Repository  string   `json:"repository,omitempty"`
 	Operation   string   `json:"operation"`
 	Branch      string   `json:"branch,omitempty"`
 	BaseBranch  string   `json:"base_branch,omitempty"`

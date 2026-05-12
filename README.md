@@ -86,6 +86,8 @@ http://127.0.0.1:8080/git/example-org/example-repo.git
 
 Use the agent ID and broker secret for Git HTTP basic auth. Do not place GitHub tokens in the agent container.
 
+Unauthenticated broker responses include `WWW-Authenticate: Basic realm="gh-agent-broker"` so standard Git credential helpers and `GIT_ASKPASS` can provide broker credentials.
+
 For Hermes agents on a VPS, prefer a dedicated broker Compose project and point the agent at the broker over `127.0.0.1` or a private Docker network. A production-oriented config template is available at `configs/production.example.yaml`; copy it to a private path and replace all placeholders before use. The GitHub App needs repository permissions for Contents read/write, Pull requests read/write, Issues read/write, and Metadata read.
 
 Hermes should provide only broker credentials:
@@ -120,6 +122,8 @@ POST /v1/policy/dry-run
 POST /v1/repos/OWNER/REPO/pulls
 POST /v1/repos/OWNER/REPO/issues/NUMBER/comments
 ```
+
+For `policy.dry-run`, the repository may be supplied as `repo: "OWNER/REPO"`, `repository: "OWNER/REPO"`, or `owner: "OWNER"` plus `repo: "REPO"`. Dry-run simulates broker-injected metadata such as `Broker-Operation-Id` and `GitHub-App-Installation-Id`; agents should not supply those fields.
 
 Create PRs and comments with metadata fields that match the configured policy. The names below are examples from the sample config, not hard-coded broker fields:
 

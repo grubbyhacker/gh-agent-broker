@@ -4,6 +4,20 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current attempt:
+
+- Addressing Hermes retest feedback before the next research-agent run.
+- Added `WWW-Authenticate: Basic realm="gh-agent-broker"` on agent auth failures so Git credential helpers and `GIT_ASKPASS` can respond naturally.
+- Updated `policy.dry-run` to accept `repo`, `repository`, or `owner`+`repo`, and to simulate broker-owned metadata injection before evaluating `pr_body` and `comment_body` assertions.
+- Expanded `/openapi.json` with request/response schemas and examples for dry-run, PR create, comment create, GitHub result, and error responses.
+
+Remaining after this attempt:
+
+- Decide whether to enforce `Hermes-Run-Id` on Git `receive-pack` for stronger audit metadata.
+- Decide when to move `issue.comment` metadata assertions from warn mode to enforce mode for autonomous research usage.
+- Design multi-principal or delegated scoped credentials for subagents with different permission sets.
+- Replace VPS source-build deployment with CI-published container images and pinned image tags.
+
 Public repo:
 
 - `https://github.com/grubbyhacker/gh-agent-broker.git`
