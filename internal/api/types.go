@@ -66,6 +66,14 @@ type CommentCreateRequest struct {
 	Permissions []string `json:"permissions,omitempty"`
 }
 
+type IssueCreateRequest struct {
+	Title       string   `json:"title"`
+	Body        string   `json:"body"`
+	Labels      []string `json:"labels,omitempty"`
+	Metadata    Metadata `json:"metadata,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
+}
+
 type GitHubResult struct {
 	URL     string `json:"url,omitempty"`
 	HTMLURL string `json:"html_url,omitempty"`

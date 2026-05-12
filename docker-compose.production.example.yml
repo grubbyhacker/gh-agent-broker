@@ -9,13 +9,29 @@ services:
       - ${BROKER_ENV_FILE:-.env}
     volumes:
       - ./configs/production.yaml:/etc/gh-agent-broker/config.yaml:ro
-      - ./secrets/github-app.pem:/run/secrets/github-app.pem:ro
+      - ./secrets/github-coder-app.pem:/run/secrets/github-coder-app.pem:ro
+      - ./secrets/github-reporter-app.pem:/run/secrets/github-reporter-app.pem:ro
       - broker-audit:/var/log/gh-agent-broker
     healthcheck:
       test: ["CMD", "/usr/local/bin/gh-agent-broker-cli", "health", "-broker", "http://127.0.0.1:8080"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+  issue-reporter:
+    image: ${BROKER_IMAGE:?set BROKER_IMAGE to a pinned ghcr.io/grubbyhacker/gh-agent-broker tag}
+    entrypoint: ["/usr/local/bin/broker-issue-reporter"]
+    command: ["-config", "/etc/gh-agent-broker/reporter.yaml"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8090:8090"
+    env_file:
+      - ${BROKER_ENV_FILE:-.env}
+    volumes:
+      - ./configs/reporter.yaml:/etc/gh-agent-broker/reporter.yaml:ro
+    depends_on:
+      broker:
+        condition: service_healthy
 
 volumes:
   broker-audit:

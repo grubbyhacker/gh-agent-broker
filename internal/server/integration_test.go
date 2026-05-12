@@ -22,7 +22,7 @@ import (
 )
 
 func TestFakeGitHubRESTIntegration(t *testing.T) {
-	var sawProbe, sawPull, sawComment bool
+	var sawProbe, sawPull, sawIssue, sawComment bool
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
@@ -53,6 +53,14 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 				t.Fatalf("comment body missing broker metadata: %s", body)
 			}
 			writeTestJSON(t, w, map[string]interface{}{"id": 3003, "url": "https://api.fake/comments/1", "html_url": "https://fake/owner/repo/pull/7#issuecomment-1"})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues":
+			requireBearer(t, r)
+			sawIssue = true
+			body := readBody(t, r)
+			if !strings.Contains(body, "Broker-Operation-Id") || !strings.Contains(body, "Dedupe-Key") || !strings.Contains(body, "agent-reported") {
+				t.Fatalf("issue body missing expected metadata/label: %s", body)
+			}
+			writeTestJSON(t, w, map[string]interface{}{"id": 4004, "number": 8, "url": "https://api.fake/issues/8", "html_url": "https://fake/owner/repo/issues/8"})
 		default:
 			t.Fatalf("unexpected fake GitHub REST request: %s %s", r.Method, r.URL.Path)
 		}
@@ -64,7 +72,7 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 		Enabled:      true,
 		Secret:       "agent-secret",
 		Repositories: []string{"owner/repo"},
-		Operations:   []string{"repo.probe", "pull.create", "issue.comment"},
+		Operations:   []string{"repo.probe", "pull.create", "issue.comment", "issue.create"},
 		BaseBranches: []string{"main"},
 		BranchPatterns: []string{
 			"^agent/agent-1/.+$",
@@ -89,8 +97,16 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 	})
 	assertStatus(t, resp, http.StatusCreated)
 
-	if !sawProbe || !sawPull || !sawComment {
-		t.Fatalf("fake REST handlers were not all exercised: probe=%v pull=%v comment=%v", sawProbe, sawPull, sawComment)
+	resp = brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/issues", map[string]interface{}{
+		"title":    "bug report",
+		"body":     "observed behavior",
+		"labels":   []string{"agent-reported"},
+		"metadata": map[string]string{"Agent-Id": "agent-1", "Dedupe-Key": "owner/repo:test"},
+	})
+	assertStatus(t, resp, http.StatusCreated)
+
+	if !sawProbe || !sawPull || !sawIssue || !sawComment {
+		t.Fatalf("fake REST handlers were not all exercised: probe=%v pull=%v issue=%v comment=%v", sawProbe, sawPull, sawIssue, sawComment)
 	}
 }
 

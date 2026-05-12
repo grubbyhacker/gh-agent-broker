@@ -59,6 +59,46 @@ func TestValidateRejectsDuplicateAgent(t *testing.T) {
 	}
 }
 
+func TestLoadSupportsNamedGitHubApps(t *testing.T) {
+	t.Setenv("TEST_AGENT_SECRET", "agent-secret")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, `
+github:
+  api_base_url: https://api.github.invalid
+  git_base_url: https://github.invalid
+  apps:
+    coder:
+      app_id: 1
+      private_key_path: coder.pem
+      installations:
+        owner/code: 11
+    reporter:
+      app_id: 2
+      private_key_path: reporter.pem
+      installations:
+        owner/issues: 22
+agents:
+  - id: reporter-1
+    enabled: true
+    secret_env: TEST_AGENT_SECRET
+    github_app: reporter
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := GitHubAppName(cfg.Agents[0]); got != "reporter" {
+		t.Fatalf("GitHubAppName = %q", got)
+	}
+	if id, ok := cfg.InstallationIDForApp("reporter", "owner/issues"); !ok || id != 22 {
+		t.Fatalf("reporter installation = %d/%v, want 22/true", id, ok)
+	}
+	if _, ok := cfg.InstallationIDForApp("reporter", "owner/code"); ok {
+		t.Fatalf("reporter unexpectedly resolved coder installation")
+	}
+}
+
 func writeFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {

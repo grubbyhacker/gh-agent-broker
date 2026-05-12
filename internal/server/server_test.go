@@ -79,6 +79,7 @@ func TestOperationsDocumentsV1RESTRoutes(t *testing.T) {
 	want := map[string]string{
 		"repo.probe":     "GET /v1/repos/{owner}/{repo}/probe",
 		"pull.create":    "POST /v1/repos/{owner}/{repo}/pulls",
+		"issue.create":   "POST /v1/repos/{owner}/{repo}/issues",
 		"issue.comment":  "POST /v1/repos/{owner}/{repo}/issues/{number}/comments",
 		"policy.dry-run": "POST /v1/policy/dry-run",
 	}

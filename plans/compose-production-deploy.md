@@ -13,7 +13,8 @@ private deployment config before running the broker.
 - Point Hermes Git remotes at the broker:
   `http://127.0.0.1:8080/git/OWNER/REPO.git` or
   `http://gh-agent-broker:8080/git/OWNER/REPO.git` on a shared Docker network.
-- The broker is the only component that mounts the GitHub App private key.
+- The broker is the only component that mounts GitHub App private keys. The
+  reporter MCP service uses a broker credential, not a GitHub App key.
 - Hermes agents receive only broker credentials: agent ID and broker agent
   secret.
 
@@ -23,8 +24,9 @@ private deployment config before running the broker.
   `0.0.0.0:8080` inside a private Docker network with no public port publish.
 - Host port publish, when used: `127.0.0.1:8080:8080`.
 - Config mount: `./configs/production.yaml:/etc/gh-agent-broker/config.yaml:ro`.
-- GitHub App key mount:
-  `./secrets/github-app.pem:/run/secrets/github-app.pem:ro`.
+- GitHub App key mounts:
+  `./secrets/github-coder-app.pem:/run/secrets/github-coder-app.pem:ro` and
+  `./secrets/github-reporter-app.pem:/run/secrets/github-reporter-app.pem:ro`.
 - Audit mount: prefer a named Docker volume at `/var/log/gh-agent-broker`.
   If using a host bind mount such as `./audit:/var/log/gh-agent-broker`, make
   it writable by container UID `65532`.
@@ -33,8 +35,9 @@ private deployment config before running the broker.
 - Required environment variables:
   - `BROKER_ADMIN_SECRET`
   - `HERMES_AGENT_BROKER_SECRET`
+  - `BROKER_REPORTER_01_SECRET`
 - Required private values in the config:
-  - GitHub App ID
+  - GitHub App IDs
   - GitHub App installation ID for each repository
   - allowed repository names
   - agent ID and branch prefix
@@ -42,9 +45,9 @@ private deployment config before running the broker.
 ## First Install
 
 1. Create a private copy of `configs/production.example.yaml`.
-2. Fill in the GitHub App ID, installation IDs, repository names, agent ID, and
+2. Fill in the GitHub App IDs, installation IDs, repository names, agent ID, and
    branch patterns.
-3. Put the GitHub App PEM at the configured key path with owner-only
+3. Put the GitHub App PEM files at the configured key paths with owner-only
    permissions.
 4. Put the admin and agent secrets in the host-owned `.env` file, using
    `.env.example` only as a variable-name template.
@@ -96,6 +99,8 @@ private deployment config before running the broker.
 The broker image includes `/usr/local/bin/gh-agent-broker-cli` for operator
 checks inside the broker container. Agent containers should also have the CLI
 when they need broker-mediated probe, dry-run, PR, or comment operations.
+Issue creation is intentionally not a CLI workflow in the current deployment
+model; expose it through the host-side reporter MCP service instead.
 
 Short-term, extract the CLI from the same pinned broker image and bind-mount it
 into the agent container:
@@ -121,6 +126,20 @@ install -m 0755 gh-agent-broker-cli-linux-amd64 ./bin/gh-agent-broker-cli
 If the agent runtime supports skills, install `skills/gh-agent-broker` so the
 agent prefers CLI commands over ad hoc REST calls.
 
+## Reporter MCP Service
+
+Run `broker-issue-reporter` as a separate service from the same pinned image
+when agents need to file issues. Override the image entrypoint to
+`/usr/local/bin/broker-issue-reporter`, mount a private
+`configs/reporter.yaml`, and provide only `BROKER_REPORTER_01_SECRET` to that
+service. Do not mount that reporter credential into Hermes or other agent
+containers.
+
+The reporter should point at a broker principal such as `broker-reporter-01`
+that uses a separate issues-only GitHub App context. Configure Hermes MCP with
+the reporter URL, for example `http://broker-issue-reporter:8090/mcp`, and let
+agents call only `broker_report_issue` for issue creation.
+
 ## Hermes Agent Guidance
 
 - Use the broker remote only; do not configure GitHub token remotes inside
@@ -129,6 +148,8 @@ agent prefers CLI commands over ad hoc REST calls.
   container environment.
 - Include configured metadata such as `Agent-Id` and `Hermes-Run-Id` on broker
   PR/comment calls.
+- Use the reporter MCP tool for issue creation. Do not inject reporter broker
+  credentials into Hermes containers or subagent sandboxes.
 - Use distinct `Hermes-Run-Id` values for parent and subagent work so audit
   events can be separated.
 - Subagents with the same permission set may share one broker identity.

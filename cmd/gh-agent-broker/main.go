@@ -66,7 +66,7 @@ func usage() {
 func commonFlags(fs *flag.FlagSet) (broker, agentID, secret *string) {
 	broker = fs.String("broker", envDefault("BROKER_URL", "http://127.0.0.1:8080"), "broker base URL")
 	agentID = fs.String("agent-id", os.Getenv("BROKER_AGENT_ID"), "broker agent ID")
-	secret = fs.String("secret", os.Getenv("BROKER_AGENT_SECRET"), "broker agent secret")
+	secret = fs.String("secret", "", "broker agent secret (defaults to BROKER_AGENT_SECRET)")
 	return broker, agentID, secret
 }
 
@@ -134,6 +134,7 @@ func cmdProbe(args []string) {
 	if *repo == "" {
 		fatal(fmt.Errorf("-repo is required"))
 	}
+	resolveSecret(secret)
 	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/probe", *agentID, *secret, nil)
 }
 
@@ -149,6 +150,7 @@ func cmdDryRun(args []string) {
 	if err := fs.Parse(args); err != nil {
 		fatal(err)
 	}
+	resolveSecret(secret)
 	body := map[string]interface{}{"repo": *repo, "operation": *operation, "branch": *branch, "base_branch": *base, "metadata": map[string]string(md)}
 	doRequest(http.MethodPost, *broker, "/v1/policy/dry-run", *agentID, *secret, body)
 }
@@ -167,6 +169,7 @@ func cmdPR(args []string) {
 	if err := fs.Parse(args); err != nil {
 		fatal(err)
 	}
+	resolveSecret(secret)
 	body := map[string]interface{}{"title": *title, "head": *head, "base": *base, "body": *bodyText, "draft": *draft, "metadata": map[string]string(md)}
 	doRequest(http.MethodPost, *broker, "/v1/repos/"+*repo+"/pulls", *agentID, *secret, body)
 }
@@ -182,6 +185,7 @@ func cmdComment(args []string) {
 	if err := fs.Parse(args); err != nil {
 		fatal(err)
 	}
+	resolveSecret(secret)
 	body := map[string]interface{}{"body": *bodyText, "metadata": map[string]string(md)}
 	doRequest(http.MethodPost, *broker, "/v1/repos/"+*repo+"/issues/"+*issue+"/comments", *agentID, *secret, body)
 }
@@ -226,6 +230,12 @@ func envDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func resolveSecret(secret *string) {
+	if *secret == "" {
+		*secret = os.Getenv("BROKER_AGENT_SECRET")
+	}
 }
 
 func fatal(err error) {

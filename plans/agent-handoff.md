@@ -106,11 +106,15 @@ Code hygiene baseline:
 - The production Compose template reads host-owned secrets from `.env` by default and keeps private config/key mounts outside git; `.env` is ignored by git and excluded from the Docker build context.
 - Agent runtimes should install or bind-mount `gh-agent-broker-cli`; compatible agents can use the generic `skills/gh-agent-broker` skill to prefer CLI commands over raw REST calls.
 - `configs/production.example.yaml` documents required GitHub App permissions and keeps Hermes metadata names as config examples only.
+- Current implementation work is adding broker-internal `issue.create`, named
+  GitHub App contexts, and a host-side `broker-issue-reporter` MCP service so
+  issue creation can use an issues-only GitHub App without injecting reporter
+  credentials into Hermes.
 - README now includes Hermes CLI usage for remotes, broker env vars, PRs, comments, and metadata.
 - Dockerfile now creates `/var/log/gh-agent-broker` owned by UID 65532, and the Compose example uses a named audit volume by default.
 - `internal/server/integration_test.go` covers fake GitHub REST operations, fake Git smart-HTTP proxying, auth-header filtering, and Git denial UX.
 - `make smoke-container` builds the image, validates config-check failure behavior, starts the broker with generated test key/config, and checks health.
-- Latest verification in this handoff: `git diff --check`, production Compose config rendering with a dummy pinned image, `mise exec -- make ci`, and `make smoke-container` passed. Plain `make ci` with the system `go1.18.1` fails before tests because the repo requires the `.mise.toml` Go toolchain.
+- Latest verification in this handoff: `mise exec -- make check`, `mise exec -- make smoke-container`, `git diff --check`, and production Compose config rendering with a dummy pinned image and `.env.example` passed. Plain `make ci` with the system `go1.18.1` fails before tests because the repo requires the `.mise.toml` Go toolchain.
 
 ## VPS Deployment Status
 
