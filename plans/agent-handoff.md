@@ -27,7 +27,9 @@ Remaining after this attempt:
 
 - Decide whether to enforce `Hermes-Run-Id` on Git `receive-pack` for stronger audit metadata.
 - Move `issue.comment` metadata assertions from warn mode to enforce mode before broader autonomous usage.
-- Design multi-principal or delegated scoped credentials for subagents with different permission sets.
+- Implement the separate sandbox MCP service plan in `plans/sandbox-mcp-v1.md`
+  for task-isolated worker containers with template-scoped broker identities
+  and read-only credential bundles.
 - Production Compose is pinned to the latest published broker image from PR `#15`.
 - Confirm the GHCR package is public after first publish if deployment hosts should pull without registry credentials.
 - Confirm the first semver release uploads standalone Linux binaries and `SHA256SUMS`.
