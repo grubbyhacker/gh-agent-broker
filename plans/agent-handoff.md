@@ -115,7 +115,14 @@ Code hygiene baseline:
 ## VPS Deployment Status
 
 - `hermes-vps` has a running broker Compose project at `/docker/gh-agent-broker`.
+- Broker Compose now consumes `BROKER_IMAGE` from `/docker/gh-agent-broker/.env`
+  and is pinned to
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-14f02d5de334f8f54123edcff934466631b9306e`.
 - Broker health is reachable from the host at `http://127.0.0.1:8080/healthz` and from the Hermes Docker network at `http://gh-agent-broker:8080/healthz`.
 - Hermes container env now includes `BROKER_URL`, `BROKER_AGENT_ID`, and `BROKER_AGENT_SECRET`.
+- Hermes Compose project at `/docker/hermes-agent-6aso` now has separate
+  `hermes-agent` and `hermes-gateway` services. `hermes-gateway` runs
+  `gateway run` through `/opt/hermes/docker/entrypoint.sh`, has no published
+  port, and reports `Gateway is running`.
 - Secrets were not committed; VPS private config/key/env live outside git under `/docker/gh-agent-broker`.
 - Hermes session `20260512_005558_19ac2d` discussed broker usage and recommended a Hermes skill/runbook for broker remotes, metadata, branch rules, subagent identity, and secret safety.
