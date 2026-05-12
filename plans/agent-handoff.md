@@ -7,14 +7,13 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 Latest Hermes retest result:
 
 - GO for the first controlled research-agent project using `BROKER_AGENT_ID=hermes-coder-01` and `grubbyhacker/research`.
-- Issue `#13` is fixed locally: `gh-agent-broker-cli configure` now writes a
-  repo-local URL-scoped Git credential helper so non-interactive
+- Issue `#13` is fixed and deployed: `gh-agent-broker-cli configure` now
+  writes a repo-local URL-scoped Git credential helper so non-interactive
   `git fetch`/`git push` can read `BROKER_AGENT_ID` and `BROKER_AGENT_SECRET`
-  from the environment without storing broker secrets in Git config. Verified
-  with `mise exec -- make check` and a temporary Git credential-flow smoke test.
-- Current integration branch also takes the pending Dependabot updates for
+  from the environment without storing broker secrets in Git config.
+- PR `#15` also took the pending Dependabot updates for
   `actions/checkout@v6`, `actions/setup-go@v6`, and
-  `github.com/golang-jwt/jwt/v4@v4.5.2` before the next VPS/container bounce.
+  `github.com/golang-jwt/jwt/v4@v4.5.2`. Issues `#13` and `#14` are closed.
 - Hermes focused v1 REST/readiness suite passed: 24 pass, 0 fail.
 - Dry-run shape tests passed for `repo`, `repository`, and `owner`+`repo` forms.
 - Git `GIT_ASKPASS` works after the `WWW-Authenticate` fix.
@@ -29,7 +28,7 @@ Remaining after this attempt:
 - Decide whether to enforce `Hermes-Run-Id` on Git `receive-pack` for stronger audit metadata.
 - Move `issue.comment` metadata assertions from warn mode to enforce mode before broader autonomous usage.
 - Design multi-principal or delegated scoped credentials for subagents with different permission sets.
-- Confirm the first GHCR image publish after this workflow lands on `main`, then switch the production Compose project to the pinned image template.
+- Production Compose is pinned to the latest published broker image from PR `#15`.
 - Confirm the GHCR package is public after first publish if deployment hosts should pull without registry credentials.
 - Confirm the first semver release uploads standalone Linux binaries and `SHA256SUMS`.
 
@@ -129,7 +128,9 @@ Code hygiene baseline:
 - `hermes-vps` has a running broker Compose project at `/docker/gh-agent-broker`.
 - Broker Compose now consumes `BROKER_IMAGE` from `/docker/gh-agent-broker/.env`
   and is pinned to
-  `ghcr.io/grubbyhacker/gh-agent-broker:sha-14f02d5de334f8f54123edcff934466631b9306e`.
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-221e3add7696ba66a69301f43fb5fa4d09b1add6`.
+- Broker and issue-reporter containers were recreated from that image on
+  2026-05-12 and are healthy/running.
 - Broker health is reachable from the host at `http://127.0.0.1:8080/healthz` and from the Hermes Docker network at `http://gh-agent-broker:8080/healthz`.
 - Hermes container env now includes `BROKER_URL`, `BROKER_AGENT_ID`, and `BROKER_AGENT_SECRET`.
 - Hermes Compose project at `/docker/hermes-agent-6aso` now has only
@@ -144,13 +145,17 @@ Code hygiene baseline:
 - `gh-agent-broker-cli` was extracted from the pinned broker image to
   `/docker/gh-agent-broker/bin/gh-agent-broker-cli` and bind-mounted read-only
   into both Hermes services at `/usr/local/bin/gh-agent-broker-cli`.
+- Hermes services were force-recreated on 2026-05-12 so the file bind mount
+  sees the updated CLI. `stat` from the host, `hermes-gateway`, and
+  `hermes-dashboard` all reported the same updated CLI size and timestamp.
 - The generic `gh-agent-broker` skill is installed at
   `/docker/hermes-agent-6aso/data/skills/gh-agent-broker` and `hermes skills
   list` reports it as a local enabled skill.
 - Verified from both `hermes-gateway` and `hermes-dashboard`:
-  `gh-agent-broker-cli health` returns `ok`. Earlier readiness testing also
-  verified `gh-agent-broker-cli probe -repo grubbyhacker/research` through the
-  broker.
+  `gh-agent-broker-cli health` returns `ok`,
+  `gh-agent-broker-cli probe -repo grubbyhacker/research` succeeds through the
+  broker, and the new `credential-helper get` subcommand returns test
+  credentials when supplied fake `BROKER_AGENT_ID`/`BROKER_AGENT_SECRET` values.
 - Repaired `/docker/hermes-agent-6aso/data` ownership to `10000:10000` after
   root-owned memory files blocked Hermes from writing
   `/opt/data/memories/USER.md.lock`. Verified write access as the `hermes`
