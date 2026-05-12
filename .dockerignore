@@ -1,0 +1,5 @@
+.git
+.tools
+/audit
+/secrets
+configs/e2e.local.yaml

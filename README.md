@@ -42,6 +42,12 @@ make check
 
 `make check` runs formatting checks, `go mod tidy` drift detection, `golangci-lint`, unit tests, race tests, `govulncheck`, and binary builds. The project targets Go 1.26.x.
 
+Docker container smoke testing is intentionally separate from `make check` because it requires a local Docker daemon:
+
+```sh
+make smoke-container
+```
+
 ## Development Environment
 
 The repo exposes two supported setup paths:
@@ -79,6 +85,46 @@ http://127.0.0.1:8080/git/example-org/example-repo.git
 ```
 
 Use the agent ID and broker secret for Git HTTP basic auth. Do not place GitHub tokens in the agent container.
+
+For Hermes agents on a VPS, prefer a dedicated broker Compose project and point the agent at the broker over `127.0.0.1` or a private Docker network. A production-oriented config template is available at `configs/production.example.yaml`; copy it to a private path and replace all placeholders before use. The GitHub App needs repository permissions for Contents read/write, Pull requests read/write, Issues read/write, and Metadata read.
+
+Hermes should provide only broker credentials:
+
+```sh
+export BROKER_URL=http://127.0.0.1:8080
+export BROKER_AGENT_ID=hermes-agent-01
+export BROKER_AGENT_SECRET=replace-me-agent-secret
+```
+
+Configure a repository remote through the broker:
+
+```sh
+gh-agent-broker-cli configure -repo OWNER/REPO -remote origin
+git remote -v
+```
+
+Create PRs and comments with metadata fields that match the configured policy. The names below are examples from the sample config, not hard-coded broker fields:
+
+```sh
+gh-agent-broker-cli pr \
+  -repo OWNER/REPO \
+  -title "Hermes agent change" \
+  -head agent/hermes-agent-01/run-123 \
+  -base main \
+  -metadata Agent-Id=hermes-agent-01 \
+  -metadata Hermes-Run-Id=run-123
+
+gh-agent-broker-cli comment \
+  -repo OWNER/REPO \
+  -issue 123 \
+  -body "Hermes finished this run." \
+  -metadata Agent-Id=hermes-agent-01 \
+  -metadata Hermes-Run-Id=run-123
+```
+
+Hermes subagents that use the same GitHub permission set can share the same broker identity, but should use distinct `Hermes-Run-Id` values for auditability. Subagents that need different repository access, branch rules, or GitHub permissions should be modeled as separate broker agents with separate secrets and policy blocks; for stronger runtime isolation, run those subagents in separate containers. A future broker delegated-credential flow may make same-container scoped delegation safer, but V1 keeps the boundary at the broker principal.
+
+See `plans/hermes-vps-integration.md` for the sanitized VPS topology, volume, secret, and rollback runbook.
 
 ## Notes
 

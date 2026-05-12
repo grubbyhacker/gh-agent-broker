@@ -10,9 +10,12 @@ services:
     volumes:
       - ./configs/example.yaml:/etc/gh-agent-broker/config.yaml:ro
       - ./secrets/github-app.pem:/run/secrets/github-app.pem:ro
-      - ./audit:/var/log/gh-agent-broker
+      - broker-audit:/var/log/gh-agent-broker
     healthcheck:
       test: ["CMD", "/usr/local/bin/gh-agent-broker-cli", "health", "-broker", "http://127.0.0.1:8080"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  broker-audit:

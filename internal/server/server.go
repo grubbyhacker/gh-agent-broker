@@ -367,7 +367,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			}},
 		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Decision: result.Decision})
-		writeGitPolicyError(w, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
+		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
 	}
 	result := policy.Check(policy.Request{
@@ -379,7 +379,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	})
 	if !result.Allowed {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision})
-		writeGitPolicyError(w, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
+		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
 	}
 	token, err := gh.InstallationToken(inst)
@@ -509,7 +509,11 @@ func receivePackBranch(body []byte) string {
 	return ""
 }
 
-func writeGitPolicyError(w http.ResponseWriter, errResp api.ErrorResponse) {
+func writeGitPolicyError(w http.ResponseWriter, r *http.Request, errResp api.ErrorResponse) {
+	if !wantsJSON(r) {
+		writeGitPolicyTextError(w, errResp)
+		return
+	}
 	b, err := json.Marshal(errResp)
 	if err != nil {
 		http.Error(w, "encode policy error failed", http.StatusInternalServerError)
@@ -518,6 +522,69 @@ func writeGitPolicyError(w http.ResponseWriter, errResp api.ErrorResponse) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
 	if _, err := w.Write(b); err != nil {
+		return
+	}
+}
+
+func wantsJSON(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "application/json")
+}
+
+func writeGitPolicyTextError(w http.ResponseWriter, errResp api.ErrorResponse) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	var b strings.Builder
+	b.WriteString("Git operation denied by gh-agent-broker policy\n")
+	if errResp.OperationID != "" {
+		fmt.Fprintf(&b, "operation_id: %s\n", errResp.OperationID)
+	}
+	if errResp.Code != "" {
+		fmt.Fprintf(&b, "code: %s\n", errResp.Code)
+	}
+	if errResp.Decision != "" {
+		fmt.Fprintf(&b, "decision: %s\n", errResp.Decision)
+	}
+	if errResp.Message != "" {
+		fmt.Fprintf(&b, "message: %s\n", errResp.Message)
+	}
+	if len(errResp.FailedChecks) > 0 {
+		b.WriteString("failed_checks:\n")
+		for _, check := range errResp.FailedChecks {
+			fmt.Fprintf(&b, "- %s", check.Dimension)
+			if check.Field != "" {
+				fmt.Fprintf(&b, ".%s", check.Field)
+			}
+			if check.Location != "" {
+				fmt.Fprintf(&b, " at %s", check.Location)
+			}
+			if check.Message != "" {
+				fmt.Fprintf(&b, ": %s", check.Message)
+			}
+			b.WriteByte('\n')
+			if check.SafeToDisplay {
+				if check.Expected != "" {
+					fmt.Fprintf(&b, "  expected: %s\n", check.Expected)
+				}
+				if check.Actual != "" {
+					fmt.Fprintf(&b, "  actual: %s\n", check.Actual)
+				}
+			}
+		}
+	}
+	if len(errResp.RequiredChanges) > 0 {
+		b.WriteString("required_changes:\n")
+		for _, change := range errResp.RequiredChanges {
+			label := change.Location
+			if label == "" {
+				label = change.Field
+			}
+			if label == "" {
+				label = "request"
+			}
+			fmt.Fprintf(&b, "- %s: %s\n", label, change.Action)
+		}
+	}
+	if _, err := w.Write([]byte(b.String())); err != nil {
 		return
 	}
 }
