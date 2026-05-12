@@ -12,7 +12,7 @@ GOVULNCHECK_VERSION := v1.1.4
 GOFILES := $(shell find . -name '*.go' -not -path './.git/*' -not -path './.tools/*')
 PACKAGES := ./...
 
-.PHONY: check ci fmt fmt-check lint test race vuln build tidy-check tools clean-tools
+.PHONY: check ci fmt fmt-check lint test race vuln build tidy-check tools clean-tools smoke-container
 
 check: fmt-check tidy-check lint test race vuln build
 
@@ -44,6 +44,9 @@ vuln: $(TOOLS_DIR)/govulncheck
 
 build:
 	$(GO) build ./cmd/broker ./cmd/gh-agent-broker
+
+smoke-container:
+	./scripts/container-smoke.sh
 
 tidy-check:
 	@tmp="$$(mktemp -d)"; \

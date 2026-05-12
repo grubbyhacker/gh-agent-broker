@@ -82,6 +82,16 @@ func (s *Server) snapshot() (*config.Config, *githubapp.Client) {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.URL.Path == "/":
+		handleDiscovery(w, r)
+	case r.URL.Path == "/docs":
+		handleDocs(w, r)
+	case r.URL.Path == "/operations" || r.URL.Path == "/api/operations":
+		handleOperations(w, r)
+	case r.URL.Path == "/openapi.json":
+		handleOpenAPI(w, r)
+	case r.URL.Path == "/whoami" || r.URL.Path == "/api/whoami":
+		s.handleWhoami(w, r)
 	case r.URL.Path == "/healthz":
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.URL.Path == "/readyz":
@@ -99,6 +109,361 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func handleDiscovery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"name":        "gh-agent-broker",
+		"description": "GitHub Agent Access Broker",
+		"version":     "v1",
+		"links": map[string]string{
+			"health":     "/healthz",
+			"ready":      "/readyz",
+			"operations": "/operations",
+			"openapi":    "/openapi.json",
+		},
+		"git_remote_template": "/git/{owner}/{repo}.git",
+		"auth":                "agent operations use HTTP basic auth with broker agent ID and broker agent secret",
+	})
+}
+
+func handleOperations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"version": "v1",
+		"operations": []map[string]interface{}{
+			{
+				"name":        "repo.probe",
+				"method":      http.MethodGet,
+				"path":        "/v1/repos/{owner}/{repo}/probe",
+				"auth":        "agent",
+				"description": "Probe configured repository access through the broker.",
+			},
+			{
+				"name":        "pull.create",
+				"method":      http.MethodPost,
+				"path":        "/v1/repos/{owner}/{repo}/pulls",
+				"auth":        "agent",
+				"description": "Create a pull request through the broker.",
+				"metadata":    "send configured metadata fields in request body metadata",
+			},
+			{
+				"name":        "issue.comment",
+				"method":      http.MethodPost,
+				"path":        "/v1/repos/{owner}/{repo}/issues/{number}/comments",
+				"auth":        "agent",
+				"description": "Create an issue or pull request comment through the broker.",
+				"metadata":    "send configured metadata fields in request body metadata",
+			},
+			{
+				"name":        "policy.dry-run",
+				"method":      http.MethodPost,
+				"path":        "/v1/policy/dry-run",
+				"auth":        "agent",
+				"description": "Evaluate broker policy without performing the requested operation.",
+			},
+			{
+				"name":        "git.upload-pack",
+				"method":      "GET/POST",
+				"path":        "/git/{owner}/{repo}.git",
+				"auth":        "git basic auth",
+				"description": "Brokered Git clone/fetch smart-HTTP endpoint.",
+			},
+			{
+				"name":        "git.receive-pack",
+				"method":      "GET/POST",
+				"path":        "/git/{owner}/{repo}.git",
+				"auth":        "git basic auth",
+				"description": "Brokered Git push smart-HTTP endpoint.",
+			},
+		},
+	})
+}
+
+func handleDocs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte(`gh-agent-broker REST routes
+
+Authentication:
+- Agent operations use HTTP basic auth with broker agent ID and broker agent secret.
+- Do not use GitHub tokens with the broker.
+
+Discovery:
+- GET /operations
+- GET /openapi.json
+- GET /whoami
+
+Operations:
+- GET  /v1/repos/{owner}/{repo}/probe
+- POST /v1/policy/dry-run
+- POST /v1/repos/{owner}/{repo}/pulls
+- POST /v1/repos/{owner}/{repo}/issues/{number}/comments
+
+Git smart HTTP:
+- /git/{owner}/{repo}.git
+`)); err != nil {
+		return
+	}
+}
+
+func handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, openAPISpec())
+}
+
+func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	cfg, _ := s.snapshot()
+	principal, ok := auth.AuthenticateAgent(r, cfg)
+	if !ok {
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", Decision: policy.DecisionDeny})
+		return
+	}
+	agent := principal.Agent
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"agent_id":            principal.ID,
+		"enabled":             agent.Enabled,
+		"repositories":        agent.Repositories,
+		"operations":          agent.Operations,
+		"branch_patterns":     agent.BranchPatterns,
+		"base_branches":       agent.BaseBranches,
+		"permissions":         agent.Permissions,
+		"metadata_assertions": agent.MetadataAssertions,
+	})
+}
+
+func openAPISpec() map[string]interface{} {
+	errorResponse := map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"code":             map[string]string{"type": "string"},
+			"message":          map[string]string{"type": "string"},
+			"operation_id":     map[string]string{"type": "string"},
+			"decision":         map[string]string{"type": "string"},
+			"failed_checks":    map[string]interface{}{"type": "array", "items": map[string]string{"type": "object"}},
+			"required_changes": map[string]interface{}{"type": "array", "items": map[string]string{"type": "object"}},
+			"warnings":         map[string]interface{}{"type": "array", "items": map[string]string{"type": "object"}},
+		},
+	}
+	return map[string]interface{}{
+		"openapi": "3.1.0",
+		"info": map[string]string{
+			"title":   "GitHub Agent Access Broker",
+			"version": "v1",
+		},
+		"security": []map[string][]string{{"agentBasicAuth": []string{}}},
+		"components": map[string]interface{}{
+			"securitySchemes": map[string]interface{}{
+				"agentBasicAuth": map[string]string{
+					"type":   "http",
+					"scheme": "basic",
+				},
+			},
+			"schemas": map[string]interface{}{
+				"Metadata": map[string]interface{}{
+					"type":                 "object",
+					"additionalProperties": map[string]string{"type": "string"},
+					"example": map[string]string{
+						"Agent-Id":      "hermes-coder-01",
+						"Hermes-Run-Id": "run-123",
+					},
+				},
+				"DryRunRequest": map[string]interface{}{
+					"type":     "object",
+					"required": []string{"operation"},
+					"properties": map[string]interface{}{
+						"agent_id":    map[string]string{"type": "string"},
+						"repo":        map[string]string{"type": "string", "description": "owner/repo, or repo name when owner is also supplied"},
+						"repository":  map[string]string{"type": "string", "description": "owner/repo alias accepted for dry-run"},
+						"owner":       map[string]string{"type": "string", "description": "repository owner, used with repo name"},
+						"operation":   map[string]string{"type": "string"},
+						"branch":      map[string]string{"type": "string"},
+						"base_branch": map[string]string{"type": "string"},
+						"permissions": map[string]interface{}{"type": "array", "items": map[string]string{"type": "string"}},
+						"metadata":    map[string]interface{}{"$ref": "#/components/schemas/Metadata"},
+					},
+					"examples": map[string]interface{}{
+						"pullCreate": map[string]interface{}{
+							"value": map[string]interface{}{
+								"repo":        "OWNER/REPO",
+								"operation":   "pull.create",
+								"branch":      "agent/hermes-coder-01/run-123",
+								"base_branch": "main",
+								"metadata": map[string]string{
+									"Agent-Id":      "hermes-coder-01",
+									"Hermes-Run-Id": "run-123",
+								},
+							},
+						},
+					},
+				},
+				"DryRunResponse": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"operation_id":     map[string]string{"type": "string"},
+						"allowed":          map[string]string{"type": "boolean"},
+						"decision":         map[string]string{"type": "string"},
+						"failed_checks":    map[string]interface{}{"type": "array", "items": map[string]string{"type": "object"}},
+						"warnings":         map[string]interface{}{"type": "array", "items": map[string]string{"type": "object"}},
+						"required_changes": map[string]interface{}{"type": "array", "items": map[string]string{"type": "object"}},
+					},
+				},
+				"PullCreateRequest": map[string]interface{}{
+					"type":     "object",
+					"required": []string{"title", "head", "base"},
+					"properties": map[string]interface{}{
+						"title":       map[string]string{"type": "string"},
+						"head":        map[string]string{"type": "string"},
+						"base":        map[string]string{"type": "string"},
+						"body":        map[string]string{"type": "string"},
+						"draft":       map[string]string{"type": "boolean"},
+						"metadata":    map[string]interface{}{"$ref": "#/components/schemas/Metadata"},
+						"permissions": map[string]interface{}{"type": "array", "items": map[string]string{"type": "string"}},
+					},
+					"example": map[string]interface{}{
+						"title": "Hermes agent change",
+						"head":  "agent/hermes-coder-01/run-123",
+						"base":  "main",
+						"body":  "Implemented requested change.",
+						"metadata": map[string]string{
+							"Agent-Id":      "hermes-coder-01",
+							"Hermes-Run-Id": "run-123",
+						},
+					},
+				},
+				"CommentCreateRequest": map[string]interface{}{
+					"type":     "object",
+					"required": []string{"body"},
+					"properties": map[string]interface{}{
+						"body":        map[string]string{"type": "string"},
+						"metadata":    map[string]interface{}{"$ref": "#/components/schemas/Metadata"},
+						"permissions": map[string]interface{}{"type": "array", "items": map[string]string{"type": "string"}},
+					},
+					"example": map[string]interface{}{
+						"body": "Hermes finished this run.",
+						"metadata": map[string]string{
+							"Agent-Id":      "hermes-coder-01",
+							"Hermes-Run-Id": "run-123",
+						},
+					},
+				},
+				"GitHubResult": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"url":      map[string]string{"type": "string"},
+						"html_url": map[string]string{"type": "string"},
+						"number":   map[string]string{"type": "integer"},
+						"id":       map[string]string{"type": "integer"},
+					},
+				},
+				"ErrorResponse": errorResponse,
+			},
+		},
+		"paths": map[string]interface{}{
+			"/healthz": map[string]interface{}{
+				"get": map[string]interface{}{
+					"summary":  "Health check",
+					"security": []map[string][]string{},
+					"responses": map[string]interface{}{
+						"200": map[string]string{"description": "healthy"},
+					},
+				},
+			},
+			"/readyz": map[string]interface{}{
+				"get": map[string]interface{}{
+					"summary":  "Readiness check",
+					"security": []map[string][]string{},
+					"responses": map[string]interface{}{
+						"200": map[string]string{"description": "ready"},
+					},
+				},
+			},
+			"/v1/policy/dry-run": map[string]interface{}{
+				"post": map[string]interface{}{
+					"summary":     "Evaluate policy without performing an operation",
+					"requestBody": jsonRequestRef("#/components/schemas/DryRunRequest"),
+					"responses": map[string]interface{}{
+						"200": map[string]interface{}{"description": "allowed or warning decision", "content": jsonContentRef("#/components/schemas/DryRunResponse")},
+						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
+					},
+				},
+			},
+			"/v1/repos/{owner}/{repo}/probe": map[string]interface{}{
+				"get": map[string]interface{}{
+					"summary":    "Probe repository access",
+					"parameters": repoPathParams(),
+					"responses": map[string]interface{}{
+						"200": map[string]interface{}{"description": "repository probe result", "content": jsonContentRef("#/components/schemas/GitHubResult")},
+						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
+					},
+				},
+			},
+			"/v1/repos/{owner}/{repo}/pulls": map[string]interface{}{
+				"post": map[string]interface{}{
+					"summary":     "Create pull request",
+					"parameters":  repoPathParams(),
+					"requestBody": jsonRequestRef("#/components/schemas/PullCreateRequest"),
+					"responses": map[string]interface{}{
+						"201": map[string]interface{}{"description": "pull request created", "content": jsonContentRef("#/components/schemas/GitHubResult")},
+						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
+					},
+				},
+			},
+			"/v1/repos/{owner}/{repo}/issues/{number}/comments": map[string]interface{}{
+				"post": map[string]interface{}{
+					"summary": "Create issue or pull request comment",
+					"parameters": append(repoPathParams(), map[string]interface{}{
+						"name": "number", "in": "path", "required": true, "schema": map[string]string{"type": "string"},
+					}),
+					"requestBody": jsonRequestRef("#/components/schemas/CommentCreateRequest"),
+					"responses": map[string]interface{}{
+						"201": map[string]interface{}{"description": "comment created", "content": jsonContentRef("#/components/schemas/GitHubResult")},
+						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
+					},
+				},
+			},
+		},
+	}
+}
+
+func repoPathParams() []map[string]interface{} {
+	return []map[string]interface{}{
+		{"name": "owner", "in": "path", "required": true, "schema": map[string]string{"type": "string"}},
+		{"name": "repo", "in": "path", "required": true, "schema": map[string]string{"type": "string"}},
+	}
+}
+
+func jsonContentRef(ref string) map[string]interface{} {
+	return map[string]interface{}{
+		"application/json": map[string]interface{}{
+			"schema": map[string]string{"$ref": ref},
+		},
+	}
+}
+
+func jsonRequestRef(ref string) map[string]interface{} {
+	return map[string]interface{}{
+		"required": true,
+		"content":  jsonContentRef(ref),
+	}
+}
+
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -106,7 +471,7 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg, _ := s.snapshot()
 	if !auth.AuthenticateAdmin(r, cfg) {
-		writeJSON(w, http.StatusUnauthorized, api.ErrorResponse{Code: "unauthorized", Message: "admin authentication failed", Decision: policy.DecisionDeny})
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "admin authentication failed", Decision: policy.DecisionDeny})
 		return
 	}
 	if err := s.Reload(); err != nil {
@@ -125,7 +490,7 @@ func (s *Server) handleDryRun(w http.ResponseWriter, r *http.Request) {
 	cfg, _ := s.snapshot()
 	principal, ok := auth.AuthenticateAgent(r, cfg)
 	if !ok {
-		writeJSON(w, http.StatusUnauthorized, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
 	var req api.DryRunRequest
@@ -137,15 +502,18 @@ func (s *Server) handleDryRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, api.ErrorResponse{Code: "agent_mismatch", Message: "request agent_id must match authenticated agent", OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
+	repo := dryRunRepo(req)
 	var installationID int64
-	if id, ok := cfg.InstallationID(req.Repo); ok {
+	if id, ok := cfg.InstallationID(repo); ok {
 		installationID = id
 	}
 	enriched := metadata.WithBrokerFields(req.Metadata, principal.ID, opID, installationID)
+	prBody := enriched
+	commentBody := enriched
 	result := policy.Check(policy.Request{
 		Agent:       principal.Agent,
 		AgentID:     principal.ID,
-		Repo:        req.Repo,
+		Repo:        repo,
 		Operation:   req.Operation,
 		Branch:      req.Branch,
 		BaseBranch:  req.BaseBranch,
@@ -153,11 +521,11 @@ func (s *Server) handleDryRun(w http.ResponseWriter, r *http.Request) {
 		Metadata:    req.Metadata,
 		Locations: map[string]map[string]string{
 			"request":      req.Metadata,
-			"pr_body":      enriched,
-			"comment_body": enriched,
+			"pr_body":      prBody,
+			"comment_body": commentBody,
 		},
 	})
-	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "policy.dry-run", Repo: req.Repo, Branch: req.Branch, RequestedPermissions: req.Permissions, Decision: result.Decision})
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "policy.dry-run", Repo: repo, Branch: req.Branch, RequestedPermissions: req.Permissions, Decision: result.Decision})
 	writeJSON(w, statusFor(result), api.DryRunResponse{
 		OperationID:     opID,
 		Allowed:         result.Allowed,
@@ -166,6 +534,16 @@ func (s *Server) handleDryRun(w http.ResponseWriter, r *http.Request) {
 		Warnings:        result.Warnings,
 		RequiredChanges: result.RequiredChanges,
 	})
+}
+
+func dryRunRepo(req api.DryRunRequest) string {
+	if req.Repository != "" {
+		return req.Repository
+	}
+	if req.Owner != "" && req.Repo != "" && !strings.Contains(req.Repo, "/") {
+		return req.Owner + "/" + req.Repo
+	}
+	return req.Repo
 }
 
 func (s *Server) handleRepoAPI(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +570,7 @@ func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request, repo string
 	cfg, gh := s.snapshot()
 	principal, ok := auth.AuthenticateAgent(r, cfg)
 	if !ok {
-		writeJSON(w, http.StatusUnauthorized, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
 	inst, ok := cfg.InstallationID(repo)
@@ -221,7 +599,7 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 	cfg, gh := s.snapshot()
 	principal, ok := auth.AuthenticateAgent(r, cfg)
 	if !ok {
-		writeJSON(w, http.StatusUnauthorized, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
 	var req api.PullCreateRequest
@@ -270,7 +648,7 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 	cfg, gh := s.snapshot()
 	principal, ok := auth.AuthenticateAgent(r, cfg)
 	if !ok {
-		writeJSON(w, http.StatusUnauthorized, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
 	var req api.CommentCreateRequest
@@ -317,7 +695,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	cfg, gh := s.snapshot()
 	principal, ok := auth.AuthenticateAgent(r, cfg)
 	if !ok {
-		http.Error(w, "agent authentication failed", http.StatusUnauthorized)
+		writeAuthText(w, "agent authentication failed")
 		return
 	}
 	repo, suffix, ok := parseGitPath(r.URL.Path)
@@ -367,7 +745,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			}},
 		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Decision: result.Decision})
-		writeGitPolicyError(w, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
+		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
 	}
 	result := policy.Check(policy.Request{
@@ -379,7 +757,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	})
 	if !result.Allowed {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision})
-		writeGitPolicyError(w, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
+		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
 	}
 	token, err := gh.InstallationToken(inst)
@@ -509,7 +887,11 @@ func receivePackBranch(body []byte) string {
 	return ""
 }
 
-func writeGitPolicyError(w http.ResponseWriter, errResp api.ErrorResponse) {
+func writeGitPolicyError(w http.ResponseWriter, r *http.Request, errResp api.ErrorResponse) {
+	if !wantsJSON(r) {
+		writeGitPolicyTextError(w, errResp)
+		return
+	}
 	b, err := json.Marshal(errResp)
 	if err != nil {
 		http.Error(w, "encode policy error failed", http.StatusInternalServerError)
@@ -522,12 +904,85 @@ func writeGitPolicyError(w http.ResponseWriter, errResp api.ErrorResponse) {
 	}
 }
 
+func wantsJSON(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "application/json")
+}
+
+func writeGitPolicyTextError(w http.ResponseWriter, errResp api.ErrorResponse) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	var b strings.Builder
+	b.WriteString("Git operation denied by gh-agent-broker policy\n")
+	if errResp.OperationID != "" {
+		fmt.Fprintf(&b, "operation_id: %s\n", errResp.OperationID)
+	}
+	if errResp.Code != "" {
+		fmt.Fprintf(&b, "code: %s\n", errResp.Code)
+	}
+	if errResp.Decision != "" {
+		fmt.Fprintf(&b, "decision: %s\n", errResp.Decision)
+	}
+	if errResp.Message != "" {
+		fmt.Fprintf(&b, "message: %s\n", errResp.Message)
+	}
+	if len(errResp.FailedChecks) > 0 {
+		b.WriteString("failed_checks:\n")
+		for _, check := range errResp.FailedChecks {
+			fmt.Fprintf(&b, "- %s", check.Dimension)
+			if check.Field != "" {
+				fmt.Fprintf(&b, ".%s", check.Field)
+			}
+			if check.Location != "" {
+				fmt.Fprintf(&b, " at %s", check.Location)
+			}
+			if check.Message != "" {
+				fmt.Fprintf(&b, ": %s", check.Message)
+			}
+			b.WriteByte('\n')
+			if check.SafeToDisplay {
+				if check.Expected != "" {
+					fmt.Fprintf(&b, "  expected: %s\n", check.Expected)
+				}
+				if check.Actual != "" {
+					fmt.Fprintf(&b, "  actual: %s\n", check.Actual)
+				}
+			}
+		}
+	}
+	if len(errResp.RequiredChanges) > 0 {
+		b.WriteString("required_changes:\n")
+		for _, change := range errResp.RequiredChanges {
+			label := change.Location
+			if label == "" {
+				label = change.Field
+			}
+			if label == "" {
+				label = "request"
+			}
+			fmt.Fprintf(&b, "- %s: %s\n", label, change.Action)
+		}
+	}
+	if _, err := w.Write([]byte(b.String())); err != nil {
+		return
+	}
+}
+
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		return
 	}
+}
+
+func writeAuthJSON(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="gh-agent-broker"`)
+	writeJSON(w, http.StatusUnauthorized, v)
+}
+
+func writeAuthText(w http.ResponseWriter, message string) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="gh-agent-broker"`)
+	http.Error(w, message, http.StatusUnauthorized)
 }
 
 func closeBody(body io.Closer) {

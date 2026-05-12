@@ -1,14 +1,14 @@
 services:
   broker:
-    build: .
+    image: ${BROKER_IMAGE:?set BROKER_IMAGE to a pinned ghcr.io/grubbyhacker/gh-agent-broker tag}
     command: ["-config", "/etc/gh-agent-broker/config.yaml"]
+    restart: unless-stopped
     ports:
       - "127.0.0.1:8080:8080"
-    environment:
-      BROKER_ADMIN_SECRET: "replace-me-admin-secret"
-      HERMES_CODER_01_BROKER_SECRET: "replace-me-agent-secret"
+    env_file:
+      - ${BROKER_ENV_FILE:-.env}
     volumes:
-      - ./configs/example.yaml:/etc/gh-agent-broker/config.yaml:ro
+      - ./configs/production.yaml:/etc/gh-agent-broker/config.yaml:ro
       - ./secrets/github-app.pem:/run/secrets/github-app.pem:ro
       - broker-audit:/var/log/gh-agent-broker
     healthcheck:

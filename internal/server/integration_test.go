@@ -1,0 +1,346 @@
+package server
+
+import (
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"gh-agent-broker/internal/audit"
+	"gh-agent-broker/internal/config"
+	"gh-agent-broker/internal/githubapp"
+)
+
+func TestFakeGitHubRESTIntegration(t *testing.T) {
+	var sawProbe, sawPull, sawComment bool
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
+			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				t.Errorf("token exchange Authorization = %q", r.Header.Get("Authorization"))
+			}
+			writeTestJSON(t, w, map[string]string{
+				"token":      "fake-install-token",
+				"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo":
+			requireBearer(t, r)
+			sawProbe = true
+			writeTestJSON(t, w, map[string]interface{}{"id": 1001, "url": "https://api.fake/repos/owner/repo", "html_url": "https://fake/owner/repo"})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			requireBearer(t, r)
+			sawPull = true
+			body := readBody(t, r)
+			if !strings.Contains(body, "Broker-Operation-Id") || !strings.Contains(body, "Agent-Id") {
+				t.Fatalf("pull body missing broker metadata: %s", body)
+			}
+			writeTestJSON(t, w, map[string]interface{}{"id": 2002, "number": 7, "url": "https://api.fake/pulls/7", "html_url": "https://fake/owner/repo/pull/7"})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues/7/comments":
+			requireBearer(t, r)
+			sawComment = true
+			body := readBody(t, r)
+			if !strings.Contains(body, "Broker-Operation-Id") || !strings.Contains(body, "Agent-Id") {
+				t.Fatalf("comment body missing broker metadata: %s", body)
+			}
+			writeTestJSON(t, w, map[string]interface{}{"id": 3003, "url": "https://api.fake/comments/1", "html_url": "https://fake/owner/repo/pull/7#issuecomment-1"})
+		default:
+			t.Fatalf("unexpected fake GitHub REST request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:           "agent-1",
+		Enabled:      true,
+		Secret:       "agent-secret",
+		Repositories: []string{"owner/repo"},
+		Operations:   []string{"repo.probe", "pull.create", "issue.comment"},
+		BaseBranches: []string{"main"},
+		BranchPatterns: []string{
+			"^agent/agent-1/.+$",
+		},
+	})
+
+	resp := brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/probe", nil)
+	assertStatus(t, resp, http.StatusOK)
+
+	resp = brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{
+		"title":    "agent change",
+		"head":     "agent/agent-1/test",
+		"base":     "main",
+		"body":     "body",
+		"metadata": map[string]string{"Agent-Id": "agent-1"},
+	})
+	assertStatus(t, resp, http.StatusCreated)
+
+	resp = brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/issues/7/comments", map[string]interface{}{
+		"body":     "done",
+		"metadata": map[string]string{"Agent-Id": "agent-1"},
+	})
+	assertStatus(t, resp, http.StatusCreated)
+
+	if !sawProbe || !sawPull || !sawComment {
+		t.Fatalf("fake REST handlers were not all exercised: probe=%v pull=%v comment=%v", sawProbe, sawPull, sawComment)
+	}
+}
+
+func TestFakeGitSmartHTTPIntegration(t *testing.T) {
+	apiServer := fakeTokenServer(t)
+	defer apiServer.Close()
+
+	var sawUploadPack, sawReceivePack bool
+	gitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "x-access-token" || pass != "fake-install-token" {
+			t.Fatalf("upstream git BasicAuth = %q/%q ok=%v", user, pass, ok)
+		}
+		if r.Header.Get("X-Agent-ID") != "" || r.Header.Get("X-Agent-Secret") != "" || r.Header.Get("Authorization") == "" {
+			t.Fatalf("broker auth headers were not filtered correctly")
+		}
+		if r.Header.Get("X-Git-Protocol") != "version=2" {
+			t.Fatalf("git protocol header was not proxied")
+		}
+
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/owner/repo.git/info/refs" && r.URL.Query().Get("service") == "git-upload-pack":
+			sawUploadPack = true
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+			writeTestBody(t, w, "upload-pack-ok")
+		case r.Method == http.MethodPost && r.URL.Path == "/owner/repo.git/git-receive-pack":
+			sawReceivePack = true
+			if !strings.Contains(readBody(t, r), "refs/heads/agent/agent-1/test") {
+				t.Fatalf("receive-pack body missing branch")
+			}
+			w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
+			writeTestBody(t, w, "receive-pack-ok")
+		default:
+			t.Fatalf("unexpected fake Git request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer gitServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, gitServer.URL, config.Agent{
+		ID:             "agent-1",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"git.upload-pack", "git.receive-pack"},
+		BranchPatterns: []string{"^refs/heads/agent/agent-1/.+$"},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/git/owner/repo.git/info/refs?service=git-upload-pack", nil)
+	req.Header.Set("X-Agent-ID", "agent-1")
+	req.Header.Set("X-Agent-Secret", "agent-secret")
+	req.Header.Set("X-Git-Protocol", "version=2")
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK || resp.Body.String() != "upload-pack-ok" {
+		t.Fatalf("upload-pack status/body = %d %q", resp.Code, resp.Body.String())
+	}
+
+	body := append(pktLine("0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/agent/agent-1/test\x00 report-status\n"), []byte("0000")...)
+	req = httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", bytes.NewReader(body))
+	req.Header.Set("X-Agent-ID", "agent-1")
+	req.Header.Set("X-Agent-Secret", "agent-secret")
+	req.Header.Set("X-Git-Protocol", "version=2")
+	resp = httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK || resp.Body.String() != "receive-pack-ok" {
+		t.Fatalf("receive-pack status/body = %d %q", resp.Code, resp.Body.String())
+	}
+
+	if !sawUploadPack || !sawReceivePack {
+		t.Fatalf("fake Git handlers were not all exercised: upload=%v receive=%v", sawUploadPack, sawReceivePack)
+	}
+}
+
+func TestGitPushDenialUsesActionableTextByDefault(t *testing.T) {
+	apiServer := fakeTokenServer(t)
+	defer apiServer.Close()
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:             "agent-1",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"git.receive-pack"},
+		BranchPatterns: []string{"^refs/heads/agent/agent-1/.+$"},
+	})
+
+	body := append(pktLine("0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\x00 report-status\n"), []byte("0000")...)
+	req := httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", bytes.NewReader(body))
+	req.SetBasicAuth("agent-1", "agent-secret")
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusForbidden)
+	}
+	got := resp.Body.String()
+	for _, want := range []string{"Git operation denied", "operation_id:", "branch", "required_changes", "use a branch matching"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("denial text missing %q: %s", want, got)
+		}
+	}
+	if !strings.HasPrefix(resp.Header().Get("Content-Type"), "text/plain") {
+		t.Fatalf("Content-Type = %q", resp.Header().Get("Content-Type"))
+	}
+}
+
+func TestGitPolicyDenialCanReturnJSON(t *testing.T) {
+	apiServer := fakeTokenServer(t)
+	defer apiServer.Close()
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:             "agent-1",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"git.receive-pack"},
+		BranchPatterns: []string{"^refs/heads/agent/agent-1/.+$"},
+	})
+
+	body := append(pktLine("0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/main\x00 report-status\n"), []byte("0000")...)
+	req := httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", bytes.NewReader(body))
+	req.SetBasicAuth("agent-1", "agent-secret")
+	req.Header.Set("Accept", "application/json")
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusForbidden)
+	}
+	if !strings.HasPrefix(resp.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("Content-Type = %q", resp.Header().Get("Content-Type"))
+	}
+	var out map[string]interface{}
+	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
+		t.Fatalf("json denial did not decode: %v; body=%s", err, resp.Body.String())
+	}
+	if out["code"] != "policy_denied" {
+		t.Fatalf("code = %v", out["code"])
+	}
+}
+
+func newTestBroker(t *testing.T, apiBaseURL, gitBaseURL string, agent config.Agent) *Server {
+	t.Helper()
+	keyPath := writeTestPrivateKey(t)
+	cfg := &config.Config{
+		Audit: config.AuditConfig{Path: filepath.Join(t.TempDir(), "audit.jsonl")},
+		GitHub: config.GitHubConfig{
+			AppID:          1,
+			PrivateKeyPath: keyPath,
+			APIBaseURL:     apiBaseURL,
+			GitBaseURL:     gitBaseURL,
+			Installations:  map[string]int64{"owner/repo": 42},
+		},
+		Agents: []config.Agent{agent},
+	}
+	auditLog, err := audit.New(cfg.Audit.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := auditLog.Close(); err != nil {
+			t.Fatalf("close audit log: %v", err)
+		}
+	})
+	gh, err := githubapp.New(cfg.GitHub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New("", cfg, gh, auditLog)
+}
+
+func writeTestPrivateKey(t *testing.T) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := x509.MarshalPKCS1PrivateKey(key)
+	path := filepath.Join(t.TempDir(), "github-app.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: b}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func fakeTokenServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/app/installations/42/access_tokens" {
+			t.Fatalf("unexpected token request: %s %s", r.Method, r.URL.Path)
+		}
+		writeTestJSON(t, w, map[string]string{
+			"token":      "fake-install-token",
+			"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+		})
+	}))
+}
+
+func brokerRequest(t *testing.T, broker *Server, method, path string, body interface{}) *httptest.ResponseRecorder {
+	t.Helper()
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req := httptest.NewRequest(method, path, rdr)
+	req.SetBasicAuth("agent-1", "agent-secret")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	return resp
+}
+
+func assertStatus(t *testing.T, resp *httptest.ResponseRecorder, want int) {
+	t.Helper()
+	if resp.Code != want {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, want, resp.Body.String())
+	}
+}
+
+func requireBearer(t *testing.T, r *http.Request) {
+	t.Helper()
+	if r.Header.Get("Authorization") != "Bearer fake-install-token" {
+		t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+	}
+}
+
+func readBody(t *testing.T, r *http.Request) string {
+	t.Helper()
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func writeTestJSON(t *testing.T, w http.ResponseWriter, v interface{}) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeTestBody(t *testing.T, w http.ResponseWriter, body string) {
+	t.Helper()
+	if _, err := w.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+}

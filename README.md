@@ -31,6 +31,35 @@ go run ./cmd/broker -config configs/example.yaml
 
 The example config reads agent/admin secrets from environment variables.
 
+## Container Artifacts And Deploy
+
+CI publishes the primary deploy artifact as an OCI image at:
+
+```text
+ghcr.io/grubbyhacker/gh-agent-broker
+```
+
+Images are tagged with immutable commit tags such as `sha-fcd5400...`, the `main` convenience tag for main-branch builds, and semver tags such as `v0.1.0` for intentional releases. Production should pin a SHA or semver tag, not `main` or `latest`.
+
+Semver tag builds also publish GitHub Release binaries:
+
+- `gh-agent-broker-linux-amd64`
+- `gh-agent-broker-cli-linux-amd64`
+- `SHA256SUMS`
+
+Use the OCI image for the broker service. Use the CLI binary as an agent runtime artifact when an agent container should call stable broker commands instead of constructing raw REST requests.
+
+For production deployment, keep private config, `.env`, and PEM files outside git. Use `.env.example` only as a variable-name template, then deploy with the production Compose template:
+
+```sh
+BROKER_IMAGE=ghcr.io/grubbyhacker/gh-agent-broker:sha-REPLACE_WITH_COMMIT_SHA \
+  docker compose -f docker-compose.production.example.yml pull
+BROKER_IMAGE=ghcr.io/grubbyhacker/gh-agent-broker:sha-REPLACE_WITH_COMMIT_SHA \
+  docker compose -f docker-compose.production.example.yml up -d
+```
+
+Rollback is the same command sequence with the previous known-good image tag.
+
 ## Code Hygiene
 
 This repo uses a strict local and CI gate:
@@ -41,6 +70,12 @@ make check
 ```
 
 `make check` runs formatting checks, `go mod tidy` drift detection, `golangci-lint`, unit tests, race tests, `govulncheck`, and binary builds. The project targets Go 1.26.x.
+
+Docker container smoke testing is intentionally separate from `make check` because it requires a local Docker daemon:
+
+```sh
+make smoke-container
+```
 
 ## Development Environment
 
@@ -61,6 +96,10 @@ The dev container runs `mise install`, installs repo tools, and runs `make check
 
 ## Agent CLI Examples
 
+Agents should prefer `gh-agent-broker-cli` for broker REST workflows. A reusable
+agent skill is available at `skills/gh-agent-broker`; install or copy that skill
+into compatible agent runtimes so agents use the broker CLI consistently.
+
 ```sh
 export BROKER_URL=http://127.0.0.1:8080
 export BROKER_AGENT_ID=hermes-coder-01
@@ -79,6 +118,68 @@ http://127.0.0.1:8080/git/example-org/example-repo.git
 ```
 
 Use the agent ID and broker secret for Git HTTP basic auth. Do not place GitHub tokens in the agent container.
+
+Unauthenticated broker responses include `WWW-Authenticate: Basic realm="gh-agent-broker"` so standard Git credential helpers and `GIT_ASKPASS` can provide broker credentials.
+
+For Hermes agents on the same deployment host, prefer a dedicated broker Compose project and point the agent at the broker over `127.0.0.1` or a private Docker network. A production-oriented config template is available at `configs/production.example.yaml`; copy it to a private path and replace all placeholders before use. The GitHub App needs repository permissions for Contents read/write, Pull requests read/write, Issues read/write, and Metadata read.
+
+Hermes should provide only broker credentials:
+
+```sh
+export BROKER_URL=http://127.0.0.1:8080
+export BROKER_AGENT_ID=hermes-agent-01
+export BROKER_AGENT_SECRET=replace-me-agent-secret
+```
+
+Configure a repository remote through the broker:
+
+```sh
+gh-agent-broker-cli configure -repo OWNER/REPO -remote origin
+git remote -v
+```
+
+The broker also exposes unauthenticated discovery routes so agents can find the raw REST API:
+
+```text
+GET /docs
+GET /operations
+GET /openapi.json
+GET /whoami
+```
+
+The raw REST routes use the `/v1` prefix and broker agent basic auth:
+
+```text
+GET  /v1/repos/OWNER/REPO/probe
+POST /v1/policy/dry-run
+POST /v1/repos/OWNER/REPO/pulls
+POST /v1/repos/OWNER/REPO/issues/NUMBER/comments
+```
+
+For `policy.dry-run`, the repository may be supplied as `repo: "OWNER/REPO"`, `repository: "OWNER/REPO"`, or `owner: "OWNER"` plus `repo: "REPO"`. Dry-run simulates broker-injected metadata such as `Broker-Operation-Id` and `GitHub-App-Installation-Id`; agents should not supply those fields.
+
+Create PRs and comments with metadata fields that match the configured policy. The names below are examples from the sample config, not hard-coded broker fields:
+
+```sh
+gh-agent-broker-cli pr \
+  -repo OWNER/REPO \
+  -title "Hermes agent change" \
+  -head agent/hermes-agent-01/run-123 \
+  -base main \
+  -metadata Agent-Id=hermes-agent-01 \
+  -metadata Hermes-Run-Id=run-123
+
+gh-agent-broker-cli comment \
+  -repo OWNER/REPO \
+  -issue 123 \
+  -body "Hermes finished this run." \
+  -metadata Agent-Id=hermes-agent-01 \
+  -metadata Hermes-Run-Id=run-123
+```
+
+Hermes subagents that use the same GitHub permission set can share the same broker identity, but should use distinct `Hermes-Run-Id` values for auditability. Subagents that need different repository access, branch rules, or GitHub permissions should be modeled as separate broker agents with separate secrets and policy blocks; for stronger runtime isolation, run those subagents in separate containers. A future broker delegated-credential flow may make same-container scoped delegation safer, but V1 keeps the boundary at the broker principal.
+
+See `plans/compose-production-deploy.md` for the sanitized Compose topology, volume, secret, and rollback runbook.
 
 ## Notes
 
