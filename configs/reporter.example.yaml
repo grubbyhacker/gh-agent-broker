@@ -1,0 +1,18 @@
+# Host-side MCP issue reporter. This service owns the broker reporter
+# credential; do not mount that credential into agent containers.
+listen: ":8090"
+mcp_path: "/mcp"
+
+broker_url: "http://broker:8080"
+broker_agent_id: "broker-reporter-01"
+broker_agent_secret_env: "BROKER_REPORTER_01_SECRET"
+
+repositories:
+  - "grubbyhacker/gh-agent-broker"
+
+default_label: "agent-reported"
+allowed_labels:
+  - "needs-triage"
+
+max_title_length: 256
+max_body_length: 20000

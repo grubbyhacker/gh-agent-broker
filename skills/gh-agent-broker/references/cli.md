@@ -63,6 +63,13 @@ gh-agent-broker-cli comment \
   -metadata Run-Id=RUN_ID
 ```
 
+## Issue Creation
+
+Do not create issues with the broker CLI. If issue creation is needed and the
+runtime exposes `broker_report_issue`, use that MCP tool with `repo`, `title`,
+`body`, and `dedupe_key`. The reporter service owns the narrower issue-only
+broker identity.
+
 ## Denials
 
 If the broker returns a structured denial, use its safe correction details to

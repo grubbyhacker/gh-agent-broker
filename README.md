@@ -9,14 +9,15 @@ The broker runs separately from Hermes, owns the GitHub App private key, authent
 - GitHub App installation token minting inside the broker only.
 - Per-agent static broker authentication.
 - HTTP Git proxy for clone/fetch/push.
-- REST endpoints for repo probe, PR creation, issue/PR comments, policy dry-run, health, readiness, and config reload.
+- REST endpoints for repo probe, PR creation, issue creation, issue/PR comments, policy dry-run, health, readiness, and config reload.
+- Optional host-side MCP issue reporter that exposes a single `broker_report_issue` tool.
 - Generic metadata assertions with `off`, `warn`, and `enforce` modes.
 - Structured denial responses with self-correction guidance.
 - YAML config and JSONL audit logs.
 
 ## Run
 
-Create a GitHub App private key at `./secrets/github-app.pem`, update `configs/example.yaml` with the real App ID, installation ID, repo, and policy, then run:
+Create GitHub App private keys under `./secrets/`, update `configs/example.yaml` with the real App IDs, installation IDs, repos, and policy, then run:
 
 ```sh
 docker compose -f docker-compose.example.yml up --build
@@ -45,9 +46,10 @@ Semver tag builds also publish GitHub Release binaries:
 
 - `gh-agent-broker-linux-amd64`
 - `gh-agent-broker-cli-linux-amd64`
+- `broker-issue-reporter-linux-amd64`
 - `SHA256SUMS`
 
-Use the OCI image for the broker service. Use the CLI binary as an agent runtime artifact when an agent container should call stable broker commands instead of constructing raw REST requests.
+Use the OCI image for the broker service and the reporter service. Use the CLI binary as an agent runtime artifact when an agent container should call stable broker commands instead of constructing raw REST requests.
 
 For production deployment, keep private config, `.env`, and PEM files outside git. Use `.env.example` only as a variable-name template, then deploy with the production Compose template:
 
@@ -121,7 +123,7 @@ Use the agent ID and broker secret for Git HTTP basic auth. Do not place GitHub 
 
 Unauthenticated broker responses include `WWW-Authenticate: Basic realm="gh-agent-broker"` so standard Git credential helpers and `GIT_ASKPASS` can provide broker credentials.
 
-For Hermes agents on the same deployment host, prefer a dedicated broker Compose project and point the agent at the broker over `127.0.0.1` or a private Docker network. A production-oriented config template is available at `configs/production.example.yaml`; copy it to a private path and replace all placeholders before use. The GitHub App needs repository permissions for Contents read/write, Pull requests read/write, Issues read/write, and Metadata read.
+For Hermes agents on the same deployment host, prefer a dedicated broker Compose project and point the agent at the broker over `127.0.0.1` or a private Docker network. A production-oriented config template is available at `configs/production.example.yaml`; copy it to a private path and replace all placeholders before use. The coder GitHub App needs repository permissions for Contents read/write, Pull requests read/write, Issues read/write, and Metadata read. The reporter GitHub App should be separate and limited to Issues read/write plus Metadata read.
 
 Hermes should provide only broker credentials:
 
@@ -153,8 +155,24 @@ The raw REST routes use the `/v1` prefix and broker agent basic auth:
 GET  /v1/repos/OWNER/REPO/probe
 POST /v1/policy/dry-run
 POST /v1/repos/OWNER/REPO/pulls
+POST /v1/repos/OWNER/REPO/issues
 POST /v1/repos/OWNER/REPO/issues/NUMBER/comments
 ```
+
+Issue creation should normally be exposed to agents through the host-side MCP
+reporter instead of the CLI. The reporter runs outside the agent container,
+owns the `broker-reporter-01` broker credential, and should use a separate
+issues-only GitHub App context:
+
+```sh
+broker-issue-reporter -config configs/reporter.example.yaml
+```
+
+Configure compatible agent runtimes to connect to the reporter MCP URL, for
+example `http://broker-issue-reporter:8090/mcp`, and call
+`broker_report_issue` with `repo`, `title`, `body`, and `dedupe_key`. The
+reporter always adds `agent-reported`, enforces an explicit repo allowlist, and
+only accepts configured extra labels.
 
 For `policy.dry-run`, the repository may be supplied as `repo: "OWNER/REPO"`, `repository: "OWNER/REPO"`, or `owner: "OWNER"` plus `repo: "REPO"`. Dry-run simulates broker-injected metadata such as `Broker-Operation-Id` and `GitHub-App-Installation-Id`; agents should not supply those fields.
 

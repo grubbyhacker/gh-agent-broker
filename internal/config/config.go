@@ -28,10 +28,17 @@ type AuditConfig struct {
 }
 
 type GitHubConfig struct {
+	AppID          int64                      `yaml:"app_id"`
+	PrivateKeyPath string                     `yaml:"private_key_path"`
+	APIBaseURL     string                     `yaml:"api_base_url"`
+	GitBaseURL     string                     `yaml:"git_base_url"`
+	Installations  map[string]int64           `yaml:"installations"`
+	Apps           map[string]GitHubAppConfig `yaml:"apps"`
+}
+
+type GitHubAppConfig struct {
 	AppID          int64            `yaml:"app_id"`
 	PrivateKeyPath string           `yaml:"private_key_path"`
-	APIBaseURL     string           `yaml:"api_base_url"`
-	GitBaseURL     string           `yaml:"git_base_url"`
 	Installations  map[string]int64 `yaml:"installations"`
 }
 
@@ -40,6 +47,7 @@ type Agent struct {
 	Enabled            bool                       `yaml:"enabled"`
 	Secret             string                     `yaml:"secret"`
 	SecretEnv          string                     `yaml:"secret_env"`
+	GitHubApp          string                     `yaml:"github_app"`
 	Repositories       []string                   `yaml:"repositories"`
 	Operations         []string                   `yaml:"operations"`
 	BranchPatterns     []string                   `yaml:"branch_patterns"`
@@ -107,14 +115,20 @@ func (c *Config) resolveSecrets() error {
 
 func (c *Config) Validate() error {
 	var errs []string
-	if c.GitHub.AppID == 0 {
-		errs = append(errs, "github.app_id is required")
+	apps := c.GitHub.AppContexts()
+	if len(apps) == 0 {
+		errs = append(errs, "github app context is required: configure legacy github.app_id/private_key_path/installations or github.apps")
 	}
-	if c.GitHub.PrivateKeyPath == "" {
-		errs = append(errs, "github.private_key_path is required")
-	}
-	if len(c.GitHub.Installations) == 0 {
-		errs = append(errs, "github.installations must not be empty")
+	for name, app := range apps {
+		if app.AppID == 0 {
+			errs = append(errs, fmt.Sprintf("github app %q app_id is required", name))
+		}
+		if app.PrivateKeyPath == "" {
+			errs = append(errs, fmt.Sprintf("github app %q private_key_path is required", name))
+		}
+		if len(app.Installations) == 0 {
+			errs = append(errs, fmt.Sprintf("github app %q installations must not be empty", name))
+		}
 	}
 	seen := map[string]bool{}
 	for _, a := range c.Agents {
@@ -127,6 +141,10 @@ func (c *Config) Validate() error {
 		seen[a.ID] = true
 		if a.Enabled && a.Secret == "" {
 			errs = append(errs, fmt.Sprintf("enabled agent %q has no secret or secret_env value", a.ID))
+		}
+		appName := GitHubAppName(a)
+		if _, ok := apps[appName]; !ok {
+			errs = append(errs, fmt.Sprintf("agent %q references unknown github_app %q", a.ID, appName))
 		}
 	}
 	if len(errs) > 0 {
@@ -145,10 +163,56 @@ func (c *Config) AgentByID(id string) (Agent, bool) {
 }
 
 func (c *Config) InstallationID(repo string) (int64, bool) {
-	id, ok := c.GitHub.Installations[strings.ToLower(repo)]
+	return c.InstallationIDForApp("", repo)
+}
+
+func (c *Config) InstallationIDForApp(appName, repo string) (int64, bool) {
+	app, ok := c.GitHub.AppContext(appName)
+	if !ok {
+		return 0, false
+	}
+	id, ok := app.Installations[strings.ToLower(repo)]
 	if ok {
 		return id, true
 	}
-	id, ok = c.GitHub.Installations[repo]
-	return id, ok
+	id, ok = app.Installations[repo]
+	if ok {
+		return id, true
+	}
+	for configuredRepo, id := range app.Installations {
+		if strings.EqualFold(configuredRepo, repo) {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+func (g GitHubConfig) AppContexts() map[string]GitHubAppConfig {
+	out := map[string]GitHubAppConfig{}
+	if g.AppID != 0 || g.PrivateKeyPath != "" || len(g.Installations) > 0 {
+		out["default"] = GitHubAppConfig{
+			AppID:          g.AppID,
+			PrivateKeyPath: g.PrivateKeyPath,
+			Installations:  g.Installations,
+		}
+	}
+	for name, app := range g.Apps {
+		out[name] = app
+	}
+	return out
+}
+
+func (g GitHubConfig) AppContext(name string) (GitHubAppConfig, bool) {
+	if name == "" {
+		name = "default"
+	}
+	app, ok := g.AppContexts()[name]
+	return app, ok
+}
+
+func GitHubAppName(agent Agent) string {
+	if agent.GitHubApp != "" {
+		return agent.GitHubApp
+	}
+	return "default"
 }

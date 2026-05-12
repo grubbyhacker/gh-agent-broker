@@ -97,7 +97,8 @@ jobs:
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/gh-agent-broker-linux-amd64 ./cmd/broker
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/gh-agent-broker-cli-linux-amd64 ./cmd/gh-agent-broker
-          (cd dist && sha256sum gh-agent-broker-linux-amd64 gh-agent-broker-cli-linux-amd64 > SHA256SUMS)
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/broker-issue-reporter-linux-amd64 ./cmd/broker-issue-reporter
+          (cd dist && sha256sum gh-agent-broker-linux-amd64 gh-agent-broker-cli-linux-amd64 broker-issue-reporter-linux-amd64 > SHA256SUMS)
 
       - name: Publish GitHub Release artifacts
         env:

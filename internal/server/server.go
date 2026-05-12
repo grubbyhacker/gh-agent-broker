@@ -161,6 +161,14 @@ func handleOperations(w http.ResponseWriter, r *http.Request) {
 				"metadata":    "send configured metadata fields in request body metadata",
 			},
 			{
+				"name":        "issue.create",
+				"method":      http.MethodPost,
+				"path":        "/v1/repos/{owner}/{repo}/issues",
+				"auth":        "agent",
+				"description": "Create an issue through the broker.",
+				"metadata":    "send configured metadata fields in request body metadata",
+			},
+			{
 				"name":        "policy.dry-run",
 				"method":      http.MethodPost,
 				"path":        "/v1/policy/dry-run",
@@ -207,6 +215,7 @@ Operations:
 - GET  /v1/repos/{owner}/{repo}/probe
 - POST /v1/policy/dry-run
 - POST /v1/repos/{owner}/{repo}/pulls
+- POST /v1/repos/{owner}/{repo}/issues
 - POST /v1/repos/{owner}/{repo}/issues/{number}/comments
 
 Git smart HTTP:
@@ -363,6 +372,26 @@ func openAPISpec() map[string]interface{} {
 						},
 					},
 				},
+				"IssueCreateRequest": map[string]interface{}{
+					"type":     "object",
+					"required": []string{"title", "body"},
+					"properties": map[string]interface{}{
+						"title":       map[string]string{"type": "string"},
+						"body":        map[string]string{"type": "string"},
+						"labels":      map[string]interface{}{"type": "array", "items": map[string]string{"type": "string"}},
+						"metadata":    map[string]interface{}{"$ref": "#/components/schemas/Metadata"},
+						"permissions": map[string]interface{}{"type": "array", "items": map[string]string{"type": "string"}},
+					},
+					"example": map[string]interface{}{
+						"title":  "Agent-reported issue",
+						"body":   "Observed behavior...",
+						"labels": []string{"agent-reported"},
+						"metadata": map[string]string{
+							"Agent-Id":   "broker-reporter-01",
+							"Dedupe-Key": "repo:path:summary",
+						},
+					},
+				},
 				"GitHubResult": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -438,6 +467,17 @@ func openAPISpec() map[string]interface{} {
 					},
 				},
 			},
+			"/v1/repos/{owner}/{repo}/issues": map[string]interface{}{
+				"post": map[string]interface{}{
+					"summary":     "Create issue",
+					"parameters":  repoPathParams(),
+					"requestBody": jsonRequestRef("#/components/schemas/IssueCreateRequest"),
+					"responses": map[string]interface{}{
+						"201": map[string]interface{}{"description": "issue created", "content": jsonContentRef("#/components/schemas/GitHubResult")},
+						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
+					},
+				},
+			},
 		},
 	}
 }
@@ -504,7 +544,7 @@ func (s *Server) handleDryRun(w http.ResponseWriter, r *http.Request) {
 	}
 	repo := dryRunRepo(req)
 	var installationID int64
-	if id, ok := cfg.InstallationID(repo); ok {
+	if id, ok := cfg.InstallationIDForApp(config.GitHubAppName(principal.Agent), repo); ok {
 		installationID = id
 	}
 	enriched := metadata.WithBrokerFields(req.Metadata, principal.ID, opID, installationID)
@@ -558,6 +598,8 @@ func (s *Server) handleRepoAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleProbe(w, r, repo)
 	case len(parts) == 3 && parts[2] == "pulls" && r.Method == http.MethodPost:
 		s.handlePullCreate(w, r, repo)
+	case len(parts) == 3 && parts[2] == "issues" && r.Method == http.MethodPost:
+		s.handleIssueCreate(w, r, repo)
 	case len(parts) == 5 && parts[2] == "issues" && parts[4] == "comments" && r.Method == http.MethodPost:
 		s.handleCommentCreate(w, r, repo, parts[3])
 	default:
@@ -573,7 +615,8 @@ func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request, repo string
 		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
-	inst, ok := cfg.InstallationID(repo)
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
 	if !ok {
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
 		return
@@ -584,7 +627,7 @@ func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request, repo string
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "repo.probe", Repo: repo, Decision: result.Decision})
 		return
 	}
-	ghResult, err := gh.GetRepo(repo, inst)
+	ghResult, err := gh.GetRepo(appName, repo, inst)
 	if err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "repo.probe", Repo: repo, Decision: result.Decision, Error: err.Error()})
 		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision})
@@ -607,7 +650,8 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_json", Message: err.Error(), OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
-	inst, ok := cfg.InstallationID(repo)
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
 	if !ok {
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
 		return
@@ -633,13 +677,69 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 		return
 	}
 	body := req.Body + metadata.RenderBlock(enriched)
-	ghResult, err := gh.CreatePull(repo, inst, req.Title, req.Head, req.Base, body, req.Draft)
+	ghResult, err := gh.CreatePull(appName, repo, inst, req.Title, req.Head, req.Base, body, req.Draft)
 	if err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.create", Repo: repo, Branch: req.Head, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error()})
 		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
 		return
 	}
 	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.create", Repo: repo, Branch: req.Head, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: ghResult.HTMLURL, Result: "ok"})
+	writeJSON(w, http.StatusCreated, ghResult)
+}
+
+func (s *Server) handleIssueCreate(w http.ResponseWriter, r *http.Request, repo string) {
+	opID := ids.NewOperationID()
+	cfg, gh := s.snapshot()
+	principal, ok := auth.AuthenticateAgent(r, cfg)
+	if !ok {
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	var req api.IssueCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_json", Message: err.Error(), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	if strings.TrimSpace(req.Title) == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "title is required", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	if strings.TrimSpace(req.Body) == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "body is required", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
+		return
+	}
+	enriched := metadata.WithBrokerFields(req.Metadata, principal.ID, opID, inst)
+	result := policy.Check(policy.Request{
+		Agent:       principal.Agent,
+		AgentID:     principal.ID,
+		Repo:        repo,
+		Operation:   "issue.create",
+		Permissions: req.Permissions,
+		Metadata:    req.Metadata,
+		Locations: map[string]map[string]string{
+			"request":    req.Metadata,
+			"issue_body": enriched,
+		},
+	})
+	if !result.Allowed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.create", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision})
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "issue creation denied by policy", &result))
+		return
+	}
+	body := req.Body + metadata.RenderBlock(enriched)
+	ghResult, err := gh.CreateIssue(appName, repo, inst, req.Title, body, req.Labels)
+	if err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.create", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error()})
+		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.create", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: ghResult.HTMLURL, Result: "ok"})
 	writeJSON(w, http.StatusCreated, ghResult)
 }
 
@@ -656,7 +756,8 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_json", Message: err.Error(), OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
-	inst, ok := cfg.InstallationID(repo)
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
 	if !ok {
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
 		return
@@ -680,7 +781,7 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		return
 	}
 	body := req.Body + metadata.RenderBlock(enriched)
-	ghResult, err := gh.CreateIssueComment(repo, issueNumber, inst, body)
+	ghResult, err := gh.CreateIssueComment(appName, repo, issueNumber, inst, body)
 	if err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error()})
 		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
@@ -708,7 +809,8 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported git operation", http.StatusBadRequest)
 		return
 	}
-	inst, ok := cfg.InstallationID(repo)
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
 	if !ok {
 		http.Error(w, "repository has no configured GitHub App installation", http.StatusForbidden)
 		return
@@ -760,7 +862,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
 	}
-	token, err := gh.InstallationToken(inst)
+	token, err := gh.InstallationToken(appName, inst)
 	if err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
 		http.Error(w, "github token exchange failed", http.StatusBadGateway)
