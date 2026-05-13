@@ -26,17 +26,45 @@ credential_bundles:
     mount_path: "/credentials/hermes"
     readonly: true
     allowed_templates:
-      - "hermes-worker"
+      - "hermes-auth-probe"
+      - "hermes-task-worker"
     secret_files:
       - "auth.json"
     redact_files:
       - "config.yaml"
 
 templates:
-  hermes-worker:
-    image: "ghcr.io/example-org/hermes-sandbox-worker:dev"
+  hermes-auth-probe:
+    image: "ghcr.io/example-org/hermes-sandbox-auth-probe:dev"
     command:
-      - "/usr/local/bin/worker-entrypoint"
+      - "/usr/local/bin/sandbox-hermes-auth-probe"
+    user: "10000:10000"
+    resources:
+      cpu_shares: 512
+      memory_mb: 4096
+      pids_limit: 512
+    network_policy: "worker-net"
+    max_runtime_minutes: 10
+    broker_agent_id: "hermes-coder-01"
+    broker_agent_secret_env: "HERMES_CODER_01_BROKER_SECRET"
+    credential_bundle: "hermes-worker"
+    branch_policy:
+      generate_prefix: "agent"
+      allowed_patterns:
+        - "^agent/hermes-coder-01/[A-Za-z0-9_.:-]+$"
+      base_branches:
+        - "main"
+    deliverables:
+      - "/output/final-summary.md"
+      - "/lessons/run-summary.md"
+    environment:
+      GIT_AUTHOR_NAME: "Hermes Sandbox Worker"
+      GIT_COMMITTER_NAME: "Hermes Sandbox Worker"
+
+  hermes-task-worker:
+    image: "ghcr.io/example-org/hermes-sandbox-task-worker:dev"
+    command:
+      - "/usr/local/bin/sandbox-hermes-task-worker"
     user: "10000:10000"
     resources:
       cpu_shares: 512
@@ -54,8 +82,8 @@ templates:
       base_branches:
         - "main"
     deliverables:
-      - "final-summary.md"
-      - "run-summary.md"
+      - "/output/final-summary.md"
+      - "/lessons/run-summary.md"
     knowledge_snapshots:
       - "/srv/hermes-sandbox-broker/snapshots/project-brief.md"
     environment:

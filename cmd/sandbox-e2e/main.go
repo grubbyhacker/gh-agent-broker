@@ -44,6 +44,10 @@ type statusOutput struct {
 	Error    string `json:"error"`
 }
 
+type listAgentsOutput struct {
+	Runs []statusOutput `json:"runs"`
+}
+
 type collectionOutput struct {
 	RunID string         `json:"run_id"`
 	Files []fileManifest `json:"files"`
@@ -56,16 +60,32 @@ type fileManifest struct {
 	Inline string `json:"inline"`
 }
 
+type markerResult struct {
+	RunID string
+	Final fileManifest
+}
+
 func main() {
 	codexAuthOnly := flag.Bool("codex-auth-only", false, "run only the Codex credential bundle auth probe")
 	hermesAuthOnly := flag.Bool("hermes-auth-only", false, "run only the Hermes credential bundle auth probe")
+	taskMarkerOnly := flag.Bool("task-marker-only", false, "run only the task marker delivery regression")
 	flag.Parse()
-	if *codexAuthOnly && *hermesAuthOnly {
-		fatalf("only one auth probe flag may be set")
+	selectedModes := 0
+	for _, selected := range []bool{*codexAuthOnly, *hermesAuthOnly, *taskMarkerOnly} {
+		if selected {
+			selectedModes++
+		}
+	}
+	if selectedModes > 1 {
+		fatalf("only one focused E2E mode may be set")
 	}
 	authOnly := *codexAuthOnly || *hermesAuthOnly
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	timeout, err := time.ParseDuration(envDefault("SANDBOX_E2E_TIMEOUT", "90s"))
+	if err != nil {
+		fatalf("invalid SANDBOX_E2E_TIMEOUT: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	endpoint := os.Getenv("SANDBOX_E2E_ENDPOINT")
 	token := os.Getenv("SANDBOX_MCP_TOKEN")
@@ -74,6 +94,7 @@ func main() {
 	baseBranch := envDefault("SANDBOX_E2E_BASE_BRANCH", "main")
 	workerTemplate := envDefault("SANDBOX_E2E_WORKER_TEMPLATE", "worker")
 	sleeperTemplate := envDefault("SANDBOX_E2E_SLEEPER_TEMPLATE", "sleeper")
+	missingDeliverableTemplate := envDefault("SANDBOX_E2E_MISSING_DELIVERABLE_TEMPLATE", "missing-deliverable")
 	expectedSecrets := expectedRedactedSecrets()
 	if endpoint == "" || token == "" || runsDir == "" {
 		fatalf("SANDBOX_E2E_ENDPOINT, SANDBOX_MCP_TOKEN, and SANDBOX_E2E_RUNS_DIR are required")
@@ -108,7 +129,20 @@ func main() {
 		fatalf("unexpected dry-run output: %+v", dryRun)
 	}
 
-	worker := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgs(workerTemplate, "real launch", repo, baseBranch)))
+	if *taskMarkerOnly {
+		first := launchAndAssertMarker(ctx, session, workerTemplate, repo, baseBranch, "SMOKE-E2E-ONE", expectedSecrets)
+		second := launchAndAssertMarker(ctx, session, workerTemplate, repo, baseBranch, "SMOKE-E2E-TWO", expectedSecrets)
+		if strings.Contains(second.Final.Inline, "SMOKE-E2E-ONE") || strings.Contains(first.Final.Inline, "SMOKE-E2E-TWO") {
+			fatalf("marker artifacts were not task-specific: first=%q second=%q", first.Final.Inline, second.Final.Inline)
+		}
+		assertCleanup(ctx, session, runsDir, first.RunID)
+		assertCleanup(ctx, session, runsDir, second.RunID)
+		fmt.Println("sandbox task marker E2E ok")
+		return
+	}
+
+	workerTask := "real launch marker SMOKE-E2E-ONE"
+	worker := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgsWithDeliverables(workerTemplate, workerTask, repo, baseBranch, []string{"repo/relative.md"})))
 	if worker.Status != "running" {
 		fatalf("worker launch status = %q", worker.Status)
 	}
@@ -155,13 +189,14 @@ func main() {
 	lessons := structured[collectionOutput](callOK(ctx, session, "collect_lessons", map[string]any{"run_id": worker.RunID}))
 	lesson := requireFile(lessons, "run-summary.md")
 	assertRedacted("lesson inline", lesson.Inline, expectedSecrets)
+	if !authOnly {
+		assertContains("final summary marker", final.Inline, "SMOKE-E2E-ONE")
+		assertContains("lesson summary marker", lesson.Inline, "SMOKE-E2E-ONE")
+	}
 
 	if authOnly {
 		if os.Getenv("SANDBOX_E2E_SKIP_CLEANUP") == "" {
-			callOK(ctx, session, "cleanup_run", map[string]any{"run_id": worker.RunID})
-			if _, err := os.Stat(runDir(runsDir, worker.RunID)); !errors.Is(err, os.ErrNotExist) {
-				fatalf("worker run dir still exists or stat failed unexpectedly: %v", err)
-			}
+			assertCleanup(ctx, session, runsDir, worker.RunID)
 		}
 		if *hermesAuthOnly {
 			fmt.Println("sandbox Hermes auth E2E ok")
@@ -170,6 +205,30 @@ func main() {
 		}
 		return
 	}
+
+	secondTask := "real launch marker SMOKE-E2E-TWO"
+	second := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgsWithDeliverables(workerTemplate, secondTask, repo, baseBranch, []string{"repo/relative.md"})))
+	secondStatus := waitStatus(ctx, session, second.RunID, "stopped", "failed", "timed_out")
+	if secondStatus.Status != "stopped" || secondStatus.ExitCode == nil || *secondStatus.ExitCode != 0 {
+		fatalf("second marker worker did not stop cleanly: %+v", secondStatus)
+	}
+	secondArtifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": second.RunID}))
+	secondFinal := requireFile(secondArtifacts, "final-summary.md")
+	secondLessons := structured[collectionOutput](callOK(ctx, session, "collect_lessons", map[string]any{"run_id": second.RunID}))
+	secondLesson := requireFile(secondLessons, "run-summary.md")
+	assertContains("second final summary marker", secondFinal.Inline, "SMOKE-E2E-TWO")
+	assertContains("second lesson summary marker", secondLesson.Inline, "SMOKE-E2E-TWO")
+	if strings.Contains(secondFinal.Inline, "SMOKE-E2E-ONE") || strings.Contains(final.Inline, "SMOKE-E2E-TWO") {
+		fatalf("marker artifacts were not task-specific: first=%q second=%q", final.Inline, secondFinal.Inline)
+	}
+
+	missing := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgs(missingDeliverableTemplate, "missing deliverable test", repo, baseBranch)))
+	missingStatus := waitStatus(ctx, session, missing.RunID, "stopped", "failed", "timed_out")
+	if missingStatus.Status != "failed" || missingStatus.ExitCode == nil || *missingStatus.ExitCode == 0 {
+		fatalf("missing deliverable template did not fail: %+v", missingStatus)
+	}
+	missingArtifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": missing.RunID}))
+	requireFile(missingArtifacts, "wrapper-diagnostics.json")
 
 	sleeper := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgs(sleeperTemplate, "stop test", repo, baseBranch)))
 	running := waitStatus(ctx, session, sleeper.RunID, "running")
@@ -182,14 +241,10 @@ func main() {
 		fatalf("stop status = %+v", stopped)
 	}
 
-	callOK(ctx, session, "cleanup_run", map[string]any{"run_id": worker.RunID})
-	callOK(ctx, session, "cleanup_run", map[string]any{"run_id": sleeper.RunID})
-	if _, err := os.Stat(runDir(runsDir, worker.RunID)); !errors.Is(err, os.ErrNotExist) {
-		fatalf("worker run dir still exists or stat failed unexpectedly: %v", err)
-	}
-	if _, err := os.Stat(runDir(runsDir, sleeper.RunID)); !errors.Is(err, os.ErrNotExist) {
-		fatalf("sleeper run dir still exists or stat failed unexpectedly: %v", err)
-	}
+	assertCleanup(ctx, session, runsDir, worker.RunID)
+	assertCleanup(ctx, session, runsDir, second.RunID)
+	assertCleanup(ctx, session, runsDir, missing.RunID)
+	assertCleanup(ctx, session, runsDir, sleeper.RunID)
 	fmt.Println("sandbox MCP E2E ok")
 }
 
@@ -268,6 +323,12 @@ func launchArgs(template, task, repo, baseBranch string) map[string]any {
 	return map[string]any{"template": template, "task": task, "repo": repo, "base_branch": baseBranch}
 }
 
+func launchArgsWithDeliverables(template, task, repo, baseBranch string, deliverables []string) map[string]any {
+	args := launchArgs(template, task, repo, baseBranch)
+	args["deliverables"] = deliverables
+	return args
+}
+
 func callOK(ctx context.Context, session *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
@@ -331,12 +392,70 @@ func waitStatus(ctx context.Context, session *mcp.ClientSession, runID string, s
 	}
 }
 
+func launchAndAssertMarker(ctx context.Context, session *mcp.ClientSession, template, repo, baseBranch, marker string, expectedSecrets []string) markerResult {
+	task := fmt.Sprintf("Smoke test the sandbox task contract. Do not create a PR, issue, comment, or push. Write /output/final-summary.md and /lessons/run-summary.md, and include the exact marker %s in both files. Then exit successfully.", marker)
+	worker := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgsWithDeliverables(template, task, repo, baseBranch, []string{"repo/relative.md"})))
+	status := waitStatus(ctx, session, worker.RunID, "stopped", "failed", "timed_out")
+	if status.Status != "stopped" || status.ExitCode == nil || *status.ExitCode != 0 {
+		logText := ""
+		logs, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "get_agent_logs", Arguments: map[string]any{"run_id": worker.RunID, "max_bytes": 8192}})
+		if err != nil {
+			logText = err.Error()
+		} else if logs != nil {
+			logText = text(logs)
+		}
+		fatalf("marker worker did not stop cleanly: status=%+v logs=%s", status, logText)
+	}
+	artifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": worker.RunID}))
+	for _, file := range artifacts.Files {
+		assertRedacted("artifact "+file.Path, file.Inline, expectedSecrets)
+	}
+	final := requireFile(artifacts, "final-summary.md")
+	assertContains("final summary marker", final.Inline, marker)
+	lessons := structured[collectionOutput](callOK(ctx, session, "collect_lessons", map[string]any{"run_id": worker.RunID}))
+	lesson := requireFile(lessons, "run-summary.md")
+	assertRedacted("lesson inline", lesson.Inline, expectedSecrets)
+	assertContains("lesson summary marker", lesson.Inline, marker)
+	return markerResult{RunID: worker.RunID, Final: final}
+}
+
+func assertCleanup(ctx context.Context, session *mcp.ClientSession, runsDir, runID string) {
+	cleaned := structured[statusOutput](callOK(ctx, session, "cleanup_run", map[string]any{"run_id": runID}))
+	if cleaned.Status != "cleaned" {
+		fatalf("cleanup status for %s = %+v", runID, cleaned)
+	}
+	if _, err := os.Stat(runDir(runsDir, runID)); !errors.Is(err, os.ErrNotExist) {
+		fatalf("run dir %s still exists or stat failed unexpectedly: %v", runID, err)
+	}
+	list := structured[listAgentsOutput](callOK(ctx, session, "list_agents", map[string]any{}))
+	for _, run := range list.Runs {
+		if run.RunID == runID {
+			fatalf("cleaned run %s is still listed: %+v", runID, list.Runs)
+		}
+	}
+	assertNoContainerForRun(runID)
+}
+
 func runDir(runsDir, runID string) string {
 	if strings.Contains(runID, "/") || strings.Contains(runID, "..") {
 		fatalf("unsafe run id %q", runID)
 	}
 	//nolint:gosec // G703: runsDir is an E2E-controlled temp directory and runID is checked above.
 	return filepath.Join(runsDir, runID)
+}
+
+func assertNoContainerForRun(runID string) {
+	if strings.ContainsAny(runID, " \t\r\n") || strings.Contains(runID, "/") {
+		fatalf("unsafe run id %q", runID)
+	}
+	//nolint:gosec // G204: E2E intentionally shells out to Docker; runID is validated before becoming a filter argument.
+	out, err := exec.Command("docker", "ps", "-aq", "--filter", "label=gh-agent-broker.run_id="+runID).Output()
+	if err != nil {
+		fatalf("docker ps for run %s: %v", runID, err)
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		fatalf("run %s still has container(s): %q", runID, string(out))
+	}
 }
 
 func containerIDForRun(runID string) string {
@@ -441,6 +560,12 @@ func assertRedacted(label, value string, secrets []string) {
 		if strings.Contains(value, secret) {
 			fatalf("%s leaked %s in %q", label, secret, value)
 		}
+	}
+}
+
+func assertContains(label, value, want string) {
+	if !strings.Contains(value, want) {
+		fatalf("%s missing %q in %q", label, want, value)
 	}
 }
 

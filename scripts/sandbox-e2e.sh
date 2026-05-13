@@ -62,6 +62,7 @@ credential_bundles:
     allowed_templates:
       - "worker"
       - "sleeper"
+      - "missing-deliverable"
     secret_files:
       - "token.txt"
 templates:
@@ -72,10 +73,13 @@ templates:
       - "-ceu"
       - |
         mkdir -p /work/home /work/hermes
+        grep -q 'Sandbox Rules' /input/sandbox-rules.md
+        grep -q 'Broker remote URL' /input/sandbox-rules.md
         wget -qO /output/broker-health.json "\$BROKER_URL/healthz"
         echo stdout \$BROKER_AGENT_SECRET \$(cat /credentials/codex/token.txt)
-        printf 'run=%s\nbroker=%s\nbundle=%s\n' "\$SANDBOX_RUN_ID" "\$BROKER_AGENT_SECRET" "\$(cat /credentials/codex/token.txt)" > /output/final-summary.md
-        printf 'lesson bundle=%s\n' "\$(cat /credentials/codex/token.txt)" > /lessons/run-summary.md
+        printf 'task=%s\nrun=%s\nbroker=%s\nbundle=%s\n' "\$(cat /input/task.md)" "\$SANDBOX_RUN_ID" "\$BROKER_AGENT_SECRET" "\$(cat /credentials/codex/token.txt)" > /output/final-summary.md
+        printf 'task=%s\nlesson bundle=%s\n' "\$(cat /input/task.md)" "\$(cat /credentials/codex/token.txt)" > /lessons/run-summary.md
+        grep -q '"repo/relative.md"' /input/task.json
     user: "65532:65532"
     resources:
       cpu_shares: 128
@@ -93,10 +97,37 @@ templates:
       base_branches:
         - "main"
     deliverables:
-      - "final-summary.md"
-      - "run-summary.md"
+      - "/output/final-summary.md"
+      - "/lessons/run-summary.md"
     knowledge_snapshots:
       - "${SNAPS}/project-brief.md"
+  missing-deliverable:
+    image: "busybox:latest"
+    command:
+      - "/bin/sh"
+      - "-ceu"
+      - |
+        printf '{"status":"failed","message":"required deliverables missing"}\n' > /output/wrapper-diagnostics.json
+        exit 30
+    user: "65532:65532"
+    resources:
+      cpu_shares: 128
+      memory_mb: 128
+      pids_limit: 64
+    network_policy: "worker-net"
+    max_runtime_minutes: 5
+    broker_agent_id: "hermes-coder-01"
+    broker_agent_secret_env: "HERMES_CODER_01_BROKER_SECRET"
+    credential_bundle: "codex"
+    branch_policy:
+      generate_prefix: "agent"
+      allowed_patterns:
+        - "^agent/hermes-coder-01/[A-Za-z0-9_.:-]+$"
+      base_branches:
+        - "main"
+    deliverables:
+      - "/output/final-summary.md"
+      - "/lessons/run-summary.md"
   sleeper:
     image: "busybox:latest"
     command:

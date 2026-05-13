@@ -75,6 +75,68 @@ func TestLaunchAgentBuildsSandboxedRuntimeSpec(t *testing.T) {
 	}
 }
 
+func TestLaunchAgentWritesTaskInputsAndMergesDeliverables(t *testing.T) {
+	cfg := baseTestConfig(t)
+	auditLog := testAudit(t)
+	defer closeTestAudit(t, auditLog)
+	service := NewService(cfg, newFakeRuntime(), auditLog)
+
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
+		Template:     "worker",
+		Task:         "write marker MARKER-ONE",
+		Repo:         "owner/repo",
+		BaseBranch:   "main",
+		Focus:        "contract test",
+		Deliverables: []string{"/output/extra.md", "/output/final-summary.md"},
+	})
+	if err != nil {
+		t.Fatalf("LaunchAgent() error = %v", err)
+	}
+	inputDir := filepath.Join(cfg.RunsDir, out.RunID, "input")
+	var contract TaskContract
+	//nolint:gosec // G304: test reads the generated task contract under this test's temp run directory.
+	b, err := os.ReadFile(filepath.Join(inputDir, "task.json"))
+	if err != nil {
+		t.Fatalf("read task.json: %v", err)
+	}
+	if err := json.Unmarshal(b, &contract); err != nil {
+		t.Fatalf("decode task.json: %v", err)
+	}
+	if contract.Task != "write marker MARKER-ONE" || contract.Focus != "contract test" {
+		t.Fatalf("unexpected task contract text: %+v", contract)
+	}
+	if contract.Repo != "owner/repo" || contract.BaseBranch != "main" || contract.Branch != out.Branch {
+		t.Fatalf("unexpected repo contract: %+v", contract)
+	}
+	if contract.BrokerRemoteURL != "http://gh-agent-broker:8080/git/owner/repo.git" {
+		t.Fatalf("broker remote URL = %q", contract.BrokerRemoteURL)
+	}
+	wantDeliverables := []string{"/output/final-summary.md", "/lessons/run-summary.md", "/output/extra.md"}
+	if strings.Join(contract.Deliverables, ",") != strings.Join(wantDeliverables, ",") {
+		t.Fatalf("deliverables = %#v, want %#v", contract.Deliverables, wantDeliverables)
+	}
+	for _, name := range []string{"task.md", "sandbox-rules.md"} {
+		//nolint:gosec // G304: test reads generated task input files under this test's temp run directory.
+		data, err := os.ReadFile(filepath.Join(inputDir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if strings.Contains(string(data), "broker-secret") {
+			t.Fatalf("%s leaked broker secret: %q", name, string(data))
+		}
+	}
+	//nolint:gosec // G304: test reads the generated sandbox rules under this test's temp run directory.
+	rules, err := os.ReadFile(filepath.Join(inputDir, "sandbox-rules.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Broker remote URL", contract.BrokerRemoteURL, "/output/final-summary.md", "/lessons/run-summary.md"} {
+		if !strings.Contains(string(rules), want) {
+			t.Fatalf("sandbox-rules.md missing %q:\n%s", want, string(rules))
+		}
+	}
+}
+
 func TestLaunchAgentRejectsDisallowedInputs(t *testing.T) {
 	cfg := baseTestConfig(t)
 	service := NewService(cfg, newFakeRuntime(), testAudit(t))
@@ -163,6 +225,17 @@ func TestLogsAndArtifactsAreRedactedAndSymlinkSafe(t *testing.T) {
 	if collected.Files[0].Inline != "secret [REDACTED]" {
 		t.Fatalf("inline = %q", collected.Files[0].Inline)
 	}
+	lessonsDir := filepath.Join(cfg.RunsDir, out.RunID, "lessons")
+	if err := os.WriteFile(filepath.Join(lessonsDir, "run-summary.md"), []byte("lesson bundle-secret Authorization: Bearer abc123secret456"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lessons, err := service.CollectLessons(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatalf("CollectLessons() error = %v", err)
+	}
+	if strings.Contains(lessons.Files[0].Inline, "bundle-secret") || strings.Contains(lessons.Files[0].Inline, "abc123secret456") {
+		t.Fatalf("lesson inline was not redacted: %q", lessons.Files[0].Inline)
+	}
 }
 
 func TestRedactorReadsJSONSecretValues(t *testing.T) {
@@ -191,6 +264,56 @@ func TestCleanupRejectsInvalidRunID(t *testing.T) {
 	if _, err := service.CleanupRun(context.Background(), RunInput{RunID: "../outside"}); err == nil {
 		t.Fatalf("CleanupRun() unexpectedly allowed traversal run id")
 	}
+}
+
+func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
+	cfg := baseTestConfig(t)
+	runtime := newFakeRuntime()
+	service := NewService(cfg, runtime, testAudit(t))
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{Template: "worker", Task: "timeout", Repo: "owner/repo", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("LaunchAgent() error = %v", err)
+	}
+	outputDir := filepath.Join(cfg.RunsDir, out.RunID, "output")
+	if err := os.WriteFile(filepath.Join(outputDir, "partial.txt"), []byte("partial output"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service.watchTimeout(context.Background(), out.RunID, time.Now().Add(10*time.Millisecond))
+	status, err := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatalf("GetAgentStatus() error = %v", err)
+	}
+	if status.Status != StatusTimedOut {
+		t.Fatalf("status = %+v, want timed_out", status)
+	}
+	artifacts, err := service.CollectArtifacts(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatalf("CollectArtifacts() error = %v", err)
+	}
+	if requireCollectedFile(t, artifacts, "partial.txt").Inline != "partial output" {
+		t.Fatalf("partial artifact missing: %+v", artifacts.Files)
+	}
+	cleaned, err := service.CleanupRun(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatalf("CleanupRun() error = %v", err)
+	}
+	if cleaned.Status != StatusCleaned {
+		t.Fatalf("cleanup status = %+v", cleaned)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.RunsDir, out.RunID)); !os.IsNotExist(err) {
+		t.Fatalf("run dir still exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func requireCollectedFile(t *testing.T, collection CollectionOutput, path string) FileManifest {
+	t.Helper()
+	for _, file := range collection.Files {
+		if file.Path == path {
+			return file
+		}
+	}
+	t.Fatalf("file %q missing from %+v", path, collection.Files)
+	return FileManifest{}
 }
 
 func baseTestConfig(t *testing.T) Config {
@@ -259,7 +382,7 @@ func testTemplate(image string) Template {
 			MemoryMB:  512,
 			PidsLimit: 128,
 		},
-		Deliverables: []string{"final-summary.md"},
+		Deliverables: []string{"/output/final-summary.md", "/lessons/run-summary.md"},
 	}
 }
 

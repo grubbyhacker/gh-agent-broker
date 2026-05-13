@@ -301,6 +301,88 @@ Code hygiene baseline:
     (`20260513T182122Z-68683c4cece7900d`) but Hermes reported the artifact
     comparison as false despite worker exit `0`; rerun with explicit trimmed
     comparison reported `hermes-final matched after trim: true`.
+- General Hermes task-worker path now exists in the repo but still needs the
+  live VPS marker run after redeploying the beta image/config:
+  - The sandbox broker now writes `/input/task.json`, `/input/task.md`, and
+    `/input/sandbox-rules.md` for every launch. `task.json` includes repo,
+    base branch, generated branch, broker remote URL, worker agent ID, focus,
+    task, and the effective deliverable list.
+  - Effective deliverables are now template defaults plus launch-request
+    deliverables, de-duplicated in order. `hermes-task-worker` defaults should
+    include `/output/final-summary.md` and `/lessons/run-summary.md`.
+  - The example sandbox config now distinguishes `hermes-auth-probe` from
+    `hermes-task-worker`; do not reuse ambiguous `hermes-worker` in new beta
+    config.
+  - Added `testdata/sandbox-hermes-task/Dockerfile`,
+    `testdata/sandbox-hermes-task/worker.sh`, and
+    `scripts/sandbox-hermes-task-e2e.sh`. The task worker copies the read-only
+    Hermes auth bundle into task-local `/work/hermes`, runs
+    `hermes chat --query ... --quiet --skills gh-agent-broker --max-turns ...`
+    from `/work`, captures stdout/stderr under `/output`, and exits nonzero if
+    Hermes fails or required deliverables are missing.
+  - `cmd/sandbox-e2e` has a `--task-marker-only` mode that launches two runs
+    with distinct markers and requires each marker in both
+    `final-summary.md` and `run-summary.md`, catching fixed-prompt/task-ignored
+    regressions.
+  - VPS beta was updated from this branch on 2026-05-13: synced to
+    `/docker/gh-agent-broker/src-sandbox-beta`, rebuilt
+    `gh-agent-broker:sandbox-beta`, refreshed `gh-agent-broker:sandbox-e2e`,
+    rebuilt `gh-agent-broker/sandbox-hermes-auth:local` and
+    `gh-agent-broker/sandbox-hermes-task:local`, refreshed
+    `/srv/hermes-sandbox-credentials/hermes-worker` from the parent Hermes auth
+    store, and replaced the persistent sandbox config with explicit
+    `hermes-auth-probe` and `hermes-task-worker` templates.
+  - Persistent VPS broker-level task marker E2E passed against
+    `http://127.0.0.1:8091/mcp` using template `hermes-task-worker` and repo
+    `grubbyhacker/research`; it launched two real Hermes task workers and
+    verified distinct markers in both required artifacts before cleanup.
+  - Hermes-originated task marker E2E passed from
+    `hermes-agent-6aso-hermes-gateway-1` through the configured
+    `sandbox-broker` MCP server. Hermes launched `hermes-task-worker`, verified
+    marker `HERMES-MCP-20260513-192416` in both `/output/final-summary.md` and
+    `/lessons/run-summary.md`, and called `cleanup_run`. Run ID:
+    `20260513T192424Z-7de7e29b6a336b9e`; follow-up checks confirmed the run
+    directory and Docker container were gone, and audit logged launch plus
+    cleanup with exit code 0.
+  - A final research beta run produced PR #9 and proved repo clone/fetch,
+    branch push, PR creation, marker artifacts, and cleanup, but exited 30
+    because repo-relative deliverables passed in `launch_agent.deliverables`
+    were interpreted by the worker as sandbox filesystem deliverables. The
+    worker contract has been corrected locally so only `/output` and `/lessons`
+    deliverables are wrapper-enforced; repo-relative deliverables remain task
+    requirements for Hermes and repository verification.
+  - The repo-relative deliverable fix was synced to the VPS beta source and
+    `gh-agent-broker/sandbox-hermes-task:local` was rebuilt. The updated
+    `cmd/sandbox-e2e --task-marker-only` now passes a repo-relative deliverable
+    in the launch request and still requires markers in `/output` and
+    `/lessons`; it passed against the persistent VPS sandbox broker and
+    `hermes-task-worker`.
+  - Hermes Telegram MCP live validation passed after the repo-relative
+    deliverable fix:
+    - `run_hermes_test` requested
+      `sandbox-task-marker-repo-relative-no-pr`; Hermes reported PASS for run
+      `20260513T203941Z-705e817009423a5c`, marker
+      `SANDBOX_TASK_MARKER_REPO_RELATIVE_NO_PR_20260513_2040Z`, status
+      `stopped`, exit code 0, cleanup `cleaned`, marker present in
+      `/output/final-summary.md` and `/lessons/run-summary.md`, and
+      repo-relative deliverable did not trip wrapper enforcement.
+    - Hermes also completed a broader push/delete-cleanup E2E:
+      run `20260513T203802Z-fd22b27682504de0`, marker
+      `HERMES_SANDBOX_BETA_E2E_20260513_2038Z`, exit code 0, cleanup
+      `cleaned`, broker probe/fetch succeeded, branch push was verified by
+      `git ls-remote`, remote branch deletion was verified, and no PR was
+      created.
+    - Codex independently verified both reported run directories were gone,
+      containers were gone, no active sandbox worker containers remained, and
+      audit had launch/cleanup entries with exit code 0.
+    - Hermes replied `SATISFIED`: no more E2E required for merge readiness.
+      Optional future tests only: failure diagnostics, timeout handling, policy
+      denial, and one extra disposable PR creation test.
+  - Latest local verification after this change: `mise exec -- make check`,
+    `scripts/sandbox-e2e.sh`, `bash -n scripts/sandbox-e2e.sh
+    scripts/sandbox-hermes-auth-e2e.sh scripts/sandbox-hermes-task-e2e.sh
+    testdata/sandbox-hermes-task/worker.sh`, and focused
+    `mise exec -- go test ./internal/sandbox ./cmd/sandbox-e2e` all passed.
 - Cleanup hardening added: if `cleanup_run` cannot remove worker-owned files
   because a worker tightened permissions inside `/work`, DockerBackend runs a
   short root cleanup helper from the worker image with the run dir mounted at

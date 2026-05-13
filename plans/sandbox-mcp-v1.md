@@ -96,6 +96,14 @@ Each launch creates this host directory structure:
   metadata.json
 ```
 
+The broker always writes task context into `/input` before starting the worker:
+
+- `task.json` contains run ID, task, focus, repo, base branch, generated
+  branch, worker agent ID, broker remote URL, and effective deliverables.
+- `task.md` contains the user task text.
+- `sandbox-rules.md` contains broker-supplied wrapper constraints and required
+  output paths.
+
 Container mounts:
 
 - `/input` read-only.
@@ -150,6 +158,13 @@ Required worker outputs:
 - `/output/final-summary.md`
 - `/lessons/run-summary.md`
 
+Required deliverables are template policy plus launch-request deliverables.
+General task workers should fail nonzero when required sandbox filesystem
+deliverables under `/output` or `/lessons` are missing. Repo-relative
+deliverables are task requirements for the agent and repository checks, not
+wrapper-validated sandbox files. Auth probes and other fixed-purpose templates
+should be named explicitly so they are not confused with task-consuming workers.
+
 Strongly recommended worker outputs:
 
 - `/lessons/tool-friction.md`
@@ -173,6 +188,10 @@ token formats. Returned logs must be byte-capped.
 - Filesystem safety: rejects symlink/path traversal in knowledge snapshots and
   artifacts; cleanup cannot delete outside run dir; artifact collection never
   follows symlinks outside run dir.
+- Task contract: launches write `/input/task.json`, `/input/task.md`, and
+  `/input/sandbox-rules.md`; marker E2Es assert unique task markers appear in
+  both required output and lesson artifacts, including two-run regression
+  coverage against fixed-prompt workers.
 - Docker config: non-root, `cap_drop: ALL`, `no-new-privileges`, resource
   limits, fixed mounts, sanitized labels/env, selected network only.
 - Lifecycle with fake backend: launch, status, logs, stop, timeout, cleanup,

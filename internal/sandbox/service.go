@@ -60,6 +60,18 @@ type RunMetadata struct {
 	EndedAt          time.Time `json:"ended_at,omitempty"`
 }
 
+type TaskContract struct {
+	RunID           string   `json:"run_id"`
+	Task            string   `json:"task"`
+	Focus           string   `json:"focus,omitempty"`
+	Repo            string   `json:"repo"`
+	BaseBranch      string   `json:"base_branch"`
+	Branch          string   `json:"branch"`
+	WorkerAgentID   string   `json:"worker_agent_id"`
+	BrokerRemoteURL string   `json:"broker_remote_url"`
+	Deliverables    []string `json:"deliverables,omitempty"`
+}
+
 type LaunchAgentInput struct {
 	Template          string   `json:"template" jsonschema:"sandbox template name"`
 	Task              string   `json:"task" jsonschema:"worker task description"`
@@ -271,6 +283,9 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 		Deliverables:     deliverables(in.Deliverables, tmpl.Deliverables),
 		StartedAt:        now,
 		Deadline:         deadline,
+	}
+	if err := s.writeTaskInputs(meta); err != nil {
+		return LaunchAgentOutput{}, err
 	}
 	spec, redactor, err := s.runtimeSpec(meta, tmpl)
 	if err != nil {
@@ -591,6 +606,65 @@ func (s *Service) writeMetadata(meta RunMetadata) error {
 	return nil
 }
 
+func (s *Service) writeTaskInputs(meta RunMetadata) error {
+	inputDir := filepath.Join(s.runDir(meta.RunID), "input")
+	contract := TaskContract{
+		RunID:           meta.RunID,
+		Task:            meta.Task,
+		Focus:           meta.Focus,
+		Repo:            meta.Repo,
+		BaseBranch:      meta.BaseBranch,
+		Branch:          meta.Branch,
+		WorkerAgentID:   meta.WorkerAgentID,
+		BrokerRemoteURL: strings.TrimRight(s.cfg.BrokerURL, "/") + "/git/" + meta.Repo + ".git",
+		Deliverables:    append([]string{}, meta.Deliverables...),
+	}
+	if err := writeJSONFile(filepath.Join(inputDir, "task.json"), contract, 0o644); err != nil {
+		return err
+	}
+	//nolint:gosec // G306: task inputs are mounted read-only and must be readable by the non-root worker.
+	if err := os.WriteFile(filepath.Join(inputDir, "task.md"), []byte(strings.TrimSpace(meta.Task)+"\n"), 0o644); err != nil {
+		return err
+	}
+	rules := sandboxRulesMarkdown(contract)
+	//nolint:gosec // G306: sandbox rules are mounted read-only and must be readable by the non-root worker.
+	return os.WriteFile(filepath.Join(inputDir, "sandbox-rules.md"), []byte(rules), 0o644)
+}
+
+func writeJSONFile(path string, value interface{}, mode os.FileMode) error {
+	b, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	//nolint:gosec // G306: task contract is mounted read-only and must be readable by the non-root worker.
+	return os.WriteFile(path, append(b, '\n'), mode)
+}
+
+func sandboxRulesMarkdown(contract TaskContract) string {
+	var b strings.Builder
+	b.WriteString("# Sandbox Rules\n\n")
+	b.WriteString("These sandbox rules are supplied by the broker wrapper. Follow them before the user task.\n\n")
+	b.WriteString("- Work under `/work` unless a task explicitly names `/output` or `/lessons`.\n")
+	b.WriteString("- Use `BROKER_URL`, `BROKER_AGENT_ID`, and `BROKER_AGENT_SECRET` only through `gh-agent-broker-cli`, broker Git remotes, or the broker skill.\n")
+	b.WriteString("- Do not print, store in artifacts, or otherwise expose broker secrets, provider credentials, authorization headers, GitHub App keys, JWTs, or installation tokens.\n")
+	b.WriteString("- Do not push, create pull requests, create issues, or comment unless the user task explicitly asks for that operation. Broker policy remains authoritative.\n")
+	b.WriteString("- Write required final artifacts before exiting.\n\n")
+	b.WriteString("## Repository Context\n\n")
+	fmt.Fprintf(&b, "- Repo: `%s`\n", contract.Repo)
+	fmt.Fprintf(&b, "- Base branch: `%s`\n", contract.BaseBranch)
+	fmt.Fprintf(&b, "- Sandbox branch: `%s`\n", contract.Branch)
+	fmt.Fprintf(&b, "- Broker remote URL: `%s`\n", contract.BrokerRemoteURL)
+	b.WriteString("- Repo setup is task-driven. If repository access is needed, initialize or clone using the broker remote and `gh-agent-broker-cli`.\n\n")
+	if len(contract.Deliverables) > 0 {
+		b.WriteString("## Required Deliverables\n\n")
+		for _, deliverable := range contract.Deliverables {
+			fmt.Fprintf(&b, "- `%s`\n", deliverable)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 func readMetadata(path string) (RunMetadata, error) {
 	// #nosec G304 -- path is constrained to a sandbox run metadata file by caller.
 	b, err := os.ReadFile(path)
@@ -688,10 +762,17 @@ func statusFromMetadata(meta RunMetadata) StatusOutput {
 }
 
 func deliverables(requested, defaults []string) []string {
-	if len(requested) > 0 {
-		return append([]string{}, requested...)
+	seen := map[string]bool{}
+	var out []string
+	for _, item := range append(append([]string{}, defaults...), requested...) {
+		item = strings.TrimSpace(item)
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
 	}
-	return append([]string{}, defaults...)
+	return out
 }
 
 func workerAgentID(tmpl Template, runID string) string {

@@ -13,7 +13,7 @@ func TestLoadExampleConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(example) error = %v", err)
 	}
-	if cfg.MCPPath != "/mcp" || cfg.Templates["hermes-worker"].BrokerAgentSecret != "broker-secret" {
+	if cfg.MCPPath != "/mcp" || cfg.Templates["hermes-task-worker"].BrokerAgentSecret != "broker-secret" {
 		t.Fatalf("loaded config = %+v", cfg)
 	}
 }
