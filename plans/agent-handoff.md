@@ -388,18 +388,24 @@ Code hygiene baseline:
   short root cleanup helper from the worker image with the run dir mounted at
   `/cleanup`, network disabled, and retries removal. This was required by
   Hermes workers because Hermes tightens files under task-local `HERMES_HOME`.
-- Not yet done: replace the temporary VPS beta image with a published pinned
-  image that includes the Hermes sandbox path, then run an LLM-driven Hermes
-  task that intentionally invokes sandbox tools.
+- PR #20 merged to `main` as
+  `e24479b95ddfe55cc7237fc2873815baa8353618`; CI passed and published the
+  official GHCR image. The VPS broker, issue-reporter, and sandbox-broker
+  services were switched from the local beta image to
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-e24479b95ddfe55cc7237fc2873815baa8353618`.
+  Health checks passed and `hermes mcp test sandbox-broker` discovered all 10
+  tools. A post-switch `hermes-task-worker` marker E2E also passed against the
+  official sandbox-broker image. The Hermes worker images remain local beta
+  images because CI does not publish those worker artifacts yet.
 
 ## VPS Deployment Status
 
 - `hermes-vps` has a running broker Compose project at `/docker/gh-agent-broker`.
 - Broker Compose now consumes `BROKER_IMAGE` from `/docker/gh-agent-broker/.env`
   and is pinned to
-  `ghcr.io/grubbyhacker/gh-agent-broker:sha-221e3add7696ba66a69301f43fb5fa4d09b1add6`.
-- Broker and issue-reporter containers were recreated from that image on
-  2026-05-12 and are healthy/running.
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-e24479b95ddfe55cc7237fc2873815baa8353618`.
+- Broker, issue-reporter, and sandbox-broker containers were recreated from
+  that image on 2026-05-13 and are healthy/running.
 - Broker health is reachable from the host at `http://127.0.0.1:8080/healthz` and from the Hermes Docker network at `http://gh-agent-broker:8080/healthz`.
 - Hermes container env now includes `BROKER_URL`, `BROKER_AGENT_ID`, and `BROKER_AGENT_SECRET`.
 - Hermes Compose project at `/docker/hermes-agent-6aso` now has only
