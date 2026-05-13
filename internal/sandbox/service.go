@@ -145,14 +145,23 @@ type LogsOutput struct {
 }
 
 type StatusOutput struct {
-	RunID    string     `json:"run_id"`
-	Status   string     `json:"status"`
-	Branch   string     `json:"branch,omitempty"`
-	Repo     string     `json:"repo,omitempty"`
-	ExitCode *int       `json:"exit_code,omitempty"`
-	Error    string     `json:"error,omitempty"`
-	Deadline time.Time  `json:"deadline,omitempty"`
-	EndedAt  *time.Time `json:"ended_at,omitempty"`
+	RunID       string              `json:"run_id"`
+	Status      string              `json:"status"`
+	Branch      string              `json:"branch,omitempty"`
+	Repo        string              `json:"repo,omitempty"`
+	ExitCode    *int                `json:"exit_code,omitempty"`
+	Error       string              `json:"error,omitempty"`
+	Deadline    time.Time           `json:"deadline,omitempty"`
+	EndedAt     *time.Time          `json:"ended_at,omitempty"`
+	Diagnostics *FailureDiagnostics `json:"diagnostics,omitempty"`
+}
+
+type FailureDiagnostics struct {
+	Source              string   `json:"source"`
+	Status              string   `json:"status,omitempty"`
+	ExitCode            *int     `json:"exit_code,omitempty"`
+	Message             string   `json:"message"`
+	MissingDeliverables []string `json:"missing_deliverables,omitempty"`
 }
 
 type ListAgentsOutput struct {
@@ -197,13 +206,17 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					meta.Status = StatusStopped
 				} else {
 					meta.Status = StatusFailed
+					if status.Error != "" {
+						meta.Error = status.Error
+					} else {
+						meta.Error = "worker exited nonzero"
+					}
+					if diagErr := s.ensureFailureDiagnostics(meta, meta.Error); diagErr != nil && meta.Error == "" {
+						meta.Error = diagErr.Error()
+					}
 				}
 			} else if time.Now().After(meta.Deadline) {
-				if err := s.runtime.Stop(ctx, meta.ContainerID, s.cfg.StopGrace.Duration); err != nil {
-					meta.Error = err.Error()
-				}
-				meta.Status = StatusTimedOut
-				meta.EndedAt = time.Now().UTC()
+				meta = s.markTimedOut(ctx, meta)
 			}
 			if err := s.writeMetadata(meta); err != nil {
 				return err
@@ -343,36 +356,50 @@ func (s *Service) ListAgents(ctx context.Context) (ListAgentsOutput, error) {
 	defer s.mu.Unlock()
 	out := ListAgentsOutput{Runs: make([]StatusOutput, 0, len(s.runs))}
 	for _, meta := range s.runs {
-		out.Runs = append(out.Runs, statusFromMetadata(*meta))
+		out.Runs = append(out.Runs, s.statusOutput(*meta))
 	}
 	return out, nil
 }
 
 func (s *Service) GetAgentStatus(ctx context.Context, in RunInput) (StatusOutput, error) {
-	_ = ctx
 	meta, err := s.lookupRun(in.RunID)
 	if err != nil {
 		return StatusOutput{}, err
 	}
 	if meta.ContainerID != "" && meta.Status == StatusRunning {
 		status, err := s.runtime.Inspect(ctx, meta.ContainerID)
-		if err == nil && !status.Running {
+		if err == nil && status.Running && time.Now().UTC().After(meta.Deadline) {
+			meta = s.markTimedOut(ctx, meta)
+			if err := s.writeMetadata(meta); err != nil {
+				return StatusOutput{}, err
+			}
+		} else if err == nil && !status.Running {
 			if status.ExitCode != nil && *status.ExitCode == 0 {
 				meta.Status = StatusStopped
 			} else {
 				meta.Status = StatusFailed
+				if status.Error != "" {
+					meta.Error = status.Error
+				} else {
+					meta.Error = "worker exited nonzero"
+				}
 			}
 			meta.ExitCode = status.ExitCode
 			meta.EndedAt = status.EndedAt
 			if meta.EndedAt.IsZero() {
 				meta.EndedAt = time.Now().UTC()
 			}
+			if meta.Status == StatusFailed {
+				if diagErr := s.ensureFailureDiagnostics(meta, meta.Error); diagErr != nil && meta.Error == "" {
+					meta.Error = diagErr.Error()
+				}
+			}
 			if err := s.writeMetadata(meta); err != nil {
 				return StatusOutput{}, err
 			}
 		}
 	}
-	return statusFromMetadata(meta), nil
+	return s.statusOutput(meta), nil
 }
 
 func (s *Service) GetAgentLogs(ctx context.Context, in LogsInput) (LogsOutput, error) {
@@ -409,7 +436,7 @@ func (s *Service) StopAgent(ctx context.Context, in RunInput) (StatusOutput, err
 		return StatusOutput{}, err
 	}
 	s.audit.Log(s.auditEvent("stop_agent", meta, "allow", nil), redactor)
-	return statusFromMetadata(meta), nil
+	return s.statusOutput(meta), nil
 }
 
 func (s *Service) CollectArtifacts(ctx context.Context, in RunInput) (CollectionOutput, error) {
@@ -461,31 +488,31 @@ func (s *Service) CleanupRun(ctx context.Context, in RunInput) (StatusOutput, er
 	delete(s.runs, meta.RunID)
 	s.mu.Unlock()
 	s.audit.Log(s.auditEvent("cleanup_run", meta, "allow", nil), s.redactor(meta))
-	return statusFromMetadata(meta), nil
+	return s.statusOutput(meta), nil
 }
 
 func (s *Service) validateLaunch(in LaunchAgentInput) (Template, string, string, int, error) {
 	tmpl, ok := s.cfg.Templates[in.Template]
 	if !ok {
-		return Template{}, "", "", 0, fmt.Errorf("unknown template %q", in.Template)
+		return Template{}, "", "", 0, fmt.Errorf("policy denial: unknown template %q; choose a configured sandbox template", in.Template)
 	}
 	if !validRepo(in.Repo) {
-		return Template{}, "", "", 0, fmt.Errorf("repo must be owner/repo")
+		return Template{}, "", "", 0, fmt.Errorf("policy denial: repo must be owner/repo; supply an allowed repository such as owner/name")
 	}
 	if !containsFold(s.cfg.Repositories, in.Repo) {
-		return Template{}, "", "", 0, fmt.Errorf("repo %q is not allowed", in.Repo)
+		return Template{}, "", "", 0, fmt.Errorf("policy denial: repo %q is not allowed; choose one of the configured sandbox repositories", in.Repo)
 	}
 	if strings.TrimSpace(in.Task) == "" {
 		return Template{}, "", "", 0, fmt.Errorf("task is required")
 	}
 	if len(in.Task) > s.cfg.MaxTaskBytes {
-		return Template{}, "", "", 0, fmt.Errorf("task exceeds max size %d bytes", s.cfg.MaxTaskBytes)
+		return Template{}, "", "", 0, fmt.Errorf("policy denial: task exceeds max size %d bytes; shorten the task request", s.cfg.MaxTaskBytes)
 	}
 	if strings.TrimSpace(in.BaseBranch) == "" {
 		return Template{}, "", "", 0, fmt.Errorf("base_branch is required")
 	}
 	if len(tmpl.BranchPolicy.BaseBranches) > 0 && !contains(tmpl.BranchPolicy.BaseBranches, in.BaseBranch) {
-		return Template{}, "", "", 0, fmt.Errorf("base_branch %q is not allowed", in.BaseBranch)
+		return Template{}, "", "", 0, fmt.Errorf("policy denial: base_branch %q is not allowed; choose a base branch allowed by the template", in.BaseBranch)
 	}
 	runID, err := newRunID()
 	if err != nil {
@@ -500,17 +527,17 @@ func (s *Service) validateLaunch(in LaunchAgentInput) (Template, string, string,
 		branch = strings.TrimRight(prefix, "/") + "/" + tmpl.BrokerAgentID + "/" + runID
 	}
 	if !safeBranch(branch) {
-		return Template{}, "", "", 0, fmt.Errorf("branch %q is unsafe", branch)
+		return Template{}, "", "", 0, fmt.Errorf("policy denial: branch %q is unsafe; use a normal Git branch name without traversal, locks, spaces, or ref metacharacters", branch)
 	}
 	if len(tmpl.BranchPolicy.AllowedPatterns) > 0 && !matchesAny(tmpl.BranchPolicy.AllowedPatterns, branch) {
-		return Template{}, "", "", 0, fmt.Errorf("branch %q does not match template branch policy", branch)
+		return Template{}, "", "", 0, fmt.Errorf("policy denial: branch %q does not match template branch policy; use the configured generated branch or an allowed agent branch", branch)
 	}
 	runtimeMinutes := in.MaxRuntimeMinutes
 	if runtimeMinutes == 0 {
 		runtimeMinutes = tmpl.MaxRuntimeMinutes
 	}
 	if runtimeMinutes < 1 || runtimeMinutes > tmpl.MaxRuntimeMinutes {
-		return Template{}, "", "", 0, fmt.Errorf("max_runtime_minutes must be between 1 and %d", tmpl.MaxRuntimeMinutes)
+		return Template{}, "", "", 0, fmt.Errorf("policy denial: max_runtime_minutes must be between 1 and %d; lower the requested runtime", tmpl.MaxRuntimeMinutes)
 	}
 	return tmpl, runID, branch, runtimeMinutes, nil
 }
@@ -733,32 +760,104 @@ func (s *Service) watchTimeout(parent context.Context, runID string, deadline ti
 	}
 	ctx, cancel := context.WithTimeout(parent, s.cfg.StopGrace.Duration+5*time.Second)
 	defer cancel()
-	if err := s.runtime.Stop(ctx, meta.ContainerID, s.cfg.StopGrace.Duration); err != nil {
-		meta.Error = err.Error()
-	}
-	meta.Status = StatusTimedOut
-	meta.EndedAt = time.Now().UTC()
+	meta = s.markTimedOut(ctx, meta)
 	if err := s.writeMetadata(meta); err != nil {
 		meta.Error = err.Error()
 	}
 	s.audit.Log(s.auditEvent("timeout", meta, "allow", errors.New("run exceeded deadline")), s.redactor(meta))
 }
 
-func statusFromMetadata(meta RunMetadata) StatusOutput {
+func (s *Service) markTimedOut(ctx context.Context, meta RunMetadata) RunMetadata {
+	if meta.ContainerID != "" {
+		if err := s.runtime.Stop(ctx, meta.ContainerID, s.cfg.StopGrace.Duration); err != nil {
+			meta.Error = "run exceeded deadline; stop failed: " + err.Error()
+		}
+	}
+	if meta.Error == "" {
+		meta.Error = "run exceeded deadline"
+	}
+	meta.Status = StatusTimedOut
+	meta.EndedAt = time.Now().UTC()
+	if err := s.ensureFailureDiagnostics(meta, meta.Error); err != nil && !strings.Contains(meta.Error, err.Error()) {
+		meta.Error = meta.Error + "; diagnostics write failed: " + err.Error()
+	}
+	return meta
+}
+
+func (s *Service) ensureFailureDiagnostics(meta RunMetadata, message string) error {
+	if meta.Status != StatusFailed && meta.Status != StatusTimedOut {
+		return nil
+	}
+	path := filepath.Join(s.runDir(meta.RunID), "output", "wrapper-diagnostics.json")
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	diagnostics := FailureDiagnostics{
+		Source:   "broker",
+		Status:   meta.Status,
+		ExitCode: meta.ExitCode,
+		Message:  message,
+	}
+	if diagnostics.Message == "" {
+		diagnostics.Message = "worker failed"
+	}
+	return writeJSONFile(path, diagnostics, 0o644)
+}
+
+func (s *Service) statusOutput(meta RunMetadata) StatusOutput {
 	var ended *time.Time
 	if !meta.EndedAt.IsZero() {
 		ended = &meta.EndedAt
 	}
-	return StatusOutput{
-		RunID:    meta.RunID,
-		Status:   meta.Status,
-		Branch:   meta.Branch,
-		Repo:     meta.Repo,
-		ExitCode: meta.ExitCode,
-		Error:    meta.Error,
-		Deadline: meta.Deadline,
-		EndedAt:  ended,
+	out := StatusOutput{
+		RunID:       meta.RunID,
+		Status:      meta.Status,
+		Branch:      meta.Branch,
+		Repo:        meta.Repo,
+		ExitCode:    meta.ExitCode,
+		Error:       meta.Error,
+		Deadline:    meta.Deadline,
+		EndedAt:     ended,
+		Diagnostics: s.readFailureDiagnostics(meta),
 	}
+	return out
+}
+
+func (s *Service) readFailureDiagnostics(meta RunMetadata) *FailureDiagnostics {
+	if meta.Status != StatusFailed && meta.Status != StatusTimedOut {
+		return nil
+	}
+	path := filepath.Join(s.runDir(meta.RunID), "output", "wrapper-diagnostics.json")
+	// #nosec G304 -- path is constrained to this run's output diagnostics file.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		message := meta.Error
+		if message == "" {
+			message = "worker failed"
+		}
+		return &FailureDiagnostics{Source: "broker", Status: meta.Status, ExitCode: meta.ExitCode, Message: message}
+	}
+	var diagnostics FailureDiagnostics
+	if err := json.Unmarshal(b, &diagnostics); err != nil {
+		return &FailureDiagnostics{Source: "broker", Status: meta.Status, ExitCode: meta.ExitCode, Message: "diagnostics file could not be decoded"}
+	}
+	if diagnostics.Source == "" {
+		diagnostics.Source = "worker"
+	}
+	if diagnostics.Status == "" {
+		diagnostics.Status = meta.Status
+	}
+	if diagnostics.ExitCode == nil {
+		diagnostics.ExitCode = meta.ExitCode
+	}
+	redactor := s.redactor(meta)
+	diagnostics.Message = redactor.Redact(diagnostics.Message)
+	for i, item := range diagnostics.MissingDeliverables {
+		diagnostics.MissingDeliverables[i] = redactor.Redact(item)
+	}
+	return &diagnostics
 }
 
 func deliverables(requested, defaults []string) []string {

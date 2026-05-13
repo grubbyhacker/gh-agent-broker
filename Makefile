@@ -12,7 +12,7 @@ GOVULNCHECK_VERSION := v1.1.4
 GOFILES := $(shell find . -name '*.go' -not -path './.git/*' -not -path './.tools/*')
 PACKAGES := ./...
 
-.PHONY: check ci fmt fmt-check lint test race vuln build tidy-check tools clean-tools smoke-container
+.PHONY: check ci fmt fmt-check lint test race vuln build tidy-check tools clean-tools smoke-container sandbox-e2e
 
 check: fmt-check tidy-check lint test race vuln build
 
@@ -47,6 +47,9 @@ build:
 
 smoke-container:
 	./scripts/container-smoke.sh
+
+sandbox-e2e:
+	./scripts/sandbox-e2e.sh
 
 tidy-check:
 	@tmp="$$(mktemp -d)"; \

@@ -172,6 +172,9 @@ func TestLaunchAgentRejectsDisallowedInputs(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("LaunchAgent() error = %v, want containing %q", err, tt.want)
 			}
+			if !strings.Contains(err.Error(), "policy denial") {
+				t.Fatalf("LaunchAgent() error = %v, want structured policy denial text", err)
+			}
 		})
 	}
 }
@@ -286,12 +289,22 @@ func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
 	if status.Status != StatusTimedOut {
 		t.Fatalf("status = %+v, want timed_out", status)
 	}
+	if status.Error != "run exceeded deadline" {
+		t.Fatalf("timeout error = %q", status.Error)
+	}
+	if status.Diagnostics == nil || status.Diagnostics.Message != "run exceeded deadline" || status.Diagnostics.Source != "broker" {
+		t.Fatalf("timeout diagnostics = %+v", status.Diagnostics)
+	}
 	artifacts, err := service.CollectArtifacts(context.Background(), RunInput{RunID: out.RunID})
 	if err != nil {
 		t.Fatalf("CollectArtifacts() error = %v", err)
 	}
 	if requireCollectedFile(t, artifacts, "partial.txt").Inline != "partial output" {
 		t.Fatalf("partial artifact missing: %+v", artifacts.Files)
+	}
+	diagnostics := requireCollectedFile(t, artifacts, "wrapper-diagnostics.json")
+	if !strings.Contains(diagnostics.Inline, "run exceeded deadline") {
+		t.Fatalf("timeout diagnostics artifact = %q", diagnostics.Inline)
 	}
 	cleaned, err := service.CleanupRun(context.Background(), RunInput{RunID: out.RunID})
 	if err != nil {
@@ -302,6 +315,44 @@ func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cfg.RunsDir, out.RunID)); !os.IsNotExist(err) {
 		t.Fatalf("run dir still exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestGetAgentStatusReturnsWorkerDiagnostics(t *testing.T) {
+	cfg := baseTestConfig(t)
+	runtime := newFakeRuntime()
+	service := NewService(cfg, runtime, testAudit(t))
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{Template: "worker", Task: "fail", Repo: "owner/repo", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("LaunchAgent() error = %v", err)
+	}
+	code := 30
+	diagnostics := FailureDiagnostics{
+		Status:              StatusFailed,
+		ExitCode:            &code,
+		Message:             "required deliverables missing",
+		MissingDeliverables: []string{"/output/final-summary.md"},
+	}
+	if err := writeJSONFile(filepath.Join(cfg.RunsDir, out.RunID, "output", "wrapper-diagnostics.json"), diagnostics, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runtime.finish(out.RunID, code, "")
+
+	status, err := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatalf("GetAgentStatus() error = %v", err)
+	}
+	if status.Status != StatusFailed || status.ExitCode == nil || *status.ExitCode != code {
+		t.Fatalf("status = %+v, want failed exit %d", status, code)
+	}
+	if status.Diagnostics == nil {
+		t.Fatalf("diagnostics missing from status: %+v", status)
+	}
+	if status.Diagnostics.Source != "worker" || status.Diagnostics.Message != "required deliverables missing" {
+		t.Fatalf("diagnostics = %+v", status.Diagnostics)
+	}
+	if strings.Join(status.Diagnostics.MissingDeliverables, ",") != "/output/final-summary.md" {
+		t.Fatalf("missing deliverables = %+v", status.Diagnostics.MissingDeliverables)
 	}
 }
 
@@ -417,10 +468,11 @@ type fakeRuntime struct {
 	specs   []RuntimeSpec
 	logs    string
 	started map[string]bool
+	exits   map[string]ContainerStatus
 }
 
 func newFakeRuntime() *fakeRuntime {
-	return &fakeRuntime{started: map[string]bool{}}
+	return &fakeRuntime{started: map[string]bool{}, exits: map[string]ContainerStatus{}}
 }
 
 func (f *fakeRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
@@ -443,6 +495,9 @@ func (f *fakeRuntime) Inspect(ctx context.Context, containerID string) (Containe
 	_ = ctx
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if status, ok := f.exits[containerID]; ok {
+		return status, nil
+	}
 	return ContainerStatus{ID: containerID, Running: f.started[containerID]}, nil
 }
 
@@ -477,4 +532,19 @@ func (f *fakeRuntime) lastSpec() RuntimeSpec {
 		return RuntimeSpec{}
 	}
 	return f.specs[len(f.specs)-1]
+}
+
+func (f *fakeRuntime) finish(runID string, exitCode int, message string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	containerID := "container-" + runID
+	f.started[containerID] = false
+	code := exitCode
+	f.exits[containerID] = ContainerStatus{
+		ID:       containerID,
+		Running:  false,
+		ExitCode: &code,
+		EndedAt:  time.Now().UTC(),
+		Error:    message,
+	}
 }

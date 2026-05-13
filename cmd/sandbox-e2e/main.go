@@ -36,12 +36,21 @@ type launchOutput struct {
 }
 
 type statusOutput struct {
-	RunID    string `json:"run_id"`
-	Status   string `json:"status"`
-	Branch   string `json:"branch"`
-	Repo     string `json:"repo"`
-	ExitCode *int   `json:"exit_code"`
-	Error    string `json:"error"`
+	RunID       string              `json:"run_id"`
+	Status      string              `json:"status"`
+	Branch      string              `json:"branch"`
+	Repo        string              `json:"repo"`
+	ExitCode    *int                `json:"exit_code"`
+	Error       string              `json:"error"`
+	Diagnostics *failureDiagnostics `json:"diagnostics"`
+}
+
+type failureDiagnostics struct {
+	Source              string   `json:"source"`
+	Status              string   `json:"status"`
+	ExitCode            *int     `json:"exit_code"`
+	Message             string   `json:"message"`
+	MissingDeliverables []string `json:"missing_deliverables"`
 }
 
 type listAgentsOutput struct {
@@ -69,9 +78,10 @@ func main() {
 	codexAuthOnly := flag.Bool("codex-auth-only", false, "run only the Codex credential bundle auth probe")
 	hermesAuthOnly := flag.Bool("hermes-auth-only", false, "run only the Hermes credential bundle auth probe")
 	taskMarkerOnly := flag.Bool("task-marker-only", false, "run only the task marker delivery regression")
+	finalizationLive := flag.Bool("finalization-live", false, "run live finalization checks against a persistent sandbox broker")
 	flag.Parse()
 	selectedModes := 0
-	for _, selected := range []bool{*codexAuthOnly, *hermesAuthOnly, *taskMarkerOnly} {
+	for _, selected := range []bool{*codexAuthOnly, *hermesAuthOnly, *taskMarkerOnly, *finalizationLive} {
 		if selected {
 			selectedModes++
 		}
@@ -81,7 +91,7 @@ func main() {
 	}
 	authOnly := *codexAuthOnly || *hermesAuthOnly
 
-	timeout, err := time.ParseDuration(envDefault("SANDBOX_E2E_TIMEOUT", "90s"))
+	timeout, err := time.ParseDuration(envDefault("SANDBOX_E2E_TIMEOUT", "180s"))
 	if err != nil {
 		fatalf("invalid SANDBOX_E2E_TIMEOUT: %v", err)
 	}
@@ -95,6 +105,7 @@ func main() {
 	workerTemplate := envDefault("SANDBOX_E2E_WORKER_TEMPLATE", "worker")
 	sleeperTemplate := envDefault("SANDBOX_E2E_SLEEPER_TEMPLATE", "sleeper")
 	missingDeliverableTemplate := envDefault("SANDBOX_E2E_MISSING_DELIVERABLE_TEMPLATE", "missing-deliverable")
+	hermesTaskTemplate := envDefault("SANDBOX_E2E_HERMES_TASK_TEMPLATE", "hermes-task-worker")
 	expectedSecrets := expectedRedactedSecrets()
 	if endpoint == "" || token == "" || runsDir == "" {
 		fatalf("SANDBOX_E2E_ENDPOINT, SANDBOX_MCP_TOKEN, and SANDBOX_E2E_RUNS_DIR are required")
@@ -117,12 +128,18 @@ func main() {
 	}()
 
 	assertTools(ctx, session)
+
+	if *finalizationLive {
+		runFinalizationLive(ctx, session, runsDir, repo, baseBranch, hermesTaskTemplate, sleeperTemplate, expectedSecrets)
+		return
+	}
+
 	callOK(ctx, session, "validate_template", map[string]any{"template": workerTemplate})
-	expectToolError(ctx, session, "validate_template", map[string]any{"template": "missing"})
-	expectToolError(ctx, session, "dry_run_launch", map[string]any{"template": workerTemplate, "task": "x", "repo": repo, "base_branch": baseBranch, "image": "busybox"})
-	expectToolError(ctx, session, "dry_run_launch", map[string]any{"template": workerTemplate, "task": "x", "repo": "owner/other", "base_branch": baseBranch})
-	expectToolError(ctx, session, "dry_run_launch", map[string]any{"template": workerTemplate, "task": "x", "repo": repo, "base_branch": baseBranch, "branch": "../bad"})
-	expectToolError(ctx, session, "dry_run_launch", map[string]any{"template": workerTemplate, "task": strings.Repeat("x", 5000), "repo": repo, "base_branch": baseBranch})
+	expectToolErrorContains(ctx, session, "validate_template", map[string]any{"template": "missing"}, "unknown template")
+	expectToolErrorContains(ctx, session, "dry_run_launch", map[string]any{"template": workerTemplate, "task": "x", "repo": repo, "base_branch": baseBranch, "image": "busybox"}, "unexpected additional properties")
+	expectToolErrorContains(ctx, session, "dry_run_launch", map[string]any{"template": workerTemplate, "task": "x", "repo": "owner/other", "base_branch": baseBranch}, "policy denial")
+	expectToolErrorContains(ctx, session, "dry_run_launch", map[string]any{"template": workerTemplate, "task": "x", "repo": repo, "base_branch": baseBranch, "branch": "../bad"}, "policy denial")
+	expectToolErrorContains(ctx, session, "dry_run_launch", map[string]any{"template": workerTemplate, "task": strings.Repeat("x", 5000), "repo": repo, "base_branch": baseBranch}, "policy denial")
 
 	dryRun := structured[launchOutput](callOK(ctx, session, "dry_run_launch", launchArgs(workerTemplate, "dry run", repo, baseBranch)))
 	if dryRun.Status != "pending" || !strings.HasPrefix(dryRun.Branch, "agent/hermes-coder-01/") {
@@ -227,8 +244,25 @@ func main() {
 	if missingStatus.Status != "failed" || missingStatus.ExitCode == nil || *missingStatus.ExitCode == 0 {
 		fatalf("missing deliverable template did not fail: %+v", missingStatus)
 	}
+	if missingStatus.Diagnostics == nil || !strings.Contains(missingStatus.Diagnostics.Message, "required deliverables missing") {
+		fatalf("missing deliverable diagnostics not returned in status: %+v", missingStatus)
+	}
 	missingArtifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": missing.RunID}))
 	requireFile(missingArtifacts, "wrapper-diagnostics.json")
+
+	timeoutArgs := launchArgs(sleeperTemplate, "timeout test", repo, baseBranch)
+	timeoutArgs["max_runtime_minutes"] = 1
+	timeoutRun := structured[launchOutput](callOK(ctx, session, "launch_agent", timeoutArgs))
+	timeoutStatus := waitStatus(ctx, session, timeoutRun.RunID, "stopped", "failed", "timed_out")
+	if timeoutStatus.Status != "timed_out" || !strings.Contains(timeoutStatus.Error, "run exceeded deadline") {
+		fatalf("timeout run did not time out with diagnostics: %+v", timeoutStatus)
+	}
+	if timeoutStatus.Diagnostics == nil || !strings.Contains(timeoutStatus.Diagnostics.Message, "run exceeded deadline") {
+		fatalf("timeout diagnostics missing: %+v", timeoutStatus)
+	}
+	timeoutArtifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": timeoutRun.RunID}))
+	timeoutDiagnostics := requireFile(timeoutArtifacts, "wrapper-diagnostics.json")
+	assertContains("timeout diagnostics artifact", timeoutDiagnostics.Inline, "run exceeded deadline")
 
 	sleeper := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgs(sleeperTemplate, "stop test", repo, baseBranch)))
 	running := waitStatus(ctx, session, sleeper.RunID, "running")
@@ -244,6 +278,7 @@ func main() {
 	assertCleanup(ctx, session, runsDir, worker.RunID)
 	assertCleanup(ctx, session, runsDir, second.RunID)
 	assertCleanup(ctx, session, runsDir, missing.RunID)
+	assertCleanup(ctx, session, runsDir, timeoutRun.RunID)
 	assertCleanup(ctx, session, runsDir, sleeper.RunID)
 	fmt.Println("sandbox MCP E2E ok")
 }
@@ -266,6 +301,86 @@ func assertTools(ctx context.Context, session *mcp.ClientSession) {
 			fatalf("tool %q missing from %v", want, tools.Tools)
 		}
 	}
+}
+
+func runFinalizationLive(ctx context.Context, session *mcp.ClientSession, runsDir, repo, baseBranch, hermesTaskTemplate, sleeperTemplate string, expectedSecrets []string) {
+	callOK(ctx, session, "validate_template", map[string]any{"template": hermesTaskTemplate})
+	callOK(ctx, session, "validate_template", map[string]any{"template": sleeperTemplate})
+	expectToolErrorContains(ctx, session, "dry_run_launch", map[string]any{
+		"template":    hermesTaskTemplate,
+		"task":        "policy denial probe",
+		"repo":        "grubbyhacker/not-allowed",
+		"base_branch": baseBranch,
+	}, "policy denial")
+
+	failureMarker := "FAILURE_DIAGNOSTICS_20260513"
+	failureTask := "Failure diagnostics probe. Write /output/final-summary.md and /lessons/run-summary.md with marker " + failureMarker + ", but intentionally do not create /output/required-never-created.txt. Do not push, create a PR, issue, or comment."
+	failure := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgsWithDeliverables(hermesTaskTemplate, failureTask, repo, baseBranch, []string{
+		"/output/final-summary.md",
+		"/lessons/run-summary.md",
+		"/output/required-never-created.txt",
+	})))
+	failureStatus := waitStatus(ctx, session, failure.RunID, "stopped", "failed", "timed_out")
+	if failureStatus.Status != "failed" || failureStatus.ExitCode == nil || *failureStatus.ExitCode != 30 {
+		includeLogsAndFail(ctx, session, failure.RunID, "failure diagnostics run status = %+v, want failed exit 30", failureStatus)
+	}
+	if failureStatus.Diagnostics == nil || !strings.Contains(failureStatus.Diagnostics.Message, "required deliverables missing") || !contains(failureStatus.Diagnostics.MissingDeliverables, "/output/required-never-created.txt") {
+		fatalf("failure diagnostics missing required details: %+v", failureStatus)
+	}
+	failureArtifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": failure.RunID}))
+	assertRedacted("failure artifacts", text(callOK(ctx, session, "get_agent_logs", map[string]any{"run_id": failure.RunID, "max_bytes": 8192})), expectedSecrets)
+	requireFile(failureArtifacts, "wrapper-diagnostics.json")
+	assertCleanup(ctx, session, runsDir, failure.RunID)
+
+	timeoutArgs := launchArgs(sleeperTemplate, "timeout probe", repo, baseBranch)
+	timeoutArgs["max_runtime_minutes"] = 1
+	timeoutRun := structured[launchOutput](callOK(ctx, session, "launch_agent", timeoutArgs))
+	timeoutStatus := waitStatus(ctx, session, timeoutRun.RunID, "stopped", "failed", "timed_out")
+	if timeoutStatus.Status != "timed_out" || !strings.Contains(timeoutStatus.Error, "run exceeded deadline") {
+		fatalf("timeout run status = %+v, want timed_out", timeoutStatus)
+	}
+	if timeoutStatus.Diagnostics == nil || !strings.Contains(timeoutStatus.Diagnostics.Message, "run exceeded deadline") {
+		fatalf("timeout diagnostics missing: %+v", timeoutStatus)
+	}
+	timeoutArtifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": timeoutRun.RunID}))
+	assertContains("timeout diagnostics artifact", requireFile(timeoutArtifacts, "wrapper-diagnostics.json").Inline, "run exceeded deadline")
+	assertCleanup(ctx, session, runsDir, timeoutRun.RunID)
+
+	ts := time.Now().UTC().Format("20060102-150405")
+	marker := "DISPOSABLE_PR_20260513_FINAL_SANDBOX_" + ts
+	branch := "agent/hermes-coder-01/disposable-pr-20260513-final-sandbox-" + ts
+	prTask := "Disposable PR creation E2E. Use the gh-agent-broker skill/CLI and broker remote only. Clone or initialize " + repo + " through the broker. Use branch " + branch + ". Add a small file under sandbox-e2e/ containing marker " + marker + ". Commit it, push through the broker, and create a PR to " + baseBranch + " titled 'Sandbox disposable PR E2E 2026-05-13'. When creating the PR, include metadata Agent-Id=hermes-coder-01 and Hermes-Run-Id=" + marker + ". Write the PR URL and marker to /output/final-summary.md and /lessons/run-summary.md. Do not use direct GitHub tokens."
+	prArgs := launchArgsWithDeliverables(hermesTaskTemplate, prTask, repo, baseBranch, []string{"/output/final-summary.md", "/lessons/run-summary.md"})
+	prArgs["branch"] = branch
+	prRun := structured[launchOutput](callOK(ctx, session, "launch_agent", prArgs))
+	prStatus := waitStatus(ctx, session, prRun.RunID, "stopped", "failed", "timed_out")
+	if prStatus.Status != "stopped" || prStatus.ExitCode == nil || *prStatus.ExitCode != 0 {
+		includeLogsAndFail(ctx, session, prRun.RunID, "disposable PR run status = %+v, want stopped exit 0", prStatus)
+	}
+	prArtifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": prRun.RunID}))
+	for _, file := range prArtifacts.Files {
+		assertRedacted("pr artifact "+file.Path, file.Inline, expectedSecrets)
+	}
+	prFinal := requireFile(prArtifacts, "final-summary.md")
+	assertContains("disposable PR marker", prFinal.Inline, marker)
+	assertContains("disposable PR URL", prFinal.Inline, "https://github.com/grubbyhacker/research/pull/")
+	prLessons := structured[collectionOutput](callOK(ctx, session, "collect_lessons", map[string]any{"run_id": prRun.RunID}))
+	assertContains("disposable PR lesson marker", requireFile(prLessons, "run-summary.md").Inline, marker)
+	assertCleanup(ctx, session, runsDir, prRun.RunID)
+
+	fmt.Printf("sandbox finalization live E2E ok: failure_run=%s timeout_run=%s pr_run=%s marker=%s\n", failure.RunID, timeoutRun.RunID, prRun.RunID, marker)
+}
+
+func includeLogsAndFail(ctx context.Context, session *mcp.ClientSession, runID, format string, args ...any) {
+	logs := ""
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "get_agent_logs", Arguments: map[string]any{"run_id": runID, "max_bytes": 16384}})
+	if err != nil {
+		logs = err.Error()
+	} else if result != nil {
+		logs = text(result)
+	}
+	args = append(args, logs)
+	fatalf(format+"\nlogs:\n%s", args...)
 }
 
 func envDefault(key, fallback string) string {
@@ -340,13 +455,19 @@ func callOK(ctx context.Context, session *mcp.ClientSession, name string, args m
 	return result
 }
 
-func expectToolError(ctx context.Context, session *mcp.ClientSession, name string, args map[string]any) {
+func expectToolErrorContains(ctx context.Context, session *mcp.ClientSession, name string, args map[string]any, want string) {
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
+		if !strings.Contains(err.Error(), want) {
+			fatalf("%s returned error %q, want containing %q", name, err.Error(), want)
+		}
 		return
 	}
 	if result == nil || !result.IsError {
 		fatalf("%s unexpectedly succeeded with args %+v: %+v", name, args, result)
+	}
+	if !strings.Contains(text(result), want) {
+		fatalf("%s tool error text = %q, want containing %q", name, text(result), want)
 	}
 }
 
@@ -445,6 +566,9 @@ func runDir(runsDir, runID string) string {
 }
 
 func assertNoContainerForRun(runID string) {
+	if os.Getenv("SANDBOX_E2E_SKIP_DOCKER_ASSERT") != "" {
+		return
+	}
 	if strings.ContainsAny(runID, " \t\r\n") || strings.Contains(runID, "/") {
 		fatalf("unsafe run id %q", runID)
 	}

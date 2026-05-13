@@ -397,6 +397,58 @@ Code hygiene baseline:
   tools. A post-switch `hermes-task-worker` marker E2E also passed against the
   official sandbox-broker image. The Hermes worker images remain local beta
   images because CI does not publish those worker artifacts yet.
+- Current feature branch for final sandbox hardening:
+  `feature/finalize-sandbox-e2e`.
+  - Added structured sandbox failure diagnostics to `get_agent_status`.
+    Failed and timed-out runs now include a `diagnostics` object, and the
+    broker writes `/output/wrapper-diagnostics.json` for broker-detected
+    timeout/nonzero-exit failures when the worker did not already provide one.
+  - Timeout enforcement now also happens during `get_agent_status`, so a
+    missed background watcher or post-restart poll still transitions overdue
+    running containers to `timed_out`.
+  - Sandbox launch policy denials now include explicit `policy denial`
+    self-correction text without exposing secrets or unrelated policy.
+  - Added `make sandbox-e2e` and a CI `sandbox-e2e` job. Publish/release jobs
+    now require the true Docker MCP E2E job as well as hygiene and container
+    smoke.
+  - `cmd/sandbox-e2e` now verifies policy-denial text, failure diagnostics,
+    timeout diagnostics, and has `--finalization-live` for persistent
+    sandbox-broker validation including a real Hermes task-worker PR creation.
+  - Latest local verification on 2026-05-13:
+    `mise exec -- make check`, `./scripts/sandbox-e2e.sh`,
+    `./scripts/container-smoke.sh`, `git diff --check`, `bash -n
+    scripts/sandbox-e2e.sh scripts/sandbox-hermes-auth-e2e.sh
+    scripts/sandbox-hermes-task-e2e.sh testdata/sandbox-hermes-task/worker.sh`,
+    and focused `mise exec -- go test ./internal/sandbox ./cmd/sandbox-e2e`
+    all passed.
+  - PR `#21` (`https://github.com/grubbyhacker/gh-agent-broker/pull/21`)
+    is open from this branch. GitHub Actions passed on the PR:
+    `check`, `container-smoke`, and the new `sandbox-e2e` job.
+  - Live VPS validation on 2026-05-13 used a temporary local beta image
+    `gh-agent-broker:sandbox-beta` for `sandbox-broker`, then restored
+    `/docker/gh-agent-broker/.env` to the official pinned image
+    `ghcr.io/grubbyhacker/gh-agent-broker:sha-e24479b95ddfe55cc7237fc2873815baa8353618`
+    and recreated only `sandbox-broker`. Health returned `{"status":"ok"}`
+    after both redeploy and restore.
+  - Live finalization E2E passed via
+    `cmd/sandbox-e2e --finalization-live` against
+    `http://127.0.0.1:8091/mcp` on `hermes-vps`:
+    policy denial contained `policy denial`; failure diagnostics run
+    `20260513T215644Z-cf4a29f31c3cd6a2` ended `failed` with exit code 30 and
+    diagnostics for `/output/required-never-created.txt`; timeout run
+    `20260513T215717Z-f03a8c9efedd059f` ended `timed_out` with
+    `run exceeded deadline`; PR run
+    `20260513T215817Z-edb0ba96995078b1` ended `stopped` with exit code 0 and
+    created disposable PR `https://github.com/grubbyhacker/research/pull/10`.
+    PR #10 was closed and branch
+    `agent/hermes-coder-01/disposable-pr-20260513-final-sandbox-20260513-215817`
+    was deleted after verification.
+  - Two stale runs from an earlier interrupted Telegram-driven attempt,
+    `20260513T215215Z-19f028d84d6afd46` and
+    `20260513T215219Z-e8f796fda300d6b6`, were manually removed from the VPS
+    after the repeatable live-finalization E2E passed. Final host check showed
+    no sandbox worker containers and no run directories left under
+    `/srv/hermes-sandbox-broker/runs`.
 
 ## VPS Deployment Status
 

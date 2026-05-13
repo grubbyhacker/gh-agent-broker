@@ -216,10 +216,15 @@ fi
 echo "running MCP-driven sandbox E2E client"
 (
   cd "${ROOT}"
-  SANDBOX_E2E_ENDPOINT=http://127.0.0.1:18091/mcp \
-  SANDBOX_MCP_TOKEN=sandbox-token-e2e \
-  SANDBOX_E2E_RUNS_DIR="${RUNS}" \
+  export SANDBOX_E2E_ENDPOINT=http://127.0.0.1:18091/mcp
+  export SANDBOX_MCP_TOKEN=sandbox-token-e2e
+  export SANDBOX_E2E_RUNS_DIR="${RUNS}"
+  export SANDBOX_E2E_TIMEOUT="${SANDBOX_E2E_TIMEOUT:-180s}"
+  if command -v mise >/dev/null 2>&1; then
     mise exec -- go run ./cmd/sandbox-e2e
+  else
+    go run ./cmd/sandbox-e2e
+  fi
 )
 
 if grep -R 'broker-secret-e2e\|bundle-secret-e2e' "${AUDIT}" >/dev/null 2>&1; then
