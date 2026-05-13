@@ -1,0 +1,63 @@
+listen: "127.0.0.1:8091"
+mcp_path: "/mcp"
+auth_token_env: "SANDBOX_MCP_TOKEN"
+runs_dir: "/srv/hermes-sandbox-broker/runs"
+broker_url: "http://broker:8080"
+production: false
+max_task_bytes: 65536
+log_byte_limit: 131072
+stop_grace: "10s"
+
+audit:
+  path: "/srv/hermes-sandbox-broker/audit/sandbox-audit.jsonl"
+
+repositories:
+  - "example-org/example-repo"
+
+network_policies:
+  worker-net:
+    network: "hermes-sandbox-workers"
+  none:
+    none: true
+
+credential_bundles:
+  hermes-worker:
+    source_path: "/srv/hermes-sandbox-credentials/hermes-worker"
+    mount_path: "/credentials/hermes"
+    readonly: true
+    allowed_templates:
+      - "hermes-worker"
+    secret_files:
+      - "auth.json"
+    redact_files:
+      - "config.yaml"
+
+templates:
+  hermes-worker:
+    image: "ghcr.io/example-org/hermes-sandbox-worker:dev"
+    command:
+      - "/usr/local/bin/worker-entrypoint"
+    user: "10000:10000"
+    resources:
+      cpu_shares: 512
+      memory_mb: 4096
+      pids_limit: 512
+    network_policy: "worker-net"
+    max_runtime_minutes: 60
+    broker_agent_id: "hermes-coder-01"
+    broker_agent_secret_env: "HERMES_CODER_01_BROKER_SECRET"
+    credential_bundle: "hermes-worker"
+    branch_policy:
+      generate_prefix: "agent"
+      allowed_patterns:
+        - "^agent/hermes-coder-01/[A-Za-z0-9_.:-]+$"
+      base_branches:
+        - "main"
+    deliverables:
+      - "final-summary.md"
+      - "run-summary.md"
+    knowledge_snapshots:
+      - "/srv/hermes-sandbox-broker/snapshots/project-brief.md"
+    environment:
+      GIT_AUTHOR_NAME: "Hermes Sandbox Worker"
+      GIT_COMMITTER_NAME: "Hermes Sandbox Worker"

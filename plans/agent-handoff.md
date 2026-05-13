@@ -27,9 +27,9 @@ Remaining after this attempt:
 
 - Decide whether to enforce `Hermes-Run-Id` on Git `receive-pack` for stronger audit metadata.
 - Move `issue.comment` metadata assertions from warn mode to enforce mode before broader autonomous usage.
-- Implement the separate sandbox MCP service plan in `plans/sandbox-mcp-v1.md`
-  for task-isolated worker containers with template-scoped broker identities
-  and read-only credential bundles.
+- Sandbox MCP v1 has an initial implementation in this repo. Remaining work is
+  operator hardening and live Docker/Hermes validation before exposing it to
+  real workers.
 - Production Compose is pinned to the latest published broker image from PR `#15`.
 - Confirm the GHCR package is public after first publish if deployment hosts should pull without registry credentials.
 - Confirm the first semver release uploads standalone Linux binaries and `SHA256SUMS`.
@@ -123,7 +123,174 @@ Code hygiene baseline:
 - Dockerfile now creates `/var/log/gh-agent-broker` owned by UID 65532, and the Compose example uses a named audit volume by default.
 - `internal/server/integration_test.go` covers fake GitHub REST operations, fake Git smart-HTTP proxying, auth-header filtering, and Git denial UX.
 - `make smoke-container` builds the image, validates config-check failure behavior, starts the broker with generated test key/config, and checks health.
-- Latest verification in this handoff: `mise exec -- make check`, `mise exec -- make smoke-container`, `git diff --check`, and production Compose config rendering with a dummy pinned image and `.env.example` passed. Plain `make ci` with the system `go1.18.1` fails before tests because the repo requires the `.mise.toml` Go toolchain.
+- Latest verification in this handoff: `mise exec -- make check`,
+  `scripts/sandbox-e2e.sh`, `scripts/sandbox-codex-auth-e2e.sh`,
+  VPS `scripts/sandbox-hermes-auth-e2e.sh`, `scripts/container-smoke.sh`,
+  `git diff --check`, `bash -n scripts/sandbox-e2e.sh`,
+  `docker compose -f docker-compose.example.yml config`, and production Compose
+  config rendering with a dummy pinned image and temporary empty env file passed.
+  Plain system `go` is too old in this shell and fails before tests because the
+  repo requires the `.mise.toml` Go toolchain.
+
+## Sandbox MCP V1 Implementation
+
+- New binary: `cmd/sandbox-broker`, shipped in the existing OCI image and built
+  by `make build` and semver release artifact workflow as
+  `sandbox-broker-linux-amd64`.
+- New package: `internal/sandbox`.
+  - Loads and validates sandbox config, including token auth, repo allowlists,
+    named network policies, read-only credential bundles, templates, digest
+    requirement in production mode, non-root users, branch policies, runtime
+    caps, and unsafe Docker socket/host network rejection.
+  - Exposes a testable `RuntimeBackend`; `DockerBackend` talks to Docker Engine
+    over the Unix socket API and creates containers with `no-new-privileges`,
+    `cap_drop: ALL`, no privileged mode, fixed mounts, configured network only,
+    resource limits, task-local `HOME`/`HERMES_HOME`, and server-side env/labels.
+  - Implements MCP service behavior for `launch_agent`, `dry_run_launch`,
+    `validate_template`, `list_agents`, `get_agent_status`, `get_agent_logs`,
+    `stop_agent`, `collect_artifacts`, `collect_lessons`, and `cleanup_run`.
+  - Launch input uses a custom JSON decoder so arbitrary fields such as image,
+    command, env, mounts, privileged flags, and network overrides are rejected
+    instead of ignored.
+  - Runs create `input`, `work`, `output`, `lessons`, `logs`, and
+    `metadata.json`; configured knowledge snapshots are copied into `/input`.
+  - Logs/artifact snippets are byte-capped and redacted using generic token
+    patterns plus values read from configured bundle `secret_files` and
+    `redact_files`. Artifact/lesson collection skips symlinks and returns
+    manifests, hashes, and small inline text only.
+  - Cleanup requires a safe run ID and deletes only under `runs_dir`.
+- New config and deployment examples:
+  - `configs/sandbox.example.yaml`
+  - `sandbox-broker` services in both Compose templates; only this service gets
+    `/var/run/docker.sock`, `runs_dir`, and credential bundle mounts.
+  - Compose examples declare an external `hermes-sandbox-workers` Docker
+    network and attach the GitHub broker to it so worker containers can reach
+    `broker_url: http://broker:8080`.
+  - Compose examples use `group_add: ${DOCKER_SOCK_GID:-1001}` for the sandbox
+    broker; on Docker Desktop here the socket is `root:1001`, and the image
+    runs as UID/GID 65532, so socket group access is required.
+  - README now documents the sandbox broker, MCP auth token, host-path
+    requirements for sibling Docker containers, and the v1 credential-bundle
+    limitation.
+- Tests added under `internal/sandbox` cover config validation, example config
+  loading, launch denial cases, generated branch/runtime spec shape, unknown
+  launch JSON field rejection, log/artifact redaction, symlink-safe artifact
+  collection, and cleanup path traversal rejection.
+- Local Docker Desktop E2E script: `scripts/sandbox-e2e.sh`, with the MCP
+  client implemented as checked-in Go code in `cmd/sandbox-e2e` rather than
+  generated source in the shell harness.
+  - Builds the packaged OCI image.
+  - Starts a private Docker network and fake broker container.
+  - Runs packaged `sandbox-broker` with Docker socket group access.
+  - Verifies unauthenticated/bad-token MCP requests return 401.
+  - Uses a real MCP client to list tools, validate templates, reject bad launch
+    inputs, launch a worker, inspect Docker security settings, verify log and
+    artifact redaction, collect artifacts/lessons, stop a running worker, and
+    cleanup runs.
+- `AGENTS.md` now explicitly bans hiding Go or other source code in shell
+  heredocs, generated temp files, or compiler stdin to bypass formatting,
+  tests, review, or linting.
+- VPS sandbox beta status as of 2026-05-13:
+  - Synced the uncommitted beta tree to
+    `/docker/gh-agent-broker/src-sandbox-beta` and built local image
+    `gh-agent-broker:sandbox-beta` on `hermes-vps`; this image was not pushed
+    to GHCR.
+  - Added `sandbox-broker` to `/docker/gh-agent-broker/docker-compose.yml`
+    using the local beta image. Existing `broker` and `issue-reporter` services
+    remain pinned to
+    `ghcr.io/grubbyhacker/gh-agent-broker:sha-221e3add7696ba66a69301f43fb5fa4d09b1add6`.
+    Compose briefly recreated `broker` while adding the dependency; it returned
+    healthy.
+  - Added private `/docker/gh-agent-broker/configs/sandbox-beta.yaml`, host
+    directories under `/srv/hermes-sandbox-broker`, and a fake beta credential
+    bundle at `/srv/hermes-sandbox-credentials/beta-codex`.
+  - Added `SANDBOX_MCP_TOKEN` and `DOCKER_SOCK_GID` to the broker private
+    `.env`; Docker socket on the VPS is `root:docker` with GID 988.
+  - Sandbox worker network policy uses `gh-agent-broker_default`, where workers
+    resolve the GitHub broker as `http://broker:8080`.
+  - Added Hermes MCP config entry `sandbox-broker` in
+    `/docker/hermes-agent-6aso/data/config.yaml` with an Authorization bearer
+    header; backed up the config before editing.
+  - Recreated `hermes-gateway` and `hermes-dashboard` so they pick up the MCP
+    config. Both returned healthy.
+  - Direct VPS sandbox E2E passed with `/tmp/sandbox-e2e` against
+    `http://127.0.0.1:8091/mcp`, repo `grubbyhacker/research`, templates
+    `beta-worker` and `beta-sleeper`. First attempt failed because
+    `busybox:latest` was absent; after `docker pull busybox:latest`, the E2E
+    passed. The stale failed run directory was removed.
+  - Hermes CLI tests passed from `hermes-gateway`:
+    `hermes mcp list`, `hermes mcp test sandbox-broker`, and
+    `hermes mcp test broker-reporter`.
+  - Broker health and sandbox health both returned `{"status":"ok"}` on the VPS.
+  - No leftover sandbox worker containers or run directories remained after the
+    beta E2E cleanup.
+- Codex credential bundle testing passed locally on Docker Desktop as of
+  2026-05-13 using `scripts/sandbox-codex-auth-e2e.sh`. The test copies local
+  Codex `auth.json` and `config.toml` into a temporary read-only bundle, mounts
+  only that bundle into a non-root sandbox worker, verifies parent Hermes auth
+  is not visible at `/opt/data` or `/input`, runs `codex exec`
+  noninteractively, collects the exact `SANDBOX_CODEX_AUTH_OK` final output,
+  redacts strings extracted from the Codex-shaped JSON secret file, and cleans
+  up the run. Do not copy live parent Hermes auth into production sandboxes by
+  default; provision a sandbox-specific Codex credential bundle for real use.
+  This local code has not been rebuilt/redeployed to the VPS beta image yet.
+- A local Codex auth E2E failure exposed two sandbox portability issues that
+  are now fixed in the repo: broker-created `work`, `output`, and `lessons`
+  mount sources are writable by non-root worker UIDs, copied knowledge
+  snapshots are readable through the read-only `/input` mount, and the Codex
+  probe image installs CA certificates. The probe sets a permissive umask so
+  cleanup succeeds when the broker runs as UID 65532 and the worker runs as UID
+  1000. For arbitrary third-party worker images, production cleanup still needs
+  either a documented worker umask contract or a broker-owned cleanup helper.
+- Local Codex auth mechanics checked on 2026-05-13:
+  - Host `codex exec --ephemeral --json --sandbox read-only --skip-git-repo-check`
+    returned the expected sentinel output.
+  - A minimal temporary `CODEX_HOME` containing only copied `auth.json` and
+    `config.toml` also returned the expected sentinel output.
+  - Added checked-in Codex auth sandbox probe files:
+    `testdata/sandbox-codex-auth/Dockerfile`,
+    `testdata/sandbox-codex-auth/worker.sh`, and
+    `scripts/sandbox-codex-auth-e2e.sh`. The worker copies the read-only
+    credential bundle into task-local `/work/home/.codex`, sets
+    `CODEX_HOME`, verifies parent Hermes auth is not visible, and runs
+    `codex exec` noninteractively.
+  - Docker Desktop local sandbox Codex auth E2E passed after Docker Desktop WSL
+    integration was restored: `scripts/sandbox-codex-auth-e2e.sh`.
+- Codex CLI in sandbox is intentionally punted for now. Upstream Hermes code
+  confirms Hermes owns a separate OpenAI Codex OAuth session in
+  `HERMES_HOME/auth.json` and avoids sharing refresh tokens with Codex CLI /
+  VS Code because refresh tokens are single-use and can trigger
+  `refresh_token_reused` races.
+- Hermes-native sandbox worker path added and proven on `hermes-vps`:
+  - Added `testdata/sandbox-hermes-auth/Dockerfile`,
+    `testdata/sandbox-hermes-auth/worker.sh`, and
+    `scripts/sandbox-hermes-auth-e2e.sh`.
+  - The worker image is based on
+    `ghcr.io/hostinger/hvps-hermes-agent:latest`, includes
+    `gh-agent-broker-cli`, and copies the checked-in `skills/gh-agent-broker`
+    skill into task-local `HERMES_HOME`.
+  - The E2E script copies `/docker/hermes-agent-6aso/data/auth.json` into a
+    temporary read-only Hermes credential bundle, generates a minimal sandbox
+    `config.yaml` for `openai-codex`, launches a non-root Hermes worker,
+    verifies parent `/opt/data/auth.json` is not visible, runs
+    `hermes -z 'Reply with exactly: HERMES_AUTH_OK'`, verifies
+    `hermes auth status openai-codex`, checks broker CLI reachability, redacts
+    auth-store string values, and cleans up.
+  - Latest VPS verification passed:
+    `SANDBOX_HERMES_AUTH_SOURCE_DIR=/docker/hermes-agent-6aso/data ./scripts/sandbox-hermes-auth-e2e.sh`.
+  - No leftover E2E sandbox worker containers or networks remained afterward.
+  - Rebuilt persistent VPS image tag `gh-agent-broker:sandbox-beta` from
+    `/docker/gh-agent-broker/src-sandbox-beta` and recreated only the
+    `sandbox-broker` Compose service; `http://127.0.0.1:8091/healthz` returned
+    `{"status":"ok"}` afterward.
+- Cleanup hardening added: if `cleanup_run` cannot remove worker-owned files
+  because a worker tightened permissions inside `/work`, DockerBackend runs a
+  short root cleanup helper from the worker image with the run dir mounted at
+  `/cleanup`, network disabled, and retries removal. This was required by
+  Hermes workers because Hermes tightens files under task-local `HERMES_HOME`.
+- Not yet done: replace the temporary VPS beta image with a published pinned
+  image that includes the Hermes sandbox path, then run an LLM-driven Hermes
+  task that intentionally invokes sandbox tools.
 
 ## VPS Deployment Status
 

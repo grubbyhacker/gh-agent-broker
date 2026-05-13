@@ -23,5 +23,6 @@ Build a GitHub Agent Access Broker that lets agent containers use GitHub App acc
 - Use `make fmt` on changed Go files.
 - Run `make check` before handoff when possible.
 - Do not add broad lint suppressions. Any `//nolint` must name the exact linter and include a reason.
+- Do not hide Go or other source code in shell heredocs, generated temp files, or compiler stdin to bypass formatting, tests, review, or linting. Test harnesses and helper clients must be checked-in source files unless the generated file is a small data/config fixture.
 - Keep `go.mod` and `go.sum` tidy.
 - Use `.mise.toml` or the dev container to satisfy repo toolchain requirements; keep `make check` as the source of truth.
