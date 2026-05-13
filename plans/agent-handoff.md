@@ -283,6 +283,24 @@ Code hygiene baseline:
     `/docker/gh-agent-broker/src-sandbox-beta` and recreated only the
     `sandbox-broker` Compose service; `http://127.0.0.1:8091/healthz` returned
     `{"status":"ok"}` afterward.
+  - Created and pushed feature branch
+    `feature/sandbox-mcp-v1-hermes` at commit `7f213f2`.
+  - Updated persistent VPS `/docker/gh-agent-broker/configs/sandbox-beta.yaml`
+    to add template `hermes-worker` and bundle
+    `/srv/hermes-sandbox-credentials/hermes-worker`, sourced from
+    `/docker/hermes-agent-6aso/data/auth.json` plus a minimal sandbox
+    `config.yaml`; restarted `sandbox-broker` so it loaded the new template.
+  - Hermes-originated E2E passed from `hermes-gateway` using the configured
+    `sandbox-broker` MCP server, not direct shell calls to the broker:
+    Hermes launched `hermes-worker`, polled status to `stopped`, observed
+    `exit_code=0`, collected artifacts, verified trimmed `hermes-final.txt`
+    matched `HERMES_AUTH_OK`, verified `final-summary.md`, and called
+    `cleanup_run`. Latest run:
+    `20260513T182210Z-de2ddbd58238fad5`.
+  - A first Hermes-originated run also launched and cleaned successfully
+    (`20260513T182122Z-68683c4cece7900d`) but Hermes reported the artifact
+    comparison as false despite worker exit `0`; rerun with explicit trimmed
+    comparison reported `hermes-final matched after trim: true`.
 - Cleanup hardening added: if `cleanup_run` cannot remove worker-owned files
   because a worker tightened permissions inside `/work`, DockerBackend runs a
   short root cleanup helper from the worker image with the run dir mounted at
