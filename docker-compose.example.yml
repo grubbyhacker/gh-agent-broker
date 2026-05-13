@@ -13,6 +13,9 @@ services:
       - ./secrets/github-coder-app.pem:/run/secrets/github-coder-app.pem:ro
       - ./secrets/github-reporter-app.pem:/run/secrets/github-reporter-app.pem:ro
       - broker-audit:/var/log/gh-agent-broker
+    networks:
+      - default
+      - sandbox-workers
     healthcheck:
       test: ["CMD", "/usr/local/bin/gh-agent-broker-cli", "health", "-broker", "http://127.0.0.1:8080"]
       interval: 30s
@@ -33,5 +36,30 @@ services:
       broker:
         condition: service_healthy
 
+  sandbox-broker:
+    build: .
+    entrypoint: ["/usr/local/bin/sandbox-broker"]
+    command: ["-config", "/etc/gh-agent-broker/sandbox.yaml"]
+    group_add:
+      - "${DOCKER_SOCK_GID:-1001}"
+    ports:
+      - "127.0.0.1:8091:8091"
+    environment:
+      SANDBOX_MCP_TOKEN: "replace-me-sandbox-token"
+      HERMES_CODER_01_BROKER_SECRET: "replace-me-agent-secret"
+    volumes:
+      - ./configs/sandbox.example.yaml:/etc/gh-agent-broker/sandbox.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /srv/hermes-sandbox-broker:/srv/hermes-sandbox-broker
+      - /srv/hermes-sandbox-credentials:/srv/hermes-sandbox-credentials:ro
+    depends_on:
+      broker:
+        condition: service_healthy
+
 volumes:
   broker-audit:
+
+networks:
+  sandbox-workers:
+    name: hermes-sandbox-workers
+    external: true

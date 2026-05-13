@@ -11,6 +11,7 @@ The broker runs separately from Hermes, owns the GitHub App private key, authent
 - HTTP Git proxy for clone/fetch/push.
 - REST endpoints for repo probe, PR creation, issue creation, issue/PR comments, policy dry-run, health, readiness, and config reload.
 - Optional host-side MCP issue reporter that exposes a single `broker_report_issue` tool.
+- Optional sandbox MCP broker that launches task-scoped worker containers from operator-defined templates.
 - Generic metadata assertions with `off`, `warn`, and `enforce` modes.
 - Structured denial responses with self-correction guidance.
 - YAML config and JSONL audit logs.
@@ -47,6 +48,7 @@ Semver tag builds also publish GitHub Release binaries:
 - `gh-agent-broker-linux-amd64`
 - `gh-agent-broker-cli-linux-amd64`
 - `broker-issue-reporter-linux-amd64`
+- `sandbox-broker-linux-amd64`
 - `SHA256SUMS`
 
 Use the OCI image for the broker service and the reporter service. Use the CLI binary as an agent runtime artifact when an agent container should call stable broker commands instead of constructing raw REST requests.
@@ -204,6 +206,26 @@ gh-agent-broker-cli comment \
 Hermes subagents that use the same GitHub permission set can share the same broker identity, but should use distinct `Hermes-Run-Id` values for auditability. Subagents that need different repository access, branch rules, or GitHub permissions should be modeled as separate broker agents with separate secrets and policy blocks; for stronger runtime isolation, run those subagents in separate containers. A future broker delegated-credential flow may make same-container scoped delegation safer, but V1 keeps the boundary at the broker principal.
 
 See `plans/compose-production-deploy.md` for the sanitized Compose topology, volume, secret, and rollback runbook.
+
+## Sandbox MCP Broker
+
+The sandbox broker is a separate process in the same OCI image:
+
+```sh
+sandbox-broker -config configs/sandbox.example.yaml
+```
+
+It exposes MCP at `/mcp` and requires `X-Sandbox-Token` or `Authorization: Bearer ...`. Hermes should receive only the MCP URL and token. Do not give Hermes the Docker socket, host root, parent `/opt/data`, memory DBs, session files, or arbitrary host mounts.
+
+`configs/sandbox.example.yaml` defines repository allowlists, Docker network policies, credential bundles, and fixed templates. Launch requests provide intent only: template, task, repo, base branch, optional branch, optional max runtime, deliverables, and focus. The caller cannot choose an image, command, environment, mounts, privileged mode, capabilities, host paths, or network overrides.
+
+Every launch gets a read-only task contract under `/input`: `task.json` for machine-readable run context, `task.md` for the user task, and `sandbox-rules.md` for broker-supplied wrapper constraints. Required deliverables are the union of template defaults and launch-request deliverables. Task workers should fail nonzero when required sandbox filesystem outputs under `/output` or `/lessons` are missing; repo-relative deliverables are task requirements, not wrapper-validated sandbox files.
+
+For Compose deployments, mount `runs_dir` and credential bundle source paths at the same absolute paths seen by the Docker host, because the sandbox broker asks Docker Engine to bind those paths into worker containers. Credential bundles are a V1 compromise: mount fresh sandbox-specific provider logins read-only, prefer revocable accounts, and delete the bundle plus revoke upstream sessions when rotating. V2 should replace bundles with a model broker/proxy for stronger protection against credential exfiltration by malicious workers.
+
+For Hermes workers, use explicit templates for different jobs: keep fixed credential checks as an auth-probe template and use a separate task-worker template for general agentic work. A Hermes-format credential bundle contains `auth.json` from Hermes' `HERMES_HOME` plus a minimal sandbox `config.yaml`; the worker copies those files into task-local `/work/hermes`, sets `HERMES_HOME=/work/hermes`, and runs Hermes there. Do not send OAuth JSON or API keys in MCP launch requests. If the parent Hermes install refreshes its Codex OAuth tokens, sync only the required Hermes auth store into the sandbox bundle from the trusted host side.
+
+The sandbox broker image runs as UID/GID `65532`. When mounting `/var/run/docker.sock`, set `DOCKER_SOCK_GID=$(stat -c '%g' /var/run/docker.sock)` for Compose so `group_add` grants the broker process access to Docker Engine without running the whole container as root.
 
 ## Notes
 
