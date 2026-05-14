@@ -63,6 +63,38 @@ func TestReportIssueCallsBrokerWithReporterIdentity(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesExposePolicyWithoutSecrets(t *testing.T) {
+	cfg := testConfig("https://broker.invalid")
+	svc := NewService(cfg)
+
+	out := svc.Capabilities()
+	if len(out.AllowedRepositories) != 1 || out.AllowedRepositories[0] != "owner/repo" {
+		t.Fatalf("AllowedRepositories = %v", out.AllowedRepositories)
+	}
+	if len(out.AllowedOptionalLabels) != 1 || out.AllowedOptionalLabels[0] != "needs-triage" {
+		t.Fatalf("AllowedOptionalLabels = %v", out.AllowedOptionalLabels)
+	}
+	if len(out.ForcedLabels) != 1 || out.ForcedLabels[0] != "agent-reported" {
+		t.Fatalf("ForcedLabels = %v", out.ForcedLabels)
+	}
+	if out.MaxTitleLength != 256 || out.MaxBodyLength != 20000 {
+		t.Fatalf("limits = title %d body %d", out.MaxTitleLength, out.MaxBodyLength)
+	}
+	if !out.DedupeKeyRequired || !strings.Contains(out.DedupeBehavior, "does not suppress duplicate") {
+		t.Fatalf("dedupe fields = required %v behavior %q", out.DedupeKeyRequired, out.DedupeBehavior)
+	}
+
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{cfg.BrokerAgentSecret, cfg.BrokerURL, cfg.BrokerAgentID} {
+		if strings.Contains(string(b), secret) {
+			t.Fatalf("capabilities leaked secret/config value %q in %s", secret, string(b))
+		}
+	}
+}
+
 func TestReportIssueRejectsDisallowedInputs(t *testing.T) {
 	svc := NewService(testConfig("http://broker.invalid"))
 	tests := []struct {
