@@ -54,6 +54,16 @@ type ReportIssueOutput struct {
 	ID      int64  `json:"id,omitempty"`
 }
 
+type CapabilitiesOutput struct {
+	AllowedRepositories   []string `json:"allowed_repositories"`
+	AllowedOptionalLabels []string `json:"allowed_optional_labels"`
+	ForcedLabels          []string `json:"forced_labels"`
+	MaxTitleLength        int      `json:"max_title_length"`
+	MaxBodyLength         int      `json:"max_body_length"`
+	DedupeKeyRequired     bool     `json:"dedupe_key_required"`
+	DedupeBehavior        string   `json:"dedupe_behavior"`
+}
+
 func Load(path string) (Config, error) {
 	// #nosec G304 -- config path is supplied by the operator on reporter startup.
 	b, err := os.ReadFile(path)
@@ -126,6 +136,22 @@ func NewService(cfg Config) *Service {
 	return &Service{
 		cfg:  cfg,
 		http: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+func (s *Service) Capabilities() CapabilitiesOutput {
+	forcedLabels := []string{}
+	if strings.TrimSpace(s.cfg.DefaultLabel) != "" {
+		forcedLabels = append(forcedLabels, strings.TrimSpace(s.cfg.DefaultLabel))
+	}
+	return CapabilitiesOutput{
+		AllowedRepositories:   append([]string(nil), s.cfg.Repositories...),
+		AllowedOptionalLabels: append([]string(nil), s.cfg.AllowedLabels...),
+		ForcedLabels:          forcedLabels,
+		MaxTitleLength:        s.cfg.MaxTitleLength,
+		MaxBodyLength:         s.cfg.MaxBodyLength,
+		DedupeKeyRequired:     true,
+		DedupeBehavior:        "dedupe_key is passed to the broker as issue metadata; the reporter does not suppress duplicate reports",
 	}
 }
 

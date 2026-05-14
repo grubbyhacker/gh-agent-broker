@@ -33,8 +33,10 @@ credentials.
    when policy metadata or branch rules may matter.
 4. Use `gh-agent-broker-cli pr` and `gh-agent-broker-cli comment` instead of
    constructing raw REST requests.
-5. If issue reporting is needed and an MCP tool named `broker_report_issue` is
-   available, use that tool instead of the CLI or raw REST. Supply `repo`,
+5. If issue reporting is needed and MCP reporter tools are available, call
+   `broker_reporter_capabilities` first to discover allowed repositories,
+   optional labels, forced labels, size limits, and dedupe requirements. Then
+   call `broker_report_issue` instead of the CLI or raw REST with `repo`,
    `title`, `body`, and a stable `dedupe_key`.
 6. Treat policy denials as self-correction feedback. Adjust repo, branch, base
    branch, operation, or required metadata; do not bypass the broker.

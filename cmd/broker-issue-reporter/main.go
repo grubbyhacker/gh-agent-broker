@@ -24,6 +24,15 @@ func main() {
 	service := reporter.NewService(cfg)
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "gh-agent-broker-issue-reporter", Version: "v1"}, nil)
 	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "broker_reporter_capabilities",
+		Description: "Discover reporter repositories, labels, size limits, and dedupe requirements.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, reporter.CapabilitiesOutput, error) {
+		out := service.Capabilities()
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "reporter capabilities returned"}},
+		}, out, nil
+	})
+	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name:        "broker_report_issue",
 		Description: "Create an allowlisted GitHub issue through gh-agent-broker using the reporter identity.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in reporter.ReportIssueInput) (*mcp.CallToolResult, reporter.ReportIssueOutput, error) {

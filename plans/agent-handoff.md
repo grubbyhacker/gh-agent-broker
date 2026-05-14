@@ -6,6 +6,11 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 
 Latest Hermes retest result:
 
+- Current branch work for issue `#12` adds reporter capability discovery via
+  `broker_reporter_capabilities`, updates the bundled `gh-agent-broker` skill
+  guidance to call it before `broker_report_issue`, and rolls in the pending
+  Dependabot Docker action bumps for setup-buildx v4, login v4, metadata v6,
+  and build-push v7.
 - GO for the first controlled research-agent project using `BROKER_AGENT_ID=hermes-coder-01` and `grubbyhacker/research`.
 - Issue `#13` is fixed and deployed: `gh-agent-broker-cli configure` now
   writes a repo-local URL-scoped Git credential helper so non-interactive

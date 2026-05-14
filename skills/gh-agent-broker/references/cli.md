@@ -70,9 +70,11 @@ gh-agent-broker-cli comment \
 ## Issue Creation
 
 Do not create issues with the broker CLI. If issue creation is needed and the
-runtime exposes `broker_report_issue`, use that MCP tool with `repo`, `title`,
-`body`, and `dedupe_key`. The reporter service owns the narrower issue-only
-broker identity.
+runtime exposes `broker_reporter_capabilities`, call it before creating an
+issue to discover allowed repositories, optional labels, forced labels, size
+limits, and dedupe requirements. Then use `broker_report_issue` with `repo`,
+`title`, `body`, and `dedupe_key`. The reporter service owns the narrower
+issue-only broker identity.
 
 ## Denials
 
