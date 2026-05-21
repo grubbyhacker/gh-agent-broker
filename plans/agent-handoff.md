@@ -6,6 +6,11 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 
 Latest Hermes retest result:
 
+- Current branch `agent/cli-whoami-wrapper` adds
+  `gh-agent-broker-cli whoami` as an authenticated wrapper for `GET /whoami`,
+  documents that `/whoami` requires broker agent auth, and updates `AGENTS.md`
+  to require coding agents to use feature branches rather than editing `main`
+  directly.
 - Current branch work for issue `#12` adds reporter capability discovery via
   `broker_reporter_capabilities`, updates the bundled `gh-agent-broker` skill
   guidance to call it before `broker_report_issue`, and rolls in the pending

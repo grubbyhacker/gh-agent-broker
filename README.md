@@ -101,6 +101,7 @@ export BROKER_AGENT_ID=hermes-coder-01
 export BROKER_AGENT_SECRET=replace-me-agent-secret
 
 gh-agent-broker-cli configure -repo example-org/example-repo
+gh-agent-broker-cli whoami
 gh-agent-broker-cli probe -repo example-org/example-repo
 gh-agent-broker-cli pr \
   -repo example-org/example-repo \
@@ -133,12 +134,12 @@ Unauthenticated discovery routes:
 GET /docs
 GET /operations
 GET /openapi.json
-GET /whoami
 ```
 
 Broker-agent authenticated routes:
 
 ```text
+GET  /whoami
 GET  /v1/repos/OWNER/REPO/probe
 POST /v1/policy/dry-run
 POST /v1/repos/OWNER/REPO/pulls
