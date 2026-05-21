@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"flag"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -74,6 +76,34 @@ func TestCredentialHelperIgnoresStoreAndErase(t *testing.T) {
 				t.Fatalf("credential helper output = %q, want empty", out.String())
 			}
 		})
+	}
+}
+
+func TestCmdWhoamiUsesAuthenticatedWhoamiEndpoint(t *testing.T) {
+	t.Setenv("BROKER_AGENT_ID", "agent-1")
+	t.Setenv("BROKER_AGENT_SECRET", "agent-secret")
+
+	var sawWhoami bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawWhoami = true
+		if r.URL.Path != "/whoami" {
+			t.Errorf("path = %q, want /whoami", r.URL.Path)
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "agent-1" || pass != "agent-secret" {
+			t.Errorf("BasicAuth = %q/%q/%v, want agent credentials", user, pass, ok)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"agent_id":"agent-1","branch_patterns":["^agent/agent-1/.+$"]}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	cmdWhoami([]string{"-broker", server.URL})
+
+	if !sawWhoami {
+		t.Fatal("whoami endpoint was not called")
 	}
 }
 

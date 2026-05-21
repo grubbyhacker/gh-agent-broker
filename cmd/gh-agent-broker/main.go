@@ -47,6 +47,8 @@ func main() {
 		cmdConfigure(os.Args[2:])
 	case "credential-helper":
 		cmdCredentialHelper(os.Args[2:])
+	case "whoami":
+		cmdWhoami(os.Args[2:])
 	case "probe":
 		cmdProbe(os.Args[2:])
 	case "dry-run":
@@ -62,7 +64,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|configure|probe|dry-run|pr|comment> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|configure|whoami|probe|dry-run|pr|comment> [flags]")
 }
 
 func commonFlags(fs *flag.FlagSet) (broker, agentID, secret *string) {
@@ -193,6 +195,16 @@ func runCredentialHelper(operation string, stdin io.Reader, stdout io.Writer, ge
 	}
 	_, err := fmt.Fprintf(stdout, "username=%s\npassword=%s\n\n", agentID, secret)
 	return err
+}
+
+func cmdWhoami(args []string) {
+	fs := flag.NewFlagSet("whoami", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	doRequest(http.MethodGet, *broker, "/whoami", *agentID, *secret, nil)
 }
 
 func cmdProbe(args []string) {
