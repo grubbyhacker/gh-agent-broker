@@ -21,6 +21,23 @@ github:
       private_key_path: "/run/secrets/github-reporter-app.pem"
       installations:
         grubbyhacker/gh-agent-broker: 131601703
+    ykm-curator:
+      app_id: 3991340
+      private_key_path: "/run/secrets/github-ykm-curator-app.pem"
+      installations:
+        grubbyhacker/ykmcorpus: 138708452
+
+mutation_limits:
+  state_path: "/var/log/gh-agent-broker/mutation-limits.json"
+  run_metadata_field: "YKM-Curator-Run"
+  action_metadata_field: "YKM-Curator-Action"
+  max_new_objects_per_run: 4
+  operation_classes:
+    pull.create: "upload"
+    issue.create: "feedback"
+  class_limits:
+    upload: 2
+    feedback: 2
 
 agents:
   - id: "hermes-agent-01"
@@ -78,8 +95,11 @@ agents:
     operations:
       - "repo.probe"
       - "issue.create"
+      - "issue.read"
+      - "issue.comments.read"
     permissions:
       - "issues:write"
+      - "issues:read"
     metadata_assertions:
       issue.create:
         mode: "enforce"
@@ -95,8 +115,66 @@ agents:
           - name: "Broker-Operation-Id"
             required: true
             locations: ["issue_body"]
+  - id: "ykm-curator"
+    enabled: true
+    secret_env: "YKM_CURATOR_BROKER_SECRET"
+    github_app: "ykm-curator"
+    repositories:
+      - "grubbyhacker/ykmcorpus"
+    operations:
+      - "repo.probe"
+      - "git.upload-pack"
+      - "git.receive-pack"
+      - "pull.create"
+      - "pull.read"
+      - "pull.files.read"
+      - "pull.reviews.read"
+      - "issue.comment"
+      - "issue.read"
+      - "issue.comments.read"
+      - "status.read"
+      - "checks.read"
+    branch_patterns:
+      - "^refs/heads/curator/[A-Za-z0-9_.:-]+/[A-Za-z0-9_.:-]+$"
+      - "^curator/[A-Za-z0-9_.:-]+/[A-Za-z0-9_.:-]+$"
+    base_branches:
+      - "main"
+    permissions:
+      - "contents:read"
+      - "contents:write"
+      - "pull_requests:read"
+      - "pull_requests:write"
+      - "issues:read"
+      - "issues:write"
+      - "checks:read"
+      - "statuses:read"
+    metadata_assertions:
+      pull.create:
+        mode: "enforce"
+        fields:
+          - name: "YKM-Curator-Run"
+            required: true
+            pattern: "^[A-Za-z0-9_.:-]+$"
+            locations: ["request", "pr_body"]
+          - name: "YKM-Curator-Action"
+            required: true
+            pattern: "^(upload|feedback|maintenance)$"
+            locations: ["request", "pr_body"]
+          - name: "Broker-Operation-Id"
+            required: true
+            locations: ["pr_body"]
+          - name: "GitHub-App-Installation-Id"
+            required: true
+            locations: ["pr_body"]
+      issue.comment:
+        mode: "enforce"
+        fields:
+          - name: "YKM-Curator-Run"
+            required: true
+            locations: ["request", "comment_body"]
 
 # GitHub App repository permissions required for this example:
 # - coder app: Contents read/write, Pull requests read/write, Issues read/write
 # - reporter app: Issues read/write only
+# - YKM Curator app: Contents read/write, Pull requests read/write, Issues read, Checks read, Commit statuses read
 # - Metadata: Read-only, automatically required by GitHub

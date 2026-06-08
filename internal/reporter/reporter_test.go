@@ -83,6 +83,9 @@ func TestCapabilitiesExposePolicyWithoutSecrets(t *testing.T) {
 	if !out.DedupeKeyRequired || !strings.Contains(out.DedupeBehavior, "does not suppress duplicate") {
 		t.Fatalf("dedupe fields = required %v behavior %q", out.DedupeKeyRequired, out.DedupeBehavior)
 	}
+	if !contains(out.ReadSupport, "broker_get_issue") {
+		t.Fatalf("ReadSupport = %v", out.ReadSupport)
+	}
 
 	b, err := json.Marshal(out)
 	if err != nil {
@@ -92,6 +95,46 @@ func TestCapabilitiesExposePolicyWithoutSecrets(t *testing.T) {
 		if strings.Contains(string(b), secret) {
 			t.Fatalf("capabilities leaked secret/config value %q in %s", secret, string(b))
 		}
+	}
+}
+
+func TestReporterReadPathsCallBrokerWithReporterIdentity(t *testing.T) {
+	var sawGet, sawSearch, sawComments bool
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "broker-reporter-01" || pass != "reporter-secret" {
+			t.Fatalf("BasicAuth = %q/%q ok=%v", user, pass, ok)
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/repos/owner/repo/issues/7":
+			sawGet = true
+			writeReporterJSON(t, w, api.IssueSummary{Number: 7, Title: "issue"})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/repos/owner/repo/issues":
+			sawSearch = true
+			if r.URL.Query().Get("body_marker") != "Dedupe-Key: test" {
+				t.Fatalf("body_marker = %q", r.URL.Query().Get("body_marker"))
+			}
+			writeReporterJSON(t, w, []api.IssueSummary{{Number: 7, Title: "issue"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/repos/owner/repo/issues/7/comments":
+			sawComments = true
+			writeReporterJSON(t, w, []api.IssueComment{{ID: 1, Body: "comment"}})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer broker.Close()
+	svc := NewService(testConfig(broker.URL))
+	if _, err := svc.GetIssue(GetIssueInput{Repo: "owner/repo", Number: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SearchIssues(SearchIssuesInput{Repo: "owner/repo", Labels: []string{"needs-triage"}, BodyMarker: "Dedupe-Key: test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.ListIssueComments(ListIssueCommentsInput{Repo: "owner/repo", Number: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if !sawGet || !sawSearch || !sawComments {
+		t.Fatalf("not all read paths called: get=%v search=%v comments=%v", sawGet, sawSearch, sawComments)
 	}
 }
 
@@ -148,4 +191,12 @@ func contains(items []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func writeReporterJSON(t *testing.T, w http.ResponseWriter, v interface{}) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		t.Fatal(err)
+	}
 }

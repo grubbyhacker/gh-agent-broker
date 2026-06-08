@@ -49,6 +49,7 @@ func TestLaunchAgentBuildsSandboxedRuntimeSpec(t *testing.T) {
 	assertMount(t, spec.Mounts, filepath.Join(cfg.RunsDir, out.RunID, "input"), "/input", true)
 	assertMount(t, spec.Mounts, filepath.Join(cfg.RunsDir, out.RunID, "work"), "/work", false)
 	assertMount(t, spec.Mounts, cfg.Bundles["codex"].SourcePath, "/credentials/codex", true)
+	assertMount(t, spec.Mounts, filepath.Join(filepath.Dir(cfg.RunsDir), "evidence"), "/data/intake", true)
 	if spec.Env["BROKER_AGENT_SECRET"] == spec.Labels["BROKER_AGENT_SECRET"] {
 		t.Fatalf("secret leaked into labels")
 	}
@@ -409,6 +410,11 @@ func baseTestConfig(t *testing.T) Config {
 	}
 	tmpl := cfg.Templates["worker"]
 	tmpl.KnowledgeSnapshots = []string{knowledge}
+	evidenceDir := filepath.Join(root, "evidence")
+	if err := os.MkdirAll(evidenceDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tmpl.ExtraMounts = []ExtraMount{{SourcePath: evidenceDir, MountPath: "/data/intake", ReadOnly: true}}
 	cfg.Templates["worker"] = tmpl
 	return cfg
 }

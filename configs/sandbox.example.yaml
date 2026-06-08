@@ -61,6 +61,32 @@ templates:
       GIT_AUTHOR_NAME: "Hermes Sandbox Worker"
       GIT_COMMITTER_NAME: "Hermes Sandbox Worker"
 
+# A private YKM Curator template can use operator-defined extra mounts like:
+#
+#  ykm-curator-dry-run:
+#    image: "ghcr.io/example-org/ykm-curator-worker:dev"
+#    command: ["/usr/local/bin/ykm-curator", "run"]
+#    user: "10000:10000"
+#    resources: {cpu_shares: 512, memory_mb: 4096, pids_limit: 512}
+#    network_policy: "worker-net"
+#    max_runtime_minutes: 60
+#    broker_agent_id: "ykm-curator"
+#    broker_agent_secret_env: "YKM_CURATOR_BROKER_SECRET"
+#    branch_policy:
+#      generate_prefix: "curator"
+#      allowed_patterns:
+#        - "^curator/[A-Za-z0-9_.:-]+/[A-Za-z0-9_.:-]+$"
+#      base_branches: ["main"]
+#    deliverables:
+#      - "/output/run-report.md"
+#    extra_mounts:
+#      - source_path: "/opt/youknowme/intake"
+#        mount_path: "/data/intake"
+#        readonly: false
+#      - source_path: "/opt/youknowme/logs"
+#        mount_path: "/data/logs"
+#        readonly: true
+
   hermes-task-worker:
     image: "ghcr.io/example-org/hermes-sandbox-task-worker:dev"
     command:

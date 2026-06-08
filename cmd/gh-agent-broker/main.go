@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -55,6 +56,30 @@ func main() {
 		cmdDryRun(os.Args[2:])
 	case "pr":
 		cmdPR(os.Args[2:])
+	case "pulls":
+		cmdPulls(os.Args[2:])
+	case "pull":
+		cmdPull(os.Args[2:])
+	case "pull-files":
+		cmdPullSubresource(os.Args[2:], "pull-files", "files")
+	case "pull-comments":
+		cmdPullSubresource(os.Args[2:], "pull-comments", "comments")
+	case "pull-reviews":
+		cmdPullSubresource(os.Args[2:], "pull-reviews", "reviews")
+	case "pull-review-comments":
+		cmdPullSubresource(os.Args[2:], "pull-review-comments", "review-comments")
+	case "pull-review-threads":
+		cmdPullSubresource(os.Args[2:], "pull-review-threads", "review-threads")
+	case "issues":
+		cmdIssues(os.Args[2:])
+	case "issue":
+		cmdIssue(os.Args[2:])
+	case "issue-comments":
+		cmdIssueComments(os.Args[2:])
+	case "commit-status":
+		cmdCommitStatus(os.Args[2:])
+	case "check-runs":
+		cmdCheckRuns(os.Args[2:])
 	case "comment":
 		cmdComment(os.Args[2:])
 	default:
@@ -64,7 +89,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|configure|whoami|probe|dry-run|pr|comment> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|issues|issue|issue-comments|commit-status|check-runs|comment> [flags]")
 }
 
 func commonFlags(fs *flag.FlagSet) (broker, agentID, secret *string) {
@@ -271,6 +296,127 @@ func cmdComment(args []string) {
 	resolveSecret(secret)
 	body := map[string]interface{}{"body": *bodyText, "metadata": map[string]string(md)}
 	doRequest(http.MethodPost, *broker, "/v1/repos/"+*repo+"/issues/"+*issue+"/comments", *agentID, *secret, body)
+}
+
+func cmdPulls(args []string) {
+	fs := flag.NewFlagSet("pulls", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	state := fs.String("state", "open", "pull request state")
+	headPrefix := fs.String("head-prefix", "", "filter returned PRs by head branch prefix")
+	bodyMarker := fs.String("body-marker", "", "filter returned PRs by body marker")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	q := queryString(map[string]string{"state": *state, "head_prefix": *headPrefix, "body_marker": *bodyMarker})
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/pulls"+q, *agentID, *secret, nil)
+}
+
+func cmdPull(args []string) {
+	fs := flag.NewFlagSet("pull", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	number := fs.String("number", "", "pull request number")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/pulls/"+*number, *agentID, *secret, nil)
+}
+
+func cmdPullSubresource(args []string, name, resource string) {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	number := fs.String("number", "", "pull request number")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/pulls/"+*number+"/"+resource, *agentID, *secret, nil)
+}
+
+func cmdIssues(args []string) {
+	fs := flag.NewFlagSet("issues", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	state := fs.String("state", "open", "issue state")
+	labels := fs.String("labels", "", "comma-separated labels")
+	assignee := fs.String("assignee", "", "assignee")
+	bodyMarker := fs.String("body-marker", "", "filter returned issues by body marker")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	q := queryString(map[string]string{"state": *state, "labels": *labels, "assignee": *assignee, "body_marker": *bodyMarker})
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/issues"+q, *agentID, *secret, nil)
+}
+
+func cmdIssue(args []string) {
+	fs := flag.NewFlagSet("issue", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	number := fs.String("number", "", "issue number")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/issues/"+*number, *agentID, *secret, nil)
+}
+
+func cmdIssueComments(args []string) {
+	fs := flag.NewFlagSet("issue-comments", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	number := fs.String("number", "", "issue number")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/issues/"+*number+"/comments", *agentID, *secret, nil)
+}
+
+func cmdCommitStatus(args []string) {
+	fs := flag.NewFlagSet("commit-status", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	sha := fs.String("sha", "", "commit sha")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/commits/"+*sha+"/status", *agentID, *secret, nil)
+}
+
+func cmdCheckRuns(args []string) {
+	fs := flag.NewFlagSet("check-runs", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	sha := fs.String("sha", "", "commit sha")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/commits/"+*sha+"/check-runs", *agentID, *secret, nil)
+}
+
+func queryString(values map[string]string) string {
+	var parts []string
+	for key, value := range values {
+		if value == "" {
+			continue
+		}
+		parts = append(parts, key+"="+urlQueryEscape(value))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "?" + strings.Join(parts, "&")
+}
+
+func urlQueryEscape(value string) string {
+	return url.QueryEscape(value)
 }
 
 func doRequest(method, broker, path, agentID, secret string, body interface{}) {

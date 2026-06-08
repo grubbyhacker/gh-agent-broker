@@ -44,6 +44,24 @@ func TestConfigValidateRejectsUnsafeSettings(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "source_path must be absolute") {
 		t.Fatalf("Validate() error = %v, want absolute source path", err)
 	}
+
+	cfg = baseTestConfig(t)
+	tmpl = cfg.Templates["worker"]
+	tmpl.ExtraMounts = []ExtraMount{{SourcePath: "/var/run/docker.sock", MountPath: "/data/docker", ReadOnly: true}}
+	cfg.Templates["worker"] = tmpl
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "source_path is not allowed") {
+		t.Fatalf("Validate() error = %v, want unsafe extra mount source", err)
+	}
+
+	cfg = baseTestConfig(t)
+	tmpl = cfg.Templates["worker"]
+	tmpl.ExtraMounts = []ExtraMount{{SourcePath: "/tmp/evidence", MountPath: "/input/evidence", ReadOnly: true}}
+	cfg.Templates["worker"] = tmpl
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "conflicts with sandbox-managed paths") {
+		t.Fatalf("Validate() error = %v, want unsafe extra mount target", err)
+	}
 }
 
 func TestConfigResolveSecrets(t *testing.T) {

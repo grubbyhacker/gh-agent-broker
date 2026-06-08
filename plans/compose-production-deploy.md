@@ -27,6 +27,8 @@ private deployment config before running the broker.
 - GitHub App key mounts:
   `./secrets/github-coder-app.pem:/run/secrets/github-coder-app.pem:ro` and
   `./secrets/github-reporter-app.pem:/run/secrets/github-reporter-app.pem:ro`.
+  Curator deployments also mount
+  `./secrets/github-ykm-curator-app.pem:/run/secrets/github-ykm-curator-app.pem:ro`.
 - Audit mount: prefer a named Docker volume at `/var/log/gh-agent-broker`.
   If using a host bind mount such as `./audit:/var/log/gh-agent-broker`, make
   it writable by container UID `65532`.

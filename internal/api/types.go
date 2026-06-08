@@ -80,3 +80,113 @@ type GitHubResult struct {
 	Number  int    `json:"number,omitempty"`
 	ID      int64  `json:"id,omitempty"`
 }
+
+type PullSummary struct {
+	ID             int64    `json:"id"`
+	Number         int      `json:"number"`
+	State          string   `json:"state"`
+	Title          string   `json:"title"`
+	Body           string   `json:"body,omitempty"`
+	HeadRef        string   `json:"head_ref"`
+	HeadSHA        string   `json:"head_sha"`
+	BaseRef        string   `json:"base_ref"`
+	Merged         bool     `json:"merged"`
+	Mergeable      *bool    `json:"mergeable,omitempty"`
+	Author         string   `json:"author,omitempty"`
+	Labels         []string `json:"labels,omitempty"`
+	URL            string   `json:"url,omitempty"`
+	HTMLURL        string   `json:"html_url,omitempty"`
+	Comments       int      `json:"comments,omitempty"`
+	ReviewComments int      `json:"review_comments,omitempty"`
+}
+
+type PullFile struct {
+	Filename  string `json:"filename"`
+	Status    string `json:"status"`
+	SHA       string `json:"sha,omitempty"`
+	Additions int    `json:"additions,omitempty"`
+	Deletions int    `json:"deletions,omitempty"`
+	Changes   int    `json:"changes,omitempty"`
+	Patch     string `json:"patch,omitempty"`
+}
+
+type IssueSummary struct {
+	ID            int64    `json:"id"`
+	Number        int      `json:"number"`
+	State         string   `json:"state"`
+	Title         string   `json:"title"`
+	Body          string   `json:"body,omitempty"`
+	Author        string   `json:"author,omitempty"`
+	Assignees     []string `json:"assignees,omitempty"`
+	Labels        []string `json:"labels,omitempty"`
+	URL           string   `json:"url,omitempty"`
+	HTMLURL       string   `json:"html_url,omitempty"`
+	IsPullRequest bool     `json:"is_pull_request,omitempty"`
+}
+
+type IssueComment struct {
+	ID        int64  `json:"id"`
+	Body      string `json:"body,omitempty"`
+	Author    string `json:"author,omitempty"`
+	URL       string `json:"url,omitempty"`
+	HTMLURL   string `json:"html_url,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+type PullReview struct {
+	ID          int64  `json:"id"`
+	State       string `json:"state"`
+	Body        string `json:"body,omitempty"`
+	Author      string `json:"author,omitempty"`
+	CommitID    string `json:"commit_id,omitempty"`
+	SubmittedAt string `json:"submitted_at,omitempty"`
+	HTMLURL     string `json:"html_url,omitempty"`
+}
+
+type PullReviewComment struct {
+	ID        int64  `json:"id"`
+	Body      string `json:"body,omitempty"`
+	Author    string `json:"author,omitempty"`
+	Path      string `json:"path,omitempty"`
+	CommitID  string `json:"commit_id,omitempty"`
+	HTMLURL   string `json:"html_url,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+type PullReviewThread struct {
+	ID                       string              `json:"id"`
+	IsResolved               *bool               `json:"is_resolved,omitempty"`
+	UnresolvedStateAvailable bool                `json:"unresolved_state_available"`
+	Comments                 []PullReviewComment `json:"comments,omitempty"`
+}
+
+type CommitStatus struct {
+	State      string          `json:"state"`
+	SHA        string          `json:"sha,omitempty"`
+	TotalCount int             `json:"total_count,omitempty"`
+	Statuses   []StatusContext `json:"statuses,omitempty"`
+}
+
+type StatusContext struct {
+	Context     string `json:"context"`
+	State       string `json:"state"`
+	Description string `json:"description,omitempty"`
+	TargetURL   string `json:"target_url,omitempty"`
+}
+
+type CheckRuns struct {
+	TotalCount int        `json:"total_count"`
+	CheckRuns  []CheckRun `json:"check_runs"`
+}
+
+type CheckRun struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Conclusion  string `json:"conclusion,omitempty"`
+	HTMLURL     string `json:"html_url,omitempty"`
+	StartedAt   string `json:"started_at,omitempty"`
+	CompletedAt string `json:"completed_at,omitempty"`
+}

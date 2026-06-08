@@ -22,6 +22,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+docker_sock_gid() {
+  if docker run --rm -v /var/run/docker.sock:/var/run/docker.sock busybox:latest stat -c '%g' /var/run/docker.sock >/dev/null 2>&1; then
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock busybox:latest stat -c '%g' /var/run/docker.sock
+  elif stat -c '%g' /var/run/docker.sock >/dev/null 2>&1; then
+    stat -c '%g' /var/run/docker.sock
+  else
+    stat -f '%g' /var/run/docker.sock
+  fi
+}
+
 if [[ ! -r "${HOME}/.codex/auth.json" || ! -r "${HOME}/.codex/config.toml" ]]; then
   echo "missing ${HOME}/.codex/auth.json or config.toml" >&2
   exit 1
@@ -116,7 +126,7 @@ BROKER_CID="$(
     sh -c 'mkdir -p /www && printf "{\"status\":\"ok\"}\n" > /www/healthz && httpd -f -p 8080 -h /www'
 )"
 
-DOCKER_SOCK_GID="$(stat -c '%g' /var/run/docker.sock)"
+DOCKER_SOCK_GID="$(docker_sock_gid)"
 echo "starting sandbox-broker with Docker socket group ${DOCKER_SOCK_GID}"
 SANDBOX_CID="$(
   docker run -d \

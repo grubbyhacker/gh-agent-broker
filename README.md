@@ -21,6 +21,9 @@ audit events.
   `broker_reporter_capabilities` and `broker_report_issue`.
 - `sandbox-broker`: a separate MCP service that launches task-scoped worker
   containers from operator-defined templates.
+- `gh-agent-proxy`: a narrow self-hosted model-call facade for sandboxed
+  workers. It keeps provider keys in the proxy/LiteLLM service, enforces
+  per-run budgets, and avoids prompt-body logging by default.
 
 GitHub App installation tokens stay inside the broker. Agents receive only
 broker credentials or MCP access to a host-side service.
@@ -31,7 +34,8 @@ broker credentials or MCP access to a host-side service.
 - GitHub App installation token minting inside the broker only.
 - HTTP Git proxy for clone, fetch, and push.
 - REST endpoints for repo probe, policy dry-run, PR creation, issue creation,
-  issue/PR comments, health/readiness, discovery, and config reload.
+  issue/PR comments, PR/issue/status/check reads, health/readiness, discovery,
+  and config reload.
 - Generic metadata assertions with `off`, `warn`, and `enforce` modes.
 - Structured denial responses with self-correction guidance.
 - YAML config, JSONL audit logs, and redaction of known secret values.
@@ -142,9 +146,21 @@ Broker-agent authenticated routes:
 GET  /whoami
 GET  /v1/repos/OWNER/REPO/probe
 POST /v1/policy/dry-run
+GET  /v1/repos/OWNER/REPO/pulls
+GET  /v1/repos/OWNER/REPO/pulls/NUMBER
+GET  /v1/repos/OWNER/REPO/pulls/NUMBER/files
+GET  /v1/repos/OWNER/REPO/pulls/NUMBER/comments
+GET  /v1/repos/OWNER/REPO/pulls/NUMBER/reviews
+GET  /v1/repos/OWNER/REPO/pulls/NUMBER/review-comments
+GET  /v1/repos/OWNER/REPO/pulls/NUMBER/review-threads
 POST /v1/repos/OWNER/REPO/pulls
+GET  /v1/repos/OWNER/REPO/issues
+GET  /v1/repos/OWNER/REPO/issues/NUMBER
+GET  /v1/repos/OWNER/REPO/issues/NUMBER/comments
 POST /v1/repos/OWNER/REPO/issues
 POST /v1/repos/OWNER/REPO/issues/NUMBER/comments
+GET  /v1/repos/OWNER/REPO/commits/SHA/status
+GET  /v1/repos/OWNER/REPO/commits/SHA/check-runs
 ```
 
 For `policy.dry-run`, the repository may be supplied as `repo: "OWNER/REPO"`,
@@ -167,9 +183,23 @@ Reporter tools:
 - `broker_report_issue`: creates an allowlisted GitHub issue with `repo`,
   `title`, `body`, `dedupe_key`, optional source metadata, and optional
   allowlisted labels.
+- `broker_get_issue`, `broker_search_issues`, and
+  `broker_list_issue_comments`: read/query allowlisted issues through the
+  reporter identity.
 
 The reporter always applies the configured default label, enforces explicit
 repo and label allowlists, and never returns broker or GitHub credentials.
+
+## Model Proxy
+
+`gh-agent-proxy` is intended for sandboxed workers that need model calls without
+receiving provider keys. It exposes `POST /v1/model/call`, requires a private
+bearer token, forwards to a configured LiteLLM-compatible upstream, and tracks
+per-run call/token budgets in a file-backed state store.
+
+The proxy logs run ID, model, decision, and token counts only. Keep
+`log_prompts: false` in production because prompts and responses may contain
+private corpus, upload, feedback, or log excerpts.
 
 ## Sandbox MCP Broker
 

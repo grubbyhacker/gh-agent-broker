@@ -44,6 +44,42 @@ func main() {
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("created issue #%d: %s", out.Number, out.HTMLURL)}},
 		}, out, nil
 	})
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "broker_get_issue",
+		Description: "Read one allowlisted GitHub issue through gh-agent-broker using the reporter identity.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in reporter.GetIssueInput) (*mcp.CallToolResult, reporterIssueOutput, error) {
+		out, err := service.GetIssue(in)
+		if err != nil {
+			return nil, reporterIssueOutput{}, err
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("read issue #%d: %s", out.Number, out.HTMLURL)}},
+		}, reporterIssueOutput{Issue: out}, nil
+	})
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "broker_search_issues",
+		Description: "Search allowlisted GitHub issues through gh-agent-broker using the reporter identity.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in reporter.SearchIssuesInput) (*mcp.CallToolResult, reporterIssuesOutput, error) {
+		out, err := service.SearchIssues(in)
+		if err != nil {
+			return nil, reporterIssuesOutput{}, err
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("returned %d issues", len(out))}},
+		}, reporterIssuesOutput{Issues: out}, nil
+	})
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "broker_list_issue_comments",
+		Description: "List comments on one allowlisted GitHub issue through gh-agent-broker using the reporter identity.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in reporter.ListIssueCommentsInput) (*mcp.CallToolResult, reporterIssueCommentsOutput, error) {
+		out, err := service.ListIssueComments(in)
+		if err != nil {
+			return nil, reporterIssueCommentsOutput{}, err
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("returned %d issue comments", len(out))}},
+		}, reporterIssueCommentsOutput{Comments: out}, nil
+	})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -73,4 +109,16 @@ func main() {
 	if err := httpServer.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+type reporterIssueOutput struct {
+	Issue interface{} `json:"issue"`
+}
+
+type reporterIssuesOutput struct {
+	Issues interface{} `json:"issues"`
+}
+
+type reporterIssueCommentsOutput struct {
+	Comments interface{} `json:"comments"`
 }

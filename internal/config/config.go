@@ -11,10 +11,11 @@ import (
 )
 
 type Config struct {
-	Server ServerConfig `yaml:"server"`
-	Audit  AuditConfig  `yaml:"audit"`
-	GitHub GitHubConfig `yaml:"github"`
-	Agents []Agent      `yaml:"agents"`
+	Server         ServerConfig         `yaml:"server"`
+	Audit          AuditConfig          `yaml:"audit"`
+	GitHub         GitHubConfig         `yaml:"github"`
+	MutationLimits MutationLimitsConfig `yaml:"mutation_limits"`
+	Agents         []Agent              `yaml:"agents"`
 }
 
 type ServerConfig struct {
@@ -40,6 +41,15 @@ type GitHubAppConfig struct {
 	AppID          int64            `yaml:"app_id"`
 	PrivateKeyPath string           `yaml:"private_key_path"`
 	Installations  map[string]int64 `yaml:"installations"`
+}
+
+type MutationLimitsConfig struct {
+	StatePath           string            `yaml:"state_path"`
+	RunMetadataField    string            `yaml:"run_metadata_field"`
+	ActionMetadataField string            `yaml:"action_metadata_field"`
+	MaxNewObjectsPerRun int               `yaml:"max_new_objects_per_run"`
+	ClassLimits         map[string]int    `yaml:"class_limits"`
+	OperationClasses    map[string]string `yaml:"operation_classes"`
 }
 
 type Agent struct {

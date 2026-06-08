@@ -73,6 +73,13 @@ type Template struct {
 	Deliverables       []string          `yaml:"deliverables"`
 	KnowledgeSnapshots []string          `yaml:"knowledge_snapshots"`
 	Environment        map[string]string `yaml:"environment"`
+	ExtraMounts        []ExtraMount      `yaml:"extra_mounts"`
+}
+
+type ExtraMount struct {
+	SourcePath string `yaml:"source_path"`
+	MountPath  string `yaml:"mount_path"`
+	ReadOnly   bool   `yaml:"readonly"`
 }
 
 type Resources struct {
@@ -296,6 +303,30 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 		if !filepath.IsAbs(path) {
 			errs = append(errs, fmt.Sprintf("template %q knowledge snapshot %q must be absolute", name, path))
 		}
+	}
+	for i, mount := range tmpl.ExtraMounts {
+		errs = append(errs, validateExtraMount(name, i, mount)...)
+	}
+	return errs
+}
+
+func validateExtraMount(template string, idx int, mount ExtraMount) []string {
+	var errs []string
+	name := fmt.Sprintf("template %q extra_mounts[%d]", template, idx)
+	source := filepath.Clean(mount.SourcePath)
+	target := filepath.Clean(mount.MountPath)
+	if !filepath.IsAbs(mount.SourcePath) {
+		errs = append(errs, fmt.Sprintf("%s source_path must be absolute", name))
+	}
+	if !filepath.IsAbs(mount.MountPath) {
+		errs = append(errs, fmt.Sprintf("%s mount_path must be absolute", name))
+	}
+	if source == "/" || source == "/var/run/docker.sock" || strings.HasPrefix(source, "/var/run/docker.sock/") {
+		errs = append(errs, fmt.Sprintf("%s source_path is not allowed", name))
+	}
+	if target == "/" || target == "/input" || target == "/work" || target == "/output" || target == "/lessons" ||
+		strings.HasPrefix(target, "/input/") || strings.HasPrefix(target, "/work/") || strings.HasPrefix(target, "/output/") || strings.HasPrefix(target, "/lessons/") {
+		errs = append(errs, fmt.Sprintf("%s mount_path conflicts with sandbox-managed paths", name))
 	}
 	return errs
 }
