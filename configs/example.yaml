@@ -38,6 +38,8 @@ agents:
       - "^agent/hermes-coder-01/.+$"
     base_branches:
       - "main"
+    branch_lifecycle_guard:
+      mode: "enforce"
     permissions:
       - "contents:read"
       - "contents:write"

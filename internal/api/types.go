@@ -91,6 +91,7 @@ type PullSummary struct {
 	HeadSHA        string   `json:"head_sha"`
 	BaseRef        string   `json:"base_ref"`
 	Merged         bool     `json:"merged"`
+	MergedAt       string   `json:"merged_at,omitempty"`
 	Mergeable      *bool    `json:"mergeable,omitempty"`
 	Author         string   `json:"author,omitempty"`
 	Labels         []string `json:"labels,omitempty"`

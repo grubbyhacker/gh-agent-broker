@@ -37,6 +37,8 @@ broker credentials or MCP access to a host-side service.
   issue/PR comments, PR/issue/status/check reads, health/readiness, discovery,
   and config reload.
 - Generic metadata assertions with `off`, `warn`, and `enforce` modes.
+- Optional per-agent branch lifecycle guard that denies or warns when a branch
+  already backed a closed PR.
 - Structured denial responses with self-correction guidance.
 - YAML config, JSONL audit logs, and redaction of known secret values.
 - Optional MCP issue reporter and sandbox broker services.
@@ -121,6 +123,11 @@ Broker Git remotes use this shape:
 ```text
 http://127.0.0.1:8080/git/example-org/example-repo.git
 ```
+
+When `branch_lifecycle_guard` is enabled for an agent, the broker checks
+brokered pushes and PR creation against same-repository PR history. Branches
+that already backed a closed or merged PR are denied in `enforce` mode, and
+agents should create a fresh branch such as `agent/$BROKER_AGENT_ID/<task>`.
 
 `gh-agent-broker-cli configure` installs a repo-local Git credential helper that
 reads `BROKER_AGENT_ID` and `BROKER_AGENT_SECRET` at fetch/push time. It does

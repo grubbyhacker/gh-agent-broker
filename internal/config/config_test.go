@@ -99,6 +99,55 @@ agents:
 	}
 }
 
+func TestBranchLifecycleGuardDefaultsWhenEnabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, `
+github:
+  app_id: 1
+  private_key_path: key.pem
+  installations:
+    owner/repo: 2
+agents:
+  - id: agent-1
+    enabled: false
+    branch_lifecycle_guard:
+      mode: enforce
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	guard := cfg.Agents[0].BranchGuard
+	if guard.Mode != "enforce" {
+		t.Fatalf("guard mode = %q", guard.Mode)
+	}
+	if len(guard.StalePRStates) != 1 || guard.StalePRStates[0] != "closed" {
+		t.Fatalf("stale states = %#v", guard.StalePRStates)
+	}
+	if len(guard.Operations) != 2 || guard.Operations[0] != "git.receive-pack" || guard.Operations[1] != "pull.create" {
+		t.Fatalf("operations = %#v", guard.Operations)
+	}
+}
+
+func TestValidateRejectsInvalidBranchLifecycleGuardMode(t *testing.T) {
+	cfg := Config{
+		GitHub: GitHubConfig{
+			AppID:          1,
+			PrivateKeyPath: "key.pem",
+			Installations:  map[string]int64{"owner/repo": 2},
+		},
+		Agents: []Agent{{
+			ID:          "agent-1",
+			Enabled:     false,
+			BranchGuard: BranchLifecycleGuard{Mode: "block"},
+		}},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("Validate() error = nil, want branch lifecycle guard mode error")
+	}
+}
+
 func writeFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {

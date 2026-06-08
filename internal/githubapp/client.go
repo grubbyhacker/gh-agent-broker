@@ -345,6 +345,7 @@ type githubPull struct {
 	Head           githubBranchRef `json:"head"`
 	Base           githubBranchRef `json:"base"`
 	Merged         bool            `json:"merged"`
+	MergedAt       string          `json:"merged_at"`
 	Mergeable      *bool           `json:"mergeable"`
 	User           githubUser      `json:"user"`
 	Labels         []githubLabel   `json:"labels"`
@@ -417,7 +418,8 @@ func mapPull(p githubPull) api.PullSummary {
 		HeadRef:        p.Head.Ref,
 		HeadSHA:        p.Head.SHA,
 		BaseRef:        p.Base.Ref,
-		Merged:         p.Merged,
+		Merged:         p.Merged || p.MergedAt != "",
+		MergedAt:       p.MergedAt,
 		Mergeable:      p.Mergeable,
 		Author:         p.User.Login,
 		Labels:         labelNames(p.Labels),
