@@ -23,6 +23,7 @@ import (
 	"gh-agent-broker/internal/config"
 	"gh-agent-broker/internal/githubapp"
 	"gh-agent-broker/internal/ids"
+	"gh-agent-broker/internal/limits"
 	"gh-agent-broker/internal/metadata"
 	"gh-agent-broker/internal/policy"
 )
@@ -153,12 +154,61 @@ func handleOperations(w http.ResponseWriter, r *http.Request) {
 				"metadata":    "send configured metadata fields in request body metadata",
 			},
 			{
+				"name":        "pull.read",
+				"method":      http.MethodGet,
+				"path":        "/v1/repos/{owner}/{repo}/pulls",
+				"auth":        "agent",
+				"description": "List or get pull requests through the broker.",
+			},
+			{
+				"name":        "pull.files.read",
+				"method":      http.MethodGet,
+				"path":        "/v1/repos/{owner}/{repo}/pulls/{number}/files",
+				"auth":        "agent",
+				"description": "List files changed by a pull request.",
+			},
+			{
+				"name":        "pull.reviews.read",
+				"method":      http.MethodGet,
+				"path":        "/v1/repos/{owner}/{repo}/pulls/{number}/reviews",
+				"auth":        "agent",
+				"description": "List pull request reviews, review comments, or review thread approximations.",
+			},
+			{
 				"name":        "issue.comment",
 				"method":      http.MethodPost,
 				"path":        "/v1/repos/{owner}/{repo}/issues/{number}/comments",
 				"auth":        "agent",
 				"description": "Create an issue or pull request comment through the broker.",
 				"metadata":    "send configured metadata fields in request body metadata",
+			},
+			{
+				"name":        "issue.read",
+				"method":      http.MethodGet,
+				"path":        "/v1/repos/{owner}/{repo}/issues",
+				"auth":        "agent",
+				"description": "List or get issues through the broker.",
+			},
+			{
+				"name":        "issue.comments.read",
+				"method":      http.MethodGet,
+				"path":        "/v1/repos/{owner}/{repo}/issues/{number}/comments",
+				"auth":        "agent",
+				"description": "List issue or pull request conversation comments through the broker.",
+			},
+			{
+				"name":        "status.read",
+				"method":      http.MethodGet,
+				"path":        "/v1/repos/{owner}/{repo}/commits/{sha}/status",
+				"auth":        "agent",
+				"description": "Read combined commit status through the broker.",
+			},
+			{
+				"name":        "checks.read",
+				"method":      http.MethodGet,
+				"path":        "/v1/repos/{owner}/{repo}/commits/{sha}/check-runs",
+				"auth":        "agent",
+				"description": "Read commit check runs through the broker.",
 			},
 			{
 				"name":        "issue.create",
@@ -214,9 +264,21 @@ Discovery:
 Operations:
 - GET  /v1/repos/{owner}/{repo}/probe
 - POST /v1/policy/dry-run
+- GET  /v1/repos/{owner}/{repo}/pulls
+- GET  /v1/repos/{owner}/{repo}/pulls/{number}
+- GET  /v1/repos/{owner}/{repo}/pulls/{number}/files
+- GET  /v1/repos/{owner}/{repo}/pulls/{number}/comments
+- GET  /v1/repos/{owner}/{repo}/pulls/{number}/reviews
+- GET  /v1/repos/{owner}/{repo}/pulls/{number}/review-comments
+- GET  /v1/repos/{owner}/{repo}/pulls/{number}/review-threads
 - POST /v1/repos/{owner}/{repo}/pulls
+- GET  /v1/repos/{owner}/{repo}/issues
+- GET  /v1/repos/{owner}/{repo}/issues/{number}
+- GET  /v1/repos/{owner}/{repo}/issues/{number}/comments
 - POST /v1/repos/{owner}/{repo}/issues
 - POST /v1/repos/{owner}/{repo}/issues/{number}/comments
+- GET  /v1/repos/{owner}/{repo}/commits/{sha}/status
+- GET  /v1/repos/{owner}/{repo}/commits/{sha}/check-runs
 
 Git smart HTTP:
 - /git/{owner}/{repo}.git
@@ -596,15 +658,244 @@ func (s *Server) handleRepoAPI(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case len(parts) == 3 && parts[2] == "probe" && r.Method == http.MethodGet:
 		s.handleProbe(w, r, repo)
+	case len(parts) == 3 && parts[2] == "pulls" && r.Method == http.MethodGet:
+		s.handlePullList(w, r, repo)
 	case len(parts) == 3 && parts[2] == "pulls" && r.Method == http.MethodPost:
 		s.handlePullCreate(w, r, repo)
+	case len(parts) == 4 && parts[2] == "pulls" && r.Method == http.MethodGet:
+		s.handlePullGet(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "pulls" && parts[4] == "files" && r.Method == http.MethodGet:
+		s.handlePullFiles(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "pulls" && parts[4] == "comments" && r.Method == http.MethodGet:
+		s.handlePullIssueComments(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "pulls" && parts[4] == "reviews" && r.Method == http.MethodGet:
+		s.handlePullReviews(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "pulls" && parts[4] == "review-comments" && r.Method == http.MethodGet:
+		s.handlePullReviewComments(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "pulls" && parts[4] == "review-threads" && r.Method == http.MethodGet:
+		s.handlePullReviewThreads(w, r, repo, parts[3])
 	case len(parts) == 3 && parts[2] == "issues" && r.Method == http.MethodPost:
 		s.handleIssueCreate(w, r, repo)
+	case len(parts) == 3 && parts[2] == "issues" && r.Method == http.MethodGet:
+		s.handleIssueList(w, r, repo)
+	case len(parts) == 4 && parts[2] == "issues" && r.Method == http.MethodGet:
+		s.handleIssueGet(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "issues" && parts[4] == "comments" && r.Method == http.MethodGet:
+		s.handleIssueComments(w, r, repo, parts[3])
 	case len(parts) == 5 && parts[2] == "issues" && parts[4] == "comments" && r.Method == http.MethodPost:
 		s.handleCommentCreate(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "commits" && parts[4] == "status" && r.Method == http.MethodGet:
+		s.handleCommitStatus(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "commits" && parts[4] == "check-runs" && r.Method == http.MethodGet:
+		s.handleCheckRuns(w, r, repo, parts[3])
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
+}
+
+func (s *Server) handlePullList(w http.ResponseWriter, r *http.Request, repo string) {
+	s.withReadAccess(w, r, repo, "pull.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		pulls, err := gh.ListPulls(appName, repo, inst, githubListQuery(r, []string{"state", "head", "base", "sort", "direction"}))
+		if err != nil {
+			return nil, err
+		}
+		if marker := strings.TrimSpace(r.URL.Query().Get("body_marker")); marker != "" {
+			filtered := pulls[:0]
+			for _, pull := range pulls {
+				if strings.Contains(pull.Body, marker) {
+					filtered = append(filtered, pull)
+				}
+			}
+			pulls = filtered
+		}
+		if prefix := strings.TrimSpace(r.URL.Query().Get("head_prefix")); prefix != "" {
+			filtered := pulls[:0]
+			for _, pull := range pulls {
+				if strings.HasPrefix(pull.HeadRef, prefix) {
+					filtered = append(filtered, pull)
+				}
+			}
+			pulls = filtered
+		}
+		return pulls, nil
+	})
+}
+
+func (s *Server) handlePullGet(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	s.withReadAccess(w, r, repo, "pull.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.GetPull(appName, repo, inst, number)
+	})
+}
+
+func (s *Server) handlePullFiles(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	s.withReadAccess(w, r, repo, "pull.files.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.ListPullFiles(appName, repo, inst, number, githubListQuery(r, nil))
+	})
+}
+
+func (s *Server) handlePullIssueComments(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	s.withReadAccess(w, r, repo, "issue.comments.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.ListIssueComments(appName, repo, inst, number, githubListQuery(r, []string{"since"}))
+	})
+}
+
+func (s *Server) handlePullReviews(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	s.withReadAccess(w, r, repo, "pull.reviews.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.ListPullReviews(appName, repo, inst, number, githubListQuery(r, nil))
+	})
+}
+
+func (s *Server) handlePullReviewComments(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	s.withReadAccess(w, r, repo, "pull.reviews.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.ListPullReviewComments(appName, repo, inst, number, githubListQuery(r, nil))
+	})
+}
+
+func (s *Server) handlePullReviewThreads(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	s.withReadAccess(w, r, repo, "pull.reviews.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.ListPullReviewThreads(appName, repo, inst, number, githubListQuery(r, nil))
+	})
+}
+
+func (s *Server) handleIssueList(w http.ResponseWriter, r *http.Request, repo string) {
+	s.withReadAccess(w, r, repo, "issue.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		issues, err := gh.ListIssues(appName, repo, inst, githubListQuery(r, []string{"state", "labels", "assignee", "creator", "mentioned", "since", "sort", "direction"}))
+		if err != nil {
+			return nil, err
+		}
+		if marker := strings.TrimSpace(r.URL.Query().Get("body_marker")); marker != "" {
+			filtered := issues[:0]
+			for _, issue := range issues {
+				if strings.Contains(issue.Body, marker) {
+					filtered = append(filtered, issue)
+				}
+			}
+			issues = filtered
+		}
+		return issues, nil
+	})
+}
+
+func (s *Server) handleIssueGet(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	s.withReadAccess(w, r, repo, "issue.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.GetIssue(appName, repo, inst, number)
+	})
+}
+
+func (s *Server) handleIssueComments(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	s.withReadAccess(w, r, repo, "issue.comments.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.ListIssueComments(appName, repo, inst, number, githubListQuery(r, []string{"since"}))
+	})
+}
+
+func (s *Server) handleCommitStatus(w http.ResponseWriter, r *http.Request, repo, sha string) {
+	s.withReadAccess(w, r, repo, "status.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.GetCommitStatus(appName, repo, inst, sha)
+	})
+}
+
+func (s *Server) handleCheckRuns(w http.ResponseWriter, r *http.Request, repo, sha string) {
+	s.withReadAccess(w, r, repo, "checks.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.ListCheckRuns(appName, repo, inst, sha, githubListQuery(r, []string{"check_name", "status", "filter"}))
+	})
+}
+
+func (s *Server) withReadAccess(w http.ResponseWriter, r *http.Request, repo, operation, branch string, fn func(opID string, gh *githubapp.Client, appName string, inst int64) (interface{}, error)) {
+	opID := ids.NewOperationID()
+	cfg, gh := s.snapshot()
+	principal, ok := auth.AuthenticateAgent(r, cfg)
+	if !ok {
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
+		return
+	}
+	result := policy.Check(policy.Request{Agent: principal.Agent, AgentID: principal.ID, Repo: repo, Operation: operation, Branch: branch})
+	if !result.Allowed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision})
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "read denied by policy", &result))
+		return
+	}
+	out, err := fn(opID, gh, appName, inst)
+	if err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
+		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: "ok"})
+	writeJSON(w, http.StatusOK, out)
+}
+
+func parsePositiveInt(w http.ResponseWriter, raw string) (int, bool) {
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "number must be a positive integer", Decision: policy.DecisionDeny})
+		return 0, false
+	}
+	return n, true
+}
+
+func githubListQuery(r *http.Request, passthrough []string) url.Values {
+	out := url.Values{}
+	perPage := 30
+	if raw := r.URL.Query().Get("per_page"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			perPage = n
+		}
+	}
+	if perPage > 100 {
+		perPage = 100
+	}
+	out.Set("per_page", strconv.Itoa(perPage))
+	page := 1
+	if raw := r.URL.Query().Get("page"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			page = n
+		}
+	}
+	out.Set("page", strconv.Itoa(page))
+	for _, key := range passthrough {
+		if value := strings.TrimSpace(r.URL.Query().Get(key)); value != "" {
+			out.Set(key, value)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request, repo string) {
@@ -676,6 +967,9 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull request creation denied by policy", &result))
 		return
 	}
+	if !s.reserveMutation(w, opID, principal.ID, "pull.create", repo, req.Head, req.Metadata) {
+		return
+	}
 	body := req.Body + metadata.RenderBlock(enriched)
 	ghResult, err := gh.CreatePull(appName, repo, inst, req.Title, req.Head, req.Base, body, req.Draft)
 	if err != nil {
@@ -730,6 +1024,9 @@ func (s *Server) handleIssueCreate(w http.ResponseWriter, r *http.Request, repo 
 	if !result.Allowed {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.create", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision})
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "issue creation denied by policy", &result))
+		return
+	}
+	if !s.reserveMutation(w, opID, principal.ID, "issue.create", repo, "", req.Metadata) {
 		return
 	}
 	body := req.Body + metadata.RenderBlock(enriched)
@@ -896,6 +1193,47 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: "status " + strconv.Itoa(resp.StatusCode)})
+}
+
+func (s *Server) reserveMutation(w http.ResponseWriter, opID, agentID, operation, repo, branch string, metadata map[string]string) bool {
+	cfg, _ := s.snapshot()
+	decision, err := limits.CheckAndReserve(cfg.MutationLimits, operation, metadata)
+	if err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: agentID, Operation: operation, Repo: repo, Branch: branch, Decision: policy.DecisionDeny, Error: err.Error()})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "mutation_limit_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+		return false
+	}
+	if decision.Allowed {
+		return true
+	}
+	s.audit.Log(audit.Event{
+		OperationID: opID,
+		AgentID:     agentID,
+		Operation:   operation,
+		Repo:        repo,
+		Branch:      branch,
+		RunID:       decision.RunID,
+		Decision:    policy.DecisionDeny,
+		Result:      "capacity_deferred",
+		Extra:       map[string]interface{}{"class": decision.Class, "reason": decision.Reason},
+	})
+	writeJSON(w, http.StatusTooManyRequests, api.ErrorResponse{
+		Code:        "capacity_deferred",
+		Message:     decision.Reason + "; retry on the next Curator run",
+		OperationID: opID,
+		Decision:    policy.DecisionDeny,
+		FailedChecks: []api.FailedCheck{{
+			Dimension:     "mutation_budget",
+			Expected:      "available per-run GitHub object budget",
+			Actual:        "exhausted",
+			SafeToDisplay: true,
+			Message:       decision.Reason,
+		}},
+		RequiredChanges: []api.RequiredChange{{
+			Action: "defer this valid action to the next Curator run",
+		}},
+	})
+	return false
 }
 
 func (s *Server) errorResponse(operationID, code, message string, result *policy.Result) api.ErrorResponse {

@@ -110,6 +110,68 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 	}
 }
 
+func TestFakeGitHubReadRESTIntegration(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
+			writeTestJSON(t, w, map[string]string{
+				"token":      "fake-install-token",
+				"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			requireBearer(t, r)
+			writeTestJSON(t, w, []map[string]interface{}{{
+				"id": 1, "number": 5, "state": "open", "title": "curator", "body": "YKM-Curator-Run: cur-1",
+				"head": map[string]string{"ref": "curator/cur-1/test", "sha": "abc"},
+				"base": map[string]string{"ref": "main"},
+				"user": map[string]string{"login": "ykm-curator"},
+			}, {
+				"id": 2, "number": 6, "state": "open", "title": "other", "body": "none",
+				"head": map[string]string{"ref": "agent/other/test", "sha": "def"},
+				"base": map[string]string{"ref": "main"},
+				"user": map[string]string{"login": "other"},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/5/files":
+			requireBearer(t, r)
+			writeTestJSON(t, w, []map[string]interface{}{{"filename": "note.md", "status": "added", "changes": 3}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/5/comments":
+			requireBearer(t, r)
+			writeTestJSON(t, w, []map[string]interface{}{{"id": 9, "body": "reviewed", "user": map[string]string{"login": "roger"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues":
+			requireBearer(t, r)
+			writeTestJSON(t, w, []map[string]interface{}{{"id": 10, "number": 11, "state": "open", "title": "followup", "body": "Dedupe-Key: ykm/test", "user": map[string]string{"login": "ykm-curator"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/abc/status":
+			requireBearer(t, r)
+			writeTestJSON(t, w, map[string]interface{}{"state": "success", "sha": "abc", "total_count": 1, "statuses": []map[string]string{{"context": "ci", "state": "success"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/commits/abc/check-runs":
+			requireBearer(t, r)
+			writeTestJSON(t, w, map[string]interface{}{"total_count": 1, "check_runs": []map[string]interface{}{{"id": 12, "name": "check", "status": "completed", "conclusion": "success"}}})
+		default:
+			t.Fatalf("unexpected fake GitHub read request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer apiServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:           "agent-1",
+		Enabled:      true,
+		Secret:       "agent-secret",
+		Repositories: []string{"owner/repo"},
+		Operations:   []string{"pull.read", "pull.files.read", "issue.comments.read", "issue.read", "status.read", "checks.read"},
+	})
+
+	resp := brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls?body_marker=YKM-Curator-Run", nil)
+	assertStatus(t, resp, http.StatusOK)
+	if got := resp.Body.String(); !strings.Contains(got, `"number":5`) || strings.Contains(got, `"number":6`) {
+		t.Fatalf("pull marker filter failed: %s", got)
+	}
+	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls/5/files", nil), http.StatusOK)
+	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls/5/comments", nil), http.StatusOK)
+	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/issues?body_marker=ykm/test", nil), http.StatusOK)
+	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/commits/abc/status", nil), http.StatusOK)
+	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/commits/abc/check-runs", nil), http.StatusOK)
+}
+
 func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 	apiServer := fakeTokenServer(t)
 	defer apiServer.Close()

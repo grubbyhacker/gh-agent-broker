@@ -62,6 +62,25 @@ type CapabilitiesOutput struct {
 	MaxBodyLength         int      `json:"max_body_length"`
 	DedupeKeyRequired     bool     `json:"dedupe_key_required"`
 	DedupeBehavior        string   `json:"dedupe_behavior"`
+	ReadSupport           []string `json:"read_support"`
+}
+
+type GetIssueInput struct {
+	Repo   string `json:"repo" jsonschema:"owner/repo repository"`
+	Number int    `json:"number" jsonschema:"issue number"`
+}
+
+type SearchIssuesInput struct {
+	Repo       string   `json:"repo" jsonschema:"owner/repo repository"`
+	State      string   `json:"state,omitempty" jsonschema:"issue state, defaults to open"`
+	Labels     []string `json:"labels,omitempty" jsonschema:"labels to filter by"`
+	Assignee   string   `json:"assignee,omitempty" jsonschema:"assignee to filter by"`
+	BodyMarker string   `json:"body_marker,omitempty" jsonschema:"optional body marker or dedupe key to filter returned issues"`
+}
+
+type ListIssueCommentsInput struct {
+	Repo   string `json:"repo" jsonschema:"owner/repo repository"`
+	Number int    `json:"number" jsonschema:"issue number"`
 }
 
 func Load(path string) (Config, error) {
@@ -152,6 +171,7 @@ func (s *Service) Capabilities() CapabilitiesOutput {
 		MaxBodyLength:         s.cfg.MaxBodyLength,
 		DedupeKeyRequired:     true,
 		DedupeBehavior:        "dedupe_key is passed to the broker as issue metadata; the reporter does not suppress duplicate reports",
+		ReadSupport:           []string{"broker_get_issue", "broker_search_issues", "broker_list_issue_comments"},
 	}
 }
 
@@ -203,6 +223,71 @@ func (s *Service) ReportIssue(in ReportIssueInput) (ReportIssueOutput, error) {
 		return ReportIssueOutput{}, err
 	}
 	return ReportIssueOutput{URL: out.URL, HTMLURL: out.HTMLURL, Number: out.Number, ID: out.ID}, nil
+}
+
+func (s *Service) GetIssue(in GetIssueInput) (api.IssueSummary, error) {
+	repo := strings.TrimSpace(in.Repo)
+	if !allowedRepo(s.cfg.Repositories, repo) {
+		return api.IssueSummary{}, fmt.Errorf("repo %q is not in reporter allowlist", repo)
+	}
+	if in.Number < 1 {
+		return api.IssueSummary{}, fmt.Errorf("number must be positive")
+	}
+	var out api.IssueSummary
+	if err := s.getJSON(issueNumberPath(repo, in.Number), &out); err != nil {
+		return api.IssueSummary{}, err
+	}
+	return out, nil
+}
+
+func (s *Service) SearchIssues(in SearchIssuesInput) ([]api.IssueSummary, error) {
+	repo := strings.TrimSpace(in.Repo)
+	if !allowedRepo(s.cfg.Repositories, repo) {
+		return nil, fmt.Errorf("repo %q is not in reporter allowlist", repo)
+	}
+	q := url.Values{}
+	if in.State == "" {
+		q.Set("state", "open")
+	} else {
+		q.Set("state", in.State)
+	}
+	if len(in.Labels) > 0 {
+		for _, label := range in.Labels {
+			if strings.TrimSpace(label) == "" {
+				continue
+			}
+			if label != s.cfg.DefaultLabel && !containsString(s.cfg.AllowedLabels, label) {
+				return nil, fmt.Errorf("label %q is not in reporter label allowlist", label)
+			}
+		}
+		q.Set("labels", strings.Join(in.Labels, ","))
+	}
+	if in.Assignee != "" {
+		q.Set("assignee", in.Assignee)
+	}
+	if in.BodyMarker != "" {
+		q.Set("body_marker", in.BodyMarker)
+	}
+	var out []api.IssueSummary
+	if err := s.getJSON(issueListPath(repo)+"?"+q.Encode(), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Service) ListIssueComments(in ListIssueCommentsInput) ([]api.IssueComment, error) {
+	repo := strings.TrimSpace(in.Repo)
+	if !allowedRepo(s.cfg.Repositories, repo) {
+		return nil, fmt.Errorf("repo %q is not in reporter allowlist", repo)
+	}
+	if in.Number < 1 {
+		return nil, fmt.Errorf("number must be positive")
+	}
+	var out []api.IssueComment
+	if err := s.getJSON(issueNumberPath(repo, in.Number)+"/comments", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Service) labels(requested []string) ([]string, error) {
@@ -264,17 +349,66 @@ func (s *Service) postIssue(repo string, body api.IssueCreateRequest, out *api.G
 	return json.Unmarshal(respBody, out)
 }
 
+func (s *Service) getJSON(path string, out interface{}) error {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(s.cfg.BrokerURL, "/")+path, nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(s.cfg.BrokerAgentID, s.cfg.BrokerAgentSecret)
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer closeBody(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("broker read failed: status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return json.Unmarshal(respBody, out)
+}
+
 func issuePath(repo string) (string, error) {
+	if err := validateRepo(repo); err != nil {
+		return "", err
+	}
+	return issueListPath(repo), nil
+}
+
+func issueListPath(repo string) string {
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok {
+		return "/v1/repos//issues"
+	}
+	return "/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/issues"
+}
+
+func issueNumberPath(repo string, number int) string {
+	return issueListPath(repo) + fmt.Sprintf("/%d", number)
+}
+
+func validateRepo(repo string) error {
 	owner, name, ok := strings.Cut(repo, "/")
 	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
-		return "", fmt.Errorf("repo must be owner/repo")
+		return fmt.Errorf("repo must be owner/repo")
 	}
-	return "/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/issues", nil
+	return nil
 }
 
 func allowedRepo(allowed []string, repo string) bool {
 	for _, item := range allowed {
 		if strings.EqualFold(item, repo) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
 			return true
 		}
 	}

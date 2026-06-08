@@ -1,0 +1,13 @@
+model_list:
+  - model_name: gpt-5-mini
+    litellm_params:
+      model: openai/gpt-5-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+litellm_settings:
+  # Prompt and completion logging must stay disabled for private corpus data.
+  success_callback: []
+  failure_callback: []

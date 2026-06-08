@@ -22,6 +22,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+docker_sock_gid() {
+  if docker run --rm -v /var/run/docker.sock:/var/run/docker.sock busybox:latest stat -c '%g' /var/run/docker.sock >/dev/null 2>&1; then
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock busybox:latest stat -c '%g' /var/run/docker.sock
+  elif stat -c '%g' /var/run/docker.sock >/dev/null 2>&1; then
+    stat -c '%g' /var/run/docker.sock
+  else
+    stat -f '%g' /var/run/docker.sock
+  fi
+}
+
 RUNS="${TMP}/runs"
 CREDS="${TMP}/credentials/codex"
 SNAPS="${TMP}/snapshots"
@@ -136,7 +146,7 @@ templates:
       - |
         trap 'exit 0' TERM
         echo ready
-        sleep 60
+        sleep 300
     user: "65532:65532"
     resources:
       cpu_shares: 128
@@ -171,7 +181,7 @@ BROKER_CID="$(
     sh -c 'mkdir -p /www && printf "{\"status\":\"ok\"}\n" > /www/healthz && httpd -f -p 8080 -h /www'
 )"
 
-DOCKER_SOCK_GID="$(stat -c '%g' /var/run/docker.sock)"
+DOCKER_SOCK_GID="$(docker_sock_gid)"
 echo "starting sandbox-broker with Docker socket group ${DOCKER_SOCK_GID}"
 SANDBOX_CID="$(
   docker run -d \

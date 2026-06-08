@@ -4,6 +4,90 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Latest YKM Curator prerequisite implementation:
+
+- Current branch `feature/ykm-curator-prereqs` implements the prerequisite
+  broker work for the YKM Curator sandbox, without applying live production
+  configuration changes.
+- Broker REST and CLI now expose deny-by-default GitHub read operations needed
+  by curator/reporter flows: PR list/detail/files/comments/reviews/review
+  comments/review threads, issue list/detail/comments, commit combined status,
+  and check runs.
+- The `broker-issue-reporter` MCP service now has issue read tools in addition
+  to issue reporting: `broker_get_issue`, `broker_search_issues`, and
+  `broker_list_issue_comments`.
+- `mutation_limits` config adds durable per-run mutation budgets for creation
+  operations. Current server enforcement covers `pull.create` and
+  `issue.create` before the GitHub API call, returning structured
+  `capacity_deferred` denials.
+- Sandbox templates now support operator-configured `extra_mounts`; callers
+  still cannot supply arbitrary mounts, and validation rejects unsafe source or
+  target paths.
+- New `gh-agent-proxy` binary and `internal/proxy` package provide a small
+  authenticated LLM gateway in front of a LiteLLM-compatible upstream. It
+  enforces model allowlists, per-run call/token budgets, request/response size
+  caps, timeout, JSONL audit logging, and prompt-body logging is disabled by
+  default.
+- New example files: `configs/proxy.example.yaml` and
+  `configs/litellm.example.yaml`. Compose examples include optional
+  `--profile proxy` services for LiteLLM and `gh-agent-proxy`.
+- Production and sandbox examples include public-safe YKM Curator placeholders
+  for the `YKM Curator` GitHub App context, `ykm-curator` broker principal,
+  curator branch patterns, metadata assertions, mutation limits, proxy env
+  vars, and sandbox mount guidance.
+- Release/build plumbing now includes `gh-agent-proxy`; semver release artifacts
+  include `gh-agent-proxy-linux-amd64`.
+- Go toolchain is now pinned to Go 1.26.4 in `.mise.toml` and `go.mod` because
+  `govulncheck` flagged standard-library vulnerabilities fixed by 1.26.4.
+- Local private runbook `runbooks/private/hermes-vps.md` exists and
+  `runbooks/private/` is excluded via `.git/info/exclude`; it is intentionally
+  untracked because this repo is public.
+- Latest verification for this branch passed:
+  `mise exec -- make check`, `mise exec -- make smoke-container`,
+  `mise exec -- make sandbox-e2e`, `docker compose -f docker-compose.example.yml config`,
+  `docker compose --profile proxy -f docker-compose.example.yml config`,
+  production Compose config rendering with a dummy pinned image/temp env both
+  with and without `--profile proxy`, `bash -n scripts/sandbox-*.sh`, and
+  `git diff --check`.
+- VPS YKM Curator config was applied on 2026-06-08:
+  `/docker/gh-agent-broker/configs/production.yaml` now has GitHub App context
+  `ykm-curator` with app ID `3991340`, installation ID `138708452` for
+  `grubbyhacker/ykmcorpus`, and broker principal `ykm-curator`.
+  `/docker/gh-agent-broker/.env` has generated
+  `YKM_CURATOR_BROKER_SECRET`, and the PEM is mounted from
+  `/docker/gh-agent-broker/secrets/github-ykm-curator-app.pem`.
+  `config-check`, broker restart, authenticated `whoami`, repo probe,
+  broker-mediated `git ls-remote`, and a `pull.create` dry-run passed.
+- VPS read-surface E2E was applied/tested on 2026-06-08:
+  current branch source was synced to
+  `/docker/gh-agent-broker/src-ykm-prereqs` and built as local image
+  `gh-agent-broker:ykm-prereqs-20260608`. `.env` now pins
+  `BROKER_IMAGE=gh-agent-broker:ykm-prereqs-20260608` with backup
+  `.env.bak-image-ykm-prereqs-20260608-023812`; previous image pin was
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-e24479b95ddfe55cc7237fc2873815baa8353618`.
+  `broker` and `issue-reporter` were recreated on the local image.
+  `broker-reporter-01` was granted `issue.read`, `issue.comments.read`, and
+  `issues:read` in private production config with backup
+  `configs/production.yaml.bak-read-e2e-20260608-023803`.
+  E2E passed through direct broker REST, the new CLI `issues` wrapper, and
+  Hermes MCP `broker-reporter` calling `broker_search_issues`, all returning
+  open issues `#27`, `#24`, and `#23` from `grubbyhacker/gh-agent-broker`.
+- VPS model proxy E2E was applied/tested on 2026-06-08:
+  private `.env` now has generated `GH_AGENT_PROXY_TOKEN`, generated
+  `LITELLM_MASTER_KEY`, and operator-supplied `OPENROUTER_API_KEY`, with
+  backup `.env.bak-proxy-20260608-025610`. Private configs
+  `/docker/gh-agent-broker/configs/proxy.yaml` and
+  `/docker/gh-agent-broker/configs/litellm.yaml` were added for OpenRouter
+  models `google/gemma-4-26b-a4b-it` and
+  `google/gemma-4-26b-a4b-it:free`. Live Compose now runs `litellm` and
+  `gh-agent-proxy`; `gh-agent-proxy` is published on host-local
+  `127.0.0.1:8092` and aliased on the Hermes network as `gh-agent-proxy`.
+  E2E passed for proxy health, denied model policy, paid model call via
+  LiteLLM/OpenRouter, one-call budget exhaustion, and audit/state checks.
+  The free model is allowed by policy but was upstream rate-limited by
+  OpenRouter/Google and currently surfaces as proxy `upstream_error` with HTTP
+  502 because the proxy normalizes non-2xx upstream responses as bad gateway.
+
 Latest Hermes retest result:
 
 - Current branch `agent/cli-whoami-wrapper` adds
@@ -86,7 +170,7 @@ Real GitHub e2e status:
 
 Code hygiene baseline:
 
-- Target Go toolchain is Go 1.26.3.
+- Target Go toolchain is Go 1.26.4.
 - `.mise.toml` pins local tools and `.devcontainer/devcontainer.json` defines a containerized dev environment.
 - `make check` is the local/CI gate.
 - Gate includes format check, `go mod tidy` drift check, `golangci-lint`, unit tests, race tests, `govulncheck`, and builds.

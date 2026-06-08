@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -202,6 +204,293 @@ func (c *Client) CreateIssueComment(appName, repo string, issueNumber string, in
 		return nil, err
 	}
 	return &api.GitHubResult{ID: out.ID, URL: out.URL, HTMLURL: out.HTMLURL}, nil
+}
+
+func (c *Client) ListPulls(appName, repo string, installationID int64, query url.Values) ([]api.PullSummary, error) {
+	var out []githubPull
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/pulls?"+query.Encode(), installationID, nil, &out); err != nil {
+		return nil, err
+	}
+	return mapPulls(out), nil
+}
+
+func (c *Client) GetPull(appName, repo string, installationID int64, number int) (api.PullSummary, error) {
+	var out githubPull
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/pulls/"+strconv.Itoa(number), installationID, nil, &out); err != nil {
+		return api.PullSummary{}, err
+	}
+	return mapPull(out), nil
+}
+
+func (c *Client) ListPullFiles(appName, repo string, installationID int64, number int, query url.Values) ([]api.PullFile, error) {
+	var out []api.PullFile
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/pulls/"+strconv.Itoa(number)+"/files?"+query.Encode(), installationID, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) ListPullReviews(appName, repo string, installationID int64, number int, query url.Values) ([]api.PullReview, error) {
+	var out []githubReview
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/pulls/"+strconv.Itoa(number)+"/reviews?"+query.Encode(), installationID, nil, &out); err != nil {
+		return nil, err
+	}
+	reviews := make([]api.PullReview, 0, len(out))
+	for _, r := range out {
+		reviews = append(reviews, api.PullReview{
+			ID:          r.ID,
+			State:       r.State,
+			Body:        r.Body,
+			Author:      r.User.Login,
+			CommitID:    r.CommitID,
+			SubmittedAt: r.SubmittedAt,
+			HTMLURL:     r.HTMLURL,
+		})
+	}
+	return reviews, nil
+}
+
+func (c *Client) ListPullReviewComments(appName, repo string, installationID int64, number int, query url.Values) ([]api.PullReviewComment, error) {
+	var out []githubReviewComment
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/pulls/"+strconv.Itoa(number)+"/comments?"+query.Encode(), installationID, nil, &out); err != nil {
+		return nil, err
+	}
+	return mapReviewComments(out), nil
+}
+
+func (c *Client) ListPullReviewThreads(appName, repo string, installationID int64, number int, query url.Values) ([]api.PullReviewThread, error) {
+	comments, err := c.ListPullReviewComments(appName, repo, installationID, number, query)
+	if err != nil {
+		return nil, err
+	}
+	threads := make([]api.PullReviewThread, 0, len(comments))
+	for _, comment := range comments {
+		threads = append(threads, api.PullReviewThread{
+			ID:                       strconv.FormatInt(comment.ID, 10),
+			UnresolvedStateAvailable: false,
+			Comments:                 []api.PullReviewComment{comment},
+		})
+	}
+	return threads, nil
+}
+
+func (c *Client) ListIssueComments(appName, repo string, installationID int64, number int, query url.Values) ([]api.IssueComment, error) {
+	var out []githubIssueComment
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/issues/"+strconv.Itoa(number)+"/comments?"+query.Encode(), installationID, nil, &out); err != nil {
+		return nil, err
+	}
+	return mapIssueComments(out), nil
+}
+
+func (c *Client) GetIssue(appName, repo string, installationID int64, number int) (api.IssueSummary, error) {
+	var out githubIssue
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/issues/"+strconv.Itoa(number), installationID, nil, &out); err != nil {
+		return api.IssueSummary{}, err
+	}
+	return mapIssue(out), nil
+}
+
+func (c *Client) ListIssues(appName, repo string, installationID int64, query url.Values) ([]api.IssueSummary, error) {
+	var out []githubIssue
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/issues?"+query.Encode(), installationID, nil, &out); err != nil {
+		return nil, err
+	}
+	issues := make([]api.IssueSummary, 0, len(out))
+	for _, issue := range out {
+		issues = append(issues, mapIssue(issue))
+	}
+	return issues, nil
+}
+
+func (c *Client) GetCommitStatus(appName, repo string, installationID int64, sha string) (api.CommitStatus, error) {
+	var out struct {
+		State      string              `json:"state"`
+		SHA        string              `json:"sha"`
+		TotalCount int                 `json:"total_count"`
+		Statuses   []api.StatusContext `json:"statuses"`
+	}
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/status", installationID, nil, &out); err != nil {
+		return api.CommitStatus{}, err
+	}
+	return api.CommitStatus{State: out.State, SHA: out.SHA, TotalCount: out.TotalCount, Statuses: out.Statuses}, nil
+}
+
+func (c *Client) ListCheckRuns(appName, repo string, installationID int64, sha string, query url.Values) (api.CheckRuns, error) {
+	var out api.CheckRuns
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/check-runs?"+query.Encode(), installationID, nil, &out); err != nil {
+		return api.CheckRuns{}, err
+	}
+	return out, nil
+}
+
+type githubUser struct {
+	Login string `json:"login"`
+}
+
+type githubLabel struct {
+	Name string `json:"name"`
+}
+
+type githubBranchRef struct {
+	Ref string `json:"ref"`
+	SHA string `json:"sha"`
+}
+
+type githubPull struct {
+	ID             int64           `json:"id"`
+	Number         int             `json:"number"`
+	State          string          `json:"state"`
+	Title          string          `json:"title"`
+	Body           string          `json:"body"`
+	Head           githubBranchRef `json:"head"`
+	Base           githubBranchRef `json:"base"`
+	Merged         bool            `json:"merged"`
+	Mergeable      *bool           `json:"mergeable"`
+	User           githubUser      `json:"user"`
+	Labels         []githubLabel   `json:"labels"`
+	URL            string          `json:"url"`
+	HTMLURL        string          `json:"html_url"`
+	Comments       int             `json:"comments"`
+	ReviewComments int             `json:"review_comments"`
+}
+
+type githubIssue struct {
+	ID          int64         `json:"id"`
+	Number      int           `json:"number"`
+	State       string        `json:"state"`
+	Title       string        `json:"title"`
+	Body        string        `json:"body"`
+	User        githubUser    `json:"user"`
+	Assignees   []githubUser  `json:"assignees"`
+	Labels      []githubLabel `json:"labels"`
+	URL         string        `json:"url"`
+	HTMLURL     string        `json:"html_url"`
+	PullRequest *struct{}     `json:"pull_request"`
+}
+
+type githubIssueComment struct {
+	ID        int64      `json:"id"`
+	Body      string     `json:"body"`
+	User      githubUser `json:"user"`
+	URL       string     `json:"url"`
+	HTMLURL   string     `json:"html_url"`
+	CreatedAt string     `json:"created_at"`
+	UpdatedAt string     `json:"updated_at"`
+}
+
+type githubReview struct {
+	ID          int64      `json:"id"`
+	State       string     `json:"state"`
+	Body        string     `json:"body"`
+	User        githubUser `json:"user"`
+	CommitID    string     `json:"commit_id"`
+	SubmittedAt string     `json:"submitted_at"`
+	HTMLURL     string     `json:"html_url"`
+}
+
+type githubReviewComment struct {
+	ID        int64      `json:"id"`
+	Body      string     `json:"body"`
+	User      githubUser `json:"user"`
+	Path      string     `json:"path"`
+	CommitID  string     `json:"commit_id"`
+	HTMLURL   string     `json:"html_url"`
+	CreatedAt string     `json:"created_at"`
+	UpdatedAt string     `json:"updated_at"`
+}
+
+func mapPulls(in []githubPull) []api.PullSummary {
+	out := make([]api.PullSummary, 0, len(in))
+	for _, p := range in {
+		out = append(out, mapPull(p))
+	}
+	return out
+}
+
+func mapPull(p githubPull) api.PullSummary {
+	return api.PullSummary{
+		ID:             p.ID,
+		Number:         p.Number,
+		State:          p.State,
+		Title:          p.Title,
+		Body:           p.Body,
+		HeadRef:        p.Head.Ref,
+		HeadSHA:        p.Head.SHA,
+		BaseRef:        p.Base.Ref,
+		Merged:         p.Merged,
+		Mergeable:      p.Mergeable,
+		Author:         p.User.Login,
+		Labels:         labelNames(p.Labels),
+		URL:            p.URL,
+		HTMLURL:        p.HTMLURL,
+		Comments:       p.Comments,
+		ReviewComments: p.ReviewComments,
+	}
+}
+
+func mapIssue(issue githubIssue) api.IssueSummary {
+	return api.IssueSummary{
+		ID:            issue.ID,
+		Number:        issue.Number,
+		State:         issue.State,
+		Title:         issue.Title,
+		Body:          issue.Body,
+		Author:        issue.User.Login,
+		Assignees:     userLogins(issue.Assignees),
+		Labels:        labelNames(issue.Labels),
+		URL:           issue.URL,
+		HTMLURL:       issue.HTMLURL,
+		IsPullRequest: issue.PullRequest != nil,
+	}
+}
+
+func mapIssueComments(in []githubIssueComment) []api.IssueComment {
+	out := make([]api.IssueComment, 0, len(in))
+	for _, comment := range in {
+		out = append(out, api.IssueComment{
+			ID:        comment.ID,
+			Body:      comment.Body,
+			Author:    comment.User.Login,
+			URL:       comment.URL,
+			HTMLURL:   comment.HTMLURL,
+			CreatedAt: comment.CreatedAt,
+			UpdatedAt: comment.UpdatedAt,
+		})
+	}
+	return out
+}
+
+func mapReviewComments(in []githubReviewComment) []api.PullReviewComment {
+	out := make([]api.PullReviewComment, 0, len(in))
+	for _, comment := range in {
+		out = append(out, api.PullReviewComment{
+			ID:        comment.ID,
+			Body:      comment.Body,
+			Author:    comment.User.Login,
+			Path:      comment.Path,
+			CommitID:  comment.CommitID,
+			HTMLURL:   comment.HTMLURL,
+			CreatedAt: comment.CreatedAt,
+			UpdatedAt: comment.UpdatedAt,
+		})
+	}
+	return out
+}
+
+func labelNames(labels []githubLabel) []string {
+	out := make([]string, 0, len(labels))
+	for _, label := range labels {
+		out = append(out, label.Name)
+	}
+	return out
+}
+
+func userLogins(users []githubUser) []string {
+	out := make([]string, 0, len(users))
+	for _, user := range users {
+		out = append(out, user.Login)
+	}
+	return out
 }
 
 func (c *Client) doJSON(appName, method, path string, installationID int64, in interface{}, out interface{}) error {

@@ -581,6 +581,9 @@ func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Red
 		bundleRedactor := RedactorForBundle(bundle)
 		redactor.known = append(redactor.known, bundleRedactor.known...)
 	}
+	for _, mount := range tmpl.ExtraMounts {
+		mounts = append(mounts, Mount{Source: mount.SourcePath, Target: mount.MountPath, ReadOnly: mount.ReadOnly})
+	}
 	spec := RuntimeSpec{
 		RunID:      meta.RunID,
 		Image:      tmpl.Image,

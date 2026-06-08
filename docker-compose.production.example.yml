@@ -11,6 +11,7 @@ services:
       - ./configs/production.yaml:/etc/gh-agent-broker/config.yaml:ro
       - ./secrets/github-coder-app.pem:/run/secrets/github-coder-app.pem:ro
       - ./secrets/github-reporter-app.pem:/run/secrets/github-reporter-app.pem:ro
+      - ./secrets/github-ykm-curator-app.pem:/run/secrets/github-ykm-curator-app.pem:ro
       - broker-audit:/var/log/gh-agent-broker
     networks:
       - default
@@ -55,6 +56,32 @@ services:
     depends_on:
       broker:
         condition: service_healthy
+
+  litellm:
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-latest}
+    command: ["--config", "/app/config.yaml"]
+    restart: unless-stopped
+    profiles: ["proxy"]
+    env_file:
+      - ${BROKER_ENV_FILE:-.env}
+    volumes:
+      - ./configs/litellm.yaml:/app/config.yaml:ro
+
+  gh-agent-proxy:
+    image: ${BROKER_IMAGE:?set BROKER_IMAGE to a pinned ghcr.io/grubbyhacker/gh-agent-broker tag}
+    entrypoint: ["/usr/local/bin/gh-agent-proxy"]
+    command: ["-config", "/etc/gh-agent-broker/proxy.yaml"]
+    restart: unless-stopped
+    profiles: ["proxy"]
+    ports:
+      - "127.0.0.1:8092:8092"
+    env_file:
+      - ${BROKER_ENV_FILE:-.env}
+    volumes:
+      - ./configs/proxy.yaml:/etc/gh-agent-broker/proxy.yaml:ro
+      - broker-audit:/var/log/gh-agent-broker
+    depends_on:
+      - litellm
 
 volumes:
   broker-audit:

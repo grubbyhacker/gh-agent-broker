@@ -1,0 +1,23 @@
+# Self-hosted model proxy facade. Keep provider keys in private env/config only.
+listen: "127.0.0.1:8092"
+auth_token_env: "GH_AGENT_PROXY_TOKEN"
+
+# Point this at a private-network LiteLLM proxy base URL, for example
+# http://litellm:4000/v1.
+upstream_url: "http://litellm:4000/v1"
+upstream_key_env: "LITELLM_MASTER_KEY"
+
+allowed_models:
+  - "gpt-5-mini"
+
+state_path: "/var/log/gh-agent-broker/proxy-budget-state.json"
+audit_path: "/var/log/gh-agent-broker/proxy-audit.jsonl"
+
+max_calls_per_run: 20
+max_tokens_per_run: 200000
+max_request_bytes: 262144
+max_response_bytes: 524288
+timeout: "2m"
+
+# Leave false in production; prompt and response bodies are private corpus data.
+log_prompts: false

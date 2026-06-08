@@ -12,6 +12,7 @@ services:
       - ./configs/example.yaml:/etc/gh-agent-broker/config.yaml:ro
       - ./secrets/github-coder-app.pem:/run/secrets/github-coder-app.pem:ro
       - ./secrets/github-reporter-app.pem:/run/secrets/github-reporter-app.pem:ro
+      - ./secrets/github-ykm-curator-app.pem:/run/secrets/github-ykm-curator-app.pem:ro
       - broker-audit:/var/log/gh-agent-broker
     networks:
       - default
@@ -55,6 +56,34 @@ services:
     depends_on:
       broker:
         condition: service_healthy
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    command: ["--config", "/app/config.yaml"]
+    profiles: ["proxy"]
+    environment:
+      LITELLM_MASTER_KEY: "replace-me-litellm-master-key"
+      OPENAI_API_KEY: "replace-me-provider-key"
+    volumes:
+      - ./configs/litellm.example.yaml:/app/config.yaml:ro
+    networks:
+      - default
+
+  gh-agent-proxy:
+    build: .
+    entrypoint: ["/usr/local/bin/gh-agent-proxy"]
+    command: ["-config", "/etc/gh-agent-broker/proxy.yaml"]
+    profiles: ["proxy"]
+    ports:
+      - "127.0.0.1:8092:8092"
+    environment:
+      GH_AGENT_PROXY_TOKEN: "replace-me-proxy-token"
+      LITELLM_MASTER_KEY: "replace-me-litellm-master-key"
+    volumes:
+      - ./configs/proxy.example.yaml:/etc/gh-agent-broker/proxy.yaml:ro
+      - broker-audit:/var/log/gh-agent-broker
+    depends_on:
+      - litellm
 
 volumes:
   broker-audit:
