@@ -6,12 +6,15 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 
 Latest YKM Curator prerequisite implementation:
 
-- Current branch `agent/issue-27-branch-lifecycle-guard` adds an opt-in
-  per-agent `branch_lifecycle_guard` that checks same-repository PR history for
-  brokered `git.receive-pack` and `pull.create`. Example configs enable
-  `mode: enforce` for branch-pushing agents so branches that already backed a
-  closed or merged PR return structured self-correction guidance to create a
-  fresh agent branch.
+- Next planned work is `plans/operator-rest-launch-profiles.md`: add host-local,
+  operator-authenticated REST launch profiles to `sandbox-broker` so
+  `systemd.timer` units and manual operators can trigger fixed sandbox launches
+  without Python or MCP client machinery. Keep this sandbox-broker only; do not
+  add Docker-launch functionality to the main GitHub broker.
+- PR `#31` is merged and deployed to production. It added opt-in per-agent
+  `branch_lifecycle_guard` checks for same-repository PR history before
+  brokered `git.receive-pack` and `pull.create`; production enables
+  `mode: enforce` for `hermes-coder-01` and `ykm-curator`.
 - Current branch `feature/ykm-curator-prereqs` implements the prerequisite
   broker work for the YKM Curator sandbox, without applying live production
   configuration changes.
