@@ -62,8 +62,15 @@ type Agent struct {
 	Operations         []string                   `yaml:"operations"`
 	BranchPatterns     []string                   `yaml:"branch_patterns"`
 	BaseBranches       []string                   `yaml:"base_branches"`
+	BranchGuard        BranchLifecycleGuard       `yaml:"branch_lifecycle_guard"`
 	Permissions        []string                   `yaml:"permissions"`
 	MetadataAssertions map[string]AssertionPolicy `yaml:"metadata_assertions"`
+}
+
+type BranchLifecycleGuard struct {
+	Mode          string   `json:"mode" yaml:"mode"`
+	StalePRStates []string `json:"stale_pr_states" yaml:"stale_pr_states"`
+	Operations    []string `json:"operations" yaml:"operations"`
 }
 
 type AssertionPolicy struct {
@@ -108,6 +115,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.GitHub.GitBaseURL == "" {
 		c.GitHub.GitBaseURL = "https://github.com"
+	}
+	for i := range c.Agents {
+		c.Agents[i].BranchGuard.applyDefaults()
 	}
 }
 
@@ -155,6 +165,9 @@ func (c *Config) Validate() error {
 		appName := GitHubAppName(a)
 		if _, ok := apps[appName]; !ok {
 			errs = append(errs, fmt.Sprintf("agent %q references unknown github_app %q", a.ID, appName))
+		}
+		if err := a.BranchGuard.Validate(); err != nil {
+			errs = append(errs, fmt.Sprintf("agent %q branch_lifecycle_guard: %v", a.ID, err))
 		}
 	}
 	if len(errs) > 0 {
@@ -225,4 +238,46 @@ func GitHubAppName(agent Agent) string {
 		return agent.GitHubApp
 	}
 	return "default"
+}
+
+func (g *BranchLifecycleGuard) applyDefaults() {
+	if strings.TrimSpace(g.Mode) == "" {
+		g.Mode = "off"
+	}
+	if strings.EqualFold(g.Mode, "off") {
+		return
+	}
+	if len(g.StalePRStates) == 0 {
+		g.StalePRStates = []string{"closed"}
+	}
+	if len(g.Operations) == 0 {
+		g.Operations = []string{"git.receive-pack", "pull.create"}
+	}
+}
+
+func (g BranchLifecycleGuard) Validate() error {
+	mode := strings.ToLower(strings.TrimSpace(g.Mode))
+	if mode == "" {
+		mode = "off"
+	}
+	switch mode {
+	case "off", "warn", "enforce":
+	default:
+		return fmt.Errorf("mode must be one of off, warn, enforce")
+	}
+	for _, state := range g.StalePRStates {
+		switch strings.ToLower(strings.TrimSpace(state)) {
+		case "closed":
+		default:
+			return fmt.Errorf("stale_pr_states currently supports only closed")
+		}
+	}
+	for _, operation := range g.Operations {
+		switch strings.TrimSpace(operation) {
+		case "git.receive-pack", "pull.create":
+		default:
+			return fmt.Errorf("operations currently supports only git.receive-pack and pull.create")
+		}
+	}
+	return nil
 }

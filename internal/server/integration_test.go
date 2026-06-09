@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"gh-agent-broker/internal/api"
 	"gh-agent-broker/internal/audit"
 	"gh-agent-broker/internal/config"
 	"gh-agent-broker/internal/githubapp"
@@ -305,6 +306,243 @@ func TestGitPolicyDenialCanReturnJSON(t *testing.T) {
 	}
 	if out["code"] != "policy_denied" {
 		t.Fatalf("code = %v", out["code"])
+	}
+}
+
+func TestBranchLifecycleGuardDeniesGitPushToClosedPullBranch(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
+			writeTestJSON(t, w, map[string]string{
+				"token":      "fake-install-token",
+				"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			requireBearer(t, r)
+			if r.URL.Query().Get("state") != "all" || r.URL.Query().Get("head") != "owner:agent/agent-1/test" {
+				t.Fatalf("unexpected pull lifecycle query: %s", r.URL.RawQuery)
+			}
+			writeTestJSON(t, w, []map[string]interface{}{{
+				"id": 6, "number": 6, "state": "closed", "title": "done", "merged": true,
+				"head":     map[string]string{"ref": "agent/agent-1/test", "sha": "abc"},
+				"base":     map[string]string{"ref": "main"},
+				"html_url": "https://fake/owner/repo/pull/6",
+			}})
+		default:
+			t.Fatalf("unexpected fake GitHub request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer apiServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:             "agent-1",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"git.receive-pack"},
+		BranchPatterns: []string{"^refs/heads/agent/agent-1/.+$"},
+		BranchGuard:    config.BranchLifecycleGuard{Mode: "enforce"},
+	})
+
+	body := append(pktLine("0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/agent/agent-1/test\x00 report-status\n"), []byte("0000")...)
+	req := httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", bytes.NewReader(body))
+	req.SetBasicAuth("agent-1", "agent-secret")
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusForbidden, resp.Body.String())
+	}
+	got := resp.Body.String()
+	for _, want := range []string{"branch_lifecycle", "PR #6", "fresh branch"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("denial text missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestBranchLifecycleGuardDeniesPullCreateFromClosedPullBranch(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
+			writeTestJSON(t, w, map[string]string{
+				"token":      "fake-install-token",
+				"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			requireBearer(t, r)
+			writeTestJSON(t, w, []map[string]interface{}{{
+				"id": 7, "number": 7, "state": "closed", "title": "closed", "merged": false,
+				"head":     map[string]string{"ref": "agent/agent-1/test", "sha": "abc"},
+				"base":     map[string]string{"ref": "main"},
+				"html_url": "https://fake/owner/repo/pull/7",
+			}})
+		default:
+			t.Fatalf("unexpected fake GitHub request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer apiServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:             "agent-1",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"pull.create"},
+		BaseBranches:   []string{"main"},
+		BranchPatterns: []string{"^agent/agent-1/.+$"},
+		BranchGuard:    config.BranchLifecycleGuard{Mode: "enforce"},
+	})
+
+	resp := brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{
+		"title": "follow-up",
+		"head":  "agent/agent-1/test",
+		"base":  "main",
+	})
+	assertStatus(t, resp, http.StatusForbidden)
+	var out struct {
+		FailedChecks []api.FailedCheck `json:"failed_checks"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
+		t.Fatalf("json denial did not decode: %v; body=%s", err, resp.Body.String())
+	}
+	if len(out.FailedChecks) != 1 || out.FailedChecks[0].Dimension != "branch_lifecycle" {
+		t.Fatalf("unexpected failed checks: %#v", out.FailedChecks)
+	}
+}
+
+func TestBranchLifecycleGuardAllowsPullCreateForOpenPullBranch(t *testing.T) {
+	var sawCreate bool
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
+			writeTestJSON(t, w, map[string]string{
+				"token":      "fake-install-token",
+				"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			requireBearer(t, r)
+			writeTestJSON(t, w, []map[string]interface{}{{
+				"id": 8, "number": 8, "state": "open", "title": "active",
+				"head": map[string]string{"ref": "agent/agent-1/test", "sha": "abc"},
+				"base": map[string]string{"ref": "main"},
+			}, {
+				"id": 10, "number": 10, "state": "closed", "title": "other branch", "merged": true,
+				"head": map[string]string{"ref": "agent/agent-1/other", "sha": "def"},
+				"base": map[string]string{"ref": "main"},
+			}})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			requireBearer(t, r)
+			sawCreate = true
+			writeTestJSON(t, w, map[string]interface{}{"id": 9, "number": 9, "url": "https://api.fake/pulls/9", "html_url": "https://fake/owner/repo/pull/9"})
+		default:
+			t.Fatalf("unexpected fake GitHub request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer apiServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:             "agent-1",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"pull.create"},
+		BaseBranches:   []string{"main"},
+		BranchPatterns: []string{"^agent/agent-1/.+$"},
+		BranchGuard:    config.BranchLifecycleGuard{Mode: "enforce"},
+	})
+
+	resp := brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{
+		"title": "follow-up",
+		"head":  "agent/agent-1/test",
+		"base":  "main",
+	})
+	assertStatus(t, resp, http.StatusCreated)
+	if !sawCreate {
+		t.Fatalf("pull create was not called")
+	}
+}
+
+func TestBranchLifecycleGuardFailsClosedWhenLookupFails(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
+			writeTestJSON(t, w, map[string]string{
+				"token":      "fake-install-token",
+				"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			requireBearer(t, r)
+			http.Error(w, "temporary failure", http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected fake GitHub request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer apiServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:             "agent-1",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"pull.create"},
+		BaseBranches:   []string{"main"},
+		BranchPatterns: []string{"^agent/agent-1/.+$"},
+		BranchGuard:    config.BranchLifecycleGuard{Mode: "enforce"},
+	})
+
+	resp := brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{
+		"title": "follow-up",
+		"head":  "agent/agent-1/test",
+		"base":  "main",
+	})
+	assertStatus(t, resp, http.StatusForbidden)
+	if !strings.Contains(resp.Body.String(), "could not verify") {
+		t.Fatalf("denial missing lookup failure message: %s", resp.Body.String())
+	}
+}
+
+func TestBranchLifecycleGuardWarnModeAllowsLookupFailure(t *testing.T) {
+	var sawCreate bool
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
+			writeTestJSON(t, w, map[string]string{
+				"token":      "fake-install-token",
+				"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
+			requireBearer(t, r)
+			http.Error(w, "temporary failure", http.StatusInternalServerError)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/pulls":
+			requireBearer(t, r)
+			sawCreate = true
+			writeTestJSON(t, w, map[string]interface{}{"id": 11, "number": 11, "url": "https://api.fake/pulls/11", "html_url": "https://fake/owner/repo/pull/11"})
+		default:
+			t.Fatalf("unexpected fake GitHub request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer apiServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:             "agent-1",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"pull.create"},
+		BaseBranches:   []string{"main"},
+		BranchPatterns: []string{"^agent/agent-1/.+$"},
+		BranchGuard:    config.BranchLifecycleGuard{Mode: "warn"},
+	})
+
+	resp := brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{
+		"title": "follow-up",
+		"head":  "agent/agent-1/test",
+		"base":  "main",
+	})
+	assertStatus(t, resp, http.StatusCreated)
+	if !sawCreate {
+		t.Fatalf("pull create was not called")
 	}
 }
 

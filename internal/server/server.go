@@ -308,14 +308,15 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 	}
 	agent := principal.Agent
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"agent_id":            principal.ID,
-		"enabled":             agent.Enabled,
-		"repositories":        agent.Repositories,
-		"operations":          agent.Operations,
-		"branch_patterns":     agent.BranchPatterns,
-		"base_branches":       agent.BaseBranches,
-		"permissions":         agent.Permissions,
-		"metadata_assertions": agent.MetadataAssertions,
+		"agent_id":               principal.ID,
+		"enabled":                agent.Enabled,
+		"repositories":           agent.Repositories,
+		"operations":             agent.Operations,
+		"branch_patterns":        agent.BranchPatterns,
+		"base_branches":          agent.BaseBranches,
+		"branch_lifecycle_guard": agent.BranchGuard,
+		"permissions":            agent.Permissions,
+		"metadata_assertions":    agent.MetadataAssertions,
 	})
 }
 
@@ -967,6 +968,19 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull request creation denied by policy", &result))
 		return
 	}
+	guardResult := s.checkBranchLifecycle(opID, gh, appName, inst, repo, req.Head, "pull.create", principal.Agent)
+	if guardResult != nil {
+		result.Warnings = append(result.Warnings, guardResult.Warnings...)
+		if !guardResult.Allowed {
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.create", Repo: repo, Branch: req.Head, RequestedPermissions: req.Permissions, Decision: guardResult.Decision})
+			writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull request creation denied by policy", guardResult))
+			return
+		}
+		if guardResult.Decision == policy.DecisionWarn {
+			result.Decision = policy.DecisionWarn
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.create", Repo: repo, Branch: req.Head, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "branch_lifecycle_warning"})
+		}
+	}
 	if !s.reserveMutation(w, opID, principal.ID, "pull.create", repo, req.Head, req.Metadata) {
 		return
 	}
@@ -1159,6 +1173,19 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
 	}
+	guardResult := s.checkBranchLifecycle(opID, gh, appName, inst, repo, branch, operation, principal.Agent)
+	if guardResult != nil {
+		result.Warnings = append(result.Warnings, guardResult.Warnings...)
+		if !guardResult.Allowed {
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: guardResult.Decision})
+			writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", guardResult))
+			return
+		}
+		if guardResult.Decision == policy.DecisionWarn {
+			result.Decision = policy.DecisionWarn
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: "branch_lifecycle_warning"})
+		}
+	}
 	token, err := gh.InstallationToken(appName, inst)
 	if err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
@@ -1236,6 +1263,91 @@ func (s *Server) reserveMutation(w http.ResponseWriter, opID, agentID, operation
 	return false
 }
 
+func (s *Server) checkBranchLifecycle(opID string, gh *githubapp.Client, appName string, inst int64, repo, branch, operation string, agent config.Agent) *policy.Result {
+	guard := agent.BranchGuard
+	mode := strings.ToLower(strings.TrimSpace(guard.Mode))
+	operations := guard.Operations
+	if len(operations) == 0 {
+		operations = []string{"git.receive-pack", "pull.create"}
+	}
+	staleStates := guard.StalePRStates
+	if len(staleStates) == 0 {
+		staleStates = []string{"closed"}
+	}
+	if mode == "" || mode == "off" || !containsString(operations, operation) {
+		return nil
+	}
+	branchName := strings.TrimPrefix(branch, "refs/heads/")
+	if branchName == "" {
+		return nil
+	}
+	owner, _, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" {
+		return nil
+	}
+	query := url.Values{}
+	query.Set("state", "all")
+	query.Set("head", owner+":"+branchName)
+	query.Set("sort", "updated")
+	query.Set("direction", "desc")
+	query.Set("per_page", "100")
+	pulls, err := gh.ListPulls(appName, repo, inst, query)
+	if err != nil {
+		check := api.FailedCheck{
+			Dimension:     "branch_lifecycle",
+			Location:      "github",
+			Expected:      "verifiable pull request state for branch",
+			Actual:        "lookup failed",
+			SafeToDisplay: true,
+			Message:       "broker could not verify whether this branch has already backed a closed pull request",
+		}
+		if mode == "warn" {
+			return &policy.Result{Allowed: true, Decision: policy.DecisionWarn, Warnings: []api.FailedCheck{check}}
+		}
+		return &policy.Result{
+			Allowed:      false,
+			Decision:     policy.DecisionDeny,
+			FailedChecks: []api.FailedCheck{check},
+			RequiredChanges: []api.RequiredChange{{
+				Location: "branch",
+				Action:   "retry after branch lifecycle state can be verified or use a fresh agent branch",
+			}},
+		}
+	}
+	for _, pull := range pulls {
+		if pull.HeadRef != branchName || !containsFoldString(staleStates, pull.State) {
+			continue
+		}
+		merged := "not merged"
+		if pull.Merged {
+			merged = "merged"
+		} else if pull.MergedAt == "" {
+			merged = "merged status unavailable"
+		}
+		check := api.FailedCheck{
+			Dimension:     "branch_lifecycle",
+			Location:      "branch",
+			Expected:      "branch with no closed pull request history",
+			Actual:        fmt.Sprintf("PR #%d is %s (%s): %s", pull.Number, pull.State, merged, pull.HTMLURL),
+			SafeToDisplay: true,
+			Message:       "branch has already backed a closed pull request; create a fresh agent branch for follow-up work",
+		}
+		if mode == "warn" {
+			return &policy.Result{Allowed: true, Decision: policy.DecisionWarn, Warnings: []api.FailedCheck{check}}
+		}
+		return &policy.Result{
+			Allowed:      false,
+			Decision:     policy.DecisionDeny,
+			FailedChecks: []api.FailedCheck{check},
+			RequiredChanges: []api.RequiredChange{{
+				Location: "branch",
+				Action:   "create and push a fresh branch matching the agent branch policy",
+			}},
+		}
+	}
+	return nil
+}
+
 func (s *Server) errorResponse(operationID, code, message string, result *policy.Result) api.ErrorResponse {
 	out := api.ErrorResponse{Code: code, Message: message, OperationID: operationID, Decision: policy.DecisionDeny}
 	if result != nil {
@@ -1245,6 +1357,24 @@ func (s *Server) errorResponse(operationID, code, message string, result *policy
 		out.Warnings = result.Warnings
 	}
 	return out
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFoldString(items []string, want string) bool {
+	for _, item := range items {
+		if strings.EqualFold(item, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseGitPath(path string) (repo, suffix string, ok bool) {

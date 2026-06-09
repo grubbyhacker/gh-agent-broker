@@ -6,6 +6,12 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 
 Latest YKM Curator prerequisite implementation:
 
+- Current branch `agent/issue-27-branch-lifecycle-guard` adds an opt-in
+  per-agent `branch_lifecycle_guard` that checks same-repository PR history for
+  brokered `git.receive-pack` and `pull.create`. Example configs enable
+  `mode: enforce` for branch-pushing agents so branches that already backed a
+  closed or merged PR return structured self-correction guidance to create a
+  fresh agent branch.
 - Current branch `feature/ykm-curator-prereqs` implements the prerequisite
   broker work for the YKM Curator sandbox, without applying live production
   configuration changes.
