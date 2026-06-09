@@ -4,13 +4,37 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
-Latest YKM Curator prerequisite implementation:
+Latest sandbox-broker operator REST launch profile implementation:
 
-- Next planned work is `plans/operator-rest-launch-profiles.md`: add host-local,
-  operator-authenticated REST launch profiles to `sandbox-broker` so
-  `systemd.timer` units and manual operators can trigger fixed sandbox launches
-  without Python or MCP client machinery. Keep this sandbox-broker only; do not
-  add Docker-launch functionality to the main GitHub broker.
+- Current branch `agent/operator-rest-launch-plan` implements
+  `plans/operator-rest-launch-profiles.md`: host-local,
+  operator-authenticated REST launch profiles for `sandbox-broker`, without
+  adding Docker-launch functionality to the main GitHub broker.
+- Sandbox config now supports `launch_profiles` and separate
+  `operator_principals`. Profiles define fixed `LaunchAgentInput` defaults plus
+  explicit `allow_overrides`; operator principals resolve `token_env`, scope
+  allowed profiles, and scope allowed actions (`launch`, `dry_run`, `status`,
+  `logs`, `artifacts`, `stop`, `cleanup`).
+- `sandbox-broker` now serves `/v1/launch-profiles`, profile dry-run/launch
+  endpoints, and `/v1/runs` status/log/artifact/lesson/stop/cleanup endpoints
+  on the existing listener. Handlers authenticate operator bearer tokens,
+  authorize profile/action scope, merge only allowlisted overrides, and call the
+  existing `sandbox.Service` methods for launch, logs, collections, stop, and
+  cleanup.
+- Sandbox audit events now include operator principal and profile fields for
+  REST operations, plus run/template/repo/branch when available. REST auth never
+  logs tokens or authorization headers.
+- `configs/sandbox.example.yaml` documents a timer token scoped to
+  launch/dry-run and a human operator token scoped to read/stop/cleanup actions,
+  both using `token_env`.
+- Added focused tests for config validation, token env resolution, REST
+  auth/authz, launch/dry-run behavior, override rejection, log redaction, and
+  artifact collection preserving existing symlink/traversal protections.
+- Latest verification for this branch passed:
+  `go test ./internal/sandbox ./cmd/sandbox-broker`, `mise exec -- make fmt`,
+  `mise exec -- make check`, and `git diff --check`.
+
+Latest YKM Curator prerequisite implementation:
 - PR `#31` is merged and deployed to production. It added opt-in per-agent
   `branch_lifecycle_guard` checks for same-repository PR history before
   brokered `git.receive-pack` and `pull.create`; production enables

@@ -17,6 +17,8 @@ type AuditEvent struct {
 	Timestamp        time.Time `json:"timestamp"`
 	Operation        string    `json:"operation"`
 	RunID            string    `json:"run_id,omitempty"`
+	Principal        string    `json:"principal,omitempty"`
+	Profile          string    `json:"profile,omitempty"`
 	Template         string    `json:"template,omitempty"`
 	ParentAgentID    string    `json:"parent_agent_id,omitempty"`
 	WorkerAgentID    string    `json:"worker_agent_id,omitempty"`
