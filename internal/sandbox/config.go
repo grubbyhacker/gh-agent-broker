@@ -22,22 +22,24 @@ const (
 )
 
 type Config struct {
-	Listen        string                      `yaml:"listen"`
-	MCPPath       string                      `yaml:"mcp_path"`
-	AuthToken     string                      `yaml:"auth_token"`
-	AuthTokenEnv  string                      `yaml:"auth_token_env"`
-	RunsDir       string                      `yaml:"runs_dir"`
-	BrokerURL     string                      `yaml:"broker_url"`
-	Production    bool                        `yaml:"production"`
-	Repositories  []string                    `yaml:"repositories"`
-	Networks      map[string]NetworkPolicy    `yaml:"network_policies"`
-	Bundles       map[string]CredentialBundle `yaml:"credential_bundles"`
-	Templates     map[string]Template         `yaml:"templates"`
-	Audit         SandboxAuditConfig          `yaml:"audit"`
-	MaxTaskBytes  int                         `yaml:"max_task_bytes"`
-	LogByteLimit  int                         `yaml:"log_byte_limit"`
-	StopGrace     Duration                    `yaml:"stop_grace"`
-	ResolvedPaths map[string]CredentialBundle `yaml:"-"`
+	Listen             string                       `yaml:"listen"`
+	MCPPath            string                       `yaml:"mcp_path"`
+	AuthToken          string                       `yaml:"auth_token"`
+	AuthTokenEnv       string                       `yaml:"auth_token_env"`
+	RunsDir            string                       `yaml:"runs_dir"`
+	BrokerURL          string                       `yaml:"broker_url"`
+	Production         bool                         `yaml:"production"`
+	Repositories       []string                     `yaml:"repositories"`
+	Networks           map[string]NetworkPolicy     `yaml:"network_policies"`
+	Bundles            map[string]CredentialBundle  `yaml:"credential_bundles"`
+	Templates          map[string]Template          `yaml:"templates"`
+	LaunchProfiles     map[string]LaunchProfile     `yaml:"launch_profiles"`
+	OperatorPrincipals map[string]OperatorPrincipal `yaml:"operator_principals"`
+	Audit              SandboxAuditConfig           `yaml:"audit"`
+	MaxTaskBytes       int                          `yaml:"max_task_bytes"`
+	LogByteLimit       int                          `yaml:"log_byte_limit"`
+	StopGrace          Duration                     `yaml:"stop_grace"`
+	ResolvedPaths      map[string]CredentialBundle  `yaml:"-"`
 }
 
 type SandboxAuditConfig struct {
@@ -92,6 +94,18 @@ type BranchPolicy struct {
 	AllowedPatterns []string `yaml:"allowed_patterns"`
 	BaseBranches    []string `yaml:"base_branches"`
 	GeneratePrefix  string   `yaml:"generate_prefix"`
+}
+
+type LaunchProfile struct {
+	LaunchAgentInput `yaml:",inline"`
+	AllowOverrides   []string `yaml:"allow_overrides"`
+}
+
+type OperatorPrincipal struct {
+	Token           string   `yaml:"token"`
+	TokenEnv        string   `yaml:"token_env"`
+	AllowedProfiles []string `yaml:"allowed_profiles"`
+	AllowedActions  []string `yaml:"allowed_actions"`
 }
 
 type Duration struct {
@@ -167,6 +181,12 @@ func (c *Config) ResolveSecrets() {
 			c.Templates[name] = tmpl
 		}
 	}
+	for name, principal := range c.OperatorPrincipals {
+		if principal.Token == "" && principal.TokenEnv != "" {
+			principal.Token = os.Getenv(principal.TokenEnv)
+			c.OperatorPrincipals[name] = principal
+		}
+	}
 }
 
 func (c *Config) Validate() error {
@@ -219,6 +239,12 @@ func (c *Config) Validate() error {
 	}
 	for name, tmpl := range c.Templates {
 		errs = append(errs, c.validateTemplate(name, tmpl)...)
+	}
+	for name, profile := range c.LaunchProfiles {
+		errs = append(errs, c.validateLaunchProfile(name, profile)...)
+	}
+	for name, principal := range c.OperatorPrincipals {
+		errs = append(errs, c.validateOperatorPrincipal(name, principal)...)
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
@@ -329,6 +355,98 @@ func validateExtraMount(template string, idx int, mount ExtraMount) []string {
 		errs = append(errs, fmt.Sprintf("%s mount_path conflicts with sandbox-managed paths", name))
 	}
 	return errs
+}
+
+func (c Config) validateLaunchProfile(name string, profile LaunchProfile) []string {
+	var errs []string
+	if name == "" {
+		errs = append(errs, "launch profile name is required")
+	}
+	tmpl, ok := c.Templates[profile.Template]
+	if strings.TrimSpace(profile.Template) == "" {
+		errs = append(errs, fmt.Sprintf("launch profile %q template is required", name))
+	} else if !ok {
+		errs = append(errs, fmt.Sprintf("launch profile %q references unknown template %q", name, profile.Template))
+	}
+	if !validRepo(profile.Repo) {
+		errs = append(errs, fmt.Sprintf("launch profile %q repo must be owner/repo", name))
+	} else if !containsFold(c.Repositories, profile.Repo) {
+		errs = append(errs, fmt.Sprintf("launch profile %q repo %q is not allowed", name, profile.Repo))
+	}
+	if strings.TrimSpace(profile.Task) == "" {
+		errs = append(errs, fmt.Sprintf("launch profile %q task is required", name))
+	} else if len(profile.Task) > c.MaxTaskBytes {
+		errs = append(errs, fmt.Sprintf("launch profile %q task exceeds max_task_bytes", name))
+	}
+	if strings.TrimSpace(profile.BaseBranch) == "" {
+		errs = append(errs, fmt.Sprintf("launch profile %q base_branch is required", name))
+	}
+	if ok {
+		if len(tmpl.BranchPolicy.BaseBranches) > 0 && !contains(tmpl.BranchPolicy.BaseBranches, profile.BaseBranch) {
+			errs = append(errs, fmt.Sprintf("launch profile %q base_branch %q is not allowed by template", name, profile.BaseBranch))
+		}
+		if profile.Branch != "" {
+			if !safeBranch(profile.Branch) {
+				errs = append(errs, fmt.Sprintf("launch profile %q branch %q is unsafe", name, profile.Branch))
+			} else if len(tmpl.BranchPolicy.AllowedPatterns) > 0 && !matchesAny(tmpl.BranchPolicy.AllowedPatterns, profile.Branch) {
+				errs = append(errs, fmt.Sprintf("launch profile %q branch %q does not match template branch policy", name, profile.Branch))
+			}
+		}
+		if profile.MaxRuntimeMinutes < 0 || profile.MaxRuntimeMinutes > tmpl.MaxRuntimeMinutes {
+			errs = append(errs, fmt.Sprintf("launch profile %q max_runtime_minutes must be between 1 and %d when set", name, tmpl.MaxRuntimeMinutes))
+		}
+	}
+	for _, field := range profile.AllowOverrides {
+		if !launchOverrideFieldAllowed(field) {
+			errs = append(errs, fmt.Sprintf("launch profile %q allow_overrides contains unsupported field %q", name, field))
+		}
+	}
+	return errs
+}
+
+func (c Config) validateOperatorPrincipal(name string, principal OperatorPrincipal) []string {
+	var errs []string
+	if name == "" {
+		errs = append(errs, "operator principal name is required")
+	}
+	if strings.TrimSpace(principal.Token) == "" {
+		errs = append(errs, fmt.Sprintf("operator principal %q token or token_env is required", name))
+	}
+	if len(principal.AllowedProfiles) == 0 {
+		errs = append(errs, fmt.Sprintf("operator principal %q allowed_profiles must not be empty", name))
+	}
+	for _, profile := range principal.AllowedProfiles {
+		if _, ok := c.LaunchProfiles[profile]; !ok {
+			errs = append(errs, fmt.Sprintf("operator principal %q references unknown launch profile %q", name, profile))
+		}
+	}
+	if len(principal.AllowedActions) == 0 {
+		errs = append(errs, fmt.Sprintf("operator principal %q allowed_actions must not be empty", name))
+	}
+	for _, action := range principal.AllowedActions {
+		if !validOperatorAction(action) {
+			errs = append(errs, fmt.Sprintf("operator principal %q has unsupported action %q", name, action))
+		}
+	}
+	return errs
+}
+
+func validOperatorAction(action string) bool {
+	switch action {
+	case "launch", "dry_run", "status", "logs", "artifacts", "stop", "cleanup":
+		return true
+	default:
+		return false
+	}
+}
+
+func launchOverrideFieldAllowed(field string) bool {
+	switch field {
+	case "task", "focus", "deliverables", "max_runtime_minutes", "branch", "base_branch", "repo", "template":
+		return true
+	default:
+		return false
+	}
 }
 
 func contains(items []string, want string) bool {

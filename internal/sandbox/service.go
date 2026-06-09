@@ -73,14 +73,14 @@ type TaskContract struct {
 }
 
 type LaunchAgentInput struct {
-	Template          string   `json:"template" jsonschema:"sandbox template name"`
-	Task              string   `json:"task" jsonschema:"worker task description"`
-	Repo              string   `json:"repo" jsonschema:"owner/repo repository"`
-	BaseBranch        string   `json:"base_branch" jsonschema:"base branch"`
-	Branch            string   `json:"branch,omitempty" jsonschema:"optional branch; generated when omitted"`
-	MaxRuntimeMinutes int      `json:"max_runtime_minutes,omitempty" jsonschema:"optional runtime cap within the template maximum"`
-	Deliverables      []string `json:"deliverables,omitempty" jsonschema:"optional expected deliverable names"`
-	Focus             string   `json:"focus,omitempty" jsonschema:"optional constrained focus for the worker"`
+	Template          string   `json:"template" yaml:"template" jsonschema:"sandbox template name"`
+	Task              string   `json:"task" yaml:"task" jsonschema:"worker task description"`
+	Repo              string   `json:"repo" yaml:"repo" jsonschema:"owner/repo repository"`
+	BaseBranch        string   `json:"base_branch" yaml:"base_branch" jsonschema:"base branch"`
+	Branch            string   `json:"branch,omitempty" yaml:"branch,omitempty" jsonschema:"optional branch; generated when omitted"`
+	MaxRuntimeMinutes int      `json:"max_runtime_minutes,omitempty" yaml:"max_runtime_minutes,omitempty" jsonschema:"optional runtime cap within the template maximum"`
+	Deliverables      []string `json:"deliverables,omitempty" yaml:"deliverables,omitempty" jsonschema:"optional expected deliverable names"`
+	Focus             string   `json:"focus,omitempty" yaml:"focus,omitempty" jsonschema:"optional constrained focus for the worker"`
 }
 
 func (in *LaunchAgentInput) UnmarshalJSON(b []byte) error {

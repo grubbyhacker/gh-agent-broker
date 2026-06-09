@@ -443,6 +443,21 @@ func testTemplate(image string) Template {
 	}
 }
 
+func testLaunchProfile() LaunchProfile {
+	return LaunchProfile{
+		LaunchAgentInput: LaunchAgentInput{
+			Template:          "worker",
+			Task:              "nightly task",
+			Repo:              "owner/repo",
+			BaseBranch:        "main",
+			MaxRuntimeMinutes: 5,
+			Deliverables:      []string{"/output/final-summary.md"},
+			Focus:             "nightly",
+		},
+		AllowOverrides: []string{"task", "focus", "max_runtime_minutes"},
+	}
+}
+
 func testAudit(t *testing.T) *AuditLogger {
 	t.Helper()
 	auditLog, err := NewAuditLogger(filepath.Join(t.TempDir(), "audit.jsonl"))

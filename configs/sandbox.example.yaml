@@ -14,6 +14,43 @@ audit:
 repositories:
   - "example-org/example-repo"
 
+launch_profiles:
+  hermes-nightly:
+    template: "hermes-task-worker"
+    repo: "example-org/example-repo"
+    base_branch: "main"
+    task: "Run the configured nightly sandbox task and write the requested deliverables."
+    focus: "nightly"
+    max_runtime_minutes: 60
+    deliverables:
+      - "/output/final-summary.md"
+      - "/lessons/run-summary.md"
+    allow_overrides:
+      - "task"
+      - "focus"
+      - "max_runtime_minutes"
+
+operator_principals:
+  timer-hermes-nightly:
+    token_env: "SANDBOX_OPERATOR_TIMER_TOKEN"
+    allowed_profiles:
+      - "hermes-nightly"
+    allowed_actions:
+      - "launch"
+      - "dry_run"
+  human-operator:
+    token_env: "SANDBOX_OPERATOR_ADMIN_TOKEN"
+    allowed_profiles:
+      - "hermes-nightly"
+    allowed_actions:
+      - "launch"
+      - "dry_run"
+      - "status"
+      - "logs"
+      - "artifacts"
+      - "stop"
+      - "cleanup"
+
 network_policies:
   worker-net:
     network: "hermes-sandbox-workers"
