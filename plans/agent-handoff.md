@@ -6,6 +6,13 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 
 Current Codex-compatible proxy surface implementation:
 
+- Current hotfix branch `hotfix/codex-budget-double-count` fixes proxy budget
+  double counting for Responses calls with missing or zero usage tokens. Call
+  reservation and token reservation are now separate, so completion-time
+  accounting no longer increments the per-run call counter a second time.
+  Regression tests cover non-streaming and streaming `/v1/responses` calls
+  without usage. Latest verification passed: `go test ./internal/proxy`,
+  `mise exec -- make fmt`, `git diff --check`, and `mise exec -- make check`.
 - Current branch now implements `plans/codex-compatible-proxy-surface.md` in
   `internal/proxy` with a restricted OpenAI-compatible Codex surface on
   `gh-agent-proxy`.

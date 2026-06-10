@@ -258,7 +258,7 @@ func (s *Service) handleModelCall(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "policy_denied", "message": err.Error()})
 		return
 	}
-	if err := s.reserve(in.RunID, 0); err != nil {
+	if err := s.reserveCall(in.RunID); err != nil {
 		s.audit.Log(auditEvent{RunID: in.RunID, Model: in.Model, Decision: "deny", Error: err.Error()})
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "budget_exhausted", "message": err.Error()})
 		return
@@ -269,7 +269,7 @@ func (s *Service) handleModelCall(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream_error", "message": err.Error()})
 		return
 	}
-	if err := s.reserve(in.RunID, usage.TotalTokens); err != nil {
+	if err := s.reserveTokens(in.RunID, usage.TotalTokens); err != nil {
 		s.audit.Log(auditEvent{RunID: in.RunID, Model: in.Model, Decision: "deny", Tokens: usage.TotalTokens, Error: err.Error()})
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "budget_exhausted", "message": err.Error()})
 		return
@@ -361,7 +361,7 @@ func (s *Service) handleCodexResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
-	if err := s.reserve(runID, 0); err != nil {
+	if err := s.reserveCall(runID); err != nil {
 		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: err.Error()})
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "budget_exhausted", "message": err.Error()})
 		return
@@ -389,7 +389,7 @@ func (s *Service) handleCodexResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usage := usageFromJSON(respBody)
-	if err := s.reserve(runID, usage.TotalTokens); err != nil {
+	if err := s.reserveTokens(runID, usage.TotalTokens); err != nil {
 		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Tokens: usage.TotalTokens, Error: err.Error()})
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "budget_exhausted", "message": err.Error()})
 		return
@@ -531,7 +531,7 @@ func (s *Service) streamCodexResponse(w http.ResponseWriter, resp *http.Response
 			break
 		}
 	}
-	if err := s.reserve(runID, usage.TotalTokens); err != nil {
+	if err := s.reserveTokens(runID, usage.TotalTokens); err != nil {
 		s.audit.Log(auditEvent{RunID: runID, Model: model, Endpoint: endpoint, Decision: "deny", Tokens: usage.TotalTokens, Error: err.Error()})
 		return
 	}
@@ -617,7 +617,7 @@ type runBudget struct {
 	Tokens int `json:"tokens"`
 }
 
-func (s *Service) reserve(runID string, tokens int) error {
+func (s *Service) reserveCall(runID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st, err := s.readBudget()
@@ -625,17 +625,29 @@ func (s *Service) reserve(runID string, tokens int) error {
 		return err
 	}
 	rb := st.Runs[runID]
-	if tokens == 0 {
-		if rb.Calls >= s.cfg.MaxCallsPerRun {
-			return fmt.Errorf("model call budget exhausted for run %s", runID)
-		}
-		rb.Calls++
-	} else {
-		if rb.Tokens+tokens > s.cfg.MaxTokensPerRun {
-			return fmt.Errorf("model token budget exhausted for run %s", runID)
-		}
-		rb.Tokens += tokens
+	if rb.Calls >= s.cfg.MaxCallsPerRun {
+		return fmt.Errorf("model call budget exhausted for run %s", runID)
 	}
+	rb.Calls++
+	st.Runs[runID] = rb
+	return s.writeBudget(st)
+}
+
+func (s *Service) reserveTokens(runID string, tokens int) error {
+	if tokens <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.readBudget()
+	if err != nil {
+		return err
+	}
+	rb := st.Runs[runID]
+	if rb.Tokens+tokens > s.cfg.MaxTokensPerRun {
+		return fmt.Errorf("model token budget exhausted for run %s", runID)
+	}
+	rb.Tokens += tokens
 	st.Runs[runID] = rb
 	return s.writeBudget(st)
 }
