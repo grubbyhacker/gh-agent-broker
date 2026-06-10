@@ -23,7 +23,8 @@ import (
 )
 
 func TestFakeGitHubRESTIntegration(t *testing.T) {
-	var sawProbe, sawPull, sawIssue, sawComment, sawDismiss, sawResolve bool
+	var sawProbe, sawPull, sawIssue, sawDismiss, sawResolve, sawGraphQLDismiss bool
+	var sawComment, sawAddLabels, sawRemoveLabel int
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
@@ -48,12 +49,15 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 			writeTestJSON(t, w, map[string]interface{}{"id": 2002, "number": 7, "url": "https://api.fake/pulls/7", "html_url": "https://fake/owner/repo/pull/7"})
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues/7/comments":
 			requireBearer(t, r)
-			sawComment = true
+			sawComment++
 			body := readBody(t, r)
 			if !strings.Contains(body, "Broker-Operation-Id") || !strings.Contains(body, "Agent-Id") {
 				t.Fatalf("comment body missing broker metadata: %s", body)
 			}
-			writeTestJSON(t, w, map[string]interface{}{"id": 3003, "url": "https://api.fake/comments/1", "html_url": "https://fake/owner/repo/pull/7#issuecomment-1"})
+			writeTestJSON(t, w, map[string]interface{}{"id": 3003, "url": "https://api.fake/comments/1", "html_url": "https://fake/owner/repo/pull/7#issuecomment-1", "created_at": "2026-06-10T00:00:00Z"})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews/80":
+			requireBearer(t, r)
+			writeTestJSON(t, w, map[string]interface{}{"id": 80, "node_id": "PRR_numeric", "state": "CHANGES_REQUESTED", "body": "review body", "user": map[string]string{"login": "roger"}, "html_url": "https://fake/owner/repo/pull/7#pullrequestreview-80"})
 		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/reviews/80/dismissals":
 			requireBearer(t, r)
 			sawDismiss = true
@@ -61,21 +65,78 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 			if !strings.Contains(body, `"message":"fixed requested changes"`) {
 				t.Fatalf("dismiss body missing message: %s", body)
 			}
-			writeTestJSON(t, w, map[string]interface{}{"id": 80, "state": "DISMISSED", "body": "review body", "user": map[string]string{"login": "roger"}, "html_url": "https://fake/owner/repo/pull/7#pullrequestreview-80"})
+			writeTestJSON(t, w, map[string]interface{}{"id": 80, "node_id": "PRR_numeric", "state": "DISMISSED", "body": "review body", "user": map[string]string{"login": "roger"}, "html_url": "https://fake/owner/repo/pull/7#pullrequestreview-80"})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues/7/labels":
+			requireBearer(t, r)
+			sawAddLabels++
+			body := readBody(t, r)
+			if !strings.Contains(body, "ym-curator: waiting-review") {
+				t.Fatalf("label add body missing label: %s", body)
+			}
+			writeTestJSON(t, w, []map[string]string{{"name": "ym-curator: waiting-review"}, {"name": "ym-curator: needs work"}})
+		case r.Method == http.MethodDelete && r.URL.Path == "/repos/owner/repo/issues/7/labels/ym-curator: needs work":
+			requireBearer(t, r)
+			sawRemoveLabel++
+			writeTestJSON(t, w, []map[string]string{{"name": "ym-curator: waiting-review"}})
 		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
 			requireBearer(t, r)
 			body := readBody(t, r)
-			if !strings.Contains(body, "resolveReviewThread") || !strings.Contains(body, "PRRT_test_thread") {
-				t.Fatalf("graphql body missing resolve mutation/thread id: %s", body)
-			}
-			sawResolve = true
-			writeTestJSON(t, w, map[string]interface{}{
-				"data": map[string]interface{}{
-					"resolveReviewThread": map[string]interface{}{
-						"thread": map[string]interface{}{"id": "PRRT_test_thread", "isResolved": true},
+			switch {
+			case strings.Contains(body, "dismissPullRequestReview") && strings.Contains(body, "PRR_graphql"):
+				sawGraphQLDismiss = true
+				writeTestJSON(t, w, map[string]interface{}{
+					"data": map[string]interface{}{
+						"dismissPullRequestReview": map[string]interface{}{
+							"pullRequestReview": map[string]interface{}{"id": "PRR_graphql", "databaseId": 81, "state": "DISMISSED", "body": "review body", "url": "https://fake/owner/repo/pull/7#pullrequestreview-81", "author": map[string]string{"login": "roger"}},
+						},
 					},
-				},
-			})
+				})
+			case strings.Contains(body, "PullRequestReview") && strings.Contains(body, "PRR_graphql"):
+				writeTestJSON(t, w, map[string]interface{}{
+					"data": map[string]interface{}{
+						"node": map[string]interface{}{"id": "PRR_graphql", "databaseId": 81, "state": "CHANGES_REQUESTED", "body": "review body", "url": "https://fake/owner/repo/pull/7#pullrequestreview-81", "author": map[string]string{"login": "roger"}},
+					},
+				})
+			case strings.Contains(body, "addPullRequestReviewThreadReply") && strings.Contains(body, "fixed requested thread"):
+				writeTestJSON(t, w, map[string]interface{}{
+					"data": map[string]interface{}{
+						"addPullRequestReviewThreadReply": map[string]interface{}{"comment": map[string]interface{}{"id": "PRRC_reply"}},
+					},
+				})
+			case strings.Contains(body, "resolveReviewThread") && strings.Contains(body, "PRRT_test_thread"):
+				sawResolve = true
+				writeTestJSON(t, w, map[string]interface{}{
+					"data": map[string]interface{}{
+						"resolveReviewThread": map[string]interface{}{
+							"thread": map[string]interface{}{"id": "PRRT_test_thread", "isResolved": true},
+						},
+					},
+				})
+			case strings.Contains(body, "PullRequestReviewThread") && strings.Contains(body, "PRRT_test_thread"):
+				writeTestJSON(t, w, map[string]interface{}{
+					"data": map[string]interface{}{
+						"node": map[string]interface{}{
+							"id":         "PRRT_test_thread",
+							"isResolved": false,
+							"path":       "note.md",
+							"line":       12,
+							"comments": map[string]interface{}{
+								"nodes": []map[string]interface{}{{
+									"id":         "PRRC_1",
+									"databaseId": 22,
+									"body":       "please fix",
+									"author":     map[string]string{"login": "roger"},
+									"path":       "note.md",
+									"line":       12,
+									"url":        "https://fake/owner/repo/pull/7#discussion_r22",
+								}},
+							},
+						},
+					},
+				})
+			default:
+				t.Fatalf("unexpected graphql body: %s", body)
+			}
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues":
 			requireBearer(t, r)
 			sawIssue = true
@@ -95,7 +156,7 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 		Enabled:      true,
 		Secret:       "agent-secret",
 		Repositories: []string{"owner/repo"},
-		Operations:   []string{"repo.probe", "pull.create", "pull.review.dismiss", "pull.review_thread.resolve", "issue.comment", "issue.create"},
+		Operations:   []string{"repo.probe", "pull.create", "pull.review.dismiss", "pull.review_thread.resolve", "issue.comment", "issue.label.add", "issue.label.remove", "issue.create"},
 		BaseBranches: []string{"main"},
 		BranchPatterns: []string{
 			"^agent/agent-1/.+$",
@@ -114,13 +175,23 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 	})
 	assertStatus(t, resp, http.StatusCreated)
 
-	resp = brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/issues/7/comments", map[string]interface{}{
+	resp = brokerRequestHeaders(t, broker, http.MethodPost, "/v1/repos/owner/repo/issues/7/comments", map[string]interface{}{
 		"body":     "done",
 		"metadata": map[string]string{"Agent-Id": "agent-1"},
-	})
+	}, map[string]string{"Idempotency-Key": "pr-repair:7:abc:comment"})
+	assertStatus(t, resp, http.StatusCreated)
+	resp = brokerRequestHeaders(t, broker, http.MethodPost, "/v1/repos/owner/repo/issues/7/comments", map[string]interface{}{
+		"body":     "done",
+		"metadata": map[string]string{"Agent-Id": "agent-1"},
+	}, map[string]string{"Idempotency-Key": "pr-repair:7:abc:comment"})
 	assertStatus(t, resp, http.StatusCreated)
 
 	resp = brokerRequest(t, broker, http.MethodPut, "/v1/repos/owner/repo/pulls/7/reviews/80/dismissal", map[string]interface{}{
+		"message":  "fixed requested changes",
+		"metadata": map[string]string{"Agent-Id": "agent-1"},
+	})
+	assertStatus(t, resp, http.StatusOK)
+	resp = brokerRequest(t, broker, http.MethodPut, "/v1/repos/owner/repo/pulls/7/reviews/PRR_graphql/dismissal", map[string]interface{}{
 		"message":  "fixed requested changes",
 		"metadata": map[string]string{"Agent-Id": "agent-1"},
 	})
@@ -132,6 +203,13 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 	})
 	assertStatus(t, resp, http.StatusOK)
 
+	resp = brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/issues/7/labels", map[string]interface{}{
+		"labels": []string{"ym-curator: waiting-review"},
+	})
+	assertStatus(t, resp, http.StatusOK)
+	resp = brokerRequest(t, broker, http.MethodDelete, "/v1/repos/owner/repo/issues/7/labels/ym-curator:%20needs%20work", nil)
+	assertStatus(t, resp, http.StatusOK)
+
 	resp = brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/issues", map[string]interface{}{
 		"title":    "bug report",
 		"body":     "observed behavior",
@@ -140,8 +218,8 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 	})
 	assertStatus(t, resp, http.StatusCreated)
 
-	if !sawProbe || !sawPull || !sawIssue || !sawComment || !sawDismiss || !sawResolve {
-		t.Fatalf("fake REST handlers were not all exercised: probe=%v pull=%v issue=%v comment=%v dismiss=%v resolve=%v", sawProbe, sawPull, sawIssue, sawComment, sawDismiss, sawResolve)
+	if !sawProbe || !sawPull || !sawIssue || sawComment != 1 || !sawDismiss || !sawGraphQLDismiss || !sawResolve || sawAddLabels != 1 || sawRemoveLabel != 1 {
+		t.Fatalf("fake REST handlers were not all exercised: probe=%v pull=%v issue=%v comment=%d dismiss=%v graphqlDismiss=%v resolve=%v addLabels=%d removeLabel=%d", sawProbe, sawPull, sawIssue, sawComment, sawDismiss, sawGraphQLDismiss, sawResolve, sawAddLabels, sawRemoveLabel)
 	}
 }
 
@@ -169,6 +247,12 @@ func TestFakeGitHubReadRESTIntegration(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/5/files":
 			requireBearer(t, r)
 			writeTestJSON(t, w, []map[string]interface{}{{"filename": "note.md", "status": "added", "changes": 3}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/5/reviews":
+			requireBearer(t, r)
+			writeTestJSON(t, w, []map[string]interface{}{{
+				"id": 80, "node_id": "PRR_test_review", "state": "CHANGES_REQUESTED", "body": "needs work",
+				"user": map[string]string{"login": "roger"}, "submitted_at": "2026-06-10T18:25:37Z", "html_url": "https://fake/owner/repo/pull/5#pullrequestreview-80",
+			}})
 		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
 			requireBearer(t, r)
 			body := readBody(t, r)
@@ -183,12 +267,16 @@ func TestFakeGitHubReadRESTIntegration(t *testing.T) {
 								"nodes": []map[string]interface{}{{
 									"id":         "PRRT_test_thread",
 									"isResolved": false,
+									"path":       "note.md",
+									"line":       12,
 									"comments": map[string]interface{}{
 										"nodes": []map[string]interface{}{{
-											"databaseId": float64(22),
+											"id":         "PRRC_test_comment",
+											"databaseId": 22,
 											"body":       "please fix",
 											"author":     map[string]string{"login": "roger"},
 											"path":       "note.md",
+											"line":       12,
 											"url":        "https://fake/owner/repo/pull/5#discussion_r22",
 											"createdAt":  "2026-06-10T00:00:00Z",
 											"updatedAt":  "2026-06-10T00:00:00Z",
@@ -232,10 +320,18 @@ func TestFakeGitHubReadRESTIntegration(t *testing.T) {
 		t.Fatalf("pull marker filter failed: %s", got)
 	}
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls/5/files", nil), http.StatusOK)
+	resp = brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls/5/reviews", nil)
+	assertStatus(t, resp, http.StatusOK)
+	if got := resp.Body.String(); !strings.Contains(got, `"id":"PRR_test_review"`) || !strings.Contains(got, `"database_id":80`) || !strings.Contains(got, `"state":"CHANGES_REQUESTED"`) {
+		t.Fatalf("reviews missing node/database id/state: %s", got)
+	}
 	resp = brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls/5/review-threads", nil)
 	assertStatus(t, resp, http.StatusOK)
 	if got := resp.Body.String(); !strings.Contains(got, `"id":"PRRT_test_thread"`) || !strings.Contains(got, `"resolvable":true`) {
 		t.Fatalf("review threads missing graphql thread id/resolvable marker: %s", got)
+	}
+	if got := resp.Body.String(); !strings.Contains(got, `"id":"PRRC_test_comment"`) || !strings.Contains(got, `"database_id":22`) || !strings.Contains(got, `"line":12`) {
+		t.Fatalf("review threads missing comment identity/path context: %s", got)
 	}
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls/5/comments", nil), http.StatusOK)
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/issues?body_marker=ykm/test", nil), http.StatusOK)
@@ -663,6 +759,9 @@ func newTestBroker(t *testing.T, apiBaseURL, gitBaseURL string, agent config.Age
 	keyPath := writeTestPrivateKey(t)
 	cfg := &config.Config{
 		Audit: config.AuditConfig{Path: filepath.Join(t.TempDir(), "audit.jsonl")},
+		Idempotency: config.IdempotencyConfig{
+			StatePath: filepath.Join(t.TempDir(), "idempotency.json"),
+		},
 		GitHub: config.GitHubConfig{
 			AppID:          1,
 			PrivateKeyPath: keyPath,
@@ -716,6 +815,10 @@ func fakeTokenServer(t *testing.T) *httptest.Server {
 }
 
 func brokerRequest(t *testing.T, broker *Server, method, path string, body interface{}) *httptest.ResponseRecorder {
+	return brokerRequestHeaders(t, broker, method, path, body, nil)
+}
+
+func brokerRequestHeaders(t *testing.T, broker *Server, method, path string, body interface{}, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	var rdr io.Reader
 	if body != nil {
@@ -729,6 +832,9 @@ func brokerRequest(t *testing.T, broker *Server, method, path string, body inter
 	req.SetBasicAuth("agent-1", "agent-secret")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
 	}
 	resp := httptest.NewRecorder()
 	broker.ServeHTTP(resp, req)

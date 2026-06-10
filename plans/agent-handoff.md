@@ -4,26 +4,43 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
-Current PR review resolution implementation:
+Current PR review repair-completion implementation:
 
-- Current branch `feature/pr-review-resolution` adds broker support for
-  dismissing PR reviews and resolving PR review threads without exposing GitHub
-  credentials to agents.
-- New deny-by-default operations are `pull.review.dismiss` and
-  `pull.review_thread.resolve`. The Curator example agent in
-  `configs/production.example.yaml` grants both because it already has
-  `pull_requests:write`; other agents remain unchanged.
-- New broker routes are
-  `PUT /v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal`
-  and
-  `PUT /v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve`.
-  Both require JSON `message` and optional `metadata`/`permissions`.
-- Review dismissal uses GitHub REST. Thread resolution uses GitHub GraphQL, and
-  review-thread listing now prefers GraphQL thread node IDs with `resolvable:
-  true`, while preserving the existing REST-comment fallback as non-resolvable.
-- New CLI commands are `dismiss-review` and `resolve-review-thread`.
+- Current branch `feature/pr-review-resolution` implements the YKM Curator
+  repair-completion broker surface without exposing GitHub credentials to
+  agents.
+- Deny-by-default write operations now include `issue.comment`,
+  `pull.review.dismiss`, `pull.review_thread.resolve`, `issue.label.add`, and
+  `issue.label.remove`. The Curator example agent in
+  `configs/production.example.yaml` grants the needed operations because it has
+  GitHub App `issues:write` and `pull_requests:write`; other agents remain
+  unchanged.
+- Broker routes now cover the requested sequence:
+  `POST /v1/repos/{owner}/{repo}/issues/{number}/comments`,
+  `PUT /v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal`,
+  `PUT /v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve`,
+  `POST /v1/repos/{owner}/{repo}/issues/{number}/labels`, and
+  `DELETE /v1/repos/{owner}/{repo}/issues/{number}/labels/{label}`.
+- Review dismissal accepts either REST numeric review IDs or GraphQL review node
+  IDs. Numeric IDs use REST dismissal; node IDs use GraphQL
+  `dismissPullRequestReview`. Already dismissed reviews are successful no-ops.
+- Thread resolution uses GraphQL review-thread node IDs. If a message is
+  supplied and the thread is not already resolved, the broker first posts a
+  GitHub-visible thread reply, then resolves the thread. Already resolved
+  threads are successful no-ops.
+- PR review and review-thread read models now expose GraphQL node IDs,
+  database IDs where available, authors, review states including
+  `CHANGES_REQUESTED`/`DISMISSED`, thread `is_resolved`, path/line context, and
+  comment path/line/body context for exact repair decisions.
+- Write routes support `Idempotency-Key`. Successful responses are persisted in
+  the configured `idempotency.state_path`, replayed on duplicate keys, and
+  audit events include operation, repo, issue/PR number, target ID/label, the
+  idempotency key, result URL/ID where available, and bounded error text.
+- New CLI support includes `dismiss-review --idempotency-key`,
+  `resolve-review-thread --idempotency-key`, `add-label`, and `remove-label`.
 - Latest verification passed: `go test ./internal/server ./cmd/gh-agent-broker
-  ./internal/githubapp`, `git diff --check`, and `mise exec -- make check`.
+  ./internal/githubapp ./internal/idempotency`, `mise exec -- make fmt`,
+  `git diff --check`, and `mise exec -- make check`.
 
 Current Codex-compatible proxy surface implementation:
 

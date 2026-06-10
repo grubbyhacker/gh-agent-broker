@@ -22,6 +22,7 @@ import (
 	"gh-agent-broker/internal/auth"
 	"gh-agent-broker/internal/config"
 	"gh-agent-broker/internal/githubapp"
+	"gh-agent-broker/internal/idempotency"
 	"gh-agent-broker/internal/ids"
 	"gh-agent-broker/internal/limits"
 	"gh-agent-broker/internal/metadata"
@@ -199,6 +200,22 @@ func handleOperations(w http.ResponseWriter, r *http.Request) {
 				"metadata":    "send configured metadata fields in request body metadata",
 			},
 			{
+				"name":        "issue.label.add",
+				"method":      http.MethodPost,
+				"path":        "/v1/repos/{owner}/{repo}/issues/{number}/labels",
+				"auth":        "agent",
+				"description": "Add labels to an issue or pull request through the broker.",
+				"metadata":    "send configured metadata fields in request body metadata",
+			},
+			{
+				"name":        "issue.label.remove",
+				"method":      http.MethodDelete,
+				"path":        "/v1/repos/{owner}/{repo}/issues/{number}/labels/{label}",
+				"auth":        "agent",
+				"description": "Remove a label from an issue or pull request through the broker.",
+				"metadata":    "send configured metadata fields in request body metadata",
+			},
+			{
 				"name":        "issue.read",
 				"method":      http.MethodGet,
 				"path":        "/v1/repos/{owner}/{repo}/issues",
@@ -295,6 +312,8 @@ Operations:
 - GET  /v1/repos/{owner}/{repo}/issues/{number}/comments
 - POST /v1/repos/{owner}/{repo}/issues
 - POST /v1/repos/{owner}/{repo}/issues/{number}/comments
+- POST /v1/repos/{owner}/{repo}/issues/{number}/labels
+- DELETE /v1/repos/{owner}/{repo}/issues/{number}/labels/{label}
 - GET  /v1/repos/{owner}/{repo}/commits/{sha}/status
 - GET  /v1/repos/{owner}/{repo}/commits/{sha}/check-runs
 
@@ -473,6 +492,15 @@ func openAPISpec() map[string]interface{} {
 						},
 					},
 				},
+				"IssueLabelsRequest": map[string]interface{}{
+					"type":     "object",
+					"required": []string{"labels"},
+					"properties": map[string]interface{}{
+						"labels":      map[string]interface{}{"type": "array", "items": map[string]string{"type": "string"}},
+						"metadata":    map[string]interface{}{"$ref": "#/components/schemas/Metadata"},
+						"permissions": map[string]interface{}{"type": "array", "items": map[string]string{"type": "string"}},
+					},
+				},
 				"PullReviewDismissRequest": map[string]interface{}{
 					"type":     "object",
 					"required": []string{"message"},
@@ -562,6 +590,32 @@ func openAPISpec() map[string]interface{} {
 					"requestBody": jsonRequestRef("#/components/schemas/CommentCreateRequest"),
 					"responses": map[string]interface{}{
 						"201": map[string]interface{}{"description": "comment created", "content": jsonContentRef("#/components/schemas/GitHubResult")},
+						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
+					},
+				},
+			},
+			"/v1/repos/{owner}/{repo}/issues/{number}/labels": map[string]interface{}{
+				"post": map[string]interface{}{
+					"summary": "Add issue or pull request labels",
+					"parameters": append(repoPathParams(), map[string]interface{}{
+						"name": "number", "in": "path", "required": true, "schema": map[string]string{"type": "string"},
+					}),
+					"requestBody": jsonRequestRef("#/components/schemas/IssueLabelsRequest"),
+					"responses": map[string]interface{}{
+						"200": map[string]interface{}{"description": "resulting labels"},
+						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
+					},
+				},
+			},
+			"/v1/repos/{owner}/{repo}/issues/{number}/labels/{label}": map[string]interface{}{
+				"delete": map[string]interface{}{
+					"summary": "Remove issue or pull request label",
+					"parameters": append(repoPathParams(),
+						map[string]interface{}{"name": "number", "in": "path", "required": true, "schema": map[string]string{"type": "string"}},
+						map[string]interface{}{"name": "label", "in": "path", "required": true, "schema": map[string]string{"type": "string"}},
+					),
+					"responses": map[string]interface{}{
+						"200": map[string]interface{}{"description": "resulting labels"},
 						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
 					},
 				},
@@ -753,6 +807,10 @@ func (s *Server) handleRepoAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleIssueComments(w, r, repo, parts[3])
 	case len(parts) == 5 && parts[2] == "issues" && parts[4] == "comments" && r.Method == http.MethodPost:
 		s.handleCommentCreate(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "issues" && parts[4] == "labels" && r.Method == http.MethodPost:
+		s.handleIssueLabelsAdd(w, r, repo, parts[3])
+	case len(parts) == 6 && parts[2] == "issues" && parts[4] == "labels" && r.Method == http.MethodDelete:
+		s.handleIssueLabelRemove(w, r, repo, parts[3], parts[5])
 	case len(parts) == 5 && parts[2] == "commits" && parts[4] == "status" && r.Method == http.MethodGet:
 		s.handleCommitStatus(w, r, repo, parts[3])
 	case len(parts) == 5 && parts[2] == "commits" && parts[4] == "check-runs" && r.Method == http.MethodGet:
@@ -856,8 +914,9 @@ func (s *Server) handlePullReviewDismiss(w http.ResponseWriter, r *http.Request,
 	if !ok {
 		return
 	}
-	reviewID, ok := parsePositiveInt64(w, rawReviewID)
-	if !ok {
+	reviewID := strings.TrimSpace(rawReviewID)
+	if reviewID == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "review_id is required", OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
 	cfg, gh := s.snapshot()
@@ -897,14 +956,34 @@ func (s *Server) handlePullReviewDismiss(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull review dismissal denied by policy", &result))
 		return
 	}
-	out, err := gh.DismissPullReview(appName, repo, inst, number, reviewID, req.Message)
+	key := idempotencyKey(r, fmt.Sprintf("pull.review.dismiss:%s:%d:%s", repo, number, reviewID))
+	extra := map[string]interface{}{"pull_number": number, "review_id": reviewID, "idempotency_key": key}
+	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	} else if replayed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
+		return
+	}
+	var out api.PullReview
+	var err error
+	if numericReviewID, parseErr := strconv.ParseInt(reviewID, 10, 64); parseErr == nil && numericReviewID > 0 {
+		out, err = gh.DismissPullReview(appName, repo, inst, number, numericReviewID, req.Message)
+	} else {
+		out, err = gh.DismissPullReviewNode(appName, inst, reviewID, req.Message)
+	}
 	if err != nil {
-		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: map[string]interface{}{"pull_number": number, "review_id": reviewID}})
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
 		return
 	}
-	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: out.HTMLURL, Result: "ok", Extra: map[string]interface{}{"pull_number": number, "review_id": reviewID}})
-	writeJSON(w, http.StatusOK, out)
+	if err := writeIdempotentJSON(w, cfg.Idempotency, key, "pull.review.dismiss", http.StatusOK, out); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: out.HTMLURL, Result: "ok", Extra: extra})
 }
 
 func (s *Server) handlePullReviewThreadResolve(w http.ResponseWriter, r *http.Request, repo, rawNumber, threadID string) {
@@ -954,14 +1033,29 @@ func (s *Server) handlePullReviewThreadResolve(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull review thread resolution denied by policy", &result))
 		return
 	}
-	out, err := gh.ResolvePullReviewThread(appName, inst, threadID)
+	key := idempotencyKey(r, fmt.Sprintf("pull.review_thread.resolve:%s:%d:%s", repo, number, threadID))
+	extra := map[string]interface{}{"pull_number": number, "thread_id": threadID, "idempotency_key": key}
+	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	} else if replayed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
+		return
+	}
+	out, err := gh.ResolvePullReviewThread(appName, inst, threadID, req.Message)
 	if err != nil {
-		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: map[string]interface{}{"pull_number": number, "thread_id": threadID}})
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
 		return
 	}
-	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "ok", Extra: map[string]interface{}{"pull_number": number, "thread_id": threadID, "resolved": out.IsResolved}})
-	writeJSON(w, http.StatusOK, out)
+	extra["resolved"] = out.IsResolved
+	if err := writeIdempotentJSON(w, cfg.Idempotency, key, "pull.review_thread.resolve", http.StatusOK, out); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "ok", Extra: extra})
 }
 
 func (s *Server) handleIssueList(w http.ResponseWriter, r *http.Request, repo string) {
@@ -1045,17 +1139,62 @@ func (s *Server) withReadAccess(w http.ResponseWriter, r *http.Request, repo, op
 	writeJSON(w, http.StatusOK, out)
 }
 
-func parsePositiveInt(w http.ResponseWriter, raw string) (int, bool) {
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 1 {
-		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "number must be a positive integer", Decision: policy.DecisionDeny})
-		return 0, false
+func replayIdempotent(w http.ResponseWriter, cfg config.IdempotencyConfig, key string) (bool, error) {
+	rec, ok, err := idempotency.Load(cfg, key)
+	if err != nil || !ok {
+		return false, err
 	}
-	return n, true
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(rec.Status)
+	if _, err := w.Write(rec.Body); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
-func parsePositiveInt64(w http.ResponseWriter, raw string) (int64, bool) {
-	n, err := strconv.ParseInt(raw, 10, 64)
+func writeIdempotentJSON(w http.ResponseWriter, cfg config.IdempotencyConfig, key, operation string, status int, out interface{}) error {
+	body, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	if err := idempotency.Store(cfg, key, idempotency.Record{Operation: operation, Status: status, Body: body}); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if _, err := w.Write(body); err != nil {
+		return err
+	}
+	return nil
+}
+
+func idempotencyHeader(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+}
+
+func idempotencyKey(r *http.Request, fallback string) string {
+	if key := idempotencyHeader(r); key != "" {
+		return key
+	}
+	return fallback
+}
+
+func cleanLabels(labels []string) []string {
+	out := make([]string, 0, len(labels))
+	seen := map[string]bool{}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" || seen[label] {
+			continue
+		}
+		seen[label] = true
+		out = append(out, label)
+	}
+	return out
+}
+
+func parsePositiveInt(w http.ResponseWriter, raw string) (int, bool) {
+	n, err := strconv.Atoi(raw)
 	if err != nil || n < 1 {
 		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "number must be a positive integer", Decision: policy.DecisionDeny})
 		return 0, false
@@ -1282,15 +1421,152 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "comment creation denied by policy", &result))
 		return
 	}
+	key := idempotencyHeader(r)
+	extra := map[string]interface{}{"issue_number": issueNumber, "idempotency_key": key}
+	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	} else if replayed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
+		return
+	}
 	body := req.Body + metadata.RenderBlock(enriched)
 	ghResult, err := gh.CreateIssueComment(appName, repo, issueNumber, inst, body)
 	if err != nil {
-		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error()})
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
 		return
 	}
-	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: ghResult.HTMLURL, Result: "ok"})
-	writeJSON(w, http.StatusCreated, ghResult)
+	extra["comment_id"] = ghResult.ID
+	if err := writeIdempotentJSON(w, cfg.Idempotency, key, "issue.comment", http.StatusCreated, ghResult); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: ghResult.HTMLURL, Result: "ok", Extra: extra})
+}
+
+func (s *Server) handleIssueLabelsAdd(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	opID := ids.NewOperationID()
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	cfg, gh := s.snapshot()
+	principal, ok := auth.AuthenticateAgent(r, cfg)
+	if !ok {
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	var req api.IssueLabelsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_json", Message: err.Error(), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	labels := cleanLabels(req.Labels)
+	if len(labels) == 0 {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "labels are required", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
+		return
+	}
+	result := policy.Check(policy.Request{
+		Agent:       principal.Agent,
+		AgentID:     principal.ID,
+		Repo:        repo,
+		Operation:   "issue.label.add",
+		Permissions: req.Permissions,
+		Metadata:    req.Metadata,
+		Locations:   map[string]map[string]string{"request": req.Metadata},
+	})
+	if !result.Allowed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.add", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Extra: map[string]interface{}{"issue_number": number, "labels": labels}})
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "label add denied by policy", &result))
+		return
+	}
+	key := idempotencyKey(r, fmt.Sprintf("issue.label.add:%s:%d:%s", repo, number, strings.Join(labels, ",")))
+	extra := map[string]interface{}{"issue_number": number, "labels": labels, "idempotency_key": key}
+	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.add", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	} else if replayed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.add", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
+		return
+	}
+	out, err := gh.AddIssueLabels(appName, repo, inst, number, labels)
+	if err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.add", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
+		return
+	}
+	body := map[string]interface{}{"labels": out}
+	if err := writeIdempotentJSON(w, cfg.Idempotency, key, "issue.label.add", http.StatusOK, body); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.add", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.add", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "ok", Extra: extra})
+}
+
+func (s *Server) handleIssueLabelRemove(w http.ResponseWriter, r *http.Request, repo, rawNumber, rawLabel string) {
+	opID := ids.NewOperationID()
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	label, err := url.PathUnescape(rawLabel)
+	if err != nil || strings.TrimSpace(label) == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "label is required", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	label = strings.TrimSpace(label)
+	cfg, gh := s.snapshot()
+	principal, ok := auth.AuthenticateAgent(r, cfg)
+	if !ok {
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
+		return
+	}
+	result := policy.Check(policy.Request{Agent: principal.Agent, AgentID: principal.ID, Repo: repo, Operation: "issue.label.remove"})
+	if !result.Allowed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.remove", Repo: repo, Decision: result.Decision, Extra: map[string]interface{}{"issue_number": number, "label": label}})
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "label removal denied by policy", &result))
+		return
+	}
+	key := idempotencyKey(r, fmt.Sprintf("issue.label.remove:%s:%d:%s", repo, number, label))
+	extra := map[string]interface{}{"issue_number": number, "label": label, "idempotency_key": key}
+	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.remove", Repo: repo, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	} else if replayed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.remove", Repo: repo, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
+		return
+	}
+	out, err := gh.RemoveIssueLabel(appName, repo, inst, number, label)
+	if err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.remove", Repo: repo, Decision: result.Decision, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
+		return
+	}
+	body := map[string]interface{}{"labels": out}
+	if err := writeIdempotentJSON(w, cfg.Idempotency, key, "issue.label.remove", http.StatusOK, body); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.remove", Repo: repo, Decision: result.Decision, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.remove", Repo: repo, Decision: result.Decision, Result: "ok", Extra: extra})
 }
 
 func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {

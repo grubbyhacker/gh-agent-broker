@@ -5,6 +5,9 @@ server:
 audit:
   path: "/var/log/gh-agent-broker/audit.jsonl"
 
+idempotency:
+  state_path: "/var/log/gh-agent-broker/idempotency.json"
+
 github:
   api_base_url: "https://api.github.com"
   git_base_url: "https://github.com"

@@ -196,17 +196,22 @@ func (c *Client) CreateIssue(appName, repo string, installationID int64, title, 
 func (c *Client) CreateIssueComment(appName, repo string, issueNumber string, installationID int64, body string) (*api.GitHubResult, error) {
 	req := map[string]interface{}{"body": body}
 	var out struct {
-		ID      int64  `json:"id"`
-		URL     string `json:"url"`
-		HTMLURL string `json:"html_url"`
+		ID        int64  `json:"id"`
+		URL       string `json:"url"`
+		HTMLURL   string `json:"html_url"`
+		CreatedAt string `json:"created_at"`
 	}
 	if err := c.doJSON(appName, http.MethodPost, "/repos/"+repo+"/issues/"+issueNumber+"/comments", installationID, req, &out); err != nil {
 		return nil, err
 	}
-	return &api.GitHubResult{ID: out.ID, URL: out.URL, HTMLURL: out.HTMLURL}, nil
+	return &api.GitHubResult{ID: out.ID, URL: out.URL, HTMLURL: out.HTMLURL, CreatedAt: out.CreatedAt}, nil
 }
 
 func (c *Client) DismissPullReview(appName, repo string, installationID int64, number int, reviewID int64, message string) (api.PullReview, error) {
+	current, err := c.GetPullReview(appName, repo, installationID, number, reviewID)
+	if err == nil && strings.EqualFold(current.State, "DISMISSED") {
+		return current, nil
+	}
 	req := map[string]string{"message": message}
 	var out githubReview
 	path := "/repos/" + repo + "/pulls/" + strconv.Itoa(number) + "/reviews/" + strconv.FormatInt(reviewID, 10) + "/dismissals"
@@ -214,6 +219,83 @@ func (c *Client) DismissPullReview(appName, repo string, installationID int64, n
 		return api.PullReview{}, err
 	}
 	return mapReview(out), nil
+}
+
+func (c *Client) GetPullReview(appName, repo string, installationID int64, number int, reviewID int64) (api.PullReview, error) {
+	var out githubReview
+	path := "/repos/" + repo + "/pulls/" + strconv.Itoa(number) + "/reviews/" + strconv.FormatInt(reviewID, 10)
+	if err := c.doJSON(appName, http.MethodGet, path, installationID, nil, &out); err != nil {
+		return api.PullReview{}, err
+	}
+	return mapReview(out), nil
+}
+
+func (c *Client) DismissPullReviewNode(appName string, installationID int64, reviewNodeID, message string) (api.PullReview, error) {
+	current, err := c.GetPullReviewNode(appName, installationID, reviewNodeID)
+	if err == nil && strings.EqualFold(current.State, "DISMISSED") {
+		return current, nil
+	}
+	var out struct {
+		DismissPullRequestReview struct {
+			PullRequestReview graphqlReview `json:"pullRequestReview"`
+		} `json:"dismissPullRequestReview"`
+	}
+	err = c.doGraphQL(appName, installationID, `mutation($reviewID: ID!, $message: String!) {
+  dismissPullRequestReview(input: {pullRequestReviewId: $reviewID, message: $message}) {
+    pullRequestReview { id databaseId state body url submittedAt author { login } }
+  }
+}`, map[string]interface{}{"reviewID": reviewNodeID, "message": message}, &out)
+	if err != nil {
+		return api.PullReview{}, err
+	}
+	return mapGraphQLReview(out.DismissPullRequestReview.PullRequestReview), nil
+}
+
+func (c *Client) GetPullReviewNode(appName string, installationID int64, reviewNodeID string) (api.PullReview, error) {
+	var out struct {
+		Node graphqlReview `json:"node"`
+	}
+	err := c.doGraphQL(appName, installationID, `query($reviewID: ID!) {
+  node(id: $reviewID) {
+    ... on PullRequestReview { id databaseId state body url submittedAt author { login } }
+  }
+}`, map[string]interface{}{"reviewID": reviewNodeID}, &out)
+	if err != nil {
+		return api.PullReview{}, err
+	}
+	if out.Node.ID == "" {
+		return api.PullReview{}, fmt.Errorf("github graphql returned no pull request review for node %q", reviewNodeID)
+	}
+	return mapGraphQLReview(out.Node), nil
+}
+
+func (c *Client) AddIssueLabels(appName, repo string, installationID int64, number int, labels []string) ([]string, error) {
+	req := map[string][]string{"labels": labels}
+	var out []githubLabel
+	if err := c.doJSON(appName, http.MethodPost, "/repos/"+repo+"/issues/"+strconv.Itoa(number)+"/labels", installationID, req, &out); err != nil {
+		return nil, err
+	}
+	return labelNames(out), nil
+}
+
+func (c *Client) RemoveIssueLabel(appName, repo string, installationID int64, number int, label string) ([]string, error) {
+	var out []githubLabel
+	status, err := c.doJSONStatus(appName, http.MethodDelete, "/repos/"+repo+"/issues/"+strconv.Itoa(number)+"/labels/"+url.PathEscape(label), installationID, nil, &out)
+	if err != nil {
+		if status == http.StatusNotFound {
+			return c.ListIssueLabels(appName, repo, installationID, number)
+		}
+		return nil, err
+	}
+	return labelNames(out), nil
+}
+
+func (c *Client) ListIssueLabels(appName, repo string, installationID int64, number int) ([]string, error) {
+	var out []githubLabel
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/issues/"+strconv.Itoa(number)+"/labels", installationID, nil, &out); err != nil {
+		return nil, err
+	}
+	return labelNames(out), nil
 }
 
 func (c *Client) ListPulls(appName, repo string, installationID int64, query url.Values) ([]api.PullSummary, error) {
@@ -272,7 +354,7 @@ func (c *Client) ListPullReviewThreads(appName, repo string, installationID int6
 	threads = make([]api.PullReviewThread, 0, len(comments))
 	for _, comment := range comments {
 		threads = append(threads, api.PullReviewThread{
-			ID:                       strconv.FormatInt(comment.ID, 10),
+			ID:                       comment.ID,
 			UnresolvedStateAvailable: false,
 			Resolvable:               false,
 			Comments:                 []api.PullReviewComment{comment},
@@ -281,7 +363,16 @@ func (c *Client) ListPullReviewThreads(appName, repo string, installationID int6
 	return threads, nil
 }
 
-func (c *Client) ResolvePullReviewThread(appName string, installationID int64, threadID string) (api.PullReviewThreadResolveResult, error) {
+func (c *Client) ResolvePullReviewThread(appName string, installationID int64, threadID, message string) (api.PullReviewThreadResolveResult, error) {
+	current, err := c.GetPullReviewThread(appName, installationID, threadID)
+	if err == nil && current.IsResolved != nil && *current.IsResolved {
+		return api.PullReviewThreadResolveResult{ID: current.ID, IsResolved: true}, nil
+	}
+	if strings.TrimSpace(message) != "" {
+		if err := c.AddPullReviewThreadReply(appName, installationID, threadID, message); err != nil {
+			return api.PullReviewThreadResolveResult{}, err
+		}
+	}
 	var out struct {
 		ResolveReviewThread struct {
 			Thread struct {
@@ -290,7 +381,7 @@ func (c *Client) ResolvePullReviewThread(appName string, installationID int64, t
 			} `json:"thread"`
 		} `json:"resolveReviewThread"`
 	}
-	err := c.doGraphQL(appName, installationID, `mutation($threadID: ID!) {
+	err = c.doGraphQL(appName, installationID, `mutation($threadID: ID!) {
   resolveReviewThread(input: {threadId: $threadID}) {
     thread { id isResolved }
   }
@@ -299,6 +390,57 @@ func (c *Client) ResolvePullReviewThread(appName string, installationID int64, t
 		return api.PullReviewThreadResolveResult{}, err
 	}
 	return api.PullReviewThreadResolveResult{ID: out.ResolveReviewThread.Thread.ID, IsResolved: out.ResolveReviewThread.Thread.IsResolved}, nil
+}
+
+func (c *Client) AddPullReviewThreadReply(appName string, installationID int64, threadID, body string) error {
+	var out struct {
+		AddPullRequestReviewThreadReply struct {
+			Comment struct {
+				ID string `json:"id"`
+			} `json:"comment"`
+		} `json:"addPullRequestReviewThreadReply"`
+	}
+	return c.doGraphQL(appName, installationID, `mutation($threadID: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadID, body: $body}) {
+    comment { id }
+  }
+}`, map[string]interface{}{"threadID": threadID, "body": body}, &out)
+}
+
+func (c *Client) GetPullReviewThread(appName string, installationID int64, threadID string) (api.PullReviewThread, error) {
+	var out struct {
+		Node graphqlReviewThread `json:"node"`
+	}
+	err := c.doGraphQL(appName, installationID, `query($threadID: ID!) {
+  node(id: $threadID) {
+    ... on PullRequestReviewThread {
+      id
+      isResolved
+      path
+      line
+      comments(first: 20) {
+        nodes {
+          id
+          databaseId
+          body
+          author { login }
+          path
+          line
+          url
+          createdAt
+          updatedAt
+        }
+      }
+    }
+  }
+}`, map[string]interface{}{"threadID": threadID}, &out)
+	if err != nil {
+		return api.PullReviewThread{}, err
+	}
+	if out.Node.ID == "" {
+		return api.PullReviewThread{}, fmt.Errorf("github graphql returned no review thread for node %q", threadID)
+	}
+	return mapGraphQLReviewThread(out.Node), nil
 }
 
 func (c *Client) listPullReviewThreadsGraphQL(appName, repo string, installationID int64, number int, query url.Values) ([]api.PullReviewThread, error) {
@@ -331,12 +473,16 @@ func (c *Client) listPullReviewThreadsGraphQL(appName, repo string, installation
         nodes {
           id
           isResolved
+          path
+          line
           comments(first: 20) {
             nodes {
+              id
               databaseId
               body
               author { login }
               path
+              line
               url
               createdAt
               updatedAt
@@ -352,26 +498,7 @@ func (c *Client) listPullReviewThreadsGraphQL(appName, repo string, installation
 	}
 	threads := make([]api.PullReviewThread, 0, len(out.Repository.PullRequest.ReviewThreads.Nodes))
 	for _, node := range out.Repository.PullRequest.ReviewThreads.Nodes {
-		resolved := node.IsResolved
-		thread := api.PullReviewThread{
-			ID:                       node.ID,
-			IsResolved:               &resolved,
-			UnresolvedStateAvailable: true,
-			Resolvable:               true,
-			Comments:                 make([]api.PullReviewComment, 0, len(node.Comments.Nodes)),
-		}
-		for _, comment := range node.Comments.Nodes {
-			thread.Comments = append(thread.Comments, api.PullReviewComment{
-				ID:        comment.DatabaseID,
-				Body:      comment.Body,
-				Author:    comment.Author.Login,
-				Path:      comment.Path,
-				HTMLURL:   comment.URL,
-				CreatedAt: comment.CreatedAt,
-				UpdatedAt: comment.UpdatedAt,
-			})
-		}
-		threads = append(threads, thread)
+		threads = append(threads, mapGraphQLReviewThread(node))
 	}
 	return threads, nil
 }
@@ -483,6 +610,7 @@ type githubIssueComment struct {
 
 type githubReview struct {
 	ID          int64      `json:"id"`
+	NodeID      string     `json:"node_id"`
 	State       string     `json:"state"`
 	Body        string     `json:"body"`
 	User        githubUser `json:"user"`
@@ -493,30 +621,48 @@ type githubReview struct {
 
 type githubReviewComment struct {
 	ID        int64      `json:"id"`
+	NodeID    string     `json:"node_id"`
 	Body      string     `json:"body"`
 	User      githubUser `json:"user"`
 	Path      string     `json:"path"`
+	Line      int        `json:"line"`
 	CommitID  string     `json:"commit_id"`
 	HTMLURL   string     `json:"html_url"`
 	CreatedAt string     `json:"created_at"`
 	UpdatedAt string     `json:"updated_at"`
 }
 
+type graphqlReview struct {
+	ID          string `json:"id"`
+	DatabaseID  int64  `json:"databaseId"`
+	State       string `json:"state"`
+	Body        string `json:"body"`
+	URL         string `json:"url"`
+	SubmittedAt string `json:"submittedAt"`
+	Author      struct {
+		Login string `json:"login"`
+	} `json:"author"`
+}
+
 type graphqlReviewThread struct {
 	ID         string `json:"id"`
 	IsResolved bool   `json:"isResolved"`
+	Path       string `json:"path"`
+	Line       int    `json:"line"`
 	Comments   struct {
 		Nodes []graphqlReviewComment `json:"nodes"`
 	} `json:"comments"`
 }
 
 type graphqlReviewComment struct {
+	ID         string `json:"id"`
 	DatabaseID int64  `json:"databaseId"`
 	Body       string `json:"body"`
 	Author     struct {
 		Login string `json:"login"`
 	} `json:"author"`
 	Path      string `json:"path"`
+	Line      int    `json:"line"`
 	URL       string `json:"url"`
 	CreatedAt string `json:"createdAt"`
 	UpdatedAt string `json:"updatedAt"`
@@ -585,32 +731,89 @@ func mapIssueComments(in []githubIssueComment) []api.IssueComment {
 }
 
 func mapReview(r githubReview) api.PullReview {
+	id := r.NodeID
+	if id == "" && r.ID != 0 {
+		id = strconv.FormatInt(r.ID, 10)
+	}
 	return api.PullReview{
-		ID:          r.ID,
+		ID:          id,
+		DatabaseID:  r.ID,
 		State:       r.State,
 		Body:        r.Body,
-		Author:      r.User.Login,
+		Author:      userRef(r.User.Login),
 		CommitID:    r.CommitID,
 		SubmittedAt: r.SubmittedAt,
 		HTMLURL:     r.HTMLURL,
 	}
 }
 
+func mapGraphQLReview(r graphqlReview) api.PullReview {
+	return api.PullReview{
+		ID:          r.ID,
+		DatabaseID:  r.DatabaseID,
+		State:       r.State,
+		Body:        r.Body,
+		Author:      userRef(r.Author.Login),
+		SubmittedAt: r.SubmittedAt,
+		HTMLURL:     r.URL,
+	}
+}
+
 func mapReviewComments(in []githubReviewComment) []api.PullReviewComment {
 	out := make([]api.PullReviewComment, 0, len(in))
 	for _, comment := range in {
+		id := comment.NodeID
+		if id == "" && comment.ID != 0 {
+			id = strconv.FormatInt(comment.ID, 10)
+		}
 		out = append(out, api.PullReviewComment{
-			ID:        comment.ID,
-			Body:      comment.Body,
-			Author:    comment.User.Login,
-			Path:      comment.Path,
-			CommitID:  comment.CommitID,
-			HTMLURL:   comment.HTMLURL,
-			CreatedAt: comment.CreatedAt,
-			UpdatedAt: comment.UpdatedAt,
+			ID:         id,
+			DatabaseID: comment.ID,
+			Body:       comment.Body,
+			Author:     userRef(comment.User.Login),
+			Path:       comment.Path,
+			Line:       comment.Line,
+			CommitID:   comment.CommitID,
+			HTMLURL:    comment.HTMLURL,
+			CreatedAt:  comment.CreatedAt,
+			UpdatedAt:  comment.UpdatedAt,
 		})
 	}
 	return out
+}
+
+func mapGraphQLReviewThread(node graphqlReviewThread) api.PullReviewThread {
+	resolved := node.IsResolved
+	thread := api.PullReviewThread{
+		ID:                       node.ID,
+		IsResolved:               &resolved,
+		UnresolvedStateAvailable: true,
+		Resolvable:               true,
+		Path:                     node.Path,
+		Line:                     node.Line,
+		Comments:                 make([]api.PullReviewComment, 0, len(node.Comments.Nodes)),
+	}
+	for _, comment := range node.Comments.Nodes {
+		thread.Comments = append(thread.Comments, api.PullReviewComment{
+			ID:         comment.ID,
+			DatabaseID: comment.DatabaseID,
+			Body:       comment.Body,
+			Author:     userRef(comment.Author.Login),
+			Path:       comment.Path,
+			Line:       comment.Line,
+			HTMLURL:    comment.URL,
+			CreatedAt:  comment.CreatedAt,
+			UpdatedAt:  comment.UpdatedAt,
+		})
+	}
+	return thread
+}
+
+func userRef(login string) *api.UserRef {
+	if login == "" {
+		return nil
+	}
+	return &api.UserRef{Login: login}
 }
 
 func labelNames(labels []githubLabel) []string {
@@ -690,21 +893,26 @@ func (c *Client) graphQLURL() string {
 }
 
 func (c *Client) doJSON(appName, method, path string, installationID int64, in interface{}, out interface{}) error {
+	_, err := c.doJSONStatus(appName, method, path, installationID, in, out)
+	return err
+}
+
+func (c *Client) doJSONStatus(appName, method, path string, installationID int64, in interface{}, out interface{}) (int, error) {
 	token, err := c.InstallationToken(appName, installationID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		body = bytes.NewReader(b)
 	}
 	req, err := http.NewRequest(method, strings.TrimRight(c.cfg.APIBaseURL, "/")+path, body)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -714,20 +922,20 @@ func (c *Client) doJSON(appName, method, path string, installationID int64, in i
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer closeBody(resp.Body)
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return err
+		return resp.StatusCode, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("github api failed: status %d: %s", resp.StatusCode, string(b))
+		return resp.StatusCode, fmt.Errorf("github api failed: status %d: %s", resp.StatusCode, string(b))
 	}
 	if out == nil {
-		return nil
+		return resp.StatusCode, nil
 	}
-	return json.Unmarshal(b, out)
+	return resp.StatusCode, json.Unmarshal(b, out)
 }
 
 func closeBody(body io.Closer) {

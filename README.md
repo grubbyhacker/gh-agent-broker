@@ -169,6 +169,8 @@ GET  /v1/repos/OWNER/REPO/issues/NUMBER
 GET  /v1/repos/OWNER/REPO/issues/NUMBER/comments
 POST /v1/repos/OWNER/REPO/issues
 POST /v1/repos/OWNER/REPO/issues/NUMBER/comments
+POST /v1/repos/OWNER/REPO/issues/NUMBER/labels
+DELETE /v1/repos/OWNER/REPO/issues/NUMBER/labels/LABEL
 GET  /v1/repos/OWNER/REPO/commits/SHA/status
 GET  /v1/repos/OWNER/REPO/commits/SHA/check-runs
 ```

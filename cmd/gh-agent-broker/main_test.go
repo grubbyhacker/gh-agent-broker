@@ -132,6 +132,9 @@ func TestCmdDismissReviewUsesBrokerEndpoint(t *testing.T) {
 		if body["message"] != "fixed" {
 			t.Errorf("message = %v, want fixed", body["message"])
 		}
+		if got := r.Header.Get("Idempotency-Key"); got != "pr-repair:7:abc:dismiss" {
+			t.Errorf("Idempotency-Key = %q", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if _, err := w.Write([]byte(`{"id":80,"state":"DISMISSED"}`)); err != nil {
 			t.Errorf("write response: %v", err)
@@ -139,7 +142,7 @@ func TestCmdDismissReviewUsesBrokerEndpoint(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	cmdDismissReview([]string{"-broker", server.URL, "-repo", "owner/repo", "-number", "7", "-review-id", "80", "-message", "fixed"})
+	cmdDismissReview([]string{"-broker", server.URL, "-repo", "owner/repo", "-number", "7", "-review-id", "80", "-message", "fixed", "-idempotency-key", "pr-repair:7:abc:dismiss"})
 
 	if !sawDismiss {
 		t.Fatal("dismiss endpoint was not called")
@@ -170,6 +173,9 @@ func TestCmdResolveReviewThreadUsesBrokerEndpoint(t *testing.T) {
 		if body["message"] != "fixed" {
 			t.Errorf("message = %v, want fixed", body["message"])
 		}
+		if got := r.Header.Get("Idempotency-Key"); got != "pr-repair:7:abc:resolve" {
+			t.Errorf("Idempotency-Key = %q", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if _, err := w.Write([]byte(`{"id":"PRRT_test_thread","is_resolved":true}`)); err != nil {
 			t.Errorf("write response: %v", err)
@@ -177,10 +183,58 @@ func TestCmdResolveReviewThreadUsesBrokerEndpoint(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	cmdResolveReviewThread([]string{"-broker", server.URL, "-repo", "owner/repo", "-number", "7", "-thread-id", "PRRT_test_thread", "-message", "fixed"})
+	cmdResolveReviewThread([]string{"-broker", server.URL, "-repo", "owner/repo", "-number", "7", "-thread-id", "PRRT_test_thread", "-message", "fixed", "-idempotency-key", "pr-repair:7:abc:resolve"})
 
 	if !sawResolve {
 		t.Fatal("resolve endpoint was not called")
+	}
+}
+
+func TestCmdLabelMutationsUseBrokerEndpoints(t *testing.T) {
+	t.Setenv("BROKER_AGENT_ID", "agent-1")
+	t.Setenv("BROKER_AGENT_SECRET", "agent-secret")
+
+	var sawAdd, sawRemove bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "agent-1" || pass != "agent-secret" {
+			t.Errorf("BasicAuth = %q/%q/%v, want agent credentials", user, pass, ok)
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/repos/owner/repo/issues/7/labels":
+			sawAdd = true
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode body: %v", err)
+			}
+			if len(body.Labels) != 1 || body.Labels[0] != "ym-curator: waiting-review" {
+				t.Errorf("labels = %v", body.Labels)
+			}
+			if got := r.Header.Get("Idempotency-Key"); got != "pr-repair:7:abc:add-label" {
+				t.Errorf("Idempotency-Key = %q", got)
+			}
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/repos/owner/repo/issues/7/labels/ym-curator: needs work":
+			sawRemove = true
+			if got := r.Header.Get("Idempotency-Key"); got != "pr-repair:7:abc:remove-label" {
+				t.Errorf("Idempotency-Key = %q", got)
+			}
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"labels":["ym-curator: waiting-review"]}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	cmdAddLabel([]string{"-broker", server.URL, "-repo", "owner/repo", "-issue", "7", "-label", "ym-curator: waiting-review", "-idempotency-key", "pr-repair:7:abc:add-label"})
+	cmdRemoveLabel([]string{"-broker", server.URL, "-repo", "owner/repo", "-issue", "7", "-label", "ym-curator: needs work", "-idempotency-key", "pr-repair:7:abc:remove-label"})
+
+	if !sawAdd || !sawRemove {
+		t.Fatalf("label endpoints called add=%v remove=%v", sawAdd, sawRemove)
 	}
 }
 

@@ -83,6 +83,8 @@ func TestOperationsDocumentsV1RESTRoutes(t *testing.T) {
 		"pull.review_thread.resolve": "PUT /v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve",
 		"issue.create":               "POST /v1/repos/{owner}/{repo}/issues",
 		"issue.comment":              "POST /v1/repos/{owner}/{repo}/issues/{number}/comments",
+		"issue.label.add":            "POST /v1/repos/{owner}/{repo}/issues/{number}/labels",
+		"issue.label.remove":         "DELETE /v1/repos/{owner}/{repo}/issues/{number}/labels/{label}",
 		"policy.dry-run":             "POST /v1/policy/dry-run",
 	}
 	for _, op := range out.Operations {
@@ -207,7 +209,7 @@ func TestOpenAPIIncludesRequestSchemas(t *testing.T) {
 	}
 	components := objectAt(t, out, "components")
 	schemas := objectAt(t, components, "schemas")
-	for _, name := range []string{"DryRunRequest", "DryRunResponse", "PullCreateRequest", "CommentCreateRequest", "PullReviewDismissRequest", "PullReviewThreadResolveRequest", "ErrorResponse"} {
+	for _, name := range []string{"DryRunRequest", "DryRunResponse", "PullCreateRequest", "CommentCreateRequest", "IssueLabelsRequest", "PullReviewDismissRequest", "PullReviewThreadResolveRequest", "ErrorResponse"} {
 		if _, ok := schemas[name]; !ok {
 			t.Fatalf("missing schema %s", name)
 		}
@@ -227,6 +229,15 @@ func TestOpenAPIIncludesRequestSchemas(t *testing.T) {
 	put = objectAt(t, resolve, "put")
 	if _, ok := put["requestBody"]; !ok {
 		t.Fatalf("pull.review_thread.resolve missing requestBody")
+	}
+	labels := objectAt(t, paths, "/v1/repos/{owner}/{repo}/issues/{number}/labels")
+	post = objectAt(t, labels, "post")
+	if _, ok := post["requestBody"]; !ok {
+		t.Fatalf("issue.label.add missing requestBody")
+	}
+	labelRemove := objectAt(t, paths, "/v1/repos/{owner}/{repo}/issues/{number}/labels/{label}")
+	if _, ok := labelRemove["delete"]; !ok {
+		t.Fatalf("issue.label.remove missing delete operation")
 	}
 }
 
