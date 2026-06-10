@@ -15,6 +15,7 @@ type Config struct {
 	Audit          AuditConfig          `yaml:"audit"`
 	GitHub         GitHubConfig         `yaml:"github"`
 	MutationLimits MutationLimitsConfig `yaml:"mutation_limits"`
+	Idempotency    IdempotencyConfig    `yaml:"idempotency"`
 	Agents         []Agent              `yaml:"agents"`
 }
 
@@ -50,6 +51,10 @@ type MutationLimitsConfig struct {
 	MaxNewObjectsPerRun int               `yaml:"max_new_objects_per_run"`
 	ClassLimits         map[string]int    `yaml:"class_limits"`
 	OperationClasses    map[string]string `yaml:"operation_classes"`
+}
+
+type IdempotencyConfig struct {
+	StatePath string `yaml:"state_path"`
 }
 
 type Agent struct {

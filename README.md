@@ -161,12 +161,16 @@ GET  /v1/repos/OWNER/REPO/pulls/NUMBER/comments
 GET  /v1/repos/OWNER/REPO/pulls/NUMBER/reviews
 GET  /v1/repos/OWNER/REPO/pulls/NUMBER/review-comments
 GET  /v1/repos/OWNER/REPO/pulls/NUMBER/review-threads
+PUT  /v1/repos/OWNER/REPO/pulls/NUMBER/reviews/REVIEW_ID/dismissal
+PUT  /v1/repos/OWNER/REPO/pulls/NUMBER/review-threads/THREAD_ID/resolve
 POST /v1/repos/OWNER/REPO/pulls
 GET  /v1/repos/OWNER/REPO/issues
 GET  /v1/repos/OWNER/REPO/issues/NUMBER
 GET  /v1/repos/OWNER/REPO/issues/NUMBER/comments
 POST /v1/repos/OWNER/REPO/issues
 POST /v1/repos/OWNER/REPO/issues/NUMBER/comments
+POST /v1/repos/OWNER/REPO/issues/NUMBER/labels
+DELETE /v1/repos/OWNER/REPO/issues/NUMBER/labels/LABEL
 GET  /v1/repos/OWNER/REPO/commits/SHA/status
 GET  /v1/repos/OWNER/REPO/commits/SHA/check-runs
 ```

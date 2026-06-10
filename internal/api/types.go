@@ -74,11 +74,30 @@ type IssueCreateRequest struct {
 	Permissions []string `json:"permissions,omitempty"`
 }
 
+type IssueLabelsRequest struct {
+	Labels      []string `json:"labels"`
+	Metadata    Metadata `json:"metadata,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
+}
+
+type PullReviewDismissRequest struct {
+	Message     string   `json:"message"`
+	Metadata    Metadata `json:"metadata,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
+}
+
+type PullReviewThreadResolveRequest struct {
+	Message     string   `json:"message"`
+	Metadata    Metadata `json:"metadata,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
+}
+
 type GitHubResult struct {
-	URL     string `json:"url,omitempty"`
-	HTMLURL string `json:"html_url,omitempty"`
-	Number  int    `json:"number,omitempty"`
-	ID      int64  `json:"id,omitempty"`
+	URL       string `json:"url,omitempty"`
+	HTMLURL   string `json:"html_url,omitempty"`
+	Number    int    `json:"number,omitempty"`
+	ID        int64  `json:"id,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 type PullSummary struct {
@@ -135,32 +154,48 @@ type IssueComment struct {
 	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
+type UserRef struct {
+	Login string `json:"login,omitempty"`
+}
+
 type PullReview struct {
-	ID          int64  `json:"id"`
-	State       string `json:"state"`
-	Body        string `json:"body,omitempty"`
-	Author      string `json:"author,omitempty"`
-	CommitID    string `json:"commit_id,omitempty"`
-	SubmittedAt string `json:"submitted_at,omitempty"`
-	HTMLURL     string `json:"html_url,omitempty"`
+	ID          string   `json:"id,omitempty"`
+	DatabaseID  int64    `json:"database_id,omitempty"`
+	State       string   `json:"state"`
+	Body        string   `json:"body,omitempty"`
+	Author      *UserRef `json:"author,omitempty"`
+	CommitID    string   `json:"commit_id,omitempty"`
+	SubmittedAt string   `json:"submitted_at,omitempty"`
+	HTMLURL     string   `json:"html_url,omitempty"`
 }
 
 type PullReviewComment struct {
-	ID        int64  `json:"id"`
-	Body      string `json:"body,omitempty"`
-	Author    string `json:"author,omitempty"`
-	Path      string `json:"path,omitempty"`
-	CommitID  string `json:"commit_id,omitempty"`
-	HTMLURL   string `json:"html_url,omitempty"`
-	CreatedAt string `json:"created_at,omitempty"`
-	UpdatedAt string `json:"updated_at,omitempty"`
+	ID         string   `json:"id,omitempty"`
+	DatabaseID int64    `json:"database_id,omitempty"`
+	Body       string   `json:"body,omitempty"`
+	Author     *UserRef `json:"author,omitempty"`
+	Path       string   `json:"path,omitempty"`
+	Line       int      `json:"line,omitempty"`
+	CommitID   string   `json:"commit_id,omitempty"`
+	HTMLURL    string   `json:"html_url,omitempty"`
+	CreatedAt  string   `json:"created_at,omitempty"`
+	UpdatedAt  string   `json:"updated_at,omitempty"`
 }
 
 type PullReviewThread struct {
 	ID                       string              `json:"id"`
+	DatabaseID               int64               `json:"database_id,omitempty"`
 	IsResolved               *bool               `json:"is_resolved,omitempty"`
 	UnresolvedStateAvailable bool                `json:"unresolved_state_available"`
+	Resolvable               bool                `json:"resolvable"`
+	Path                     string              `json:"path,omitempty"`
+	Line                     int                 `json:"line,omitempty"`
 	Comments                 []PullReviewComment `json:"comments,omitempty"`
+}
+
+type PullReviewThreadResolveResult struct {
+	ID         string `json:"id"`
+	IsResolved bool   `json:"is_resolved"`
 }
 
 type CommitStatus struct {

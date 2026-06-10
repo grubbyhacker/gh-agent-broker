@@ -70,6 +70,14 @@ func main() {
 		cmdPullSubresource(os.Args[2:], "pull-review-comments", "review-comments")
 	case "pull-review-threads":
 		cmdPullSubresource(os.Args[2:], "pull-review-threads", "review-threads")
+	case "dismiss-review":
+		cmdDismissReview(os.Args[2:])
+	case "resolve-review-thread":
+		cmdResolveReviewThread(os.Args[2:])
+	case "add-label":
+		cmdAddLabel(os.Args[2:])
+	case "remove-label":
+		cmdRemoveLabel(os.Args[2:])
 	case "issues":
 		cmdIssues(os.Args[2:])
 	case "issue":
@@ -89,7 +97,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|issues|issue|issue-comments|commit-status|check-runs|comment> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|dismiss-review|resolve-review-thread|add-label|remove-label|issues|issue|issue-comments|commit-status|check-runs|comment> [flags]")
 }
 
 func commonFlags(fs *flag.FlagSet) (broker, agentID, secret *string) {
@@ -288,6 +296,7 @@ func cmdComment(args []string) {
 	repo := fs.String("repo", "", "owner/repo")
 	issue := fs.String("issue", "", "issue or PR number")
 	bodyText := fs.String("body", "", "comment body")
+	idempotencyKey := fs.String("idempotency-key", "", "optional Idempotency-Key header")
 	var md metadataFlag
 	fs.Var(&md, "metadata", "metadata key=value, repeatable")
 	if err := fs.Parse(args); err != nil {
@@ -295,7 +304,7 @@ func cmdComment(args []string) {
 	}
 	resolveSecret(secret)
 	body := map[string]interface{}{"body": *bodyText, "metadata": map[string]string(md)}
-	doRequest(http.MethodPost, *broker, "/v1/repos/"+*repo+"/issues/"+*issue+"/comments", *agentID, *secret, body)
+	doRequestWithHeaders(http.MethodPost, *broker, "/v1/repos/"+*repo+"/issues/"+*issue+"/comments", *agentID, *secret, body, idempotencyHeaders(*idempotencyKey))
 }
 
 func cmdPulls(args []string) {
@@ -335,6 +344,76 @@ func cmdPullSubresource(args []string, name, resource string) {
 	}
 	resolveSecret(secret)
 	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/pulls/"+*number+"/"+resource, *agentID, *secret, nil)
+}
+
+func cmdDismissReview(args []string) {
+	fs := flag.NewFlagSet("dismiss-review", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	number := fs.String("number", "", "pull request number")
+	reviewID := fs.String("review-id", "", "pull request review ID")
+	message := fs.String("message", "", "dismissal message")
+	idempotencyKey := fs.String("idempotency-key", "", "optional Idempotency-Key header")
+	var md metadataFlag
+	fs.Var(&md, "metadata", "metadata key=value, repeatable")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	body := map[string]interface{}{"message": *message, "metadata": map[string]string(md)}
+	path := "/v1/repos/" + *repo + "/pulls/" + *number + "/reviews/" + *reviewID + "/dismissal"
+	doRequestWithHeaders(http.MethodPut, *broker, path, *agentID, *secret, body, idempotencyHeaders(*idempotencyKey))
+}
+
+func cmdResolveReviewThread(args []string) {
+	fs := flag.NewFlagSet("resolve-review-thread", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	number := fs.String("number", "", "pull request number")
+	threadID := fs.String("thread-id", "", "GraphQL review thread node ID")
+	message := fs.String("message", "", "resolution message for broker audit")
+	idempotencyKey := fs.String("idempotency-key", "", "optional Idempotency-Key header")
+	var md metadataFlag
+	fs.Var(&md, "metadata", "metadata key=value, repeatable")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	body := map[string]interface{}{"message": *message, "metadata": map[string]string(md)}
+	path := "/v1/repos/" + *repo + "/pulls/" + *number + "/review-threads/" + url.PathEscape(*threadID) + "/resolve"
+	doRequestWithHeaders(http.MethodPut, *broker, path, *agentID, *secret, body, idempotencyHeaders(*idempotencyKey))
+}
+
+func cmdAddLabel(args []string) {
+	fs := flag.NewFlagSet("add-label", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	issue := fs.String("issue", "", "issue or PR number")
+	label := fs.String("label", "", "label to add")
+	idempotencyKey := fs.String("idempotency-key", "", "optional Idempotency-Key header")
+	var md metadataFlag
+	fs.Var(&md, "metadata", "metadata key=value, repeatable")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	body := map[string]interface{}{"labels": []string{*label}, "metadata": map[string]string(md)}
+	doRequestWithHeaders(http.MethodPost, *broker, "/v1/repos/"+*repo+"/issues/"+*issue+"/labels", *agentID, *secret, body, idempotencyHeaders(*idempotencyKey))
+}
+
+func cmdRemoveLabel(args []string) {
+	fs := flag.NewFlagSet("remove-label", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	issue := fs.String("issue", "", "issue or PR number")
+	label := fs.String("label", "", "label to remove")
+	idempotencyKey := fs.String("idempotency-key", "", "optional Idempotency-Key header")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	path := "/v1/repos/" + *repo + "/issues/" + *issue + "/labels/" + url.PathEscape(*label)
+	doRequestWithHeaders(http.MethodDelete, *broker, path, *agentID, *secret, nil, idempotencyHeaders(*idempotencyKey))
 }
 
 func cmdIssues(args []string) {
@@ -420,6 +499,10 @@ func urlQueryEscape(value string) string {
 }
 
 func doRequest(method, broker, path, agentID, secret string, body interface{}) {
+	doRequestWithHeaders(method, broker, path, agentID, secret, body, nil)
+}
+
+func doRequestWithHeaders(method, broker, path, agentID, secret string, body interface{}, headers map[string]string) {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -438,6 +521,11 @@ func doRequest(method, broker, path, agentID, secret string, body interface{}) {
 	if agentID != "" || secret != "" {
 		req.SetBasicAuth(agentID, secret)
 	}
+	for key, value := range headers {
+		if value != "" {
+			req.Header.Set(key, value)
+		}
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fatal(err)
@@ -452,6 +540,13 @@ func doRequest(method, broker, path, agentID, secret string, body interface{}) {
 		os.Exit(1)
 	}
 	fmt.Println(string(b))
+}
+
+func idempotencyHeaders(key string) map[string]string {
+	if key == "" {
+		return nil
+	}
+	return map[string]string{"Idempotency-Key": key}
 }
 
 func envDefault(key, fallback string) string {

@@ -39,6 +39,9 @@ mutation_limits:
     upload: 2
     feedback: 2
 
+idempotency:
+  state_path: "/var/log/gh-agent-broker/idempotency.json"
+
 agents:
   - id: "hermes-agent-01"
     enabled: true
@@ -131,7 +134,11 @@ agents:
       - "pull.read"
       - "pull.files.read"
       - "pull.reviews.read"
+      - "pull.review.dismiss"
+      - "pull.review_thread.resolve"
       - "issue.comment"
+      - "issue.label.add"
+      - "issue.label.remove"
       - "issue.read"
       - "issue.comments.read"
       - "status.read"
@@ -180,5 +187,5 @@ agents:
 # GitHub App repository permissions required for this example:
 # - coder app: Contents read/write, Pull requests read/write, Issues read/write
 # - reporter app: Issues read/write only
-# - YKM Curator app: Contents read/write, Pull requests read/write, Issues read, Checks read, Commit statuses read
+# - YKM Curator app: Contents read/write, Pull requests read/write, Issues read/write, Checks read, Commit statuses read
 # - Metadata: Read-only, automatically required by GitHub
