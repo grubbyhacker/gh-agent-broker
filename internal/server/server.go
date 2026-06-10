@@ -172,7 +172,23 @@ func handleOperations(w http.ResponseWriter, r *http.Request) {
 				"method":      http.MethodGet,
 				"path":        "/v1/repos/{owner}/{repo}/pulls/{number}/reviews",
 				"auth":        "agent",
-				"description": "List pull request reviews, review comments, or review thread approximations.",
+				"description": "List pull request reviews, review comments, or review threads.",
+			},
+			{
+				"name":        "pull.review.dismiss",
+				"method":      http.MethodPut,
+				"path":        "/v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal",
+				"auth":        "agent",
+				"description": "Dismiss a pull request review through the broker.",
+				"metadata":    "send configured metadata fields in request body metadata",
+			},
+			{
+				"name":        "pull.review_thread.resolve",
+				"method":      http.MethodPut,
+				"path":        "/v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve",
+				"auth":        "agent",
+				"description": "Resolve a pull request review thread through the broker.",
+				"metadata":    "send configured metadata fields in request body metadata",
 			},
 			{
 				"name":        "issue.comment",
@@ -271,6 +287,8 @@ Operations:
 - GET  /v1/repos/{owner}/{repo}/pulls/{number}/reviews
 - GET  /v1/repos/{owner}/{repo}/pulls/{number}/review-comments
 - GET  /v1/repos/{owner}/{repo}/pulls/{number}/review-threads
+- PUT  /v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal
+- PUT  /v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve
 - POST /v1/repos/{owner}/{repo}/pulls
 - GET  /v1/repos/{owner}/{repo}/issues
 - GET  /v1/repos/{owner}/{repo}/issues/{number}
@@ -455,6 +473,24 @@ func openAPISpec() map[string]interface{} {
 						},
 					},
 				},
+				"PullReviewDismissRequest": map[string]interface{}{
+					"type":     "object",
+					"required": []string{"message"},
+					"properties": map[string]interface{}{
+						"message":     map[string]string{"type": "string"},
+						"metadata":    map[string]interface{}{"$ref": "#/components/schemas/Metadata"},
+						"permissions": map[string]interface{}{"type": "array", "items": map[string]string{"type": "string"}},
+					},
+				},
+				"PullReviewThreadResolveRequest": map[string]interface{}{
+					"type":     "object",
+					"required": []string{"message"},
+					"properties": map[string]interface{}{
+						"message":     map[string]string{"type": "string"},
+						"metadata":    map[string]interface{}{"$ref": "#/components/schemas/Metadata"},
+						"permissions": map[string]interface{}{"type": "array", "items": map[string]string{"type": "string"}},
+					},
+				},
 				"GitHubResult": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -537,6 +573,34 @@ func openAPISpec() map[string]interface{} {
 					"requestBody": jsonRequestRef("#/components/schemas/IssueCreateRequest"),
 					"responses": map[string]interface{}{
 						"201": map[string]interface{}{"description": "issue created", "content": jsonContentRef("#/components/schemas/GitHubResult")},
+						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
+					},
+				},
+			},
+			"/v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal": map[string]interface{}{
+				"put": map[string]interface{}{
+					"summary": "Dismiss pull request review",
+					"parameters": append(repoPathParams(),
+						map[string]interface{}{"name": "number", "in": "path", "required": true, "schema": map[string]string{"type": "integer"}},
+						map[string]interface{}{"name": "review_id", "in": "path", "required": true, "schema": map[string]string{"type": "integer"}},
+					),
+					"requestBody": jsonRequestRef("#/components/schemas/PullReviewDismissRequest"),
+					"responses": map[string]interface{}{
+						"200": map[string]interface{}{"description": "review dismissed"},
+						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
+					},
+				},
+			},
+			"/v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve": map[string]interface{}{
+				"put": map[string]interface{}{
+					"summary": "Resolve pull request review thread",
+					"parameters": append(repoPathParams(),
+						map[string]interface{}{"name": "number", "in": "path", "required": true, "schema": map[string]string{"type": "integer"}},
+						map[string]interface{}{"name": "thread_id", "in": "path", "required": true, "schema": map[string]string{"type": "string"}},
+					),
+					"requestBody": jsonRequestRef("#/components/schemas/PullReviewThreadResolveRequest"),
+					"responses": map[string]interface{}{
+						"200": map[string]interface{}{"description": "thread resolved"},
 						"403": map[string]interface{}{"description": "denied", "content": jsonContentRef("#/components/schemas/ErrorResponse")},
 					},
 				},
@@ -675,6 +739,10 @@ func (s *Server) handleRepoAPI(w http.ResponseWriter, r *http.Request) {
 		s.handlePullReviewComments(w, r, repo, parts[3])
 	case len(parts) == 5 && parts[2] == "pulls" && parts[4] == "review-threads" && r.Method == http.MethodGet:
 		s.handlePullReviewThreads(w, r, repo, parts[3])
+	case len(parts) == 7 && parts[2] == "pulls" && parts[4] == "reviews" && parts[6] == "dismissal" && r.Method == http.MethodPut:
+		s.handlePullReviewDismiss(w, r, repo, parts[3], parts[5])
+	case len(parts) == 7 && parts[2] == "pulls" && parts[4] == "review-threads" && parts[6] == "resolve" && r.Method == http.MethodPut:
+		s.handlePullReviewThreadResolve(w, r, repo, parts[3], parts[5])
 	case len(parts) == 3 && parts[2] == "issues" && r.Method == http.MethodPost:
 		s.handleIssueCreate(w, r, repo)
 	case len(parts) == 3 && parts[2] == "issues" && r.Method == http.MethodGet:
@@ -782,6 +850,120 @@ func (s *Server) handlePullReviewThreads(w http.ResponseWriter, r *http.Request,
 	})
 }
 
+func (s *Server) handlePullReviewDismiss(w http.ResponseWriter, r *http.Request, repo, rawNumber, rawReviewID string) {
+	opID := ids.NewOperationID()
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	reviewID, ok := parsePositiveInt64(w, rawReviewID)
+	if !ok {
+		return
+	}
+	cfg, gh := s.snapshot()
+	principal, ok := auth.AuthenticateAgent(r, cfg)
+	if !ok {
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	var req api.PullReviewDismissRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_json", Message: err.Error(), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "message is required", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
+		return
+	}
+	result := policy.Check(policy.Request{
+		Agent:       principal.Agent,
+		AgentID:     principal.ID,
+		Repo:        repo,
+		Operation:   "pull.review.dismiss",
+		Permissions: req.Permissions,
+		Metadata:    req.Metadata,
+		Locations: map[string]map[string]string{
+			"request": req.Metadata,
+		},
+	})
+	if !result.Allowed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Extra: map[string]interface{}{"pull_number": number, "review_id": reviewID}})
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull review dismissal denied by policy", &result))
+		return
+	}
+	out, err := gh.DismissPullReview(appName, repo, inst, number, reviewID, req.Message)
+	if err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: map[string]interface{}{"pull_number": number, "review_id": reviewID}})
+		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: out.HTMLURL, Result: "ok", Extra: map[string]interface{}{"pull_number": number, "review_id": reviewID}})
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handlePullReviewThreadResolve(w http.ResponseWriter, r *http.Request, repo, rawNumber, threadID string) {
+	opID := ids.NewOperationID()
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(threadID) == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "thread_id is required", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	cfg, gh := s.snapshot()
+	principal, ok := auth.AuthenticateAgent(r, cfg)
+	if !ok {
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	var req api.PullReviewThreadResolveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_json", Message: err.Error(), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "message is required", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
+		return
+	}
+	result := policy.Check(policy.Request{
+		Agent:       principal.Agent,
+		AgentID:     principal.ID,
+		Repo:        repo,
+		Operation:   "pull.review_thread.resolve",
+		Permissions: req.Permissions,
+		Metadata:    req.Metadata,
+		Locations: map[string]map[string]string{
+			"request": req.Metadata,
+		},
+	})
+	if !result.Allowed {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Extra: map[string]interface{}{"pull_number": number, "thread_id": threadID}})
+		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull review thread resolution denied by policy", &result))
+		return
+	}
+	out, err := gh.ResolvePullReviewThread(appName, inst, threadID)
+	if err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: map[string]interface{}{"pull_number": number, "thread_id": threadID}})
+		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "ok", Extra: map[string]interface{}{"pull_number": number, "thread_id": threadID, "resolved": out.IsResolved}})
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) handleIssueList(w http.ResponseWriter, r *http.Request, repo string) {
 	s.withReadAccess(w, r, repo, "issue.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
 		issues, err := gh.ListIssues(appName, repo, inst, githubListQuery(r, []string{"state", "labels", "assignee", "creator", "mentioned", "since", "sort", "direction"}))
@@ -865,6 +1047,15 @@ func (s *Server) withReadAccess(w http.ResponseWriter, r *http.Request, repo, op
 
 func parsePositiveInt(w http.ResponseWriter, raw string) (int, bool) {
 	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "number must be a positive integer", Decision: policy.DecisionDeny})
+		return 0, false
+	}
+	return n, true
+}
+
+func parsePositiveInt64(w http.ResponseWriter, raw string) (int64, bool) {
+	n, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || n < 1 {
 		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "number must be a positive integer", Decision: policy.DecisionDeny})
 		return 0, false

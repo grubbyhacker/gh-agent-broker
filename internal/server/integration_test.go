@@ -23,7 +23,7 @@ import (
 )
 
 func TestFakeGitHubRESTIntegration(t *testing.T) {
-	var sawProbe, sawPull, sawIssue, sawComment bool
+	var sawProbe, sawPull, sawIssue, sawComment, sawDismiss, sawResolve bool
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
@@ -54,6 +54,28 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 				t.Fatalf("comment body missing broker metadata: %s", body)
 			}
 			writeTestJSON(t, w, map[string]interface{}{"id": 3003, "url": "https://api.fake/comments/1", "html_url": "https://fake/owner/repo/pull/7#issuecomment-1"})
+		case r.Method == http.MethodPut && r.URL.Path == "/repos/owner/repo/pulls/7/reviews/80/dismissals":
+			requireBearer(t, r)
+			sawDismiss = true
+			body := readBody(t, r)
+			if !strings.Contains(body, `"message":"fixed requested changes"`) {
+				t.Fatalf("dismiss body missing message: %s", body)
+			}
+			writeTestJSON(t, w, map[string]interface{}{"id": 80, "state": "DISMISSED", "body": "review body", "user": map[string]string{"login": "roger"}, "html_url": "https://fake/owner/repo/pull/7#pullrequestreview-80"})
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			requireBearer(t, r)
+			body := readBody(t, r)
+			if !strings.Contains(body, "resolveReviewThread") || !strings.Contains(body, "PRRT_test_thread") {
+				t.Fatalf("graphql body missing resolve mutation/thread id: %s", body)
+			}
+			sawResolve = true
+			writeTestJSON(t, w, map[string]interface{}{
+				"data": map[string]interface{}{
+					"resolveReviewThread": map[string]interface{}{
+						"thread": map[string]interface{}{"id": "PRRT_test_thread", "isResolved": true},
+					},
+				},
+			})
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues":
 			requireBearer(t, r)
 			sawIssue = true
@@ -73,7 +95,7 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 		Enabled:      true,
 		Secret:       "agent-secret",
 		Repositories: []string{"owner/repo"},
-		Operations:   []string{"repo.probe", "pull.create", "issue.comment", "issue.create"},
+		Operations:   []string{"repo.probe", "pull.create", "pull.review.dismiss", "pull.review_thread.resolve", "issue.comment", "issue.create"},
 		BaseBranches: []string{"main"},
 		BranchPatterns: []string{
 			"^agent/agent-1/.+$",
@@ -98,6 +120,18 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 	})
 	assertStatus(t, resp, http.StatusCreated)
 
+	resp = brokerRequest(t, broker, http.MethodPut, "/v1/repos/owner/repo/pulls/7/reviews/80/dismissal", map[string]interface{}{
+		"message":  "fixed requested changes",
+		"metadata": map[string]string{"Agent-Id": "agent-1"},
+	})
+	assertStatus(t, resp, http.StatusOK)
+
+	resp = brokerRequest(t, broker, http.MethodPut, "/v1/repos/owner/repo/pulls/7/review-threads/PRRT_test_thread/resolve", map[string]interface{}{
+		"message":  "fixed requested thread",
+		"metadata": map[string]string{"Agent-Id": "agent-1"},
+	})
+	assertStatus(t, resp, http.StatusOK)
+
 	resp = brokerRequest(t, broker, http.MethodPost, "/v1/repos/owner/repo/issues", map[string]interface{}{
 		"title":    "bug report",
 		"body":     "observed behavior",
@@ -106,8 +140,8 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 	})
 	assertStatus(t, resp, http.StatusCreated)
 
-	if !sawProbe || !sawPull || !sawIssue || !sawComment {
-		t.Fatalf("fake REST handlers were not all exercised: probe=%v pull=%v issue=%v comment=%v", sawProbe, sawPull, sawIssue, sawComment)
+	if !sawProbe || !sawPull || !sawIssue || !sawComment || !sawDismiss || !sawResolve {
+		t.Fatalf("fake REST handlers were not all exercised: probe=%v pull=%v issue=%v comment=%v dismiss=%v resolve=%v", sawProbe, sawPull, sawIssue, sawComment, sawDismiss, sawResolve)
 	}
 }
 
@@ -135,6 +169,37 @@ func TestFakeGitHubReadRESTIntegration(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/5/files":
 			requireBearer(t, r)
 			writeTestJSON(t, w, []map[string]interface{}{{"filename": "note.md", "status": "added", "changes": 3}})
+		case r.Method == http.MethodPost && r.URL.Path == "/graphql":
+			requireBearer(t, r)
+			body := readBody(t, r)
+			if !strings.Contains(body, "reviewThreads") {
+				t.Fatalf("graphql body missing reviewThreads query: %s", body)
+			}
+			writeTestJSON(t, w, map[string]interface{}{
+				"data": map[string]interface{}{
+					"repository": map[string]interface{}{
+						"pullRequest": map[string]interface{}{
+							"reviewThreads": map[string]interface{}{
+								"nodes": []map[string]interface{}{{
+									"id":         "PRRT_test_thread",
+									"isResolved": false,
+									"comments": map[string]interface{}{
+										"nodes": []map[string]interface{}{{
+											"databaseId": float64(22),
+											"body":       "please fix",
+											"author":     map[string]string{"login": "roger"},
+											"path":       "note.md",
+											"url":        "https://fake/owner/repo/pull/5#discussion_r22",
+											"createdAt":  "2026-06-10T00:00:00Z",
+											"updatedAt":  "2026-06-10T00:00:00Z",
+										}},
+									},
+								}},
+							},
+						},
+					},
+				},
+			})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/5/comments":
 			requireBearer(t, r)
 			writeTestJSON(t, w, []map[string]interface{}{{"id": 9, "body": "reviewed", "user": map[string]string{"login": "roger"}}})
@@ -158,7 +223,7 @@ func TestFakeGitHubReadRESTIntegration(t *testing.T) {
 		Enabled:      true,
 		Secret:       "agent-secret",
 		Repositories: []string{"owner/repo"},
-		Operations:   []string{"pull.read", "pull.files.read", "issue.comments.read", "issue.read", "status.read", "checks.read"},
+		Operations:   []string{"pull.read", "pull.files.read", "pull.reviews.read", "issue.comments.read", "issue.read", "status.read", "checks.read"},
 	})
 
 	resp := brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls?body_marker=YKM-Curator-Run", nil)
@@ -167,10 +232,57 @@ func TestFakeGitHubReadRESTIntegration(t *testing.T) {
 		t.Fatalf("pull marker filter failed: %s", got)
 	}
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls/5/files", nil), http.StatusOK)
+	resp = brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls/5/review-threads", nil)
+	assertStatus(t, resp, http.StatusOK)
+	if got := resp.Body.String(); !strings.Contains(got, `"id":"PRRT_test_thread"`) || !strings.Contains(got, `"resolvable":true`) {
+		t.Fatalf("review threads missing graphql thread id/resolvable marker: %s", got)
+	}
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/pulls/5/comments", nil), http.StatusOK)
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/issues?body_marker=ykm/test", nil), http.StatusOK)
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/commits/abc/status", nil), http.StatusOK)
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/commits/abc/check-runs", nil), http.StatusOK)
+}
+
+func TestPullReviewWriteDenials(t *testing.T) {
+	broker := newTestBroker(t, "https://github.invalid", "https://github.invalid", config.Agent{
+		ID:           "agent-1",
+		Enabled:      true,
+		Secret:       "agent-secret",
+		Repositories: []string{"owner/repo"},
+		Operations:   []string{"pull.reviews.read"},
+	})
+
+	resp := brokerRequest(t, broker, http.MethodPut, "/v1/repos/owner/repo/pulls/7/reviews/80/dismissal", map[string]interface{}{
+		"message": "",
+	})
+	assertStatus(t, resp, http.StatusBadRequest)
+	if !strings.Contains(resp.Body.String(), "message is required") {
+		t.Fatalf("missing message response = %s", resp.Body.String())
+	}
+
+	resp = brokerRequest(t, broker, http.MethodPut, "/v1/repos/owner/repo/pulls/7/reviews/80/dismissal", map[string]interface{}{
+		"message": "fixed",
+	})
+	assertStatus(t, resp, http.StatusForbidden)
+	if !strings.Contains(resp.Body.String(), "pull.review.dismiss") {
+		t.Fatalf("policy denial should mention operation: %s", resp.Body.String())
+	}
+
+	resp = brokerRequest(t, broker, http.MethodPut, "/v1/repos/owner/repo/pulls/7/review-threads/PRRT_test_thread/resolve", map[string]interface{}{
+		"message": "",
+	})
+	assertStatus(t, resp, http.StatusBadRequest)
+	if !strings.Contains(resp.Body.String(), "message is required") {
+		t.Fatalf("missing message response = %s", resp.Body.String())
+	}
+
+	resp = brokerRequest(t, broker, http.MethodPut, "/v1/repos/owner/repo/pulls/7/review-threads/PRRT_test_thread/resolve", map[string]interface{}{
+		"message": "fixed",
+	})
+	assertStatus(t, resp, http.StatusForbidden)
+	if !strings.Contains(resp.Body.String(), "pull.review_thread.resolve") {
+		t.Fatalf("policy denial should mention operation: %s", resp.Body.String())
+	}
 }
 
 func TestFakeGitSmartHTTPIntegration(t *testing.T) {

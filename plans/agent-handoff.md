@@ -4,6 +4,27 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current PR review resolution implementation:
+
+- Current branch `feature/pr-review-resolution` adds broker support for
+  dismissing PR reviews and resolving PR review threads without exposing GitHub
+  credentials to agents.
+- New deny-by-default operations are `pull.review.dismiss` and
+  `pull.review_thread.resolve`. The Curator example agent in
+  `configs/production.example.yaml` grants both because it already has
+  `pull_requests:write`; other agents remain unchanged.
+- New broker routes are
+  `PUT /v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal`
+  and
+  `PUT /v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve`.
+  Both require JSON `message` and optional `metadata`/`permissions`.
+- Review dismissal uses GitHub REST. Thread resolution uses GitHub GraphQL, and
+  review-thread listing now prefers GraphQL thread node IDs with `resolvable:
+  true`, while preserving the existing REST-comment fallback as non-resolvable.
+- New CLI commands are `dismiss-review` and `resolve-review-thread`.
+- Latest verification passed: `go test ./internal/server ./cmd/gh-agent-broker
+  ./internal/githubapp`, `git diff --check`, and `mise exec -- make check`.
+
 Current Codex-compatible proxy surface implementation:
 
 - Current hotfix branch `hotfix/codex-budget-double-count` fixes proxy budget

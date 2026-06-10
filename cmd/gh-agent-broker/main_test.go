@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"net/http"
 	"net/http/httptest"
@@ -104,6 +105,82 @@ func TestCmdWhoamiUsesAuthenticatedWhoamiEndpoint(t *testing.T) {
 
 	if !sawWhoami {
 		t.Fatal("whoami endpoint was not called")
+	}
+}
+
+func TestCmdDismissReviewUsesBrokerEndpoint(t *testing.T) {
+	t.Setenv("BROKER_AGENT_ID", "agent-1")
+	t.Setenv("BROKER_AGENT_SECRET", "agent-secret")
+
+	var sawDismiss bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawDismiss = true
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %q, want PUT", r.Method)
+		}
+		if r.URL.Path != "/v1/repos/owner/repo/pulls/7/reviews/80/dismissal" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "agent-1" || pass != "agent-secret" {
+			t.Errorf("BasicAuth = %q/%q/%v, want agent credentials", user, pass, ok)
+		}
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		if body["message"] != "fixed" {
+			t.Errorf("message = %v, want fixed", body["message"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"id":80,"state":"DISMISSED"}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	cmdDismissReview([]string{"-broker", server.URL, "-repo", "owner/repo", "-number", "7", "-review-id", "80", "-message", "fixed"})
+
+	if !sawDismiss {
+		t.Fatal("dismiss endpoint was not called")
+	}
+}
+
+func TestCmdResolveReviewThreadUsesBrokerEndpoint(t *testing.T) {
+	t.Setenv("BROKER_AGENT_ID", "agent-1")
+	t.Setenv("BROKER_AGENT_SECRET", "agent-secret")
+
+	var sawResolve bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawResolve = true
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %q, want PUT", r.Method)
+		}
+		if r.URL.Path != "/v1/repos/owner/repo/pulls/7/review-threads/PRRT_test_thread/resolve" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "agent-1" || pass != "agent-secret" {
+			t.Errorf("BasicAuth = %q/%q/%v, want agent credentials", user, pass, ok)
+		}
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		if body["message"] != "fixed" {
+			t.Errorf("message = %v, want fixed", body["message"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"id":"PRRT_test_thread","is_resolved":true}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	cmdResolveReviewThread([]string{"-broker", server.URL, "-repo", "owner/repo", "-number", "7", "-thread-id", "PRRT_test_thread", "-message", "fixed"})
+
+	if !sawResolve {
+		t.Fatal("resolve endpoint was not called")
 	}
 }
 

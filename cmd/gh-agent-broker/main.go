@@ -70,6 +70,10 @@ func main() {
 		cmdPullSubresource(os.Args[2:], "pull-review-comments", "review-comments")
 	case "pull-review-threads":
 		cmdPullSubresource(os.Args[2:], "pull-review-threads", "review-threads")
+	case "dismiss-review":
+		cmdDismissReview(os.Args[2:])
+	case "resolve-review-thread":
+		cmdResolveReviewThread(os.Args[2:])
 	case "issues":
 		cmdIssues(os.Args[2:])
 	case "issue":
@@ -89,7 +93,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|issues|issue|issue-comments|commit-status|check-runs|comment> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|dismiss-review|resolve-review-thread|issues|issue|issue-comments|commit-status|check-runs|comment> [flags]")
 }
 
 func commonFlags(fs *flag.FlagSet) (broker, agentID, secret *string) {
@@ -335,6 +339,42 @@ func cmdPullSubresource(args []string, name, resource string) {
 	}
 	resolveSecret(secret)
 	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/pulls/"+*number+"/"+resource, *agentID, *secret, nil)
+}
+
+func cmdDismissReview(args []string) {
+	fs := flag.NewFlagSet("dismiss-review", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	number := fs.String("number", "", "pull request number")
+	reviewID := fs.String("review-id", "", "pull request review ID")
+	message := fs.String("message", "", "dismissal message")
+	var md metadataFlag
+	fs.Var(&md, "metadata", "metadata key=value, repeatable")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	body := map[string]interface{}{"message": *message, "metadata": map[string]string(md)}
+	path := "/v1/repos/" + *repo + "/pulls/" + *number + "/reviews/" + *reviewID + "/dismissal"
+	doRequest(http.MethodPut, *broker, path, *agentID, *secret, body)
+}
+
+func cmdResolveReviewThread(args []string) {
+	fs := flag.NewFlagSet("resolve-review-thread", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	number := fs.String("number", "", "pull request number")
+	threadID := fs.String("thread-id", "", "GraphQL review thread node ID")
+	message := fs.String("message", "", "resolution message for broker audit")
+	var md metadataFlag
+	fs.Var(&md, "metadata", "metadata key=value, repeatable")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	body := map[string]interface{}{"message": *message, "metadata": map[string]string(md)}
+	path := "/v1/repos/" + *repo + "/pulls/" + *number + "/review-threads/" + url.PathEscape(*threadID) + "/resolve"
+	doRequest(http.MethodPut, *broker, path, *agentID, *secret, body)
 }
 
 func cmdIssues(args []string) {

@@ -77,11 +77,13 @@ func TestOperationsDocumentsV1RESTRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]string{
-		"repo.probe":     "GET /v1/repos/{owner}/{repo}/probe",
-		"pull.create":    "POST /v1/repos/{owner}/{repo}/pulls",
-		"issue.create":   "POST /v1/repos/{owner}/{repo}/issues",
-		"issue.comment":  "POST /v1/repos/{owner}/{repo}/issues/{number}/comments",
-		"policy.dry-run": "POST /v1/policy/dry-run",
+		"repo.probe":                 "GET /v1/repos/{owner}/{repo}/probe",
+		"pull.create":                "POST /v1/repos/{owner}/{repo}/pulls",
+		"pull.review.dismiss":        "PUT /v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal",
+		"pull.review_thread.resolve": "PUT /v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve",
+		"issue.create":               "POST /v1/repos/{owner}/{repo}/issues",
+		"issue.comment":              "POST /v1/repos/{owner}/{repo}/issues/{number}/comments",
+		"policy.dry-run":             "POST /v1/policy/dry-run",
 	}
 	for _, op := range out.Operations {
 		if got, ok := want[op.Name]; ok {
@@ -205,7 +207,7 @@ func TestOpenAPIIncludesRequestSchemas(t *testing.T) {
 	}
 	components := objectAt(t, out, "components")
 	schemas := objectAt(t, components, "schemas")
-	for _, name := range []string{"DryRunRequest", "DryRunResponse", "PullCreateRequest", "CommentCreateRequest", "ErrorResponse"} {
+	for _, name := range []string{"DryRunRequest", "DryRunResponse", "PullCreateRequest", "CommentCreateRequest", "PullReviewDismissRequest", "PullReviewThreadResolveRequest", "ErrorResponse"} {
 		if _, ok := schemas[name]; !ok {
 			t.Fatalf("missing schema %s", name)
 		}
@@ -215,6 +217,16 @@ func TestOpenAPIIncludesRequestSchemas(t *testing.T) {
 	post := objectAt(t, pulls, "post")
 	if _, ok := post["requestBody"]; !ok {
 		t.Fatalf("pull.create missing requestBody")
+	}
+	dismissal := objectAt(t, paths, "/v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal")
+	put := objectAt(t, dismissal, "put")
+	if _, ok := put["requestBody"]; !ok {
+		t.Fatalf("pull.review.dismiss missing requestBody")
+	}
+	resolve := objectAt(t, paths, "/v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve")
+	put = objectAt(t, resolve, "put")
+	if _, ok := put["requestBody"]; !ok {
+		t.Fatalf("pull.review_thread.resolve missing requestBody")
 	}
 }
 

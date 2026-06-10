@@ -131,6 +131,8 @@ agents:
       - "pull.read"
       - "pull.files.read"
       - "pull.reviews.read"
+      - "pull.review.dismiss"
+      - "pull.review_thread.resolve"
       - "issue.comment"
       - "issue.read"
       - "issue.comments.read"

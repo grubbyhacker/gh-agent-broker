@@ -74,6 +74,18 @@ type IssueCreateRequest struct {
 	Permissions []string `json:"permissions,omitempty"`
 }
 
+type PullReviewDismissRequest struct {
+	Message     string   `json:"message"`
+	Metadata    Metadata `json:"metadata,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
+}
+
+type PullReviewThreadResolveRequest struct {
+	Message     string   `json:"message"`
+	Metadata    Metadata `json:"metadata,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
+}
+
 type GitHubResult struct {
 	URL     string `json:"url,omitempty"`
 	HTMLURL string `json:"html_url,omitempty"`
@@ -160,7 +172,13 @@ type PullReviewThread struct {
 	ID                       string              `json:"id"`
 	IsResolved               *bool               `json:"is_resolved,omitempty"`
 	UnresolvedStateAvailable bool                `json:"unresolved_state_available"`
+	Resolvable               bool                `json:"resolvable"`
 	Comments                 []PullReviewComment `json:"comments,omitempty"`
+}
+
+type PullReviewThreadResolveResult struct {
+	ID         string `json:"id"`
+	IsResolved bool   `json:"is_resolved"`
 }
 
 type CommitStatus struct {
