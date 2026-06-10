@@ -213,6 +213,48 @@ func TestCodexResponsesStreamsSSE(t *testing.T) {
 	}
 }
 
+func TestCodexResponsesWithoutUsageCountsOneCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeProxyTestJSON(t, w, map[string]interface{}{
+			"id":     "resp-no-usage",
+			"object": "response",
+		})
+	}))
+	defer upstream.Close()
+	svc, _ := newCodexTestService(t, upstream.URL+"/v1")
+	svc.cfg.MaxCallsPerRun = 5
+
+	resp := codexResponseRequest(svc, `{"model":"ykm-codex-haiku","input":"x"}`, "run-no-usage")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", resp.Code, resp.Body.String())
+	}
+	state := readTestBudget(t, svc)
+	if got := state.Runs["run-no-usage"]; got.Calls != 1 || got.Tokens != 0 {
+		t.Fatalf("budget = %+v, want 1 call and 0 tokens", got)
+	}
+}
+
+func TestCodexResponsesStreamWithoutUsageCountsOneCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, "data: {\"delta\":\"hello\"}\n\n"); err != nil {
+			t.Fatal(err)
+		}
+	}))
+	defer upstream.Close()
+	svc, _ := newCodexTestService(t, upstream.URL+"/v1")
+	svc.cfg.MaxCallsPerRun = 5
+
+	resp := codexResponseRequest(svc, `{"model":"ykm-codex-haiku","stream":true,"input":"x"}`, "run-stream-no-usage")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", resp.Code, resp.Body.String())
+	}
+	state := readTestBudget(t, svc)
+	if got := state.Runs["run-stream-no-usage"]; got.Calls != 1 || got.Tokens != 0 {
+		t.Fatalf("budget = %+v, want 1 call and 0 tokens", got)
+	}
+}
+
 func newTestService(t *testing.T, upstream string) *Service {
 	t.Helper()
 	svc, err := NewService(Config{
