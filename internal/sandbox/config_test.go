@@ -141,6 +141,25 @@ func TestConfigValidateLaunchProfilesAndOperatorPrincipals(t *testing.T) {
 	}
 
 	cfg = baseTestConfig(t)
+	profile = testLaunchProfile()
+	profile.MaxRuntimeMinutes = 0
+	profile.MaxRuntimeSeconds = 30
+	profile.AllowOverrides = []string{"task", "max_runtime_seconds"}
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	if err = cfg.Validate(); err != nil {
+		t.Fatalf("Validate() with second runtime profile error = %v", err)
+	}
+
+	cfg = baseTestConfig(t)
+	profile = testLaunchProfile()
+	profile.MaxRuntimeSeconds = 30
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "only one") {
+		t.Fatalf("Validate() error = %v, want mixed runtime unit rejection", err)
+	}
+
+	cfg = baseTestConfig(t)
 	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": testLaunchProfile()}
 	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
 		"timer": {AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"launch"}},
