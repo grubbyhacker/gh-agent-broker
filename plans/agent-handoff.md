@@ -4,8 +4,47 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current Codex-compatible proxy surface implementation:
+
+- Current branch now implements `plans/codex-compatible-proxy-surface.md` in
+  `internal/proxy` with a restricted OpenAI-compatible Codex surface on
+  `gh-agent-proxy`.
+- New config fields are `codex_auth_token[_env]`,
+  `codex_upstream_key[_env]`, and `codex_allowed_models`. Model exposure is
+  alias-based and not hard-coded to Haiku; example config includes
+  `ykm-codex-haiku` and `ykm-codex-sonnet` aliases mapped to upstream
+  LiteLLM/OpenRouter model IDs.
+- Added authenticated `GET /v1/models` and `POST /v1/responses`. Responses
+  calls require `X-GH-Agent-Run-ID`, enforce model allowlist, byte limits, call
+  budgets, token budgets when upstream usage is available, and audit
+  endpoint/run/model/decision/tokens/error without prompt bodies or auth
+  headers. Streaming SSE responses are passed through while parsing usage
+  opportunistically.
+- Existing `/v1/model/call` behavior is preserved.
+- Added `make proxy-codex-e2e`, which starts a fake Responses-compatible
+  LiteLLM upstream, launches a real `gh-agent-proxy` process with generated
+  config, verifies raw `/v1/models` and `/v1/responses` behavior, then runs a
+  real local `codex exec` process through the proxy using `env_key`,
+  `wire_api = "responses"`, and `env_http_headers` for `X-GH-Agent-Run-ID`.
+- Latest focused verification: `go test ./internal/proxy` and
+  `mise exec -- make proxy-codex-e2e` passed.
+
 Latest sandbox-broker operator REST launch profile implementation:
 
+- PR `#32` is merged and deployed to the VPS as
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-89590202fcba9d51e5095b1bf7790b36bbbfd755`.
+  The live stack is healthy for `broker`, `issue-reporter`, `sandbox-broker`,
+  `gh-agent-proxy`, and `litellm`.
+- VPS sandbox config now has a reusable host-local REST E2E profile
+  `beta-sleeper-rest-e2e`, timer principal `rest-e2e-timer`, and operator
+  principal `rest-e2e-operator`. Backups were written before changes:
+  `.env.bak-rest-profiles-20260609-212038` and
+  `configs/sandbox-beta.yaml.bak-rest-profiles-20260609-212038`.
+- Live REST E2E passed on 2026-06-09:
+  profile discovery, dry-run, disallowed repo override denial, timer-token log
+  denial, launch, status, logs, artifacts, lessons, stop, cleanup, run
+  directory removal, worker container removal, and audit inspection. Successful
+  run ID: `20260609T212430Z-b226c9da47ca08f5`.
 - Current branch `agent/operator-rest-launch-plan` implements
   `plans/operator-rest-launch-profiles.md`: host-local,
   operator-authenticated REST launch profiles for `sandbox-broker`, without

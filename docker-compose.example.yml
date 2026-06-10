@@ -78,7 +78,9 @@ services:
       - "127.0.0.1:8092:8092"
     environment:
       GH_AGENT_PROXY_TOKEN: "replace-me-proxy-token"
+      GH_AGENT_CODEX_PROXY_TOKEN: "replace-me-codex-proxy-token"
       LITELLM_MASTER_KEY: "replace-me-litellm-master-key"
+      LITELLM_CODEX_PROXY_KEY: "replace-me-litellm-codex-key"
     volumes:
       - ./configs/proxy.example.yaml:/etc/gh-agent-broker/proxy.yaml:ro
       - broker-audit:/var/log/gh-agent-broker

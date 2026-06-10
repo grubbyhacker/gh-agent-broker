@@ -85,6 +85,7 @@ Docker-dependent checks are separate:
 ```sh
 make smoke-container
 make sandbox-e2e
+make proxy-codex-e2e
 ```
 
 Supported setup paths are `.mise.toml` and `.devcontainer/devcontainer.json`.
@@ -203,6 +204,12 @@ repo and label allowlists, and never returns broker or GitHub credentials.
 receiving provider keys. It exposes `POST /v1/model/call`, requires a private
 bearer token, forwards to a configured LiteLLM-compatible upstream, and tracks
 per-run call/token budgets in a file-backed state store.
+
+When configured with `codex_auth_token_env` and `codex_allowed_models`, the
+same proxy also exposes a restricted OpenAI-compatible surface for Codex CLI:
+`GET /v1/models` and `POST /v1/responses`. Codex-compatible calls require their
+own bearer token plus `X-GH-Agent-Run-ID`, expose only configured model aliases,
+and can use a separate scoped LiteLLM virtual key via `codex_upstream_key_env`.
 
 The proxy logs run ID, model, decision, and token counts only. Keep
 `log_prompts: false` in production because prompts and responses may contain

@@ -2,13 +2,30 @@
 listen: "127.0.0.1:8092"
 auth_token_env: "GH_AGENT_PROXY_TOKEN"
 
+# Optional OpenAI-compatible surface for Codex CLI custom providers. Use a
+# separate executor token so sandboxed workers do not share the generic model
+# proxy token.
+codex_auth_token_env: "GH_AGENT_CODEX_PROXY_TOKEN"
+
 # Point this at a private-network LiteLLM proxy base URL, for example
 # http://litellm:4000/v1.
 upstream_url: "http://litellm:4000/v1"
 upstream_key_env: "LITELLM_MASTER_KEY"
 
+# Optional scoped LiteLLM virtual key for Codex-compatible calls. If unset, the
+# proxy falls back to upstream_key_env.
+codex_upstream_key_env: "LITELLM_CODEX_PROXY_KEY"
+
 allowed_models:
   - "gpt-5-mini"
+
+# Models exposed by GET /v1/models for Codex. The name is the sandbox-visible
+# alias; upstream_model is what the proxy sends to LiteLLM.
+codex_allowed_models:
+  - name: "ykm-codex-haiku"
+    upstream_model: "anthropic/claude-haiku-4.5"
+  - name: "ykm-codex-sonnet"
+    upstream_model: "anthropic/claude-sonnet-4.5"
 
 state_path: "/var/log/gh-agent-broker/proxy-budget-state.json"
 audit_path: "/var/log/gh-agent-broker/proxy-audit.jsonl"
