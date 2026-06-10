@@ -6,9 +6,17 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 
 Current PR review repair-completion implementation:
 
-- Current branch `feature/pr-review-resolution` implements the YKM Curator
-  repair-completion broker surface without exposing GitHub credentials to
-  agents.
+- PR `#36` is merged and deployed to the VPS as
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-72c6ef0eb4a1edef9b62d9086ca4ac878c602e52`.
+  Live Compose services `broker`, `issue-reporter`, `sandbox-broker`, and
+  `gh-agent-proxy` are running that image; `broker` is healthy.
+- VPS private config/env backups before the rollout were written as
+  `.env.bak-pr-review-resolution-20260610-232116` and
+  `configs/production.yaml.bak-pr-review-resolution-20260610-232116`.
+- Live private production config now has `idempotency.state_path` set to
+  `/var/log/gh-agent-broker/idempotency.json`, and `ykm-curator` is allowed for
+  `pull.review.dismiss`, `pull.review_thread.resolve`, `issue.label.add`, and
+  `issue.label.remove`.
 - Deny-by-default write operations now include `issue.comment`,
   `pull.review.dismiss`, `pull.review_thread.resolve`, `issue.label.add`, and
   `issue.label.remove`. The Curator example agent in
@@ -38,9 +46,13 @@ Current PR review repair-completion implementation:
   idempotency key, result URL/ID where available, and bounded error text.
 - New CLI support includes `dismiss-review --idempotency-key`,
   `resolve-review-thread --idempotency-key`, `add-label`, and `remove-label`.
-- Latest verification passed: `go test ./internal/server ./cmd/gh-agent-broker
-  ./internal/githubapp ./internal/idempotency`, `mise exec -- make fmt`,
-  `git diff --check`, and `mise exec -- make check`.
+- Latest local verification passed: `go test ./internal/server
+  ./cmd/gh-agent-broker ./internal/githubapp ./internal/idempotency`,
+  `mise exec -- make fmt`, `git diff --check`, and `mise exec -- make check`.
+  Latest VPS verification passed: image pull, production config-check with the
+  new image, Compose restart, `/healthz` on broker/sandbox/proxy, `/operations`
+  advertising all four new operations, and authenticated `ykm-curator`
+  policy dry-runs allowing all four operations.
 
 Current Codex-compatible proxy surface implementation:
 
