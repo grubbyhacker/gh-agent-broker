@@ -6,6 +6,17 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 
 Current Codex-compatible proxy surface implementation:
 
+- PR `#34` is merged and deployed to the VPS as
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-1ea26f2f126219df1a35caace8957bf581323f7c`.
+  The `.env` backup before repinning was
+  `.env.bak-hotfix-budget-double-count-20260610-210720`.
+  Post-deploy checks passed: services `broker`, `gh-agent-proxy`,
+  `issue-reporter`, and `sandbox-broker` all report image revision
+  `1ea26f2f126219df1a35caace8957bf581323f7c`; health endpoints on
+  `8080`, `8091`, and `8092` returned `200`; authenticated `/v1/models`
+  returned the Codex aliases; and a live streaming `/v1/responses` call through
+  `gh-agent-proxy` returned `200` with budget state `calls: 1, tokens: 0` for a
+  fresh run.
 - Current hotfix branch `hotfix/codex-budget-double-count` fixes proxy budget
   double counting for Responses calls with missing or zero usage tokens. Call
   reservation and token reservation are now separate, so completion-time
