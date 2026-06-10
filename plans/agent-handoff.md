@@ -6,7 +6,11 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 
 Current Codex-compatible proxy surface implementation:
 
-- Current branch now implements `plans/codex-compatible-proxy-surface.md` in
+- PR `#33` is merged and deployed to the VPS as
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-6964af012214d54b1d36c9d38680516083b71bf3`.
+  The live stack is healthy for `broker`, `issue-reporter`, `sandbox-broker`,
+  `gh-agent-proxy`, and `litellm`.
+- PR `#33` implements `plans/codex-compatible-proxy-surface.md` in
   `internal/proxy` with a restricted OpenAI-compatible Codex surface on
   `gh-agent-proxy`.
 - New config fields are `codex_auth_token[_env]`,
@@ -28,6 +32,21 @@ Current Codex-compatible proxy surface implementation:
   `wire_api = "responses"`, and `env_http_headers` for `X-GH-Agent-Run-ID`.
 - Latest focused verification: `go test ./internal/proxy` and
   `mise exec -- make proxy-codex-e2e` passed.
+- Deployment backups from the first Codex proxy config attempt:
+  `.env.bak-codex-proxy-20260610-202607` and
+  `configs/proxy.yaml.bak-codex-proxy-20260610-202607`.
+- Production is running the new image, but the Codex-compatible route is not
+  enabled in live `configs/proxy.yaml` yet. A live test with
+  `codex_allowed_models` enabled returned `401` for unauthenticated
+  `/v1/models` and `200` for authenticated `/v1/models`, but a tiny
+  `/v1/responses` call through LiteLLM/OpenRouter returned proxy `502` because
+  LiteLLM returned upstream `400`.
+- Direct LiteLLM `/v1/responses` checks against current OpenRouter-backed model
+  groups also returned `400` with OpenRouter reporting the provider-prefixed
+  model IDs as invalid. The proxy config was restored to the pre-Codex-route
+  backup to avoid advertising broken Codex aliases. Next step is to solve the
+  live LiteLLM/OpenRouter Responses path, or add a broker-side Responses-to-chat
+  compatibility layer, before enabling Codex aliases in production.
 
 Latest sandbox-broker operator REST launch profile implementation:
 
