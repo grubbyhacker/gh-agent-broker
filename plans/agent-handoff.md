@@ -4,6 +4,29 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current CI sandbox E2E speed work for issue #35:
+
+- Current branch `fix/sandbox-e2e-ci-speed` reduces the fixed runtime of
+  `CI / sandbox-e2e`.
+- Sandbox launch input now supports `max_runtime_seconds` as a shorter runtime
+  cap, mutually exclusive with `max_runtime_minutes` and still bounded by the
+  template `max_runtime_minutes`. Existing minute-based behavior remains
+  unchanged.
+- `cmd/sandbox-e2e` uses a 5-second timeout probe instead of waiting for a
+  one-minute timeout, removing the hard minute-long floor from the E2E.
+- `scripts/sandbox-e2e.sh` supports `SANDBOX_E2E_SKIP_IMAGE_BUILD=1` and
+  `SANDBOX_E2E_IMAGE` so CI can use a prebuilt image. It verifies the image is
+  available before running.
+- GitHub Actions `sandbox-e2e` now builds `gh-agent-broker:sandbox-e2e` via
+  `docker/build-push-action` with a `type=gha` BuildKit cache, then runs the
+  script in prebuilt-image mode.
+- The Dockerfile uses BuildKit cache mounts for Go module and build caches.
+- Latest verification passed: `make fmt`, `go test ./internal/sandbox
+  ./cmd/sandbox-e2e`, `bash -n scripts/sandbox-e2e.sh`, `git diff --check`,
+  `./scripts/sandbox-e2e.sh` (about 23s locally including image build),
+  `SANDBOX_E2E_SKIP_IMAGE_BUILD=1 ./scripts/sandbox-e2e.sh` (about 12s
+  locally), and `make check`.
+
 Current PR review repair-completion implementation:
 
 - Current branch `feature/pr-review-resolution` implements the YKM Curator

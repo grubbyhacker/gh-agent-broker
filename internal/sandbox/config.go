@@ -392,8 +392,14 @@ func (c Config) validateLaunchProfile(name string, profile LaunchProfile) []stri
 				errs = append(errs, fmt.Sprintf("launch profile %q branch %q does not match template branch policy", name, profile.Branch))
 			}
 		}
+		if profile.MaxRuntimeMinutes != 0 && profile.MaxRuntimeSeconds != 0 {
+			errs = append(errs, fmt.Sprintf("launch profile %q must set only one of max_runtime_minutes or max_runtime_seconds", name))
+		}
 		if profile.MaxRuntimeMinutes < 0 || profile.MaxRuntimeMinutes > tmpl.MaxRuntimeMinutes {
 			errs = append(errs, fmt.Sprintf("launch profile %q max_runtime_minutes must be between 1 and %d when set", name, tmpl.MaxRuntimeMinutes))
+		}
+		if profile.MaxRuntimeSeconds < 0 || time.Duration(profile.MaxRuntimeSeconds)*time.Second > time.Duration(tmpl.MaxRuntimeMinutes)*time.Minute {
+			errs = append(errs, fmt.Sprintf("launch profile %q max_runtime_seconds must not exceed template max_runtime_minutes %d when set", name, tmpl.MaxRuntimeMinutes))
 		}
 	}
 	for _, field := range profile.AllowOverrides {
@@ -442,7 +448,7 @@ func validOperatorAction(action string) bool {
 
 func launchOverrideFieldAllowed(field string) bool {
 	switch field {
-	case "task", "focus", "deliverables", "max_runtime_minutes", "branch", "base_branch", "repo", "template":
+	case "task", "focus", "deliverables", "max_runtime_minutes", "max_runtime_seconds", "branch", "base_branch", "repo", "template":
 		return true
 	default:
 		return false

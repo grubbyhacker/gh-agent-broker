@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 NET="ghab-sandbox-e2e-$RANDOM-$$"
+IMAGE="${SANDBOX_E2E_IMAGE:-gh-agent-broker:sandbox-e2e}"
 BROKER_CID=""
 SANDBOX_CID=""
 
@@ -166,8 +167,16 @@ templates:
 YAML
 chmod 0444 "${CONFIG}"
 
-echo "building gh-agent-broker:sandbox-e2e"
-docker build -t gh-agent-broker:sandbox-e2e "${ROOT}" >/dev/null
+if [[ "${SANDBOX_E2E_SKIP_IMAGE_BUILD:-}" == "1" ]]; then
+  echo "using prebuilt ${IMAGE}"
+  if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    echo "SANDBOX_E2E_SKIP_IMAGE_BUILD=1 but ${IMAGE} is not available" >&2
+    exit 1
+  fi
+else
+  echo "building ${IMAGE}"
+  docker build -t "${IMAGE}" "${ROOT}" >/dev/null
+fi
 
 echo "creating Docker network ${NET}"
 docker network create "${NET}" >/dev/null
@@ -196,7 +205,7 @@ SANDBOX_CID="$(
     -v "${AUDIT}:${AUDIT}" \
     -v /var/run/docker.sock:/var/run/docker.sock \
     --entrypoint /usr/local/bin/sandbox-broker \
-    gh-agent-broker:sandbox-e2e \
+    "${IMAGE}" \
     -config "${CONFIG}" -allow-public-bind
 )"
 
