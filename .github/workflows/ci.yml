@@ -48,23 +48,7 @@ jobs:
           go-version: "1.26.x"
           cache: true
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build sandbox E2E image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          load: true
-          tags: gh-agent-broker:sandbox-e2e
-          provenance: false
-          sbom: false
-          cache-from: type=gha,scope=sandbox-e2e
-          cache-to: type=gha,mode=max,scope=sandbox-e2e,ignore-error=true
-
       - name: Run sandbox MCP E2E
-        env:
-          SANDBOX_E2E_SKIP_IMAGE_BUILD: "1"
         run: make sandbox-e2e
 
   publish-image:

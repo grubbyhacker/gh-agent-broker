@@ -4,10 +4,15 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
-Current CI sandbox E2E speed work for issue #35:
+Current CI sandbox E2E speed follow-up for issue #35:
 
-- Current branch `fix/sandbox-e2e-ci-speed` reduces the fixed runtime of
-  `CI / sandbox-e2e`.
+- Current branch `fix/sandbox-e2e-minimal-image` keeps the seconds-level timeout
+  probe from PR `#37`, but removes the Buildx/GHA cache path that offset the
+  runtime savings in GitHub Actions.
+- Recent CI timing review showed the actual sandbox E2E script fell from about
+  1:42-1:48 to 0:12-0:16, but the added Buildx/cache image-build step cost
+  54s on the PR run and 98s on the post-merge `main` run, making the main
+  `sandbox-e2e` job slower overall.
 - Sandbox launch input now supports `max_runtime_seconds` as a shorter runtime
   cap, mutually exclusive with `max_runtime_minutes` and still bounded by the
   template `max_runtime_minutes`. Existing minute-based behavior remains
@@ -15,17 +20,16 @@ Current CI sandbox E2E speed work for issue #35:
 - `cmd/sandbox-e2e` uses a 5-second timeout probe instead of waiting for a
   one-minute timeout, removing the hard minute-long floor from the E2E.
 - `scripts/sandbox-e2e.sh` supports `SANDBOX_E2E_SKIP_IMAGE_BUILD=1` and
-  `SANDBOX_E2E_IMAGE` so CI can use a prebuilt image. It verifies the image is
-  available before running.
-- GitHub Actions `sandbox-e2e` now builds `gh-agent-broker:sandbox-e2e` via
-  `docker/build-push-action` with a `type=gha` BuildKit cache, then runs the
-  script in prebuilt-image mode.
-- The Dockerfile uses BuildKit cache mounts for Go module and build caches.
-- Latest verification passed: `make fmt`, `go test ./internal/sandbox
-  ./cmd/sandbox-e2e`, `bash -n scripts/sandbox-e2e.sh`, `git diff --check`,
-  `./scripts/sandbox-e2e.sh` (about 23s locally including image build),
-  `SANDBOX_E2E_SKIP_IMAGE_BUILD=1 ./scripts/sandbox-e2e.sh` (about 12s
-  locally), and `make check`.
+  `SANDBOX_E2E_IMAGE` for manual experiments, but CI now just runs
+  `make sandbox-e2e` and lets the script build the image directly.
+- Added `Dockerfile.sandbox-e2e`, a minimal image that builds and packages only
+  `sandbox-broker`, which is the only broker binary the sandbox MCP E2E needs.
+- Restored the production `Dockerfile` to the plain pre-cache-mount form.
+- Latest verification passed: `go test ./internal/sandbox ./cmd/sandbox-e2e`,
+  `bash -n scripts/sandbox-e2e.sh`, `git diff --check`,
+  `./scripts/sandbox-e2e.sh` (about 18s locally including image build),
+  `docker build --no-cache -f Dockerfile.sandbox-e2e ...` (about 7s locally),
+  `make check`, and `make smoke-container`.
 
 Current PR review repair-completion implementation:
 

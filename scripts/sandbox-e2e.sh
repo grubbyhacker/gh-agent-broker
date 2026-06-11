@@ -175,7 +175,7 @@ if [[ "${SANDBOX_E2E_SKIP_IMAGE_BUILD:-}" == "1" ]]; then
   fi
 else
   echo "building ${IMAGE}"
-  docker build -t "${IMAGE}" "${ROOT}" >/dev/null
+  docker build -f "${ROOT}/Dockerfile.sandbox-e2e" -t "${IMAGE}" "${ROOT}" >/dev/null
 fi
 
 echo "creating Docker network ${NET}"
