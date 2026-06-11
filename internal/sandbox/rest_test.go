@@ -92,6 +92,126 @@ func TestRESTDryRunAndOverridePolicy(t *testing.T) {
 	}
 }
 
+func TestRESTParameterizedPreviewAndLaunch(t *testing.T) {
+	cfg := restTestConfig(t)
+	profile := testLaunchProfile()
+	profile.Parameters = map[string]ParameterDeclaration{
+		"upload_ids": {
+			Type:      "string_list",
+			Required:  true,
+			MaxItems:  2,
+			MaxLength: 24,
+			Pattern:   `^[A-Za-z0-9_.:-]+$`,
+		},
+	}
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	runtime := newFakeRuntime()
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := NewAuditLogger(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(cfg, runtime, auditLog)
+	handler := NewRESTHandler(service)
+
+	body := []byte(`{"parameters":{"upload_ids":["upl_123","upl_456"]}}`)
+	req := restRequest(http.MethodPost, "/v1/launch-profiles/nightly/preview", "timer-secret", body)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("preview status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatalf("preview created runtime specs")
+	}
+	if entries, err := os.ReadDir(cfg.RunsDir); err == nil && len(entries) != 0 {
+		t.Fatalf("preview created run dir entries: %+v", entries)
+	}
+	var preview LaunchPreviewOutput
+	if err := json.NewDecoder(resp.Body).Decode(&preview); err != nil {
+		t.Fatal(err)
+	}
+	gotUploads, ok := preview.TaskContract.Parameters["upload_ids"].([]any)
+	if !ok || len(gotUploads) != 2 || gotUploads[0] != "upl_123" {
+		t.Fatalf("preview parameters = %#v", preview.TaskContract.Parameters)
+	}
+	if preview.Template.Image == "" || preview.Budgets.RuntimeSeconds == 0 || preview.ConfigVersion == "" || preview.ConfigLoadedAt.IsZero() {
+		t.Fatalf("incomplete preview = %+v", preview)
+	}
+
+	req = restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "timer-secret", body)
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("launch status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	var launched LaunchAgentOutput
+	if err := json.NewDecoder(resp.Body).Decode(&launched); err != nil {
+		t.Fatal(err)
+	}
+	taskBytes, err := os.ReadFile(filepath.Join(cfg.RunsDir, launched.RunID, "input", "task.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contract TaskContract
+	if err := json.Unmarshal(taskBytes, &contract); err != nil {
+		t.Fatal(err)
+	}
+	uploads, ok := contract.Parameters["upload_ids"].([]any)
+	if !ok {
+		t.Fatalf("task contract parameters = %#v", contract.Parameters)
+	}
+	if len(uploads) != 2 || uploads[1] != "upl_456" {
+		t.Fatalf("task contract parameters = %#v", contract.Parameters)
+	}
+
+	if err := auditLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	//nolint:gosec // G304: auditPath is generated inside this test's temp directory.
+	auditBytes, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(auditBytes), `"parameters":{"upload_ids":["upl_123","upl_456"]}`) {
+		t.Fatalf("audit did not record sanitized parameters: %s", auditBytes)
+	}
+}
+
+func TestRESTParameterizedLaunchRejectsInvalidParametersBeforeRunCreation(t *testing.T) {
+	cfg := restTestConfig(t)
+	profile := testLaunchProfile()
+	profile.Parameters = map[string]ParameterDeclaration{
+		"upload_ids": {Type: "string_list", Required: true, MaxItems: 1, MaxLength: 8, Pattern: `^[A-Za-z0-9_]+$`},
+	}
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	runtime := newFakeRuntime()
+	service := NewService(cfg, runtime, testAudit(t))
+	handler := NewRESTHandler(service)
+
+	body := []byte(`{"parameters":{"upload_ids":["valid","too_many"]}}`)
+	req := restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "timer-secret", body)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("invalid parameters status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	if len(runtime.specs) != 0 {
+		t.Fatalf("invalid parameters created runtime specs")
+	}
+	if entries, err := os.ReadDir(cfg.RunsDir); err == nil && len(entries) != 0 {
+		t.Fatalf("invalid parameters created run dir entries: %+v", entries)
+	}
+
+	body = []byte(`{"parameters":{"upload_ids":["valid"]},"repo":"owner/other"}`)
+	req = restRequest(http.MethodPost, "/v1/launch-profiles/nightly/preview", "timer-secret", body)
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "only parameters") {
+		t.Fatalf("unexpected top-level field status = %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestRESTRunCollectionsReuseServiceProtections(t *testing.T) {
 	cfg := restTestConfig(t)
 	service := NewService(cfg, newFakeRuntime(), testAudit(t))

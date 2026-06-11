@@ -5,6 +5,7 @@ runs_dir: "/srv/hermes-sandbox-broker/runs"
 broker_url: "http://broker:8080"
 production: false
 max_task_bytes: 65536
+max_parameter_bytes: 16384
 log_byte_limit: 131072
 stop_grace: "10s"
 
@@ -29,6 +30,23 @@ launch_profiles:
       - "task"
       - "focus"
       - "max_runtime_minutes"
+  # ykm-curator-upload-batch:
+  #   template: "ykm-curator-dry-run"
+  #   repo: "example-org/ykmcorpus"
+  #   base_branch: "main"
+  #   task: "Process the opaque upload selectors supplied in task.json parameters."
+  #   focus: "upload-intake"
+  #   max_runtime_minutes: 60
+  #   deliverables:
+  #     - "/output/run-report.md"
+  #     - "/lessons/run-summary.md"
+  #   parameters:
+  #     upload_ids:
+  #       type: "string_list"
+  #       required: true
+  #       max_items: 10
+  #       max_length: 64
+  #       pattern: "^[A-Za-z0-9_.:-]+$"
 
 operator_principals:
   timer-hermes-nightly:

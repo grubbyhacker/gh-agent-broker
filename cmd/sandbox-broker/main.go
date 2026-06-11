@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -56,7 +57,11 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte(`{"status":"ok"}` + "\n")); err != nil {
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"status":           "ok",
+			"config_loaded_at": cfg.ConfigLoadedAt,
+			"config_version":   cfg.ConfigVersion,
+		}); err != nil {
 			return
 		}
 	})

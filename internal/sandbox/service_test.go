@@ -437,10 +437,11 @@ func baseTestConfig(t *testing.T) Config {
 		Templates: map[string]Template{
 			"worker": testTemplate("example.com/worker@sha256:1111111111111111111111111111111111111111111111111111111111111111"),
 		},
-		MaxTaskBytes: 1024,
-		LogByteLimit: 1024,
-		StopGrace:    Duration{Duration: time.Second},
-		Audit:        SandboxAuditConfig{Path: filepath.Join(root, "audit", "sandbox.jsonl")},
+		MaxTaskBytes:      1024,
+		MaxParameterBytes: 1024,
+		LogByteLimit:      1024,
+		StopGrace:         Duration{Duration: time.Second},
+		Audit:             SandboxAuditConfig{Path: filepath.Join(root, "audit", "sandbox.jsonl")},
 	}
 	tmpl := cfg.Templates["worker"]
 	tmpl.KnowledgeSnapshots = []string{knowledge}

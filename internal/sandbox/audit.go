@@ -14,22 +14,23 @@ type AuditLogger struct {
 }
 
 type AuditEvent struct {
-	Timestamp        time.Time `json:"timestamp"`
-	Operation        string    `json:"operation"`
-	RunID            string    `json:"run_id,omitempty"`
-	Principal        string    `json:"principal,omitempty"`
-	Profile          string    `json:"profile,omitempty"`
-	Template         string    `json:"template,omitempty"`
-	ParentAgentID    string    `json:"parent_agent_id,omitempty"`
-	WorkerAgentID    string    `json:"worker_agent_id,omitempty"`
-	Repo             string    `json:"repo,omitempty"`
-	Branch           string    `json:"branch,omitempty"`
-	ImageDigest      string    `json:"image_digest,omitempty"`
-	CredentialBundle string    `json:"credential_bundle,omitempty"`
-	Status           string    `json:"status,omitempty"`
-	ExitCode         *int      `json:"exit_code,omitempty"`
-	Decision         string    `json:"decision"`
-	Error            string    `json:"error,omitempty"`
+	Timestamp        time.Time      `json:"timestamp"`
+	Operation        string         `json:"operation"`
+	RunID            string         `json:"run_id,omitempty"`
+	Principal        string         `json:"principal,omitempty"`
+	Profile          string         `json:"profile,omitempty"`
+	Template         string         `json:"template,omitempty"`
+	ParentAgentID    string         `json:"parent_agent_id,omitempty"`
+	WorkerAgentID    string         `json:"worker_agent_id,omitempty"`
+	Repo             string         `json:"repo,omitempty"`
+	Branch           string         `json:"branch,omitempty"`
+	ImageDigest      string         `json:"image_digest,omitempty"`
+	CredentialBundle string         `json:"credential_bundle,omitempty"`
+	Parameters       map[string]any `json:"parameters,omitempty"`
+	Status           string         `json:"status,omitempty"`
+	ExitCode         *int           `json:"exit_code,omitempty"`
+	Decision         string         `json:"decision"`
+	Error            string         `json:"error,omitempty"`
 }
 
 func NewAuditLogger(path string) (*AuditLogger, error) {
