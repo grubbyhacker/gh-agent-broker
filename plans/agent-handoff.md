@@ -4,8 +4,152 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
-Latest YKM Curator prerequisite implementation:
+Current CI sandbox E2E speed follow-up for issue #35:
 
+- Current branch `fix/sandbox-e2e-minimal-image` keeps the seconds-level timeout
+  probe from PR `#37`, but removes the Buildx/GHA cache path that offset the
+  runtime savings in GitHub Actions.
+- Recent CI timing review showed the actual sandbox E2E script fell from about
+  1:42-1:48 to 0:12-0:16, but the added Buildx/cache image-build step cost
+  54s on the PR run and 98s on the post-merge `main` run, making the main
+  `sandbox-e2e` job slower overall.
+- Sandbox launch input now supports `max_runtime_seconds` as a shorter runtime
+  cap, mutually exclusive with `max_runtime_minutes` and still bounded by the
+  template `max_runtime_minutes`. Existing minute-based behavior remains
+  unchanged.
+- `cmd/sandbox-e2e` uses a 5-second timeout probe instead of waiting for a
+  one-minute timeout, removing the hard minute-long floor from the E2E.
+- `scripts/sandbox-e2e.sh` supports `SANDBOX_E2E_SKIP_IMAGE_BUILD=1` and
+  `SANDBOX_E2E_IMAGE` for manual experiments, but CI now just runs
+  `make sandbox-e2e` and lets the script build the image directly.
+- Added `Dockerfile.sandbox-e2e`, a minimal image that builds and packages only
+  `sandbox-broker`, which is the only broker binary the sandbox MCP E2E needs.
+- Restored the production `Dockerfile` to the plain pre-cache-mount form.
+- Latest verification passed: `go test ./internal/sandbox ./cmd/sandbox-e2e`,
+  `bash -n scripts/sandbox-e2e.sh`, `git diff --check`,
+  `./scripts/sandbox-e2e.sh` (about 18s locally including image build),
+  `docker build --no-cache -f Dockerfile.sandbox-e2e ...` (about 7s locally),
+  `make check`, and `make smoke-container`.
+
+Current PR review repair-completion implementation:
+
+- Current branch `feature/pr-review-resolution` implements the YKM Curator
+  repair-completion broker surface without exposing GitHub credentials to
+  agents.
+- Deny-by-default write operations now include `issue.comment`,
+  `pull.review.dismiss`, `pull.review_thread.resolve`, `issue.label.add`, and
+  `issue.label.remove`. The Curator example agent in
+  `configs/production.example.yaml` grants the needed operations because it has
+  GitHub App `issues:write` and `pull_requests:write`; other agents remain
+  unchanged.
+- Broker routes now cover the requested sequence:
+  `POST /v1/repos/{owner}/{repo}/issues/{number}/comments`,
+  `PUT /v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal`,
+  `PUT /v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve`,
+  `POST /v1/repos/{owner}/{repo}/issues/{number}/labels`, and
+  `DELETE /v1/repos/{owner}/{repo}/issues/{number}/labels/{label}`.
+- Review dismissal accepts either REST numeric review IDs or GraphQL review node
+  IDs. Numeric IDs use REST dismissal; node IDs use GraphQL
+  `dismissPullRequestReview`. Already dismissed reviews are successful no-ops.
+- Thread resolution uses GraphQL review-thread node IDs. If a message is
+  supplied and the thread is not already resolved, the broker first posts a
+  GitHub-visible thread reply, then resolves the thread. Already resolved
+  threads are successful no-ops.
+- PR review and review-thread read models now expose GraphQL node IDs,
+  database IDs where available, authors, review states including
+  `CHANGES_REQUESTED`/`DISMISSED`, thread `is_resolved`, path/line context, and
+  comment path/line/body context for exact repair decisions.
+- Write routes support `Idempotency-Key`. Successful responses are persisted in
+  the configured `idempotency.state_path`, replayed on duplicate keys, and
+  audit events include operation, repo, issue/PR number, target ID/label, the
+  idempotency key, result URL/ID where available, and bounded error text.
+- New CLI support includes `dismiss-review --idempotency-key`,
+  `resolve-review-thread --idempotency-key`, `add-label`, and `remove-label`.
+- Latest verification passed: `go test ./internal/server ./cmd/gh-agent-broker
+  ./internal/githubapp ./internal/idempotency`, `mise exec -- make fmt`,
+  `git diff --check`, and `mise exec -- make check`.
+
+Current Codex-compatible proxy surface implementation:
+
+- Current hotfix branch `hotfix/codex-budget-double-count` fixes proxy budget
+  double counting for Responses calls with missing or zero usage tokens. Call
+  reservation and token reservation are now separate, so completion-time
+  accounting no longer increments the per-run call counter a second time.
+  Regression tests cover non-streaming and streaming `/v1/responses` calls
+  without usage. Latest verification passed: `go test ./internal/proxy`,
+  `mise exec -- make fmt`, `git diff --check`, and `mise exec -- make check`.
+- Current branch now implements `plans/codex-compatible-proxy-surface.md` in
+  `internal/proxy` with a restricted OpenAI-compatible Codex surface on
+  `gh-agent-proxy`.
+- New config fields are `codex_auth_token[_env]`,
+  `codex_upstream_key[_env]`, and `codex_allowed_models`. Model exposure is
+  alias-based and not hard-coded to Haiku; example config includes
+  `ykm-codex-haiku` and `ykm-codex-sonnet` aliases mapped to upstream
+  LiteLLM/OpenRouter model IDs.
+- Added authenticated `GET /v1/models` and `POST /v1/responses`. Responses
+  calls require `X-GH-Agent-Run-ID`, enforce model allowlist, byte limits, call
+  budgets, token budgets when upstream usage is available, and audit
+  endpoint/run/model/decision/tokens/error without prompt bodies or auth
+  headers. Streaming SSE responses are passed through while parsing usage
+  opportunistically.
+- Existing `/v1/model/call` behavior is preserved.
+- Added `make proxy-codex-e2e`, which starts a fake Responses-compatible
+  LiteLLM upstream, launches a real `gh-agent-proxy` process with generated
+  config, verifies raw `/v1/models` and `/v1/responses` behavior, then runs a
+  real local `codex exec` process through the proxy using `env_key`,
+  `wire_api = "responses"`, and `env_http_headers` for `X-GH-Agent-Run-ID`.
+- Latest focused verification: `go test ./internal/proxy` and
+  `mise exec -- make proxy-codex-e2e` passed.
+
+Latest sandbox-broker operator REST launch profile implementation:
+
+- PR `#32` is merged and deployed to the VPS as
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-89590202fcba9d51e5095b1bf7790b36bbbfd755`.
+  The live stack is healthy for `broker`, `issue-reporter`, `sandbox-broker`,
+  `gh-agent-proxy`, and `litellm`.
+- VPS sandbox config now has a reusable host-local REST E2E profile
+  `beta-sleeper-rest-e2e`, timer principal `rest-e2e-timer`, and operator
+  principal `rest-e2e-operator`. Backups were written before changes:
+  `.env.bak-rest-profiles-20260609-212038` and
+  `configs/sandbox-beta.yaml.bak-rest-profiles-20260609-212038`.
+- Live REST E2E passed on 2026-06-09:
+  profile discovery, dry-run, disallowed repo override denial, timer-token log
+  denial, launch, status, logs, artifacts, lessons, stop, cleanup, run
+  directory removal, worker container removal, and audit inspection. Successful
+  run ID: `20260609T212430Z-b226c9da47ca08f5`.
+- Current branch `agent/operator-rest-launch-plan` implements
+  `plans/operator-rest-launch-profiles.md`: host-local,
+  operator-authenticated REST launch profiles for `sandbox-broker`, without
+  adding Docker-launch functionality to the main GitHub broker.
+- Sandbox config now supports `launch_profiles` and separate
+  `operator_principals`. Profiles define fixed `LaunchAgentInput` defaults plus
+  explicit `allow_overrides`; operator principals resolve `token_env`, scope
+  allowed profiles, and scope allowed actions (`launch`, `dry_run`, `status`,
+  `logs`, `artifacts`, `stop`, `cleanup`).
+- `sandbox-broker` now serves `/v1/launch-profiles`, profile dry-run/launch
+  endpoints, and `/v1/runs` status/log/artifact/lesson/stop/cleanup endpoints
+  on the existing listener. Handlers authenticate operator bearer tokens,
+  authorize profile/action scope, merge only allowlisted overrides, and call the
+  existing `sandbox.Service` methods for launch, logs, collections, stop, and
+  cleanup.
+- Sandbox audit events now include operator principal and profile fields for
+  REST operations, plus run/template/repo/branch when available. REST auth never
+  logs tokens or authorization headers.
+- `configs/sandbox.example.yaml` documents a timer token scoped to
+  launch/dry-run and a human operator token scoped to read/stop/cleanup actions,
+  both using `token_env`.
+- Added focused tests for config validation, token env resolution, REST
+  auth/authz, launch/dry-run behavior, override rejection, log redaction, and
+  artifact collection preserving existing symlink/traversal protections.
+- Latest verification for this branch passed:
+  `go test ./internal/sandbox ./cmd/sandbox-broker`, `mise exec -- make fmt`,
+  `mise exec -- make check`, and `git diff --check`.
+
+Latest YKM Curator prerequisite implementation:
+- PR `#31` is merged and deployed to production. It added opt-in per-agent
+  `branch_lifecycle_guard` checks for same-repository PR history before
+  brokered `git.receive-pack` and `pull.create`; production enables
+  `mode: enforce` for `hermes-coder-01` and `ykm-curator`.
 - Current branch `feature/ykm-curator-prereqs` implements the prerequisite
   broker work for the YKM Curator sandbox, without applying live production
   configuration changes.

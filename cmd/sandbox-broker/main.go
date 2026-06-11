@@ -63,6 +63,7 @@ func main() {
 	mux.Handle(cfg.MCPPath, tokenAuth(cfg.AuthToken, mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		return mcpServer
 	}, &mcp.StreamableHTTPOptions{Stateless: true})))
+	mux.Handle("/v1/", sandbox.NewRESTHandler(service))
 
 	log.Printf("sandbox broker listening on %s, mcp path %s", cfg.Listen, cfg.MCPPath)
 	httpServer := &http.Server{

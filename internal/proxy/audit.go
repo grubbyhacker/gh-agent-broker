@@ -17,6 +17,7 @@ type auditEvent struct {
 	Timestamp time.Time `json:"timestamp"`
 	RunID     string    `json:"run_id,omitempty"`
 	Model     string    `json:"model,omitempty"`
+	Endpoint  string    `json:"endpoint,omitempty"`
 	Decision  string    `json:"decision"`
 	Tokens    int       `json:"tokens,omitempty"`
 	Error     string    `json:"error,omitempty"`

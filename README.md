@@ -37,6 +37,8 @@ broker credentials or MCP access to a host-side service.
   issue/PR comments, PR/issue/status/check reads, health/readiness, discovery,
   and config reload.
 - Generic metadata assertions with `off`, `warn`, and `enforce` modes.
+- Optional per-agent branch lifecycle guard that denies or warns when a branch
+  already backed a closed PR.
 - Structured denial responses with self-correction guidance.
 - YAML config, JSONL audit logs, and redaction of known secret values.
 - Optional MCP issue reporter and sandbox broker services.
@@ -83,6 +85,7 @@ Docker-dependent checks are separate:
 ```sh
 make smoke-container
 make sandbox-e2e
+make proxy-codex-e2e
 ```
 
 Supported setup paths are `.mise.toml` and `.devcontainer/devcontainer.json`.
@@ -122,6 +125,11 @@ Broker Git remotes use this shape:
 http://127.0.0.1:8080/git/example-org/example-repo.git
 ```
 
+When `branch_lifecycle_guard` is enabled for an agent, the broker checks
+brokered pushes and PR creation against same-repository PR history. Branches
+that already backed a closed or merged PR are denied in `enforce` mode, and
+agents should create a fresh branch such as `agent/$BROKER_AGENT_ID/<task>`.
+
 `gh-agent-broker-cli configure` installs a repo-local Git credential helper that
 reads `BROKER_AGENT_ID` and `BROKER_AGENT_SECRET` at fetch/push time. It does
 not store the broker secret in Git config. Standard Git credential helpers and
@@ -153,12 +161,16 @@ GET  /v1/repos/OWNER/REPO/pulls/NUMBER/comments
 GET  /v1/repos/OWNER/REPO/pulls/NUMBER/reviews
 GET  /v1/repos/OWNER/REPO/pulls/NUMBER/review-comments
 GET  /v1/repos/OWNER/REPO/pulls/NUMBER/review-threads
+PUT  /v1/repos/OWNER/REPO/pulls/NUMBER/reviews/REVIEW_ID/dismissal
+PUT  /v1/repos/OWNER/REPO/pulls/NUMBER/review-threads/THREAD_ID/resolve
 POST /v1/repos/OWNER/REPO/pulls
 GET  /v1/repos/OWNER/REPO/issues
 GET  /v1/repos/OWNER/REPO/issues/NUMBER
 GET  /v1/repos/OWNER/REPO/issues/NUMBER/comments
 POST /v1/repos/OWNER/REPO/issues
 POST /v1/repos/OWNER/REPO/issues/NUMBER/comments
+POST /v1/repos/OWNER/REPO/issues/NUMBER/labels
+DELETE /v1/repos/OWNER/REPO/issues/NUMBER/labels/LABEL
 GET  /v1/repos/OWNER/REPO/commits/SHA/status
 GET  /v1/repos/OWNER/REPO/commits/SHA/check-runs
 ```
@@ -196,6 +208,12 @@ repo and label allowlists, and never returns broker or GitHub credentials.
 receiving provider keys. It exposes `POST /v1/model/call`, requires a private
 bearer token, forwards to a configured LiteLLM-compatible upstream, and tracks
 per-run call/token budgets in a file-backed state store.
+
+When configured with `codex_auth_token_env` and `codex_allowed_models`, the
+same proxy also exposes a restricted OpenAI-compatible surface for Codex CLI:
+`GET /v1/models` and `POST /v1/responses`. Codex-compatible calls require their
+own bearer token plus `X-GH-Agent-Run-ID`, expose only configured model aliases,
+and can use a separate scoped LiteLLM virtual key via `codex_upstream_key_env`.
 
 The proxy logs run ID, model, decision, and token counts only. Keep
 `log_prompts: false` in production because prompts and responses may contain

@@ -73,14 +73,15 @@ type TaskContract struct {
 }
 
 type LaunchAgentInput struct {
-	Template          string   `json:"template" jsonschema:"sandbox template name"`
-	Task              string   `json:"task" jsonschema:"worker task description"`
-	Repo              string   `json:"repo" jsonschema:"owner/repo repository"`
-	BaseBranch        string   `json:"base_branch" jsonschema:"base branch"`
-	Branch            string   `json:"branch,omitempty" jsonschema:"optional branch; generated when omitted"`
-	MaxRuntimeMinutes int      `json:"max_runtime_minutes,omitempty" jsonschema:"optional runtime cap within the template maximum"`
-	Deliverables      []string `json:"deliverables,omitempty" jsonschema:"optional expected deliverable names"`
-	Focus             string   `json:"focus,omitempty" jsonschema:"optional constrained focus for the worker"`
+	Template          string   `json:"template" yaml:"template" jsonschema:"sandbox template name"`
+	Task              string   `json:"task" yaml:"task" jsonschema:"worker task description"`
+	Repo              string   `json:"repo" yaml:"repo" jsonschema:"owner/repo repository"`
+	BaseBranch        string   `json:"base_branch" yaml:"base_branch" jsonschema:"base branch"`
+	Branch            string   `json:"branch,omitempty" yaml:"branch,omitempty" jsonschema:"optional branch; generated when omitted"`
+	MaxRuntimeMinutes int      `json:"max_runtime_minutes,omitempty" yaml:"max_runtime_minutes,omitempty" jsonschema:"optional runtime cap within the template maximum"`
+	MaxRuntimeSeconds int      `json:"max_runtime_seconds,omitempty" yaml:"max_runtime_seconds,omitempty" jsonschema:"optional shorter runtime cap within the template maximum"`
+	Deliverables      []string `json:"deliverables,omitempty" yaml:"deliverables,omitempty" jsonschema:"optional expected deliverable names"`
+	Focus             string   `json:"focus,omitempty" yaml:"focus,omitempty" jsonschema:"optional constrained focus for the worker"`
 }
 
 func (in *LaunchAgentInput) UnmarshalJSON(b []byte) error {
@@ -96,6 +97,7 @@ func (in *LaunchAgentInput) UnmarshalJSON(b []byte) error {
 		"base_branch":         true,
 		"branch":              true,
 		"max_runtime_minutes": true,
+		"max_runtime_seconds": true,
 		"deliverables":        true,
 		"focus":               true,
 	}
@@ -232,12 +234,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 
 func (s *Service) DryRunLaunch(ctx context.Context, in LaunchAgentInput) (LaunchAgentOutput, error) {
 	_ = ctx
-	tmpl, runID, branch, runtimeMinutes, err := s.validateLaunch(in)
+	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
 	if err != nil {
 		s.auditDeny("dry_run_launch", in, err)
 		return LaunchAgentOutput{}, err
 	}
-	deadline := time.Now().UTC().Add(time.Duration(runtimeMinutes) * time.Minute)
+	deadline := time.Now().UTC().Add(runtimeLimit)
 	return LaunchAgentOutput{
 		RunID:         runID,
 		WorkerAgentID: workerAgentID(tmpl, runID),
@@ -249,13 +251,13 @@ func (s *Service) DryRunLaunch(ctx context.Context, in LaunchAgentInput) (Launch
 }
 
 func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchAgentOutput, error) {
-	tmpl, runID, branch, runtimeMinutes, err := s.validateLaunch(in)
+	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
 	if err != nil {
 		s.auditDeny("launch_agent", in, err)
 		return LaunchAgentOutput{}, err
 	}
 	now := time.Now().UTC()
-	deadline := now.Add(time.Duration(runtimeMinutes) * time.Minute)
+	deadline := now.Add(runtimeLimit)
 	runDir := s.runDir(runID)
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
 		return LaunchAgentOutput{}, err
@@ -491,7 +493,7 @@ func (s *Service) CleanupRun(ctx context.Context, in RunInput) (StatusOutput, er
 	return s.statusOutput(meta), nil
 }
 
-func (s *Service) validateLaunch(in LaunchAgentInput) (Template, string, string, int, error) {
+func (s *Service) validateLaunch(in LaunchAgentInput) (Template, string, string, time.Duration, error) {
 	tmpl, ok := s.cfg.Templates[in.Template]
 	if !ok {
 		return Template{}, "", "", 0, fmt.Errorf("policy denial: unknown template %q; choose a configured sandbox template", in.Template)
@@ -532,14 +534,36 @@ func (s *Service) validateLaunch(in LaunchAgentInput) (Template, string, string,
 	if len(tmpl.BranchPolicy.AllowedPatterns) > 0 && !matchesAny(tmpl.BranchPolicy.AllowedPatterns, branch) {
 		return Template{}, "", "", 0, fmt.Errorf("policy denial: branch %q does not match template branch policy; use the configured generated branch or an allowed agent branch", branch)
 	}
+	runtimeLimit, err := runtimeLimit(in, tmpl)
+	if err != nil {
+		return Template{}, "", "", 0, err
+	}
+	return tmpl, runID, branch, runtimeLimit, nil
+}
+
+func runtimeLimit(in LaunchAgentInput, tmpl Template) (time.Duration, error) {
+	maxRuntime := time.Duration(tmpl.MaxRuntimeMinutes) * time.Minute
+	if in.MaxRuntimeMinutes != 0 && in.MaxRuntimeSeconds != 0 {
+		return 0, fmt.Errorf("policy denial: set only one of max_runtime_minutes or max_runtime_seconds")
+	}
+	if in.MaxRuntimeSeconds != 0 {
+		if in.MaxRuntimeSeconds < 1 {
+			return 0, fmt.Errorf("policy denial: max_runtime_seconds must be positive")
+		}
+		limit := time.Duration(in.MaxRuntimeSeconds) * time.Second
+		if limit > maxRuntime {
+			return 0, fmt.Errorf("policy denial: max_runtime_seconds must not exceed template max_runtime_minutes %d; lower the requested runtime", tmpl.MaxRuntimeMinutes)
+		}
+		return limit, nil
+	}
 	runtimeMinutes := in.MaxRuntimeMinutes
 	if runtimeMinutes == 0 {
 		runtimeMinutes = tmpl.MaxRuntimeMinutes
 	}
 	if runtimeMinutes < 1 || runtimeMinutes > tmpl.MaxRuntimeMinutes {
-		return Template{}, "", "", 0, fmt.Errorf("policy denial: max_runtime_minutes must be between 1 and %d; lower the requested runtime", tmpl.MaxRuntimeMinutes)
+		return 0, fmt.Errorf("policy denial: max_runtime_minutes must be between 1 and %d; lower the requested runtime", tmpl.MaxRuntimeMinutes)
 	}
-	return tmpl, runID, branch, runtimeMinutes, nil
+	return time.Duration(runtimeMinutes) * time.Minute, nil
 }
 
 func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Redactor, error) {

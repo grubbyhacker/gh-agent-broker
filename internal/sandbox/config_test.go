@@ -8,6 +8,8 @@ import (
 
 func TestLoadExampleConfig(t *testing.T) {
 	t.Setenv("SANDBOX_MCP_TOKEN", "mcp-secret")
+	t.Setenv("SANDBOX_OPERATOR_TIMER_TOKEN", "timer-secret")
+	t.Setenv("SANDBOX_OPERATOR_ADMIN_TOKEN", "operator-secret")
 	t.Setenv("HERMES_CODER_01_BROKER_SECRET", "broker-secret")
 	cfg, err := Load(filepath.Join("..", "..", "configs", "sandbox.example.yaml"))
 	if err != nil {
@@ -67,6 +69,7 @@ func TestConfigValidateRejectsUnsafeSettings(t *testing.T) {
 func TestConfigResolveSecrets(t *testing.T) {
 	t.Setenv("SANDBOX_TOKEN", "mcp-secret")
 	t.Setenv("WORKER_SECRET", "broker-secret")
+	t.Setenv("OPERATOR_TOKEN", "operator-secret")
 	cfg := baseTestConfig(t)
 	cfg.AuthToken = ""
 	cfg.AuthTokenEnv = "SANDBOX_TOKEN"
@@ -74,11 +77,95 @@ func TestConfigResolveSecrets(t *testing.T) {
 	tmpl.BrokerAgentSecret = ""
 	tmpl.BrokerSecretEnv = "WORKER_SECRET"
 	cfg.Templates["worker"] = tmpl
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": testLaunchProfile()}
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"timer": {
+			TokenEnv:        "OPERATOR_TOKEN",
+			AllowedProfiles: []string{"nightly"},
+			AllowedActions:  []string{"launch", "dry_run"},
+		},
+	}
 	cfg.ResolveSecrets()
 	if cfg.AuthToken != "mcp-secret" {
 		t.Fatalf("AuthToken = %q", cfg.AuthToken)
 	}
 	if cfg.Templates["worker"].BrokerAgentSecret != "broker-secret" {
 		t.Fatalf("BrokerAgentSecret was not resolved")
+	}
+	if cfg.OperatorPrincipals["timer"].Token != "operator-secret" {
+		t.Fatalf("operator token was not resolved")
+	}
+}
+
+func TestConfigValidateLaunchProfilesAndOperatorPrincipals(t *testing.T) {
+	cfg := baseTestConfig(t)
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": testLaunchProfile()}
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"timer": {
+			Token:           "timer-secret",
+			AllowedProfiles: []string{"nightly"},
+			AllowedActions:  []string{"launch", "dry_run"},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	cfg = baseTestConfig(t)
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": testLaunchProfile()}
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"timer": {Token: "timer-secret", AllowedProfiles: []string{"missing"}, AllowedActions: []string{"launch"}},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "unknown launch profile") {
+		t.Fatalf("Validate() error = %v, want unknown launch profile", err)
+	}
+
+	cfg = baseTestConfig(t)
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": testLaunchProfile()}
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"timer": {Token: "timer-secret", AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"shell"}},
+	}
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "unsupported action") {
+		t.Fatalf("Validate() error = %v, want unsupported action", err)
+	}
+
+	cfg = baseTestConfig(t)
+	profile := testLaunchProfile()
+	profile.AllowOverrides = []string{"env"}
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "unsupported field") {
+		t.Fatalf("Validate() error = %v, want unsupported override field", err)
+	}
+
+	cfg = baseTestConfig(t)
+	profile = testLaunchProfile()
+	profile.MaxRuntimeMinutes = 0
+	profile.MaxRuntimeSeconds = 30
+	profile.AllowOverrides = []string{"task", "max_runtime_seconds"}
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	if err = cfg.Validate(); err != nil {
+		t.Fatalf("Validate() with second runtime profile error = %v", err)
+	}
+
+	cfg = baseTestConfig(t)
+	profile = testLaunchProfile()
+	profile.MaxRuntimeSeconds = 30
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "only one") {
+		t.Fatalf("Validate() error = %v, want mixed runtime unit rejection", err)
+	}
+
+	cfg = baseTestConfig(t)
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": testLaunchProfile()}
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"timer": {AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"launch"}},
+	}
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "token or token_env is required") {
+		t.Fatalf("Validate() error = %v, want token requirement", err)
 	}
 }

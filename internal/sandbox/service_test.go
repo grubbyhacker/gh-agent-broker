@@ -162,6 +162,16 @@ func TestLaunchAgentRejectsDisallowedInputs(t *testing.T) {
 			want: "max_runtime_minutes",
 		},
 		{
+			name: "seconds runtime too high",
+			in:   LaunchAgentInput{Template: "worker", Task: "task", Repo: "owner/repo", BaseBranch: "main", MaxRuntimeSeconds: 601},
+			want: "max_runtime_seconds",
+		},
+		{
+			name: "mixed runtime units",
+			in:   LaunchAgentInput{Template: "worker", Task: "task", Repo: "owner/repo", BaseBranch: "main", MaxRuntimeMinutes: 1, MaxRuntimeSeconds: 30},
+			want: "only one",
+		},
+		{
 			name: "task size",
 			in:   LaunchAgentInput{Template: "worker", Task: strings.Repeat("x", cfg.MaxTaskBytes+1), Repo: "owner/repo", BaseBranch: "main"},
 			want: "task exceeds",
@@ -177,6 +187,30 @@ func TestLaunchAgentRejectsDisallowedInputs(t *testing.T) {
 				t.Fatalf("LaunchAgent() error = %v, want structured policy denial text", err)
 			}
 		})
+	}
+}
+
+func TestLaunchAgentAcceptsShorterSecondRuntimeLimit(t *testing.T) {
+	cfg := baseTestConfig(t)
+	runtime := newFakeRuntime()
+	service := NewService(cfg, runtime, testAudit(t))
+	before := time.Now().UTC()
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
+		Template:          "worker",
+		Task:              "task",
+		Repo:              "owner/repo",
+		BaseBranch:        "main",
+		MaxRuntimeSeconds: 3,
+	})
+	if err != nil {
+		t.Fatalf("LaunchAgent() error = %v", err)
+	}
+	remaining := out.Deadline.Sub(before)
+	if remaining < 2*time.Second || remaining > 5*time.Second {
+		t.Fatalf("deadline = %v after launch start, want about 3s", remaining)
+	}
+	if spec := runtime.lastSpec(); spec.Timeout < 2*time.Second || spec.Timeout > 5*time.Second {
+		t.Fatalf("runtime timeout = %v, want about 3s", spec.Timeout)
 	}
 }
 
@@ -440,6 +474,21 @@ func testTemplate(image string) Template {
 			PidsLimit: 128,
 		},
 		Deliverables: []string{"/output/final-summary.md", "/lessons/run-summary.md"},
+	}
+}
+
+func testLaunchProfile() LaunchProfile {
+	return LaunchProfile{
+		LaunchAgentInput: LaunchAgentInput{
+			Template:          "worker",
+			Task:              "nightly task",
+			Repo:              "owner/repo",
+			BaseBranch:        "main",
+			MaxRuntimeMinutes: 5,
+			Deliverables:      []string{"/output/final-summary.md"},
+			Focus:             "nightly",
+		},
+		AllowOverrides: []string{"task", "focus", "max_runtime_minutes"},
 	}
 }
 

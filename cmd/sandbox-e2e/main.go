@@ -251,7 +251,7 @@ func main() {
 	requireFile(missingArtifacts, "wrapper-diagnostics.json")
 
 	timeoutArgs := launchArgs(sleeperTemplate, "timeout test", repo, baseBranch)
-	timeoutArgs["max_runtime_minutes"] = 1
+	timeoutArgs["max_runtime_seconds"] = 5
 	timeoutRun := structured[launchOutput](callOK(ctx, session, "launch_agent", timeoutArgs))
 	timeoutStatus := waitStatus(ctx, session, timeoutRun.RunID, "stopped", "failed", "timed_out")
 	if timeoutStatus.Status != "timed_out" || !strings.Contains(timeoutStatus.Error, "run exceeded deadline") {
@@ -333,7 +333,7 @@ func runFinalizationLive(ctx context.Context, session *mcp.ClientSession, runsDi
 	assertCleanup(ctx, session, runsDir, failure.RunID)
 
 	timeoutArgs := launchArgs(sleeperTemplate, "timeout probe", repo, baseBranch)
-	timeoutArgs["max_runtime_minutes"] = 1
+	timeoutArgs["max_runtime_seconds"] = 5
 	timeoutRun := structured[launchOutput](callOK(ctx, session, "launch_agent", timeoutArgs))
 	timeoutStatus := waitStatus(ctx, session, timeoutRun.RunID, "stopped", "failed", "timed_out")
 	if timeoutStatus.Status != "timed_out" || !strings.Contains(timeoutStatus.Error, "run exceeded deadline") {
