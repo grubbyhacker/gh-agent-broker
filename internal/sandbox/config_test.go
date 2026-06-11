@@ -169,3 +169,54 @@ func TestConfigValidateLaunchProfilesAndOperatorPrincipals(t *testing.T) {
 		t.Fatalf("Validate() error = %v, want token requirement", err)
 	}
 }
+
+func TestConfigValidateLaunchProfileParameters(t *testing.T) {
+	cfg := baseTestConfig(t)
+	profile := testLaunchProfile()
+	profile.Parameters = map[string]ParameterDeclaration{
+		"upload_ids": {
+			Type:      "string_list",
+			Required:  true,
+			MaxItems:  3,
+			MaxLength: 32,
+			Pattern:   `^[A-Za-z0-9_.:-]+$`,
+		},
+		"attempt": {
+			Type: "integer",
+			Min:  intPtr(1),
+			Max:  intPtr(5),
+		},
+	}
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"timer": {Token: "timer-secret", AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"launch", "dry_run"}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() with parameters error = %v", err)
+	}
+
+	profile.Parameters["bad-name!"] = ParameterDeclaration{Type: "string", MaxLength: 16}
+	cfg.LaunchProfiles["nightly"] = profile
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "invalid name") {
+		t.Fatalf("Validate() error = %v, want invalid parameter name", err)
+	}
+
+	cfg = baseTestConfig(t)
+	profile = testLaunchProfile()
+	profile.Parameters = map[string]ParameterDeclaration{
+		"upload_ids": {Type: "string_list", MaxItems: 1, MaxLength: 8, Default: []any{"ok", "too-many"}},
+	}
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"timer": {Token: "timer-secret", AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"launch", "dry_run"}},
+	}
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "default is invalid") {
+		t.Fatalf("Validate() error = %v, want invalid default", err)
+	}
+}
+
+func intPtr(v int) *int {
+	return &v
+}

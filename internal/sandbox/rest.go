@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,9 +20,10 @@ type operatorIdentity struct {
 }
 
 type launchProfileSummary struct {
-	Name           string           `json:"name"`
-	Request        LaunchAgentInput `json:"request"`
-	AllowOverrides []string         `json:"allow_overrides,omitempty"`
+	Name           string                          `json:"name"`
+	Request        LaunchAgentInput                `json:"request"`
+	AllowOverrides []string                        `json:"allow_overrides,omitempty"`
+	Parameters     map[string]ParameterDeclaration `json:"parameters,omitempty"`
 }
 
 type launchProfilesOutput struct {
@@ -71,9 +73,10 @@ func (h *restHandler) handleLaunchProfiles(w http.ResponseWriter, r *http.Reques
 			Name:           name,
 			Request:        profile.LaunchAgentInput,
 			AllowOverrides: append([]string(nil), profile.AllowOverrides...),
+			Parameters:     profile.Parameters,
 		})
 	}
-	h.audit("launch_profiles.list", identity.Name, "", "", "", "", "", "allow", nil)
+	h.audit("launch_profiles.list", identity.Name, "", "", "", "", "", "allow", nil, nil)
 	writeJSON(w, http.StatusOK, launchProfilesOutput{Profiles: profiles})
 }
 
@@ -84,7 +87,7 @@ func (h *restHandler) handleLaunchProfileAction(w http.ResponseWriter, r *http.R
 		return
 	}
 	name, action := parts[0], parts[1]
-	if action != "launch" && action != "dry-run" {
+	if action != "launch" && action != "dry-run" && action != "preview" {
 		writeRESTError(w, http.StatusNotFound, "not_found")
 		return
 	}
@@ -94,9 +97,13 @@ func (h *restHandler) handleLaunchProfileAction(w http.ResponseWriter, r *http.R
 	}
 	operatorAction := "launch"
 	operation := "launch_profiles.launch"
-	if action == "dry-run" {
+	switch action {
+	case "dry-run":
 		operatorAction = "dry_run"
 		operation = "launch_profiles.dry_run"
+	case "preview":
+		operatorAction = "dry_run"
+		operation = "launch_profiles.preview"
 	}
 	identity, ok := h.authenticate(w, r, operation)
 	if !ok {
@@ -106,10 +113,24 @@ func (h *restHandler) handleLaunchProfileAction(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	in, err := mergeLaunchProfile(profile, r)
+	in, params, err := resolveLaunchProfileRequest(profile, r, h.service.cfg.MaxParameterBytes)
 	if err != nil {
-		h.audit(operation, identity.Name, name, "", profile.Template, profile.Repo, profile.Branch, "deny", err)
+		h.audit(operation, identity.Name, name, "", profile.Template, profile.Repo, profile.Branch, "deny", err, params)
 		writeRESTError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if action == "preview" {
+		out, err := h.service.PreviewLaunch(r.Context(), in)
+		if err != nil {
+			h.audit(operation, identity.Name, name, "", in.Template, in.Repo, in.Branch, "deny", err, params)
+			writeRESTError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		out.Profile = name
+		out.Principal = identity.Name
+		out.AllowedActions = append([]string(nil), identity.Principal.AllowedActions...)
+		h.audit(operation, identity.Name, name, "", in.Template, in.Repo, out.TaskContract.Branch, "allow", nil, params)
+		writeJSON(w, http.StatusOK, out)
 		return
 	}
 	var out LaunchAgentOutput
@@ -119,11 +140,11 @@ func (h *restHandler) handleLaunchProfileAction(w http.ResponseWriter, r *http.R
 		out, err = h.service.LaunchAgent(r.Context(), in)
 	}
 	if err != nil {
-		h.audit(operation, identity.Name, name, "", in.Template, in.Repo, in.Branch, "deny", err)
+		h.audit(operation, identity.Name, name, "", in.Template, in.Repo, in.Branch, "deny", err, params)
 		writeRESTError(w, http.StatusForbidden, err.Error())
 		return
 	}
-	h.audit(operation, identity.Name, name, out.RunID, in.Template, in.Repo, out.Branch, "allow", nil)
+	h.audit(operation, identity.Name, name, out.RunID, in.Template, in.Repo, out.Branch, "allow", nil, params)
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -141,11 +162,11 @@ func (h *restHandler) handleRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.service.ListAgents(r.Context())
 	if err != nil {
-		h.audit("runs.list", identity.Name, "", "", "", "", "", "deny", err)
+		h.audit("runs.list", identity.Name, "", "", "", "", "", "deny", err, nil)
 		writeRESTError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	h.audit("runs.list", identity.Name, "", "", "", "", "", "allow", nil)
+	h.audit("runs.list", identity.Name, "", "", "", "", "", "allow", nil, nil)
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -194,11 +215,11 @@ func (h *restHandler) runStatus(w http.ResponseWriter, r *http.Request, runID st
 	}
 	out, err := h.service.GetAgentStatus(r.Context(), RunInput{RunID: runID})
 	if err != nil {
-		h.audit("runs.status", identity.Name, "", runID, "", "", "", "deny", err)
+		h.audit("runs.status", identity.Name, "", runID, "", "", "", "deny", err, nil)
 		writeRESTError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	h.audit("runs.status", identity.Name, "", runID, "", out.Repo, out.Branch, "allow", nil)
+	h.audit("runs.status", identity.Name, "", runID, "", out.Repo, out.Branch, "allow", nil, nil)
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -225,11 +246,11 @@ func (h *restHandler) runLogs(w http.ResponseWriter, r *http.Request, runID stri
 	}
 	out, err := h.service.GetAgentLogs(r.Context(), LogsInput{RunID: runID, MaxBytes: maxBytes})
 	if err != nil {
-		h.audit("runs.logs", identity.Name, "", runID, "", "", "", "deny", err)
+		h.audit("runs.logs", identity.Name, "", runID, "", "", "", "deny", err, nil)
 		writeRESTError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	h.audit("runs.logs", identity.Name, "", runID, "", "", "", "allow", nil)
+	h.audit("runs.logs", identity.Name, "", runID, "", "", "", "allow", nil, nil)
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -256,11 +277,11 @@ func (h *restHandler) runCollection(w http.ResponseWriter, r *http.Request, runI
 		out, err = h.service.CollectArtifacts(r.Context(), RunInput{RunID: runID})
 	}
 	if err != nil {
-		h.audit(operation, identity.Name, "", runID, "", "", "", "deny", err)
+		h.audit(operation, identity.Name, "", runID, "", "", "", "deny", err, nil)
 		writeRESTError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	h.audit(operation, identity.Name, "", runID, "", "", "", "allow", nil)
+	h.audit(operation, identity.Name, "", runID, "", "", "", "allow", nil, nil)
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -287,11 +308,11 @@ func (h *restHandler) runMutation(w http.ResponseWriter, r *http.Request, runID,
 		out, err = h.service.StopAgent(r.Context(), RunInput{RunID: runID})
 	}
 	if err != nil {
-		h.audit(operation, identity.Name, "", runID, "", "", "", "deny", err)
+		h.audit(operation, identity.Name, "", runID, "", "", "", "deny", err, nil)
 		writeRESTError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	h.audit(operation, identity.Name, "", runID, "", out.Repo, out.Branch, "allow", nil)
+	h.audit(operation, identity.Name, "", runID, "", out.Repo, out.Branch, "allow", nil, nil)
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -302,7 +323,7 @@ func (h *restHandler) authenticate(w http.ResponseWriter, r *http.Request, opera
 			return operatorIdentity{Name: name, Principal: principal}, true
 		}
 	}
-	h.audit(operation, "", "", "", "", "", "", "deny", fmt.Errorf("unauthorized"))
+	h.audit(operation, "", "", "", "", "", "", "deny", fmt.Errorf("unauthorized"), nil)
 	writeRESTError(w, http.StatusUnauthorized, "unauthorized")
 	return operatorIdentity{}, false
 }
@@ -310,14 +331,14 @@ func (h *restHandler) authenticate(w http.ResponseWriter, r *http.Request, opera
 func (h *restHandler) authorizeProfile(w http.ResponseWriter, identity operatorIdentity, profile, action, operation string) (LaunchProfile, bool) {
 	if !contains(identity.Principal.AllowedActions, action) || !contains(identity.Principal.AllowedProfiles, profile) {
 		err := fmt.Errorf("forbidden")
-		h.audit(operation, identity.Name, profile, "", "", "", "", "deny", err)
+		h.audit(operation, identity.Name, profile, "", "", "", "", "deny", err, nil)
 		writeRESTError(w, http.StatusForbidden, "forbidden")
 		return LaunchProfile{}, false
 	}
 	launchProfile, ok := h.service.cfg.LaunchProfiles[profile]
 	if !ok {
 		err := fmt.Errorf("unknown launch profile")
-		h.audit(operation, identity.Name, profile, "", "", "", "", "deny", err)
+		h.audit(operation, identity.Name, profile, "", "", "", "", "deny", err, nil)
 		writeRESTError(w, http.StatusNotFound, "unknown launch profile")
 		return LaunchProfile{}, false
 	}
@@ -329,48 +350,85 @@ func (h *restHandler) authorizeAction(w http.ResponseWriter, identity operatorId
 		return true
 	}
 	err := fmt.Errorf("forbidden")
-	h.audit(operation, identity.Name, "", "", "", "", "", "deny", err)
+	h.audit(operation, identity.Name, "", "", "", "", "", "deny", err, nil)
 	writeRESTError(w, http.StatusForbidden, "forbidden")
 	return false
 }
 
-func (h *restHandler) audit(operation, principal, profile, runID, template, repo, branch, decision string, err error) {
+func (h *restHandler) audit(operation, principal, profile, runID, template, repo, branch, decision string, err error, params map[string]any) {
 	msg := ""
 	if err != nil {
 		msg = err.Error()
 	}
 	h.service.audit.Log(AuditEvent{
-		Operation: operation,
-		Principal: principal,
-		Profile:   profile,
-		RunID:     runID,
-		Template:  template,
-		Repo:      repo,
-		Branch:    branch,
-		Decision:  decision,
-		Error:     msg,
+		Operation:  operation,
+		Principal:  principal,
+		Profile:    profile,
+		RunID:      runID,
+		Template:   template,
+		Repo:       repo,
+		Branch:     branch,
+		Parameters: cloneParameters(params),
+		Decision:   decision,
+		Error:      msg,
 	}, NewRedactor(nil))
 }
 
-func mergeLaunchProfile(profile LaunchProfile, r *http.Request) (LaunchAgentInput, error) {
+func resolveLaunchProfileRequest(profile LaunchProfile, r *http.Request, maxBytes int) (LaunchAgentInput, map[string]any, error) {
+	params := map[string]any(nil)
 	defer closeBody(r.Body)
 	if r.Body == nil || r.ContentLength == 0 {
-		return profile.LaunchAgentInput, nil
+		resolved, err := resolveProfileParameters(profile, nil)
+		in := profile.LaunchAgentInput
+		in.Parameters = resolved
+		return in, resolved, err
+	}
+	if maxBytes < 1 {
+		maxBytes = defaultMaxParamBytes
+	}
+	b, err := io.ReadAll(io.LimitReader(r.Body, int64(maxBytes)+1))
+	if err != nil {
+		return LaunchAgentInput{}, nil, err
+	}
+	if len(b) > maxBytes {
+		return LaunchAgentInput{}, nil, fmt.Errorf("request body exceeds max_parameter_bytes %d", maxBytes)
 	}
 	var raw map[string]json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-		return LaunchAgentInput{}, err
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return LaunchAgentInput{}, nil, err
 	}
 	if len(raw) == 0 {
-		return profile.LaunchAgentInput, nil
+		resolved, err := resolveProfileParameters(profile, nil)
+		in := profile.LaunchAgentInput
+		in.Parameters = resolved
+		return in, resolved, err
+	}
+	if rawParams, ok := raw["parameters"]; ok {
+		if len(raw) != 1 {
+			return LaunchAgentInput{}, nil, fmt.Errorf("request body must contain only parameters")
+		}
+		var submitted map[string]any
+		if err := json.Unmarshal(rawParams, &submitted); err != nil {
+			return LaunchAgentInput{}, nil, fmt.Errorf("parameters must be an object")
+		}
+		resolved, err := resolveProfileParameters(profile, submitted)
+		if err != nil {
+			return LaunchAgentInput{}, resolved, err
+		}
+		in := profile.LaunchAgentInput
+		in.Parameters = resolved
+		return in, resolved, nil
+	}
+	if len(profile.Parameters) > 0 {
+		return LaunchAgentInput{}, nil, fmt.Errorf("parameterized profile requests must contain only parameters")
 	}
 	if overrides, ok := raw["overrides"]; ok {
 		if len(raw) != 1 {
-			return LaunchAgentInput{}, fmt.Errorf("request body must contain only overrides")
+			return LaunchAgentInput{}, nil, fmt.Errorf("request body must contain only overrides")
 		}
 		raw = map[string]json.RawMessage{}
 		if err := json.Unmarshal(overrides, &raw); err != nil {
-			return LaunchAgentInput{}, fmt.Errorf("overrides must be an object")
+			return LaunchAgentInput{}, nil, fmt.Errorf("overrides must be an object")
 		}
 	}
 	allowed := map[string]bool{}
@@ -379,32 +437,34 @@ func mergeLaunchProfile(profile LaunchProfile, r *http.Request) (LaunchAgentInpu
 	}
 	for field := range raw {
 		if !launchOverrideFieldAllowed(field) {
-			return LaunchAgentInput{}, fmt.Errorf("unsupported override field %q", field)
+			return LaunchAgentInput{}, nil, fmt.Errorf("unsupported override field %q", field)
 		}
 		if !allowed[field] {
-			return LaunchAgentInput{}, fmt.Errorf("override field %q is not allowed for this profile", field)
+			return LaunchAgentInput{}, nil, fmt.Errorf("override field %q is not allowed for this profile", field)
 		}
 	}
 	mergedBytes, err := json.Marshal(profile.LaunchAgentInput)
 	if err != nil {
-		return LaunchAgentInput{}, err
+		return LaunchAgentInput{}, nil, err
 	}
 	var merged map[string]json.RawMessage
 	if err := json.Unmarshal(mergedBytes, &merged); err != nil {
-		return LaunchAgentInput{}, err
+		return LaunchAgentInput{}, nil, err
 	}
 	for field, value := range raw {
 		merged[field] = value
 	}
 	finalBytes, err := json.Marshal(merged)
 	if err != nil {
-		return LaunchAgentInput{}, err
+		return LaunchAgentInput{}, nil, err
 	}
 	var out LaunchAgentInput
 	if err := json.Unmarshal(finalBytes, &out); err != nil {
-		return LaunchAgentInput{}, err
+		return LaunchAgentInput{}, nil, err
 	}
-	return out, nil
+	params, err = resolveProfileParameters(profile, nil)
+	out.Parameters = params
+	return out, params, err
 }
 
 func bearerToken(r *http.Request) string {

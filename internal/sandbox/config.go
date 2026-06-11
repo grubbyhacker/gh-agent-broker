@@ -2,6 +2,9 @@
 package sandbox
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,11 +17,12 @@ import (
 )
 
 const (
-	defaultListen       = "127.0.0.1:8091"
-	defaultMCPPath      = "/mcp"
-	defaultRunsDir      = "/srv/hermes-sandbox-broker/runs"
-	defaultMaxTaskBytes = 64 * 1024
-	defaultLogByteLimit = 128 * 1024
+	defaultListen        = "127.0.0.1:8091"
+	defaultMCPPath       = "/mcp"
+	defaultRunsDir       = "/srv/hermes-sandbox-broker/runs"
+	defaultMaxTaskBytes  = 64 * 1024
+	defaultMaxParamBytes = 16 * 1024
+	defaultLogByteLimit  = 128 * 1024
 )
 
 type Config struct {
@@ -37,9 +41,12 @@ type Config struct {
 	OperatorPrincipals map[string]OperatorPrincipal `yaml:"operator_principals"`
 	Audit              SandboxAuditConfig           `yaml:"audit"`
 	MaxTaskBytes       int                          `yaml:"max_task_bytes"`
+	MaxParameterBytes  int                          `yaml:"max_parameter_bytes"`
 	LogByteLimit       int                          `yaml:"log_byte_limit"`
 	StopGrace          Duration                     `yaml:"stop_grace"`
 	ResolvedPaths      map[string]CredentialBundle  `yaml:"-"`
+	ConfigLoadedAt     time.Time                    `yaml:"-"`
+	ConfigVersion      string                       `yaml:"-"`
 }
 
 type SandboxAuditConfig struct {
@@ -98,7 +105,19 @@ type BranchPolicy struct {
 
 type LaunchProfile struct {
 	LaunchAgentInput `yaml:",inline"`
-	AllowOverrides   []string `yaml:"allow_overrides"`
+	AllowOverrides   []string                        `yaml:"allow_overrides"`
+	Parameters       map[string]ParameterDeclaration `yaml:"parameters"`
+}
+
+type ParameterDeclaration struct {
+	Type      string `yaml:"type" json:"type"`
+	Required  bool   `yaml:"required" json:"required,omitempty"`
+	Default   any    `yaml:"default,omitempty" json:"default,omitempty"`
+	Min       *int   `yaml:"min,omitempty" json:"min,omitempty"`
+	Max       *int   `yaml:"max,omitempty" json:"max,omitempty"`
+	MaxLength int    `yaml:"max_length,omitempty" json:"max_length,omitempty"`
+	MaxItems  int    `yaml:"max_items,omitempty" json:"max_items,omitempty"`
+	Pattern   string `yaml:"pattern,omitempty" json:"pattern,omitempty"`
 }
 
 type OperatorPrincipal struct {
@@ -147,7 +166,13 @@ func Load(path string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
+	cfg.StampLoaded(time.Now().UTC())
 	return cfg, nil
+}
+
+func (c *Config) StampLoaded(loadedAt time.Time) {
+	c.ConfigLoadedAt = loadedAt
+	c.ConfigVersion = c.versionDigest()
 }
 
 func (c *Config) ApplyDefaults() {
@@ -162,6 +187,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.MaxTaskBytes == 0 {
 		c.MaxTaskBytes = defaultMaxTaskBytes
+	}
+	if c.MaxParameterBytes == 0 {
+		c.MaxParameterBytes = defaultMaxParamBytes
 	}
 	if c.LogByteLimit == 0 {
 		c.LogByteLimit = defaultLogByteLimit
@@ -202,6 +230,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxTaskBytes < 1 {
 		errs = append(errs, "max_task_bytes must be positive")
+	}
+	if c.MaxParameterBytes < 1 {
+		errs = append(errs, "max_parameter_bytes must be positive")
 	}
 	if c.LogByteLimit < 1 {
 		errs = append(errs, "log_byte_limit must be positive")
@@ -407,6 +438,47 @@ func (c Config) validateLaunchProfile(name string, profile LaunchProfile) []stri
 			errs = append(errs, fmt.Sprintf("launch profile %q allow_overrides contains unsupported field %q", name, field))
 		}
 	}
+	for paramName, decl := range profile.Parameters {
+		errs = append(errs, validateParameterDeclaration(name, paramName, decl)...)
+	}
+	return errs
+}
+
+func validateParameterDeclaration(profileName, name string, decl ParameterDeclaration) []string {
+	var errs []string
+	if !safeParameterName(name) {
+		errs = append(errs, fmt.Sprintf("launch profile %q parameter %q has invalid name", profileName, name))
+	}
+	switch decl.Type {
+	case "string":
+		if decl.MaxLength < 1 {
+			errs = append(errs, fmt.Sprintf("launch profile %q parameter %q max_length must be positive", profileName, name))
+		}
+	case "string_list":
+		if decl.MaxItems < 1 {
+			errs = append(errs, fmt.Sprintf("launch profile %q parameter %q max_items must be positive", profileName, name))
+		}
+		if decl.MaxLength < 1 {
+			errs = append(errs, fmt.Sprintf("launch profile %q parameter %q max_length must be positive", profileName, name))
+		}
+	case "boolean":
+	case "integer":
+		if decl.Min != nil && decl.Max != nil && *decl.Min > *decl.Max {
+			errs = append(errs, fmt.Sprintf("launch profile %q parameter %q min must not exceed max", profileName, name))
+		}
+	default:
+		errs = append(errs, fmt.Sprintf("launch profile %q parameter %q has unsupported type %q", profileName, name, decl.Type))
+	}
+	if decl.Pattern != "" {
+		if _, err := regexp.Compile(decl.Pattern); err != nil {
+			errs = append(errs, fmt.Sprintf("launch profile %q parameter %q has invalid pattern", profileName, name))
+		}
+	}
+	if decl.Default != nil {
+		if _, err := normalizeParameterValue(name, decl, decl.Default); err != nil {
+			errs = append(errs, fmt.Sprintf("launch profile %q parameter %q default is invalid: %v", profileName, name, err))
+		}
+	}
 	return errs
 }
 
@@ -453,6 +525,203 @@ func launchOverrideFieldAllowed(field string) bool {
 	default:
 		return false
 	}
+}
+
+func resolveProfileParameters(profile LaunchProfile, submitted map[string]any) (map[string]any, error) {
+	if len(submitted) > 0 && len(profile.Parameters) == 0 {
+		return nil, fmt.Errorf("profile does not allow parameters")
+	}
+	for name := range submitted {
+		if _, ok := profile.Parameters[name]; !ok {
+			return nil, fmt.Errorf("unsupported parameter %q", name)
+		}
+	}
+	if len(profile.Parameters) == 0 {
+		return map[string]any{}, nil
+	}
+	out := map[string]any{}
+	for name, decl := range profile.Parameters {
+		value, ok := submitted[name]
+		if !ok {
+			value = decl.Default
+		}
+		if value == nil {
+			if decl.Required {
+				return nil, fmt.Errorf("required parameter %q is missing", name)
+			}
+			continue
+		}
+		normalized, err := normalizeParameterValue(name, decl, value)
+		if err != nil {
+			return nil, err
+		}
+		out[name] = normalized
+	}
+	return out, nil
+}
+
+func normalizeParameterValue(name string, decl ParameterDeclaration, value any) (any, error) {
+	switch decl.Type {
+	case "string":
+		v, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("parameter %q must be a string", name)
+		}
+		if err := validateParameterString(name, decl, v); err != nil {
+			return nil, err
+		}
+		return v, nil
+	case "string_list":
+		values, err := stringListValue(value)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %q must be a list of strings", name)
+		}
+		if len(values) > decl.MaxItems {
+			return nil, fmt.Errorf("parameter %q must contain at most %d items", name, decl.MaxItems)
+		}
+		for _, item := range values {
+			if err := validateParameterString(name, decl, item); err != nil {
+				return nil, err
+			}
+		}
+		return values, nil
+	case "boolean":
+		v, ok := value.(bool)
+		if !ok {
+			return nil, fmt.Errorf("parameter %q must be a boolean", name)
+		}
+		return v, nil
+	case "integer":
+		v, ok := integerValue(value)
+		if !ok {
+			return nil, fmt.Errorf("parameter %q must be an integer", name)
+		}
+		if decl.Min != nil && v < *decl.Min {
+			return nil, fmt.Errorf("parameter %q must be at least %d", name, *decl.Min)
+		}
+		if decl.Max != nil && v > *decl.Max {
+			return nil, fmt.Errorf("parameter %q must be at most %d", name, *decl.Max)
+		}
+		return v, nil
+	default:
+		return nil, fmt.Errorf("parameter %q has unsupported type %q", name, decl.Type)
+	}
+}
+
+func validateParameterString(name string, decl ParameterDeclaration, value string) error {
+	if len(value) > decl.MaxLength {
+		return fmt.Errorf("parameter %q string value exceeds max_length %d", name, decl.MaxLength)
+	}
+	if decl.Pattern != "" {
+		matched, err := regexp.MatchString(decl.Pattern, value)
+		if err != nil {
+			return fmt.Errorf("parameter %q pattern is invalid", name)
+		}
+		if !matched {
+			return fmt.Errorf("parameter %q string value does not match required pattern", name)
+		}
+	}
+	return nil
+}
+
+func stringListValue(value any) ([]string, error) {
+	switch v := value.(type) {
+	case []string:
+		return append([]string(nil), v...), nil
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("non-string item")
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("not a list")
+	}
+}
+
+func integerValue(value any) (int, bool) {
+	switch v := value.(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), int64(int(v)) == v
+	case int32:
+		return int(v), true
+	case float64:
+		i := int(v)
+		return i, float64(i) == v
+	case float32:
+		i := int(v)
+		return i, float32(i) == v
+	default:
+		return 0, false
+	}
+}
+
+func safeParameterName(name string) bool {
+	if len(name) == 0 || len(name) > 64 {
+		return false
+	}
+	return regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(name)
+}
+
+func (c Config) versionDigest() string {
+	templates := make(map[string]any, len(c.Templates))
+	for name, tmpl := range c.Templates {
+		templates[name] = map[string]any{
+			"image":               tmpl.Image,
+			"command":             tmpl.Command,
+			"user":                tmpl.User,
+			"resources":           tmpl.Resources,
+			"network_policy":      tmpl.NetworkPolicy,
+			"max_runtime_minutes": tmpl.MaxRuntimeMinutes,
+			"broker_agent_id":     tmpl.BrokerAgentID,
+			"broker_secret_env":   tmpl.BrokerSecretEnv,
+			"branch_policy":       tmpl.BranchPolicy,
+			"credential_bundle":   tmpl.CredentialBundle,
+			"deliverables":        tmpl.Deliverables,
+			"knowledge_snapshots": tmpl.KnowledgeSnapshots,
+			"environment":         tmpl.Environment,
+			"extra_mounts":        tmpl.ExtraMounts,
+		}
+	}
+	principals := make(map[string]any, len(c.OperatorPrincipals))
+	for name, principal := range c.OperatorPrincipals {
+		principals[name] = map[string]any{
+			"token_env":        principal.TokenEnv,
+			"allowed_profiles": principal.AllowedProfiles,
+			"allowed_actions":  principal.AllowedActions,
+		}
+	}
+	view := map[string]any{
+		"listen":              c.Listen,
+		"mcp_path":            c.MCPPath,
+		"auth_token_env":      c.AuthTokenEnv,
+		"runs_dir":            c.RunsDir,
+		"broker_url":          c.BrokerURL,
+		"production":          c.Production,
+		"repositories":        c.Repositories,
+		"network_policies":    c.Networks,
+		"credential_bundles":  c.Bundles,
+		"templates":           templates,
+		"launch_profiles":     c.LaunchProfiles,
+		"operator_principals": principals,
+		"audit":               c.Audit,
+		"max_task_bytes":      c.MaxTaskBytes,
+		"max_parameter_bytes": c.MaxParameterBytes,
+		"log_byte_limit":      c.LogByteLimit,
+		"stop_grace":          c.StopGrace,
+	}
+	b, err := json.Marshal(view)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func contains(items []string, want string) bool {

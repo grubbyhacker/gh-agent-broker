@@ -4,6 +4,39 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current parameterized sandbox launch profile implementation:
+
+- Current branch `feature/parameterized-launch-profiles` adds parameterized
+  REST launch profiles to `sandbox-broker` without letting callers alter
+  profile-owned authority such as repo, template/image, mounts, credentials,
+  runtime budgets, or enabled actions.
+- Sandbox launch profiles now support `parameters` declarations with primitive
+  types `string`, `string_list`, `boolean`, and `integer`, plus required/default
+  values, integer min/max, string/list length limits, max list items, and an
+  optional generic regex pattern. Broker validation is shape-only; values remain
+  opaque to domain code such as YKM Curator.
+- Profile action request bodies can use `{"parameters": {...}}`. Parameterized
+  profiles reject legacy override fields, while non-parameterized profiles keep
+  the existing override behavior.
+- `/input/task.json` now includes a `parameters` object when resolved
+  parameters are present. Preview, dry-run, and launch all validate the resolved
+  task contract size before container creation.
+- New `POST /v1/launch-profiles/{name}/preview` authenticates like dry-run,
+  creates no run directory/container, and returns profile/principal, config
+  loaded timestamp/version, resolved launch request, resolved task contract,
+  template image/command/user/network/credential-bundle name/broker-agent ID,
+  runtime/resource budgets, and caller allowed actions.
+- Sandbox audit events now record sanitized parameter values alongside
+  profile/principal/run metadata; secrets, auth headers, broker credentials, and
+  credential bundle contents are still excluded/redacted.
+- Sandbox config now records a sanitized `config_version` digest and
+  `config_loaded_at` timestamp. `/healthz` reports both. Runtime reload is not
+  part of this change.
+- `configs/sandbox.example.yaml` documents `max_parameter_bytes` and a commented
+  YKM-style `upload_ids` `string_list` profile example.
+- Latest verification passed: `go test ./internal/sandbox ./cmd/sandbox-broker`,
+  `make fmt`, `git diff --check`, and `make check`.
+
 Current CI sandbox E2E speed follow-up for issue #35:
 
 - Current branch `fix/sandbox-e2e-minimal-image` keeps the seconds-level timeout

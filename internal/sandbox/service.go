@@ -38,50 +38,53 @@ type pathPermissionFixer interface {
 }
 
 type RunMetadata struct {
-	RunID            string    `json:"run_id"`
-	Template         string    `json:"template"`
-	Repo             string    `json:"repo"`
-	BaseBranch       string    `json:"base_branch"`
-	Branch           string    `json:"branch"`
-	Task             string    `json:"task"`
-	Focus            string    `json:"focus,omitempty"`
-	WorkerAgentID    string    `json:"worker_agent_id"`
-	BrokerAgentID    string    `json:"broker_agent_id"`
-	CredentialBundle string    `json:"credential_bundle,omitempty"`
-	ContainerID      string    `json:"container_id,omitempty"`
-	Image            string    `json:"image"`
-	ImageDigest      string    `json:"image_digest,omitempty"`
-	Status           string    `json:"status"`
-	ExitCode         *int      `json:"exit_code,omitempty"`
-	Error            string    `json:"error,omitempty"`
-	Deliverables     []string  `json:"deliverables,omitempty"`
-	StartedAt        time.Time `json:"started_at"`
-	Deadline         time.Time `json:"deadline"`
-	EndedAt          time.Time `json:"ended_at,omitempty"`
+	RunID            string         `json:"run_id"`
+	Template         string         `json:"template"`
+	Repo             string         `json:"repo"`
+	BaseBranch       string         `json:"base_branch"`
+	Branch           string         `json:"branch"`
+	Task             string         `json:"task"`
+	Focus            string         `json:"focus,omitempty"`
+	WorkerAgentID    string         `json:"worker_agent_id"`
+	BrokerAgentID    string         `json:"broker_agent_id"`
+	CredentialBundle string         `json:"credential_bundle,omitempty"`
+	ContainerID      string         `json:"container_id,omitempty"`
+	Image            string         `json:"image"`
+	ImageDigest      string         `json:"image_digest,omitempty"`
+	Status           string         `json:"status"`
+	ExitCode         *int           `json:"exit_code,omitempty"`
+	Error            string         `json:"error,omitempty"`
+	Deliverables     []string       `json:"deliverables,omitempty"`
+	Parameters       map[string]any `json:"parameters,omitempty"`
+	StartedAt        time.Time      `json:"started_at"`
+	Deadline         time.Time      `json:"deadline"`
+	EndedAt          time.Time      `json:"ended_at,omitempty"`
 }
 
 type TaskContract struct {
-	RunID           string   `json:"run_id"`
-	Task            string   `json:"task"`
-	Focus           string   `json:"focus,omitempty"`
-	Repo            string   `json:"repo"`
-	BaseBranch      string   `json:"base_branch"`
-	Branch          string   `json:"branch"`
-	WorkerAgentID   string   `json:"worker_agent_id"`
-	BrokerRemoteURL string   `json:"broker_remote_url"`
-	Deliverables    []string `json:"deliverables,omitempty"`
+	RunID           string         `json:"run_id"`
+	Task            string         `json:"task"`
+	Focus           string         `json:"focus,omitempty"`
+	Repo            string         `json:"repo"`
+	BaseBranch      string         `json:"base_branch"`
+	Branch          string         `json:"branch"`
+	WorkerAgentID   string         `json:"worker_agent_id"`
+	BrokerRemoteURL string         `json:"broker_remote_url"`
+	Deliverables    []string       `json:"deliverables,omitempty"`
+	Parameters      map[string]any `json:"parameters,omitempty"`
 }
 
 type LaunchAgentInput struct {
-	Template          string   `json:"template" yaml:"template" jsonschema:"sandbox template name"`
-	Task              string   `json:"task" yaml:"task" jsonschema:"worker task description"`
-	Repo              string   `json:"repo" yaml:"repo" jsonschema:"owner/repo repository"`
-	BaseBranch        string   `json:"base_branch" yaml:"base_branch" jsonschema:"base branch"`
-	Branch            string   `json:"branch,omitempty" yaml:"branch,omitempty" jsonschema:"optional branch; generated when omitted"`
-	MaxRuntimeMinutes int      `json:"max_runtime_minutes,omitempty" yaml:"max_runtime_minutes,omitempty" jsonschema:"optional runtime cap within the template maximum"`
-	MaxRuntimeSeconds int      `json:"max_runtime_seconds,omitempty" yaml:"max_runtime_seconds,omitempty" jsonschema:"optional shorter runtime cap within the template maximum"`
-	Deliverables      []string `json:"deliverables,omitempty" yaml:"deliverables,omitempty" jsonschema:"optional expected deliverable names"`
-	Focus             string   `json:"focus,omitempty" yaml:"focus,omitempty" jsonschema:"optional constrained focus for the worker"`
+	Template          string         `json:"template" yaml:"template" jsonschema:"sandbox template name"`
+	Task              string         `json:"task" yaml:"task" jsonschema:"worker task description"`
+	Repo              string         `json:"repo" yaml:"repo" jsonschema:"owner/repo repository"`
+	BaseBranch        string         `json:"base_branch" yaml:"base_branch" jsonschema:"base branch"`
+	Branch            string         `json:"branch,omitempty" yaml:"branch,omitempty" jsonschema:"optional branch; generated when omitted"`
+	MaxRuntimeMinutes int            `json:"max_runtime_minutes,omitempty" yaml:"max_runtime_minutes,omitempty" jsonschema:"optional runtime cap within the template maximum"`
+	MaxRuntimeSeconds int            `json:"max_runtime_seconds,omitempty" yaml:"max_runtime_seconds,omitempty" jsonschema:"optional shorter runtime cap within the template maximum"`
+	Deliverables      []string       `json:"deliverables,omitempty" yaml:"deliverables,omitempty" jsonschema:"optional expected deliverable names"`
+	Focus             string         `json:"focus,omitempty" yaml:"focus,omitempty" jsonschema:"optional constrained focus for the worker"`
+	Parameters        map[string]any `json:"parameters,omitempty" yaml:"-" jsonschema:"broker-resolved opaque profile parameters"`
 }
 
 func (in *LaunchAgentInput) UnmarshalJSON(b []byte) error {
@@ -100,6 +103,7 @@ func (in *LaunchAgentInput) UnmarshalJSON(b []byte) error {
 		"max_runtime_seconds": true,
 		"deliverables":        true,
 		"focus":               true,
+		"parameters":          true,
 	}
 	for key := range raw {
 		if !allowed[key] {
@@ -121,6 +125,34 @@ type LaunchAgentOutput struct {
 	Branch        string    `json:"branch"`
 	Status        string    `json:"status"`
 	Deadline      time.Time `json:"deadline"`
+}
+
+type LaunchPreviewOutput struct {
+	Profile          string              `json:"profile,omitempty"`
+	Principal        string              `json:"principal,omitempty"`
+	ConfigLoadedAt   time.Time           `json:"config_loaded_at"`
+	ConfigVersion    string              `json:"config_version"`
+	Request          LaunchAgentInput    `json:"request"`
+	TaskContract     TaskContract        `json:"task_contract"`
+	Template         TemplatePreview     `json:"template"`
+	Budgets          LaunchPreviewBudget `json:"budgets"`
+	AllowedActions   []string            `json:"allowed_actions,omitempty"`
+	AllowedMutations []string            `json:"allowed_mutations"`
+}
+
+type TemplatePreview struct {
+	Image            string    `json:"image"`
+	Command          []string  `json:"command,omitempty"`
+	User             string    `json:"user"`
+	NetworkPolicy    string    `json:"network_policy"`
+	CredentialBundle string    `json:"credential_bundle,omitempty"`
+	BrokerAgentID    string    `json:"broker_agent_id"`
+	Resources        Resources `json:"resources"`
+}
+
+type LaunchPreviewBudget struct {
+	RuntimeSeconds int64     `json:"runtime_seconds"`
+	Resources      Resources `json:"resources"`
 }
 
 type ValidateTemplateInput struct {
@@ -171,6 +203,10 @@ type ListAgentsOutput struct {
 }
 
 func NewService(cfg Config, runtime RuntimeBackend, auditLog *AuditLogger) *Service {
+	cfg.ApplyDefaults()
+	if cfg.ConfigLoadedAt.IsZero() || cfg.ConfigVersion == "" {
+		cfg.StampLoaded(time.Now().UTC())
+	}
 	return &Service{
 		cfg:     cfg,
 		runtime: runtime,
@@ -239,7 +275,30 @@ func (s *Service) DryRunLaunch(ctx context.Context, in LaunchAgentInput) (Launch
 		s.auditDeny("dry_run_launch", in, err)
 		return LaunchAgentOutput{}, err
 	}
-	deadline := time.Now().UTC().Add(runtimeLimit)
+	now := time.Now().UTC()
+	deadline := now.Add(runtimeLimit)
+	meta := RunMetadata{
+		RunID:            runID,
+		Template:         in.Template,
+		Repo:             in.Repo,
+		BaseBranch:       in.BaseBranch,
+		Branch:           branch,
+		Task:             in.Task,
+		Focus:            in.Focus,
+		WorkerAgentID:    workerAgentID(tmpl, runID),
+		BrokerAgentID:    tmpl.BrokerAgentID,
+		CredentialBundle: tmpl.CredentialBundle,
+		Image:            tmpl.Image,
+		Status:           StatusPending,
+		Deliverables:     deliverables(in.Deliverables, tmpl.Deliverables),
+		Parameters:       cloneParameters(in.Parameters),
+		StartedAt:        now,
+		Deadline:         deadline,
+	}
+	if err := s.validateTaskContract(s.taskContract(meta)); err != nil {
+		s.auditDeny("dry_run_launch", in, err)
+		return LaunchAgentOutput{}, err
+	}
 	return LaunchAgentOutput{
 		RunID:         runID,
 		WorkerAgentID: workerAgentID(tmpl, runID),
@@ -247,6 +306,57 @@ func (s *Service) DryRunLaunch(ctx context.Context, in LaunchAgentInput) (Launch
 		Branch:        branch,
 		Status:        StatusPending,
 		Deadline:      deadline,
+	}, nil
+}
+
+func (s *Service) PreviewLaunch(ctx context.Context, in LaunchAgentInput) (LaunchPreviewOutput, error) {
+	_ = ctx
+	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
+	if err != nil {
+		return LaunchPreviewOutput{}, err
+	}
+	now := time.Now().UTC()
+	meta := RunMetadata{
+		RunID:            runID,
+		Template:         in.Template,
+		Repo:             in.Repo,
+		BaseBranch:       in.BaseBranch,
+		Branch:           branch,
+		Task:             in.Task,
+		Focus:            in.Focus,
+		WorkerAgentID:    workerAgentID(tmpl, runID),
+		BrokerAgentID:    tmpl.BrokerAgentID,
+		CredentialBundle: tmpl.CredentialBundle,
+		Image:            tmpl.Image,
+		Status:           StatusPending,
+		Deliverables:     deliverables(in.Deliverables, tmpl.Deliverables),
+		Parameters:       cloneParameters(in.Parameters),
+		StartedAt:        now,
+		Deadline:         now.Add(runtimeLimit),
+	}
+	contract := s.taskContract(meta)
+	if err := s.validateTaskContract(contract); err != nil {
+		return LaunchPreviewOutput{}, err
+	}
+	return LaunchPreviewOutput{
+		ConfigLoadedAt: s.cfg.ConfigLoadedAt,
+		ConfigVersion:  s.cfg.ConfigVersion,
+		Request:        in,
+		TaskContract:   contract,
+		Template: TemplatePreview{
+			Image:            tmpl.Image,
+			Command:          append([]string(nil), tmpl.Command...),
+			User:             tmpl.User,
+			NetworkPolicy:    tmpl.NetworkPolicy,
+			CredentialBundle: tmpl.CredentialBundle,
+			BrokerAgentID:    tmpl.BrokerAgentID,
+			Resources:        tmpl.Resources,
+		},
+		Budgets: LaunchPreviewBudget{
+			RuntimeSeconds: int64(runtimeLimit / time.Second),
+			Resources:      tmpl.Resources,
+		},
+		AllowedMutations: []string{},
 	}, nil
 }
 
@@ -258,6 +368,27 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 	}
 	now := time.Now().UTC()
 	deadline := now.Add(runtimeLimit)
+	meta := RunMetadata{
+		RunID:            runID,
+		Template:         in.Template,
+		Repo:             in.Repo,
+		BaseBranch:       in.BaseBranch,
+		Branch:           branch,
+		Task:             in.Task,
+		Focus:            in.Focus,
+		WorkerAgentID:    workerAgentID(tmpl, runID),
+		BrokerAgentID:    tmpl.BrokerAgentID,
+		CredentialBundle: tmpl.CredentialBundle,
+		Image:            tmpl.Image,
+		Status:           StatusPending,
+		Deliverables:     deliverables(in.Deliverables, tmpl.Deliverables),
+		Parameters:       cloneParameters(in.Parameters),
+		StartedAt:        now,
+		Deadline:         deadline,
+	}
+	if err := s.validateTaskContract(s.taskContract(meta)); err != nil {
+		return LaunchAgentOutput{}, err
+	}
 	runDir := s.runDir(runID)
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
 		return LaunchAgentOutput{}, err
@@ -281,23 +412,6 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 	}
 	if err := copyKnowledgeSnapshots(tmpl.KnowledgeSnapshots, filepath.Join(runDir, "input")); err != nil {
 		return LaunchAgentOutput{}, err
-	}
-	meta := RunMetadata{
-		RunID:            runID,
-		Template:         in.Template,
-		Repo:             in.Repo,
-		BaseBranch:       in.BaseBranch,
-		Branch:           branch,
-		Task:             in.Task,
-		Focus:            in.Focus,
-		WorkerAgentID:    workerAgentID(tmpl, runID),
-		BrokerAgentID:    tmpl.BrokerAgentID,
-		CredentialBundle: tmpl.CredentialBundle,
-		Image:            tmpl.Image,
-		Status:           StatusPending,
-		Deliverables:     deliverables(in.Deliverables, tmpl.Deliverables),
-		StartedAt:        now,
-		Deadline:         deadline,
 	}
 	if err := s.writeTaskInputs(meta); err != nil {
 		return LaunchAgentOutput{}, err
@@ -662,16 +776,9 @@ func (s *Service) writeMetadata(meta RunMetadata) error {
 
 func (s *Service) writeTaskInputs(meta RunMetadata) error {
 	inputDir := filepath.Join(s.runDir(meta.RunID), "input")
-	contract := TaskContract{
-		RunID:           meta.RunID,
-		Task:            meta.Task,
-		Focus:           meta.Focus,
-		Repo:            meta.Repo,
-		BaseBranch:      meta.BaseBranch,
-		Branch:          meta.Branch,
-		WorkerAgentID:   meta.WorkerAgentID,
-		BrokerRemoteURL: strings.TrimRight(s.cfg.BrokerURL, "/") + "/git/" + meta.Repo + ".git",
-		Deliverables:    append([]string{}, meta.Deliverables...),
+	contract := s.taskContract(meta)
+	if err := s.validateTaskContract(contract); err != nil {
+		return err
 	}
 	if err := writeJSONFile(filepath.Join(inputDir, "task.json"), contract, 0o644); err != nil {
 		return err
@@ -683,6 +790,32 @@ func (s *Service) writeTaskInputs(meta RunMetadata) error {
 	rules := sandboxRulesMarkdown(contract)
 	//nolint:gosec // G306: sandbox rules are mounted read-only and must be readable by the non-root worker.
 	return os.WriteFile(filepath.Join(inputDir, "sandbox-rules.md"), []byte(rules), 0o644)
+}
+
+func (s *Service) taskContract(meta RunMetadata) TaskContract {
+	return TaskContract{
+		RunID:           meta.RunID,
+		Task:            meta.Task,
+		Focus:           meta.Focus,
+		Repo:            meta.Repo,
+		BaseBranch:      meta.BaseBranch,
+		Branch:          meta.Branch,
+		WorkerAgentID:   meta.WorkerAgentID,
+		BrokerRemoteURL: strings.TrimRight(s.cfg.BrokerURL, "/") + "/git/" + meta.Repo + ".git",
+		Deliverables:    append([]string{}, meta.Deliverables...),
+		Parameters:      cloneParameters(meta.Parameters),
+	}
+}
+
+func (s *Service) validateTaskContract(contract TaskContract) error {
+	b, err := json.Marshal(contract)
+	if err != nil {
+		return err
+	}
+	if len(b) > s.cfg.MaxTaskBytes {
+		return fmt.Errorf("policy denial: resolved task contract exceeds max size %d bytes; shorten the task request or parameters", s.cfg.MaxTaskBytes)
+	}
+	return nil
 }
 
 func writeJSONFile(path string, value interface{}, mode os.FileMode) error {
@@ -748,12 +881,13 @@ func (s *Service) redactor(meta RunMetadata) Redactor {
 
 func (s *Service) auditDeny(operation string, in LaunchAgentInput, err error) {
 	s.audit.Log(AuditEvent{
-		Operation: operation,
-		Template:  in.Template,
-		Repo:      in.Repo,
-		Branch:    in.Branch,
-		Decision:  "deny",
-		Error:     err.Error(),
+		Operation:  operation,
+		Template:   in.Template,
+		Repo:       in.Repo,
+		Branch:     in.Branch,
+		Parameters: cloneParameters(in.Parameters),
+		Decision:   "deny",
+		Error:      err.Error(),
 	}, NewRedactor(nil))
 }
 
@@ -767,6 +901,7 @@ func (s *Service) auditEvent(operation string, meta RunMetadata, decision string
 		Branch:           meta.Branch,
 		ImageDigest:      meta.ImageDigest,
 		CredentialBundle: meta.CredentialBundle,
+		Parameters:       cloneParameters(meta.Parameters),
 		Status:           meta.Status,
 		ExitCode:         meta.ExitCode,
 		Decision:         decision,
@@ -897,6 +1032,22 @@ func deliverables(requested, defaults []string) []string {
 		}
 		seen[item] = true
 		out = append(out, item)
+	}
+	return out
+}
+
+func cloneParameters(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		switch values := v.(type) {
+		case []string:
+			out[k] = append([]string(nil), values...)
+		default:
+			out[k] = values
+		}
 	}
 	return out
 }
