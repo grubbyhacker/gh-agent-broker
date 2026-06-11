@@ -18,6 +18,7 @@ Build a GitHub Agent Access Broker that lets agent containers use GitHub App acc
 ## Development
 
 - Make code and documentation changes on feature branches, not directly on `main`.
+- Never merge your own pull requests unless the human-in-the-loop explicitly instructs you to merge.
 - Language: Go.
 - Target toolchain: Go 1.26.x.
 - Prefer small packages under `internal/` with unit tests for policy, metadata, auth, and audit behavior.
