@@ -170,6 +170,15 @@ func (c *Config) Validate() error {
 		appName := GitHubAppName(a)
 		if _, ok := apps[appName]; !ok {
 			errs = append(errs, fmt.Sprintf("agent %q references unknown github_app %q", a.ID, appName))
+		} else if a.Enabled {
+			for _, repo := range a.Repositories {
+				if repo == "" {
+					continue
+				}
+				if _, ok := c.InstallationIDForApp(appName, repo); !ok {
+					errs = append(errs, fmt.Sprintf("enabled agent %q repository %q is not covered by github app %q installations", a.ID, repo, appName))
+				}
+			}
 		}
 		if err := a.BranchGuard.Validate(); err != nil {
 			errs = append(errs, fmt.Sprintf("agent %q branch_lifecycle_guard: %v", a.ID, err))
@@ -208,11 +217,25 @@ func (c *Config) InstallationIDForApp(appName, repo string) (int64, bool) {
 		return id, true
 	}
 	for configuredRepo, id := range app.Installations {
-		if strings.EqualFold(configuredRepo, repo) {
+		if installationCoversRepo(configuredRepo, repo) {
 			return id, true
 		}
 	}
 	return 0, false
+}
+
+func installationCoversRepo(configured, repo string) bool {
+	configured = strings.TrimSpace(configured)
+	repo = strings.TrimSpace(repo)
+	if strings.EqualFold(configured, repo) {
+		return true
+	}
+	owner, _, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" {
+		return false
+	}
+	wildcardOwner, wildcardSuffix, ok := strings.Cut(configured, "/")
+	return ok && wildcardSuffix == "*" && strings.EqualFold(wildcardOwner, owner)
 }
 
 func (g GitHubConfig) AppContexts() map[string]GitHubAppConfig {

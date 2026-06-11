@@ -21,7 +21,7 @@ github:
       app_id: 3684230
       private_key_path: "/run/secrets/github-reporter-app.pem"
       installations:
-        grubbyhacker/gh-agent-broker: 131601703
+        grubbyhacker/*: 131601703
 
 agents:
   - id: "hermes-coder-01"
@@ -78,6 +78,8 @@ agents:
     github_app: "reporter"
     repositories:
       - "grubbyhacker/gh-agent-broker"
+      - "grubbyhacker/youknowme"
+      - "grubbyhacker/ykmcorpus"
     operations:
       - "repo.probe"
       - "issue.create"

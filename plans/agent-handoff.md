@@ -9,6 +9,29 @@ Current agent workflow guidance update:
 - `AGENTS.md` now explicitly says coding agents must never merge their own pull
   requests unless the human-in-the-loop explicitly instructs them to merge.
 
+Current reporter installation coverage fix:
+
+- Issue `#41` was confirmed as a mismatch between reporter-advertised repos and
+  broker GitHub App installation mappings. The reporter service and
+  `broker-reporter-01` allowed `grubbyhacker/gh-agent-broker`,
+  `grubbyhacker/youknowme`, and `grubbyhacker/ykmcorpus`, but
+  `github.apps.reporter.installations` only mapped
+  `grubbyhacker/gh-agent-broker`.
+- Immediate VPS mitigation was applied on 2026-06-11 by adding exact reporter
+  installation mappings for `grubbyhacker/youknowme` and
+  `grubbyhacker/ykmcorpus`, both using installation ID `131601703`. Backup:
+  `configs/production.yaml.bak-reporter-installations-20260611-080958`.
+- Post-mitigation checks passed: broker config-check, broker restart, broker
+  health, and authenticated `broker-reporter-01` `repo.probe` returned `200`
+  for both YKM repos.
+- Current branch `feature/github-app-installation-wildcards` implements the
+  durable code fix: owner wildcard installation mappings such as
+  `grubbyhacker/*`, and config validation that rejects enabled agents whose
+  repo allowlist is not covered by their selected GitHub App installation map.
+  Latest verification passed: `go test ./internal/config`, focused
+  server/CLI/config tests, example `config-check`, `git diff --check`, and
+  `make check`.
+
 Current parameterized sandbox launch profile implementation:
 
 - PR `#39` is merged and deployed to the VPS as
