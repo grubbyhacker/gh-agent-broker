@@ -1,14 +1,9 @@
-# syntax=docker/dockerfile:1
-
 FROM golang:1.26 AS build
 WORKDIR /src
 COPY go.mod go.sum* ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+RUN go mod download
 COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -o /out/gh-agent-broker ./cmd/broker \
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/gh-agent-broker ./cmd/broker \
  && CGO_ENABLED=0 GOOS=linux go build -o /out/gh-agent-broker-cli ./cmd/gh-agent-broker \
  && CGO_ENABLED=0 GOOS=linux go build -o /out/broker-issue-reporter ./cmd/broker-issue-reporter \
  && CGO_ENABLED=0 GOOS=linux go build -o /out/sandbox-broker ./cmd/sandbox-broker \
