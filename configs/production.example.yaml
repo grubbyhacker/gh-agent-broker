@@ -20,7 +20,7 @@ github:
       app_id: 3684230
       private_key_path: "/run/secrets/github-reporter-app.pem"
       installations:
-        grubbyhacker/gh-agent-broker: 131601703
+        grubbyhacker/*: 131601703
     ykm-curator:
       app_id: 3991340
       private_key_path: "/run/secrets/github-ykm-curator-app.pem"
@@ -97,6 +97,8 @@ agents:
     github_app: "reporter"
     repositories:
       - "grubbyhacker/gh-agent-broker"
+      - "grubbyhacker/youknowme"
+      - "grubbyhacker/ykmcorpus"
     operations:
       - "repo.probe"
       - "issue.create"

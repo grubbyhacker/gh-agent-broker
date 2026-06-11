@@ -99,6 +99,69 @@ agents:
 	}
 }
 
+func TestInstallationIDForAppSupportsOwnerWildcard(t *testing.T) {
+	cfg := Config{
+		GitHub: GitHubConfig{
+			Apps: map[string]GitHubAppConfig{
+				"reporter": {
+					AppID:          1,
+					PrivateKeyPath: "reporter.pem",
+					Installations: map[string]int64{
+						"grubbyhacker/*": 42,
+					},
+				},
+			},
+		},
+		Agents: []Agent{{
+			ID:           "broker-reporter-01",
+			Enabled:      true,
+			Secret:       "secret",
+			GitHubApp:    "reporter",
+			Repositories: []string{"grubbyhacker/youknowme", "grubbyhacker/ykmcorpus"},
+		}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if id, ok := cfg.InstallationIDForApp("reporter", "grubbyhacker/youknowme"); !ok || id != 42 {
+		t.Fatalf("wildcard installation = %d/%v, want 42/true", id, ok)
+	}
+	if _, ok := cfg.InstallationIDForApp("reporter", "other/youknowme"); ok {
+		t.Fatalf("wildcard unexpectedly matched another owner")
+	}
+}
+
+func TestValidateRejectsEnabledAgentRepoMissingInstallation(t *testing.T) {
+	cfg := Config{
+		GitHub: GitHubConfig{
+			Apps: map[string]GitHubAppConfig{
+				"reporter": {
+					AppID:          1,
+					PrivateKeyPath: "reporter.pem",
+					Installations: map[string]int64{
+						"grubbyhacker/gh-agent-broker": 42,
+					},
+				},
+			},
+		},
+		Agents: []Agent{{
+			ID:           "broker-reporter-01",
+			Enabled:      true,
+			Secret:       "secret",
+			GitHubApp:    "reporter",
+			Repositories: []string{"grubbyhacker/gh-agent-broker", "grubbyhacker/youknowme"},
+		}},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("Validate() error = nil, want missing installation coverage")
+	}
+	want := `enabled agent "broker-reporter-01" repository "grubbyhacker/youknowme" is not covered by github app "reporter" installations`
+	if err.Error() != want {
+		t.Fatalf("Validate() error = %q, want %q", err.Error(), want)
+	}
+}
+
 func TestBranchLifecycleGuardDefaultsWhenEnabled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	writeFile(t, path, `
