@@ -4,8 +4,22 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current agent workflow guidance update:
+
+- `AGENTS.md` now explicitly says coding agents must never merge their own pull
+  requests unless the human-in-the-loop explicitly instructs them to merge.
+
 Current parameterized sandbox launch profile implementation:
 
+- PR `#39` is merged and deployed to the VPS as
+  `ghcr.io/grubbyhacker/gh-agent-broker:sha-79bbb1e41faea1211da10effedf08fe0d6d5689e`.
+  Backup before image pin change:
+  `.env.bak-image-parameterized-profiles-20260611-045128`.
+  Post-deploy checks passed: Compose config render, image pull/recreate,
+  Compose service status, broker/sandbox/proxy health endpoints, broker CLI
+  health from the broker container, image pin inspection for broker,
+  issue-reporter, sandbox-broker, and gh-agent-proxy, short service log tails,
+  and Hermes gateway/dashboard `gh-agent-broker-cli health`.
 - Current branch `feature/parameterized-launch-profiles` adds parameterized
   REST launch profiles to `sandbox-broker` without letting callers alter
   profile-owned authority such as repo, template/image, mounts, credentials,
