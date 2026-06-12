@@ -5,7 +5,8 @@ builds and publishes the `gh-agent-broker` image from `main`.
 
 The deploy workflow checks out `grubbyhacker/vps-ops`, installs Ansible,
 installs the Ansible collections pinned by `vps-ops/requirements.yml`, writes
-the deploy SSH key to a temporary file on the GitHub-hosted runner, and runs:
+the deploy SSH key to a temporary file on the GitHub-hosted runner, waits for
+SSH connectivity to the deploy inventory hosts, and runs:
 
 ```sh
 ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
@@ -15,7 +16,9 @@ ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.ym
 
 The VPS hostname and target connection details come from
 `vps-ops/inventory/production.yml`; they are not hardcoded in this repository's
-deploy workflow.
+deploy workflow. The SSH preflight resolves the same playbook target hosts from
+that inventory, retries each endpoint with backoff, and fails before Ansible if
+the VPS is not reachable.
 
 ## Required Secrets
 
