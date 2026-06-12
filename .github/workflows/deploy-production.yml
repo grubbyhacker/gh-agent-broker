@@ -3,6 +3,7 @@ name: Deploy Production
 # Required repository secrets:
 # - DEPLOY_SSH_PRIVATE_KEY: ed25519 private key for github-deployer@srv1656293.hstgr.cloud.
 # - VPS_OPS_READ_TOKEN: fine-grained PAT with read access to grubbyhacker/vps-ops.
+# - ANSIBLE_VAULT_PASSWORD: password for decrypting ansible-vault secrets in vps-ops.
 
 on:
   workflow_run:
@@ -43,6 +44,14 @@ jobs:
           install -m 0600 /dev/null /tmp/hermes-deploy
           printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > /tmp/hermes-deploy
 
+      - name: Write vault password
+        env:
+          ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+        run: |
+          mkdir -p ~/.config/vps-ops
+          install -m 0600 /dev/null ~/.config/vps-ops/vault-password
+          printf '%s' "$ANSIBLE_VAULT_PASSWORD" > ~/.config/vps-ops/vault-password
+
       - name: Deploy gh-agent-broker
         working-directory: vps-ops
         run: |
@@ -50,6 +59,8 @@ jobs:
             -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ github.event.workflow_run.head_sha }}" \
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
 
-      - name: Clean up deploy SSH key
+      - name: Clean up secrets
         if: always()
-        run: rm -f /tmp/hermes-deploy
+        run: |
+          rm -f /tmp/hermes-deploy
+          rm -f ~/.config/vps-ops/vault-password
