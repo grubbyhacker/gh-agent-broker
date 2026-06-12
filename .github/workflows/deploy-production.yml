@@ -1,0 +1,54 @@
+name: Deploy Production
+
+# Required repository secrets:
+# - DEPLOY_SSH_PRIVATE_KEY: ed25519 private key for github-deployer@srv1656293.hstgr.cloud.
+# - VPS_OPS_READ_TOKEN: fine-grained PAT with read access to grubbyhacker/vps-ops.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy gh-agent-broker
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
+
+    steps:
+      - name: Checkout vps-ops
+        uses: actions/checkout@v6
+        with:
+          repository: grubbyhacker/vps-ops
+          token: ${{ secrets.VPS_OPS_READ_TOKEN }}
+          path: vps-ops
+
+      - name: Install Ansible
+        run: |
+          python3 -m pip install --user "ansible==10.*"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Ansible collections
+        run: ansible-galaxy collection install ansible.posix community.docker
+
+      - name: Write deploy SSH key
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+        run: |
+          install -m 0600 /dev/null /tmp/hermes-deploy
+          printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > /tmp/hermes-deploy
+
+      - name: Deploy gh-agent-broker
+        working-directory: vps-ops
+        run: |
+          ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
+            -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ github.event.workflow_run.head_sha }}" \
+            -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
+
+      - name: Clean up deploy SSH key
+        if: always()
+        run: rm -f /tmp/hermes-deploy
