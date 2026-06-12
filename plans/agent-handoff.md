@@ -4,6 +4,21 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current deploy SSH preflight update:
+
+- Current branch `codex/deploy-ssh-preflight` adds a `Wait for VPS SSH` step to
+  `.github/workflows/deploy-production.yml` before the Ansible deploy step. The
+  step derives hosts from `vps-ops` inventory via the deploy playbook,
+  resolves Ansible SSH host/user/port variables, and retries SSH with linear
+  backoff before failing the workflow.
+- `docs/deploy.md` now documents that the deploy workflow waits for SSH
+  connectivity while still sourcing VPS target details from
+  `vps-ops/inventory/production.yml`, not from hardcoded host values in this
+  repository.
+- Intended verification: workflow YAML parse/static check, `git diff --check`,
+  and a PR/main GitHub Actions run that reaches the production approval gate
+  and then runs the preflight before Ansible after approval.
+
 Current agent workflow guidance update:
 
 - `AGENTS.md` now explicitly says coding agents must never merge their own pull

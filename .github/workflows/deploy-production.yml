@@ -52,6 +52,54 @@ jobs:
           install -m 0600 /dev/null ~/.config/vps-ops/vault-password
           printf '%s' "$ANSIBLE_VAULT_PASSWORD" > ~/.config/vps-ops/vault-password
 
+      - name: Wait for VPS SSH
+        working-directory: vps-ops
+        run: |
+          set -euo pipefail
+
+          mapfile -t hosts < <(
+            ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml --list-hosts |
+              awk '/^[[:space:]]+[A-Za-z0-9_.-]+$/ { print $1 }'
+          )
+
+          if [[ "${#hosts[@]}" -eq 0 ]]; then
+            echo "::error::No deploy hosts resolved from vps-ops inventory"
+            exit 1
+          fi
+
+          for host in "${hosts[@]}"; do
+            inventory_json="$(ansible-inventory -i inventory/production.yml --host "$host")"
+            ssh_host="$(jq -r --arg host "$host" '.ansible_host // .ansible_ssh_host // $host' <<<"$inventory_json")"
+            ssh_user="$(jq -r '.ansible_user // .ansible_ssh_user // "github-deployer"' <<<"$inventory_json")"
+            ssh_port="$(jq -r '.ansible_port // .ansible_ssh_port // 22' <<<"$inventory_json")"
+            endpoint="${ssh_user}@${ssh_host}"
+
+            for attempt in 1 2 3 4 5; do
+              if ssh \
+                -o BatchMode=yes \
+                -o ConnectTimeout=10 \
+                -o ConnectionAttempts=1 \
+                -o StrictHostKeyChecking=accept-new \
+                -o AddressFamily=inet \
+                -p "$ssh_port" \
+                -i /tmp/hermes-deploy \
+                "$endpoint" \
+                'echo "SSH OK"'; then
+                echo "SSH preflight succeeded for ${host} (${endpoint}:${ssh_port})"
+                break
+              fi
+
+              if [[ "$attempt" -eq 5 ]]; then
+                echo "::error::SSH preflight failed for ${host} (${endpoint}:${ssh_port}) after ${attempt} attempts"
+                exit 1
+              fi
+
+              delay=$((attempt * 10))
+              echo "SSH attempt ${attempt} failed for ${host} (${endpoint}:${ssh_port}), waiting ${delay}s..."
+              sleep "$delay"
+            done
+          done
+
       - name: Deploy gh-agent-broker
         working-directory: vps-ops
         run: |
