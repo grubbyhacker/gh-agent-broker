@@ -3,9 +3,9 @@
 Production deploys run from GitHub Actions after the `CI` workflow successfully
 builds and publishes the `gh-agent-broker` image from `main`.
 
-The deploy workflow checks out `grubbyhacker/vps-ops`, installs Ansible and the
-required collections, writes the deploy SSH key to a temporary file on the
-GitHub-hosted runner, and runs:
+The deploy workflow checks out `grubbyhacker/vps-ops`, installs Ansible,
+installs the Ansible collections pinned by `vps-ops/requirements.yml`, writes
+the deploy SSH key to a temporary file on the GitHub-hosted runner, and runs:
 
 ```sh
 ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
