@@ -4,6 +4,18 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current agent development and deployment documentation update:
+
+- Current branch `docs/agent-development-deployment` updates `AGENTS.md` with
+  the current production deployment path, local staging command and endpoints,
+  compose service inventory, Ansible-managed config ownership, and PR workflow.
+- Key operational guardrail now documented: agents must not SSH directly to
+  `hermes-vps` for production changes; production changes go through the
+  GitHub Actions deployment pipeline, with read-only diagnostics allowed only
+  when explicitly authorized.
+- Latest local verification passed: documentation diff review,
+  `git diff --check`, and `make check`.
+
 Current deploy SSH preflight update:
 
 - Current branch `codex/deploy-ssh-preflight` adds a `Wait for VPS SSH` step to
