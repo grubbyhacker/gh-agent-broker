@@ -18,6 +18,8 @@ Build a GitHub Agent Access Broker that lets agent containers use GitHub App acc
 ## Development
 
 - Make code and documentation changes on feature branches, not directly on `main`.
+- Use the normal flow: feature branch, pull request, CI pass, then merge.
+- Do not push directly to `main`.
 - Never merge your own pull requests unless the human-in-the-loop explicitly instructs you to merge.
 - Language: Go.
 - Target toolchain: Go 1.26.x.
@@ -28,3 +30,32 @@ Build a GitHub Agent Access Broker that lets agent containers use GitHub App acc
 - Do not hide Go or other source code in shell heredocs, generated temp files, or compiler stdin to bypass formatting, tests, review, or linting. Test harnesses and helper clients must be checked-in source files unless the generated file is a small data/config fixture.
 - Keep `go.mod` and `go.sum` tidy.
 - Use `.mise.toml` or the dev container to satisfy repo toolchain requirements; keep `make check` as the source of truth.
+
+## Deployment
+
+- Production deploys through GitHub Actions on pushes to `main`, after CI passes.
+- The production deployment workflow has an environment approval gate; deployment requires approval before production changes are applied.
+- Ansible runs from the `grubbyhacker/vps-ops` repository over SSH to `hermes-vps` (`srv1656293.hstgr.cloud`).
+- The production deploy user is `github-deployer`.
+- Agents must not SSH directly to `hermes-vps` for production changes. All production changes must go through the GitHub Actions deployment pipeline.
+- Diagnostic read-only SSH checks against `hermes-vps` are acceptable only when explicitly authorized.
+
+## Local Staging
+
+- Run local staging from the `vps-ops` repository with `mise run deploy:staging -- gh-agent-broker`.
+- In local staging, the broker REST and health API is available at `http://127.0.0.1:8080`.
+- In local staging, the issue-reporter MCP endpoint is available at `http://127.0.0.1:8090/mcp`.
+- `sandbox-broker` is disabled in local staging because `local.yml` sets `sandbox_broker_enabled: false`.
+
+## Compose Services
+
+- `broker` on port `8080`: main REST and health API.
+- `issue-reporter` on port `8090` internal, published locally: MCP endpoint.
+- `gh-agent-proxy` on port `8092`: token proxy.
+- `litellm` on port `4000` internal: model proxy.
+- `sandbox-broker`: sandbox orchestrator, production only.
+
+## Configuration
+
+- Runtime config files are managed by Ansible in `vps-ops/roles/gh-agent-broker/files/configs/`.
+- Do not edit config files directly on the VPS. Configuration changes must go through `vps-ops` and the deployment pipeline.
