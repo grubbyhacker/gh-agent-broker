@@ -41,7 +41,7 @@ broker credentials or MCP access to a host-side service.
   already backed a closed PR.
 - Structured denial responses with self-correction guidance.
 - YAML config, JSONL audit logs, and redaction of known secret values.
-- Optional MCP issue reporter and sandbox broker services.
+- Optional MCP issue reporter, sandbox broker, and model proxy services.
 
 V1 validates operation, repo, branch, base branch, permissions, and configurable
 metadata. It does not hard-code Hermes metadata names; fields such as
@@ -265,12 +265,12 @@ for main-branch builds, and semver tags such as `v1.0.0`. Production should pin
 a SHA or semver tag, not `main` or `latest`.
 
 Semver tag builds also publish Linux amd64 binaries for `gh-agent-broker`,
-`gh-agent-broker-cli`, `broker-issue-reporter`, and `sandbox-broker`, plus
-`SHA256SUMS`.
+`gh-agent-broker-cli`, `broker-issue-reporter`, `sandbox-broker`, and
+`gh-agent-proxy`, plus `SHA256SUMS`.
 
-Use the OCI image for the broker, reporter, and sandbox-broker services. Use
-the CLI binary as an agent runtime artifact when an agent container should call
-stable broker commands.
+Use the OCI image for the broker, reporter, sandbox-broker, and gh-agent-proxy
+services. Use the CLI binary as an agent runtime artifact when an agent
+container should call stable broker commands.
 
 For production deployment, keep private config, `.env`, and PEM files outside
 git. Use `.env.example` only as a variable-name template, then deploy with the
