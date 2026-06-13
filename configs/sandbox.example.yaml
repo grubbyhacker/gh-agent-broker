@@ -134,6 +134,7 @@ templates:
 #      base_branches: ["main"]
 #    deliverables:
 #      - "/output/run-report.md"
+#    completion_status_path: "/data/intake/curator-status.json"
 #    extra_mounts:
 #      - source_path: "/opt/youknowme/intake"
 #        mount_path: "/data/intake"

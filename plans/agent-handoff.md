@@ -4,6 +4,36 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current sandbox curator lifecycle/status fix:
+
+- Current branch `feature/sandbox-curator-status-lifecycle` fixes sandbox-broker
+  terminal run finalization so a container that has already exited nonzero is
+  recorded as `failed` with its exit code and captured output/error text, rather
+  than being overwritten as `timed_out` by the timeout watcher.
+- `internal/sandbox` now centralizes exited-run finalization across
+  reconciliation and status polling; `markTimedOut` re-inspects before stopping
+  so races with already-exited containers preserve the real status.
+- Templates can set `completion_status_path`, which must resolve under a
+  writable `extra_mounts` target. On terminal success/failure/timeout,
+  sandbox-broker writes JSON status containing UTC timestamp, status, exit code,
+  and a brief redacted message. Docker-backed writes use a helper container and
+  the worker bind mounts, so the broker container does not need the host intake
+  path mounted directly.
+- Sandbox creation now emits a structured JSON log line with `job_id`,
+  `profile`, `template`, `success`, and `duration_ms` after Docker container
+  creation succeeds or fails.
+- The public sandbox example documents
+  `completion_status_path: "/data/intake/curator-status.json"` for YKM curator
+  templates.
+- Companion config branch in `vps-ops`: `feature/curator-status-file`, adding
+  `completion_status_path: "/data/intake/curator-status.json"` to the three
+  production curator templates. The existing production curator intake mounts
+  are already writable (`readonly: false`), so no mount change was required.
+- Verification passed: `go test ./internal/sandbox ./cmd/sandbox-broker`,
+  `make check`, `git diff --check`, and in `vps-ops`
+  `ansible-playbook -i inventory/production.yml playbooks/site.yml --syntax-check`
+  plus `git diff --check`.
+
 Current agent development and deployment documentation update:
 
 - Current branch `docs/agent-development-deployment` updates `AGENTS.md` with

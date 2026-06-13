@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -37,8 +39,13 @@ type pathPermissionFixer interface {
 	MakeRemovable(ctx context.Context, image, path string) error
 }
 
+type runtimeFileWriter interface {
+	WriteFile(ctx context.Context, image string, mounts []Mount, path string, contents []byte) error
+}
+
 type RunMetadata struct {
 	RunID            string         `json:"run_id"`
+	Profile          string         `json:"profile,omitempty"`
 	Template         string         `json:"template"`
 	Repo             string         `json:"repo"`
 	BaseBranch       string         `json:"base_branch"`
@@ -85,6 +92,7 @@ type LaunchAgentInput struct {
 	Deliverables      []string       `json:"deliverables,omitempty" yaml:"deliverables,omitempty" jsonschema:"optional expected deliverable names"`
 	Focus             string         `json:"focus,omitempty" yaml:"focus,omitempty" jsonschema:"optional constrained focus for the worker"`
 	Parameters        map[string]any `json:"parameters,omitempty" yaml:"-" jsonschema:"broker-resolved opaque profile parameters"`
+	Profile           string         `json:"-" yaml:"-"`
 }
 
 func (in *LaunchAgentInput) UnmarshalJSON(b []byte) error {
@@ -238,21 +246,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				meta.Error = "container missing during startup reconciliation"
 				meta.EndedAt = time.Now().UTC()
 			} else if !status.Running {
-				meta.ExitCode = status.ExitCode
-				meta.EndedAt = status.EndedAt
-				if status.ExitCode != nil && *status.ExitCode == 0 {
-					meta.Status = StatusStopped
-				} else {
-					meta.Status = StatusFailed
-					if status.Error != "" {
-						meta.Error = status.Error
-					} else {
-						meta.Error = "worker exited nonzero"
-					}
-					if diagErr := s.ensureFailureDiagnostics(meta, meta.Error); diagErr != nil && meta.Error == "" {
-						meta.Error = diagErr.Error()
-					}
-				}
+				meta = s.finalizeExitedRun(ctx, meta, status)
 			} else if time.Now().After(meta.Deadline) {
 				meta = s.markTimedOut(ctx, meta)
 			}
@@ -279,6 +273,7 @@ func (s *Service) DryRunLaunch(ctx context.Context, in LaunchAgentInput) (Launch
 	deadline := now.Add(runtimeLimit)
 	meta := RunMetadata{
 		RunID:            runID,
+		Profile:          in.Profile,
 		Template:         in.Template,
 		Repo:             in.Repo,
 		BaseBranch:       in.BaseBranch,
@@ -318,6 +313,7 @@ func (s *Service) PreviewLaunch(ctx context.Context, in LaunchAgentInput) (Launc
 	now := time.Now().UTC()
 	meta := RunMetadata{
 		RunID:            runID,
+		Profile:          in.Profile,
 		Template:         in.Template,
 		Repo:             in.Repo,
 		BaseBranch:       in.BaseBranch,
@@ -370,6 +366,7 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 	deadline := now.Add(runtimeLimit)
 	meta := RunMetadata{
 		RunID:            runID,
+		Profile:          in.Profile,
 		Template:         in.Template,
 		Repo:             in.Repo,
 		BaseBranch:       in.BaseBranch,
@@ -420,7 +417,9 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 	if err != nil {
 		return LaunchAgentOutput{}, err
 	}
+	createStarted := time.Now()
 	info, err := s.runtime.Create(ctx, spec)
+	s.logSandboxCreation(meta, time.Since(createStarted), err)
 	if err != nil {
 		meta.Status = StatusFailed
 		meta.Error = err.Error()
@@ -437,6 +436,7 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 		meta.Status = StatusFailed
 		meta.Error = err.Error()
 		meta.EndedAt = time.Now().UTC()
+		s.writeCompletionStatus(ctx, meta)
 		if writeErr := s.writeMetadata(meta); writeErr != nil {
 			return LaunchAgentOutput{}, writeErr
 		}
@@ -490,26 +490,7 @@ func (s *Service) GetAgentStatus(ctx context.Context, in RunInput) (StatusOutput
 				return StatusOutput{}, err
 			}
 		} else if err == nil && !status.Running {
-			if status.ExitCode != nil && *status.ExitCode == 0 {
-				meta.Status = StatusStopped
-			} else {
-				meta.Status = StatusFailed
-				if status.Error != "" {
-					meta.Error = status.Error
-				} else {
-					meta.Error = "worker exited nonzero"
-				}
-			}
-			meta.ExitCode = status.ExitCode
-			meta.EndedAt = status.EndedAt
-			if meta.EndedAt.IsZero() {
-				meta.EndedAt = time.Now().UTC()
-			}
-			if meta.Status == StatusFailed {
-				if diagErr := s.ensureFailureDiagnostics(meta, meta.Error); diagErr != nil && meta.Error == "" {
-					meta.Error = diagErr.Error()
-				}
-			}
+			meta = s.finalizeExitedRun(ctx, meta, status)
 			if err := s.writeMetadata(meta); err != nil {
 				return StatusOutput{}, err
 			}
@@ -926,13 +907,26 @@ func (s *Service) watchTimeout(parent context.Context, runID string, deadline ti
 	if err := s.writeMetadata(meta); err != nil {
 		meta.Error = err.Error()
 	}
-	s.audit.Log(s.auditEvent("timeout", meta, "allow", errors.New("run exceeded deadline")), s.redactor(meta))
+	if meta.Status == StatusTimedOut {
+		s.audit.Log(s.auditEvent("timeout", meta, "allow", errors.New("run exceeded deadline")), s.redactor(meta))
+	} else {
+		s.audit.Log(s.auditEvent("run_finalized", meta, "allow", nil), s.redactor(meta))
+	}
 }
 
 func (s *Service) markTimedOut(ctx context.Context, meta RunMetadata) RunMetadata {
 	if meta.ContainerID != "" {
+		status, err := s.runtime.Inspect(ctx, meta.ContainerID)
+		if err == nil && !status.Running {
+			return s.finalizeExitedRun(ctx, meta, status)
+		}
 		if err := s.runtime.Stop(ctx, meta.ContainerID, s.cfg.StopGrace.Duration); err != nil {
 			meta.Error = "run exceeded deadline; stop failed: " + err.Error()
+		} else {
+			status, err := s.runtime.Inspect(ctx, meta.ContainerID)
+			if err == nil && status.ExitCode != nil {
+				meta.ExitCode = status.ExitCode
+			}
 		}
 	}
 	if meta.Error == "" {
@@ -943,7 +937,182 @@ func (s *Service) markTimedOut(ctx context.Context, meta RunMetadata) RunMetadat
 	if err := s.ensureFailureDiagnostics(meta, meta.Error); err != nil && !strings.Contains(meta.Error, err.Error()) {
 		meta.Error = meta.Error + "; diagnostics write failed: " + err.Error()
 	}
+	s.writeCompletionStatus(ctx, meta)
 	return meta
+}
+
+func (s *Service) finalizeExitedRun(ctx context.Context, meta RunMetadata, status ContainerStatus) RunMetadata {
+	meta.ExitCode = status.ExitCode
+	meta.EndedAt = status.EndedAt
+	if meta.EndedAt.IsZero() {
+		meta.EndedAt = time.Now().UTC()
+	}
+	if status.ExitCode != nil && *status.ExitCode == 0 {
+		meta.Status = StatusStopped
+		meta.Error = ""
+		s.writeCompletionStatus(ctx, meta)
+		return meta
+	}
+	meta.Status = StatusFailed
+	meta.Error = s.workerFailureMessage(ctx, meta, status)
+	if diagErr := s.ensureFailureDiagnostics(meta, meta.Error); diagErr != nil && meta.Error == "" {
+		meta.Error = diagErr.Error()
+	}
+	s.writeCompletionStatus(ctx, meta)
+	return meta
+}
+
+func (s *Service) workerFailureMessage(ctx context.Context, meta RunMetadata, status ContainerStatus) string {
+	message := strings.TrimSpace(status.Error)
+	if message == "" {
+		if status.ExitCode != nil {
+			message = fmt.Sprintf("worker exited with code %d", *status.ExitCode)
+		} else {
+			message = "worker exited nonzero"
+		}
+	}
+	if meta.ContainerID == "" {
+		return message
+	}
+	logs, err := s.runtime.Logs(ctx, meta.ContainerID, 2048)
+	if err != nil {
+		return message
+	}
+	logs = strings.TrimSpace(s.redactor(meta).Redact(logs))
+	if logs == "" {
+		return message
+	}
+	return message + ": " + abbreviate(logs, 500)
+}
+
+type completionStatusFile struct {
+	Timestamp time.Time `json:"timestamp"`
+	Status    string    `json:"status"`
+	ExitCode  int       `json:"exit_code"`
+	Message   string    `json:"message"`
+}
+
+func (s *Service) writeCompletionStatus(ctx context.Context, meta RunMetadata) {
+	status, ok := completionStatus(meta)
+	if !ok {
+		return
+	}
+	tmpl := s.cfg.Templates[meta.Template]
+	statusPath := strings.TrimSpace(tmpl.CompletionStatusPath)
+	if statusPath == "" {
+		return
+	}
+	exitCode := 0
+	if meta.ExitCode != nil {
+		exitCode = *meta.ExitCode
+	} else if status == StatusTimedOut {
+		exitCode = -1
+	}
+	message := strings.TrimSpace(meta.Error)
+	if message == "" {
+		message = "worker completed successfully"
+	}
+	payload := completionStatusFile{
+		Timestamp: time.Now().UTC(),
+		Status:    status,
+		ExitCode:  exitCode,
+		Message:   abbreviate(s.redactor(meta).Redact(message), 500),
+	}
+	b, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		s.logCompletionStatusFailure(meta, err)
+		return
+	}
+	spec, _, err := s.runtimeSpec(meta, tmpl)
+	if err != nil {
+		s.logCompletionStatusFailure(meta, err)
+		return
+	}
+	b = append(b, '\n')
+	hostPath, ok := resolveMountedPath(statusPath, spec.Mounts)
+	if !ok {
+		s.logCompletionStatusFailure(meta, fmt.Errorf("completion status path %q is not under a writable mount", statusPath))
+		return
+	}
+	if writer, ok := s.runtime.(runtimeFileWriter); ok {
+		if err := writer.WriteFile(ctx, tmpl.Image, spec.Mounts, statusPath, b); err != nil {
+			s.logCompletionStatusFailure(meta, err)
+		}
+		return
+	}
+	//nolint:gosec // G306: completion status is non-secret health metadata read by the mounted service.
+	if err := os.WriteFile(hostPath, b, 0o644); err != nil {
+		s.logCompletionStatusFailure(meta, err)
+	}
+}
+
+func completionStatus(meta RunMetadata) (string, bool) {
+	switch meta.Status {
+	case StatusStopped:
+		return "success", true
+	case StatusFailed:
+		return StatusFailed, true
+	case StatusTimedOut:
+		return StatusTimedOut, true
+	default:
+		return "", false
+	}
+}
+
+func resolveMountedPath(containerPath string, mounts []Mount) (string, bool) {
+	cleanContainerPath := path.Clean(containerPath)
+	for _, mount := range mounts {
+		if mount.ReadOnly {
+			continue
+		}
+		target := path.Clean(mount.Target)
+		if cleanContainerPath != target && !strings.HasPrefix(cleanContainerPath, target+"/") {
+			continue
+		}
+		rel, err := filepath.Rel(filepath.FromSlash(target), filepath.FromSlash(cleanContainerPath))
+		if err != nil {
+			continue
+		}
+		return filepath.Join(filepath.Clean(mount.Source), rel), true
+	}
+	return "", false
+}
+
+func abbreviate(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	return strings.TrimSpace(value[:max]) + "..."
+}
+
+func (s *Service) logCompletionStatusFailure(meta RunMetadata, err error) {
+	log.Printf(`{"event":"completion_status_write","job_id":%q,"profile":%q,"template":%q,"success":false,"error":%q}`,
+		meta.RunID, meta.Profile, meta.Template, s.redactor(meta).Redact(err.Error()))
+}
+
+func (s *Service) logSandboxCreation(meta RunMetadata, duration time.Duration, err error) {
+	success := err == nil
+	errorMessage := ""
+	if err != nil {
+		errorMessage = s.redactor(meta).Redact(err.Error())
+	}
+	event := map[string]any{
+		"event":       "sandbox_creation",
+		"job_id":      meta.RunID,
+		"profile":     meta.Profile,
+		"template":    meta.Template,
+		"success":     success,
+		"duration_ms": duration.Milliseconds(),
+	}
+	if errorMessage != "" {
+		event["error"] = errorMessage
+	}
+	b, marshalErr := json.Marshal(event)
+	if marshalErr != nil {
+		return
+	}
+	log.Print(string(b))
 }
 
 func (s *Service) ensureFailureDiagnostics(meta RunMetadata, message string) error {

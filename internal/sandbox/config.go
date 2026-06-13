@@ -68,21 +68,22 @@ type CredentialBundle struct {
 }
 
 type Template struct {
-	Image              string            `yaml:"image"`
-	Command            []string          `yaml:"command"`
-	User               string            `yaml:"user"`
-	Resources          Resources         `yaml:"resources"`
-	NetworkPolicy      string            `yaml:"network_policy"`
-	MaxRuntimeMinutes  int               `yaml:"max_runtime_minutes"`
-	BrokerAgentID      string            `yaml:"broker_agent_id"`
-	BrokerAgentSecret  string            `yaml:"broker_agent_secret"`
-	BrokerSecretEnv    string            `yaml:"broker_agent_secret_env"`
-	BranchPolicy       BranchPolicy      `yaml:"branch_policy"`
-	CredentialBundle   string            `yaml:"credential_bundle"`
-	Deliverables       []string          `yaml:"deliverables"`
-	KnowledgeSnapshots []string          `yaml:"knowledge_snapshots"`
-	Environment        map[string]string `yaml:"environment"`
-	ExtraMounts        []ExtraMount      `yaml:"extra_mounts"`
+	Image                string            `yaml:"image"`
+	Command              []string          `yaml:"command"`
+	User                 string            `yaml:"user"`
+	Resources            Resources         `yaml:"resources"`
+	NetworkPolicy        string            `yaml:"network_policy"`
+	MaxRuntimeMinutes    int               `yaml:"max_runtime_minutes"`
+	BrokerAgentID        string            `yaml:"broker_agent_id"`
+	BrokerAgentSecret    string            `yaml:"broker_agent_secret"`
+	BrokerSecretEnv      string            `yaml:"broker_agent_secret_env"`
+	BranchPolicy         BranchPolicy      `yaml:"branch_policy"`
+	CredentialBundle     string            `yaml:"credential_bundle"`
+	Deliverables         []string          `yaml:"deliverables"`
+	KnowledgeSnapshots   []string          `yaml:"knowledge_snapshots"`
+	Environment          map[string]string `yaml:"environment"`
+	ExtraMounts          []ExtraMount      `yaml:"extra_mounts"`
+	CompletionStatusPath string            `yaml:"completion_status_path"`
 }
 
 type ExtraMount struct {
@@ -364,7 +365,27 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 	for i, mount := range tmpl.ExtraMounts {
 		errs = append(errs, validateExtraMount(name, i, mount)...)
 	}
+	if tmpl.CompletionStatusPath != "" {
+		errs = append(errs, validateCompletionStatusPath(name, tmpl)...)
+	}
 	return errs
+}
+
+func validateCompletionStatusPath(template string, tmpl Template) []string {
+	statusPath := filepath.Clean(tmpl.CompletionStatusPath)
+	if !filepath.IsAbs(tmpl.CompletionStatusPath) {
+		return []string{fmt.Sprintf("template %q completion_status_path must be absolute", template)}
+	}
+	for _, mount := range tmpl.ExtraMounts {
+		target := filepath.Clean(mount.MountPath)
+		if mount.ReadOnly {
+			continue
+		}
+		if statusPath == target || strings.HasPrefix(statusPath, target+"/") {
+			return nil
+		}
+	}
+	return []string{fmt.Sprintf("template %q completion_status_path must be under a writable extra_mounts target", template)}
 }
 
 func validateExtraMount(template string, idx int, mount ExtraMount) []string {
