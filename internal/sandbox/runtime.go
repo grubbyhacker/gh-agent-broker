@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -156,6 +158,51 @@ func (d *DockerBackend) Remove(ctx context.Context, containerID string) error {
 	return d.do(ctx, http.MethodDelete, "/containers/"+url.PathEscape(containerID)+"?force=1&v=1", nil, nil)
 }
 
+func (d *DockerBackend) WriteFile(ctx context.Context, image string, mounts []Mount, targetPath string, contents []byte) error {
+	parent := path.Dir(path.Clean(targetPath))
+	name := path.Base(path.Clean(targetPath))
+	if parent == "." || parent == "/" || name == "." || name == "/" {
+		return fmt.Errorf("invalid target path %q", targetPath)
+	}
+	reqBody := dockerCreateRequest{
+		Image: image,
+		User:  "0:0",
+		Labels: map[string]string{
+			"gh-agent-broker.sandbox.status_writer": "true",
+		},
+		HostConfig: dockerHostConfig{
+			ReadonlyRootfs:  false,
+			SecurityOpt:     []string{"no-new-privileges"},
+			CapDrop:         []string{"ALL"},
+			NetworkMode:     "none",
+			Binds:           binds(mounts),
+			PidsLimit:       64,
+			Memory:          64 * 1024 * 1024,
+			AutoRemove:      false,
+			Privileged:      false,
+			PublishAllPorts: false,
+		},
+	}
+	var created struct {
+		ID string `json:"Id"`
+	}
+	if err := d.doJSON(ctx, http.MethodPost, "/containers/create?name="+url.QueryEscape("sandbox-status-writer-"+time.Now().UTC().Format("20060102T150405.000000000")), reqBody, &created); err != nil {
+		return err
+	}
+	if created.ID == "" {
+		return fmt.Errorf("docker status writer did not return container id")
+	}
+	defer func() {
+		//nolint:errcheck // Best-effort removal of a helper container after writing status.
+		_ = d.Remove(context.WithoutCancel(ctx), created.ID)
+	}()
+	archive, err := singleFileTar(name, contents, 0o644)
+	if err != nil {
+		return err
+	}
+	return d.doWithContentType(ctx, http.MethodPut, "/containers/"+url.PathEscape(created.ID)+"/archive?path="+url.QueryEscape(parent), bytes.NewReader(archive), nil, "application/x-tar")
+}
+
 func (d *DockerBackend) MakeRemovable(ctx context.Context, image, path string) error {
 	cleanPath := filepath.Clean(path)
 	reqBody := dockerCreateRequest{
@@ -264,12 +311,16 @@ func (d *DockerBackend) doJSON(ctx context.Context, method, path string, in, out
 }
 
 func (d *DockerBackend) do(ctx context.Context, method, path string, body io.Reader, out io.Writer) error {
+	return d.doWithContentType(ctx, method, path, body, out, "application/json")
+}
+
+func (d *DockerBackend) doWithContentType(ctx context.Context, method, path string, body io.Reader, out io.Writer, contentType string) error {
 	req, err := http.NewRequestWithContext(ctx, method, "http://docker"+path, body)
 	if err != nil {
 		return err
 	}
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentType)
 	}
 	resp, err := d.client.Do(req)
 	if err != nil {
@@ -291,6 +342,27 @@ func (d *DockerBackend) do(ctx context.Context, method, path string, body io.Rea
 		return err
 	}
 	return nil
+}
+
+func singleFileTar(name string, contents []byte, mode int64) ([]byte, error) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: name,
+		Mode: mode,
+		Size: int64(len(contents)),
+		Uid:  1000,
+		Gid:  1000,
+	}); err != nil {
+		return nil, err
+	}
+	if _, err := tw.Write(contents); err != nil {
+		return nil, err
+	}
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 type dockerCreateRequest struct {

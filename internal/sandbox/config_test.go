@@ -64,6 +64,15 @@ func TestConfigValidateRejectsUnsafeSettings(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "conflicts with sandbox-managed paths") {
 		t.Fatalf("Validate() error = %v, want unsafe extra mount target", err)
 	}
+
+	cfg = baseTestConfig(t)
+	tmpl = cfg.Templates["worker"]
+	tmpl.CompletionStatusPath = "/data/intake/curator-status.json"
+	cfg.Templates["worker"] = tmpl
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "writable extra_mounts") {
+		t.Fatalf("Validate() error = %v, want writable completion status mount requirement", err)
+	}
 }
 
 func TestConfigResolveSecrets(t *testing.T) {

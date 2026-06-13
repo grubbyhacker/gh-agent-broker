@@ -120,6 +120,7 @@ func (h *restHandler) handleLaunchProfileAction(w http.ResponseWriter, r *http.R
 		return
 	}
 	if action == "preview" {
+		in.Profile = name
 		out, err := h.service.PreviewLaunch(r.Context(), in)
 		if err != nil {
 			h.audit(operation, identity.Name, name, "", in.Template, in.Repo, in.Branch, "deny", err, params)
@@ -135,8 +136,10 @@ func (h *restHandler) handleLaunchProfileAction(w http.ResponseWriter, r *http.R
 	}
 	var out LaunchAgentOutput
 	if action == "dry-run" {
+		in.Profile = name
 		out, err = h.service.DryRunLaunch(r.Context(), in)
 	} else {
+		in.Profile = name
 		out, err = h.service.LaunchAgent(r.Context(), in)
 	}
 	if err != nil {

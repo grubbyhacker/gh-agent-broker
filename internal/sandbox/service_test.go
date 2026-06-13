@@ -353,6 +353,33 @@ func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
 	}
 }
 
+func TestTimeoutWatcherPreservesAlreadyExitedFailure(t *testing.T) {
+	cfg := baseTestConfig(t)
+	runtime := newFakeRuntime()
+	runtime.logs = "stderr: permission denied\n"
+	service := NewService(cfg, runtime, testAudit(t))
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{Template: "worker", Task: "fail early", Repo: "owner/repo", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("LaunchAgent() error = %v", err)
+	}
+	runtime.finish(out.RunID, 2, "permission denied")
+
+	service.watchTimeout(context.Background(), out.RunID, time.Now().Add(10*time.Millisecond))
+	status, err := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatalf("GetAgentStatus() error = %v", err)
+	}
+	if status.Status != StatusFailed || status.ExitCode == nil || *status.ExitCode != 2 {
+		t.Fatalf("status = %+v, want failed exit 2", status)
+	}
+	if strings.Contains(status.Error, "run exceeded deadline") {
+		t.Fatalf("status misreported timeout: %+v", status)
+	}
+	if !strings.Contains(status.Error, "permission denied") {
+		t.Fatalf("failure did not include captured error/log text: %+v", status)
+	}
+}
+
 func TestGetAgentStatusReturnsWorkerDiagnostics(t *testing.T) {
 	cfg := baseTestConfig(t)
 	runtime := newFakeRuntime()
@@ -388,6 +415,39 @@ func TestGetAgentStatusReturnsWorkerDiagnostics(t *testing.T) {
 	}
 	if strings.Join(status.Diagnostics.MissingDeliverables, ",") != "/output/final-summary.md" {
 		t.Fatalf("missing deliverables = %+v", status.Diagnostics.MissingDeliverables)
+	}
+}
+
+func TestCompletionStatusFileWrittenForConfiguredTemplate(t *testing.T) {
+	cfg := baseTestConfig(t)
+	tmpl := cfg.Templates["worker"]
+	tmpl.CompletionStatusPath = "/data/intake/curator-status.json"
+	tmpl.ExtraMounts = []ExtraMount{{SourcePath: filepath.Join(filepath.Dir(cfg.RunsDir), "evidence"), MountPath: "/data/intake", ReadOnly: false}}
+	cfg.Templates["worker"] = tmpl
+	runtime := newFakeRuntime()
+	service := NewService(cfg, runtime, testAudit(t))
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{Template: "worker", Task: "done", Repo: "owner/repo", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("LaunchAgent() error = %v", err)
+	}
+	runtime.finish(out.RunID, 0, "")
+
+	status, err := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatalf("GetAgentStatus() error = %v", err)
+	}
+	if status.Status != StatusStopped {
+		t.Fatalf("status = %+v, want stopped", status)
+	}
+	var statusFile completionStatusFile
+	if err := json.Unmarshal(runtime.writtenFile("/data/intake/curator-status.json"), &statusFile); err != nil {
+		t.Fatalf("decode completion status: %v", err)
+	}
+	if statusFile.Status != "success" || statusFile.ExitCode != 0 || statusFile.Message != "worker completed successfully" {
+		t.Fatalf("completion status = %+v", statusFile)
+	}
+	if statusFile.Timestamp.IsZero() {
+		t.Fatalf("completion status timestamp missing: %+v", statusFile)
 	}
 }
 
@@ -525,10 +585,11 @@ type fakeRuntime struct {
 	logs    string
 	started map[string]bool
 	exits   map[string]ContainerStatus
+	writes  map[string][]byte
 }
 
 func newFakeRuntime() *fakeRuntime {
-	return &fakeRuntime{started: map[string]bool{}, exits: map[string]ContainerStatus{}}
+	return &fakeRuntime{started: map[string]bool{}, exits: map[string]ContainerStatus{}, writes: map[string][]byte{}}
 }
 
 func (f *fakeRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
@@ -581,6 +642,14 @@ func (f *fakeRuntime) Remove(ctx context.Context, containerID string) error {
 	return nil
 }
 
+func (f *fakeRuntime) WriteFile(ctx context.Context, image string, mounts []Mount, path string, contents []byte) error {
+	_, _, _ = ctx, image, mounts
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.writes[path] = append([]byte(nil), contents...)
+	return nil
+}
+
 func (f *fakeRuntime) lastSpec() RuntimeSpec {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -603,4 +672,10 @@ func (f *fakeRuntime) finish(runID string, exitCode int, message string) {
 		EndedAt:  time.Now().UTC(),
 		Error:    message,
 	}
+}
+
+func (f *fakeRuntime) writtenFile(path string) []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]byte(nil), f.writes[path]...)
 }
