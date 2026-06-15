@@ -478,10 +478,7 @@ func TestExitWatcherFinalizesRunAndWritesTerminalAudit(t *testing.T) {
 	if statusFile.Status != "success" || statusFile.ExitCode != 0 {
 		t.Fatalf("completion status = %+v", statusFile)
 	}
-	events := readSandboxAuditEvents(t, auditPath)
-	if !hasTerminalAudit(events, out.RunID, finalizeReasonWorkerExit, terminalSourceExited, StatusStopped) {
-		t.Fatalf("worker exit terminal audit missing from %+v", events)
-	}
+	waitForTerminalAudit(t, auditPath, out.RunID, finalizeReasonWorkerExit, terminalSourceExited, StatusStopped)
 }
 
 func TestTimeoutStopAlreadyStoppedFinalizesExitedRun(t *testing.T) {
@@ -578,6 +575,20 @@ func hasTerminalAudit(events []AuditEvent, runID, reason, source, status string)
 		}
 	}
 	return false
+}
+
+func waitForTerminalAudit(t *testing.T, path, runID, reason, source, status string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var events []AuditEvent
+	for time.Now().Before(deadline) {
+		events = readSandboxAuditEvents(t, path)
+		if hasTerminalAudit(events, runID, reason, source, status) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("terminal audit missing from %+v", events)
 }
 
 func baseTestConfig(t *testing.T) Config {
