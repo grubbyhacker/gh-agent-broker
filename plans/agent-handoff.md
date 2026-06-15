@@ -6,6 +6,19 @@ The repository is a greenfield Go implementation of a GitHub Agent Access Broker
 
 Current sandbox curator lifecycle/status fix:
 
+- Current post-merge CI repair branch `fix/postmerge-sandbox-status` fixes a
+  race introduced by PR #51 where `GetAgentStatus` could return stale
+  `running` while `watchExit` was already finalizing a stopped worker. The
+  finalization guard now uses a per-run completion channel so contending status
+  polls wait for terminal metadata before returning.
+- Failure from main run `27526543315`: `make ci` failed in the `check` job
+  during `go test -race ./...`; `TestGetAgentStatusReturnsWorkerDiagnostics`
+  observed `Status:running ... ExitCode:<nil> ... Diagnostics:<nil>` instead
+  of failed exit 30.
+- Latest local verification for the repair passed:
+  `go test -race ./internal/sandbox -run TestGetAgentStatusReturnsWorkerDiagnostics -count=50`,
+  `.tools/bin/golangci-lint cache clean && make ci`, `make smoke-container`,
+  and `make sandbox-e2e`.
 - Current branch `feature/sandbox-curator-status-lifecycle` fixes sandbox-broker
   terminal run finalization so a container that has already exited nonzero is
   recorded as `failed` with its exit code and captured output/error text, rather
