@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   deploy:
@@ -52,60 +53,164 @@ jobs:
           install -m 0600 /dev/null ~/.config/vps-ops/vault-password
           printf '%s' "$ANSIBLE_VAULT_PASSWORD" > ~/.config/vps-ops/vault-password
 
-      - name: Wait for VPS SSH
-        working-directory: vps-ops
-        run: |
-          set -euo pipefail
-
-          mapfile -t hosts < <(
-            ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml --list-hosts |
-              awk '/^[[:space:]]+[A-Za-z0-9_.-]+$/ { print $1 }'
-          )
-
-          if [[ "${#hosts[@]}" -eq 0 ]]; then
-            echo "::error::No deploy hosts resolved from vps-ops inventory"
-            exit 1
-          fi
-
-          for host in "${hosts[@]}"; do
-            inventory_json="$(ansible-inventory -i inventory/production.yml --host "$host")"
-            ssh_host="$(jq -r --arg host "$host" '.ansible_host // .ansible_ssh_host // $host' <<<"$inventory_json")"
-            ssh_user="$(jq -r '.ansible_user // .ansible_ssh_user // "github-deployer"' <<<"$inventory_json")"
-            ssh_port="$(jq -r '.ansible_port // .ansible_ssh_port // 22' <<<"$inventory_json")"
-            endpoint="${ssh_user}@${ssh_host}"
-
-            for attempt in 1 2 3 4 5; do
-              if ssh \
-                -o BatchMode=yes \
-                -o ConnectTimeout=10 \
-                -o ConnectionAttempts=1 \
-                -o StrictHostKeyChecking=accept-new \
-                -o AddressFamily=inet \
-                -p "$ssh_port" \
-                -i /tmp/hermes-deploy \
-                "$endpoint" \
-                'echo "SSH OK"'; then
-                echo "SSH preflight succeeded for ${host} (${endpoint}:${ssh_port})"
-                break
-              fi
-
-              if [[ "$attempt" -eq 5 ]]; then
-                echo "::error::SSH preflight failed for ${host} (${endpoint}:${ssh_port}) after ${attempt} attempts"
-                exit 1
-              fi
-
-              delay=$((attempt * 10))
-              echo "SSH attempt ${attempt} failed for ${host} (${endpoint}:${ssh_port}), waiting ${delay}s..."
-              sleep "$delay"
-            done
-          done
-
       - name: Deploy gh-agent-broker
         working-directory: vps-ops
         run: |
           ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
             -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ github.event.workflow_run.head_sha }}" \
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
+
+      - name: Capture SSH failure diagnostics
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+
+          host="srv1656293.hstgr.cloud"
+          port="22"
+          user="github-deployer"
+          label="ssh-deploy-flakiness"
+          issue_title="SSH deploy flakiness log"
+
+          ts_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          runner_ip_ipify="$(curl -s --max-time 5 https://api.ipify.org 2>&1)"
+          runner_ip_ifconfig="$(curl -s --max-time 5 https://ifconfig.me 2>&1)"
+          runner_ip_summary="$(printf '%s' "${runner_ip_ipify:-unknown}" | tr -d '\r\n')"
+
+          ssh_start="$(date +%s)"
+          ssh_error="$(
+            ssh -vvv \
+              -o BatchMode=yes \
+              -o ConnectTimeout=10 \
+              -o ConnectionAttempts=1 \
+              -o StrictHostKeyChecking=accept-new \
+              -o AddressFamily=inet \
+              -i /tmp/hermes-deploy \
+              -p "$port" \
+              "${user}@${host}" \
+              'echo ok' 2>&1
+          )"
+          ssh_end="$(date +%s)"
+          time_to_fail_s="$((ssh_end - ssh_start))"
+
+          if grep -qi "Connection refused" <<<"$ssh_error"; then
+            error_class="refused"
+          elif grep -Eqi "Connection timed out|Operation timed out" <<<"$ssh_error"; then
+            error_class="timed_out"
+          elif grep -qi "Connection reset" <<<"$ssh_error"; then
+            error_class="reset"
+          elif grep -Eqi "Permission denied|publickey" <<<"$ssh_error"; then
+            error_class="auth"
+          elif grep -Eqi "Could not resolve|Name or service not known" <<<"$ssh_error"; then
+            error_class="dns"
+          else
+            error_class="other"
+          fi
+
+          if ! command -v nc >/dev/null 2>&1; then
+            sudo apt-get update >/tmp/ssh-diag-apt-update.log 2>&1
+            sudo apt-get install -y netcat-openbsd >/tmp/ssh-diag-netcat-install.log 2>&1
+          fi
+          if command -v nc >/dev/null 2>&1; then
+            tcp22="$(nc -vz -w5 "$host" "$port" 2>&1)"
+          else
+            tcp22="nc unavailable"
+          fi
+
+          if ! command -v mtr >/dev/null 2>&1; then
+            sudo apt-get update >/tmp/ssh-diag-apt-update-mtr.log 2>&1
+            sudo apt-get install -y mtr-tiny >/tmp/ssh-diag-mtr-install.log 2>&1
+          fi
+          if command -v mtr >/dev/null 2>&1; then
+            mtr_output="$(mtr -T -P "$port" -c 10 --report "$host" 2>&1)"
+          else
+            mtr_output="mtr unavailable"
+          fi
+
+          diagnostics_json="$(
+            jq -n \
+              --arg ts_utc "$ts_utc" \
+              --arg runner_ip_ipify "$runner_ip_ipify" \
+              --arg runner_ip_ifconfig "$runner_ip_ifconfig" \
+              --arg ssh_error "$ssh_error" \
+              --arg error_class "$error_class" \
+              --arg time_to_fail_s "$time_to_fail_s" \
+              --arg tcp22 "$tcp22" \
+              --arg mtr "$mtr_output" \
+              --arg run_id "${{ github.run_id }}" \
+              --arg run_attempt "${{ github.run_attempt }}" \
+              --arg job "${{ github.job }}" \
+              --arg workflow "${{ github.workflow }}" \
+              --arg runner_name "${{ runner.name }}" \
+              --arg runner_env "$RUNNER_ENVIRONMENT" \
+              '{
+                ts_utc: $ts_utc,
+                runner_ip: {
+                  api_ipify_org: $runner_ip_ipify,
+                  ifconfig_me: $runner_ip_ifconfig
+                },
+                ssh_error: $ssh_error,
+                error_class: $error_class,
+                time_to_fail_s: ($time_to_fail_s | tonumber),
+                tcp22: $tcp22,
+                mtr: $mtr,
+                gh: {
+                  run_id: $run_id,
+                  run_attempt: $run_attempt,
+                  job: $job,
+                  workflow: $workflow,
+                  runner_name: $runner_name,
+                  runner_env: $runner_env
+                }
+              }'
+          )"
+
+          echo '```json'
+          printf '%s\n' "$diagnostics_json"
+          echo '```'
+
+          summary="FAIL ${error_class} runner=${runner_ip_summary:-unknown} ${ts_utc} attempt=${{ github.run_attempt }}"
+          comment_body="$(mktemp)"
+          {
+            printf '%s\n\n' "$summary"
+            echo '```json'
+            printf '%s\n' "$diagnostics_json"
+            echo '```'
+          } > "$comment_body"
+
+          gh label create "$label" \
+            --repo "$GITHUB_REPOSITORY" \
+            --description "SSH deploy flakiness diagnostics" \
+            --color "d73a4a" >/dev/null 2>&1 || true
+
+          issue_number="$(
+            gh issue list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state open \
+              --label "$label" \
+              --json number \
+              --jq '.[0].number // empty' 2>/dev/null
+          )"
+
+          if [[ -z "$issue_number" ]]; then
+            issue_url="$(
+              gh issue create \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "$issue_title" \
+                --body "Durable log for intermittent production deploy SSH failures." \
+                --label "$label" 2>/tmp/ssh-diag-gh-issue-create.log
+            )"
+            issue_number="${issue_url##*/}"
+          fi
+
+          if [[ -n "$issue_number" ]]; then
+            gh issue comment "$issue_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body-file "$comment_body" >/dev/null 2>&1 || true
+          else
+            echo "::warning::Unable to find or create SSH deploy flakiness issue"
+          fi
 
       - name: Clean up secrets
         if: always()
