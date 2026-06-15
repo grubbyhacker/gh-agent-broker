@@ -4,6 +4,22 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current production SSH diagnostics hardening:
+
+- Failed production run `27569598853`, job `81502348587`, was the expected
+  intermittent VPS SSH connectivity failure, not a deploy workflow regression:
+  Ansible failed during `Gathering Facts` with
+  `ssh: connect to host srv1656293.hstgr.cloud port 22: Connection timed out`.
+- The PR `#53` diagnostics step did run, classified the failure as
+  `timed_out`, printed JSON, and posted a durable comment to issue `#54`
+  (`ssh-deploy-flakiness`). Captured runner IP was `172.200.23.68`,
+  `time_to_fail_s` was `10`, and `mtr` returned only its report header with no
+  responding hop rows.
+- Current branch `fix/robust-ssh-diagnostics` hardens the diagnostics step so
+  optional package installs and GitHub issue/label/comment operations emit
+  explicit `::warning::` messages instead of failing silently. JSON rendering now
+  uses Python already required by the workflow, avoiding dependence on `jq`.
+
 Current sandbox curator lifecycle/status fix:
 
 - Current post-merge CI repair branch `fix/postmerge-sandbox-status` fixes a
