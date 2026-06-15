@@ -67,6 +67,32 @@ jobs:
         run: |
           set +e
 
+          warn() {
+            echo "::warning::$*"
+          }
+
+          compact_file() {
+            tr '\r\n' '  ' < "$1" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-500
+          }
+
+          install_diag_package() {
+            local tool="$1"
+            local package="$2"
+            local suffix="$3"
+
+            if command -v "$tool" >/dev/null 2>&1; then
+              return 0
+            fi
+
+            if ! sudo apt-get update >"/tmp/ssh-diag-apt-update-${suffix}.log" 2>&1; then
+              warn "Unable to update apt metadata for ${package}: $(compact_file "/tmp/ssh-diag-apt-update-${suffix}.log")"
+            fi
+
+            if ! sudo apt-get install -y "$package" >"/tmp/ssh-diag-${package}-install.log" 2>&1; then
+              warn "Unable to install ${package}: $(compact_file "/tmp/ssh-diag-${package}-install.log")"
+            fi
+          }
+
           host="srv1656293.hstgr.cloud"
           port="22"
           user="github-deployer"
@@ -108,63 +134,74 @@ jobs:
             error_class="other"
           fi
 
-          if ! command -v nc >/dev/null 2>&1; then
-            sudo apt-get update >/tmp/ssh-diag-apt-update.log 2>&1
-            sudo apt-get install -y netcat-openbsd >/tmp/ssh-diag-netcat-install.log 2>&1
-          fi
+          install_diag_package "nc" "netcat-openbsd" "netcat"
           if command -v nc >/dev/null 2>&1; then
             tcp22="$(nc -vz -w5 "$host" "$port" 2>&1)"
           else
             tcp22="nc unavailable"
           fi
 
-          if ! command -v mtr >/dev/null 2>&1; then
-            sudo apt-get update >/tmp/ssh-diag-apt-update-mtr.log 2>&1
-            sudo apt-get install -y mtr-tiny >/tmp/ssh-diag-mtr-install.log 2>&1
-          fi
+          install_diag_package "mtr" "mtr-tiny" "mtr"
           if command -v mtr >/dev/null 2>&1; then
             mtr_output="$(mtr -T -P "$port" -c 10 --report "$host" 2>&1)"
           else
             mtr_output="mtr unavailable"
           fi
 
+          export SSH_DIAG_TS_UTC="$ts_utc"
+          export SSH_DIAG_RUNNER_IP_IPIFY="$runner_ip_ipify"
+          export SSH_DIAG_RUNNER_IP_IFCONFIG="$runner_ip_ifconfig"
+          export SSH_DIAG_SSH_ERROR="$ssh_error"
+          export SSH_DIAG_ERROR_CLASS="$error_class"
+          export SSH_DIAG_TIME_TO_FAIL_S="$time_to_fail_s"
+          export SSH_DIAG_TCP22="$tcp22"
+          export SSH_DIAG_MTR="$mtr_output"
+          export SSH_DIAG_RUN_ID="${{ github.run_id }}"
+          export SSH_DIAG_RUN_ATTEMPT="${{ github.run_attempt }}"
+          export SSH_DIAG_JOB="${{ github.job }}"
+          export SSH_DIAG_WORKFLOW="${{ github.workflow }}"
+          export SSH_DIAG_RUNNER_NAME="${{ runner.name }}"
+          export SSH_DIAG_RUNNER_ENV="$RUNNER_ENVIRONMENT"
+
           diagnostics_json="$(
-            jq -n \
-              --arg ts_utc "$ts_utc" \
-              --arg runner_ip_ipify "$runner_ip_ipify" \
-              --arg runner_ip_ifconfig "$runner_ip_ifconfig" \
-              --arg ssh_error "$ssh_error" \
-              --arg error_class "$error_class" \
-              --arg time_to_fail_s "$time_to_fail_s" \
-              --arg tcp22 "$tcp22" \
-              --arg mtr "$mtr_output" \
-              --arg run_id "${{ github.run_id }}" \
-              --arg run_attempt "${{ github.run_attempt }}" \
-              --arg job "${{ github.job }}" \
-              --arg workflow "${{ github.workflow }}" \
-              --arg runner_name "${{ runner.name }}" \
-              --arg runner_env "$RUNNER_ENVIRONMENT" \
-              '{
-                ts_utc: $ts_utc,
-                runner_ip: {
-                  api_ipify_org: $runner_ip_ipify,
-                  ifconfig_me: $runner_ip_ifconfig
-                },
-                ssh_error: $ssh_error,
-                error_class: $error_class,
-                time_to_fail_s: ($time_to_fail_s | tonumber),
-                tcp22: $tcp22,
-                mtr: $mtr,
-                gh: {
-                  run_id: $run_id,
-                  run_attempt: $run_attempt,
-                  job: $job,
-                  workflow: $workflow,
-                  runner_name: $runner_name,
-                  runner_env: $runner_env
-                }
-              }'
+            python3 - <<'PY'
+          import json
+          import os
+
+          def env(name):
+              return os.environ.get(name, "")
+
+          try:
+              time_to_fail_s = int(env("SSH_DIAG_TIME_TO_FAIL_S"))
+          except ValueError:
+              time_to_fail_s = 0
+
+          print(json.dumps({
+              "ts_utc": env("SSH_DIAG_TS_UTC"),
+              "runner_ip": {
+                  "api_ipify_org": env("SSH_DIAG_RUNNER_IP_IPIFY"),
+                  "ifconfig_me": env("SSH_DIAG_RUNNER_IP_IFCONFIG"),
+              },
+              "ssh_error": env("SSH_DIAG_SSH_ERROR"),
+              "error_class": env("SSH_DIAG_ERROR_CLASS"),
+              "time_to_fail_s": time_to_fail_s,
+              "tcp22": env("SSH_DIAG_TCP22"),
+              "mtr": env("SSH_DIAG_MTR"),
+              "gh": {
+                  "run_id": env("SSH_DIAG_RUN_ID"),
+                  "run_attempt": env("SSH_DIAG_RUN_ATTEMPT"),
+                  "job": env("SSH_DIAG_JOB"),
+                  "workflow": env("SSH_DIAG_WORKFLOW"),
+                  "runner_name": env("SSH_DIAG_RUNNER_NAME"),
+                  "runner_env": env("SSH_DIAG_RUNNER_ENV"),
+              },
+          }, indent=2))
+          PY
           )"
+          if [[ -z "$diagnostics_json" ]]; then
+            warn "Unable to render SSH diagnostics JSON"
+            diagnostics_json="{}"
+          fi
 
           echo '```json'
           printf '%s\n' "$diagnostics_json"
@@ -179,10 +216,30 @@ jobs:
             echo '```'
           } > "$comment_body"
 
-          gh label create "$label" \
-            --repo "$GITHUB_REPOSITORY" \
-            --description "SSH deploy flakiness diagnostics" \
-            --color "d73a4a" >/dev/null 2>&1 || true
+          gh_error="$(mktemp)"
+          label_names="$(
+            gh label list \
+              --repo "$GITHUB_REPOSITORY" \
+              --search "$label" \
+              --json name \
+              --jq '.[].name' 2>"$gh_error"
+          )"
+          label_list_status="$?"
+          if [[ "$label_list_status" -ne 0 ]]; then
+            warn "Unable to list GitHub labels, durable SSH diagnostics may not be logged: $(compact_file "$gh_error")"
+            label_exists=""
+          else
+            label_exists="$(awk -v label="$label" '$0 == label { print; exit }' <<<"$label_names")"
+          fi
+
+          if [[ "$label_list_status" -eq 0 && -z "$label_exists" ]]; then
+            if ! gh label create "$label" \
+              --repo "$GITHUB_REPOSITORY" \
+              --description "SSH deploy flakiness diagnostics" \
+              --color "d73a4a" > /dev/null 2>"$gh_error"; then
+              warn "Unable to create GitHub label '${label}', durable SSH diagnostics may not be logged: $(compact_file "$gh_error")"
+            fi
+          fi
 
           issue_number="$(
             gh issue list \
@@ -190,8 +247,13 @@ jobs:
               --state open \
               --label "$label" \
               --json number \
-              --jq '.[0].number // empty' 2>/dev/null
+              --jq '.[0].number // empty' 2>"$gh_error"
           )"
+          issue_list_status="$?"
+          if [[ "$issue_list_status" -ne 0 ]]; then
+            warn "Unable to list SSH deploy flakiness tracking issues: $(compact_file "$gh_error")"
+            issue_number=""
+          fi
 
           if [[ -z "$issue_number" ]]; then
             issue_url="$(
@@ -199,17 +261,27 @@ jobs:
                 --repo "$GITHUB_REPOSITORY" \
                 --title "$issue_title" \
                 --body "Durable log for intermittent production deploy SSH failures." \
-                --label "$label" 2>/tmp/ssh-diag-gh-issue-create.log
+                --label "$label" 2>"$gh_error"
             )"
-            issue_number="${issue_url##*/}"
+            issue_create_status="$?"
+            if [[ "$issue_create_status" -eq 0 ]]; then
+              issue_number="${issue_url##*/}"
+            else
+              warn "Unable to create SSH deploy flakiness tracking issue: $(compact_file "$gh_error")"
+              issue_number=""
+            fi
           fi
 
           if [[ -n "$issue_number" ]]; then
-            gh issue comment "$issue_number" \
+            if gh issue comment "$issue_number" \
               --repo "$GITHUB_REPOSITORY" \
-              --body-file "$comment_body" >/dev/null 2>&1 || true
+              --body-file "$comment_body" > /dev/null 2>"$gh_error"; then
+              echo "Posted SSH failure diagnostics to issue #${issue_number}"
+            else
+              warn "Unable to post SSH diagnostics comment to issue #${issue_number}: $(compact_file "$gh_error")"
+            fi
           else
-            echo "::warning::Unable to find or create SSH deploy flakiness issue"
+            warn "Skipping durable SSH diagnostics comment because no tracking issue was available"
           fi
 
       - name: Clean up secrets
