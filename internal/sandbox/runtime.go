@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,7 @@ import (
 type RuntimeBackend interface {
 	Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error)
 	Start(ctx context.Context, containerID string) error
+	Wait(ctx context.Context, containerID string) (ContainerStatus, error)
 	Inspect(ctx context.Context, containerID string) (ContainerStatus, error)
 	Logs(ctx context.Context, containerID string, limitBytes int) (string, error)
 	Stop(ctx context.Context, containerID string, grace time.Duration) error
@@ -116,6 +118,46 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 
 func (d *DockerBackend) Start(ctx context.Context, containerID string) error {
 	return d.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerID)+"/start", nil, nil)
+}
+
+func (d *DockerBackend) Wait(ctx context.Context, containerID string) (ContainerStatus, error) {
+	path := "/containers/" + url.PathEscape(containerID) + "/wait?condition=not-running"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker"+path, nil)
+	if err != nil {
+		return ContainerStatus{}, err
+	}
+	waitClient := *d.client
+	waitClient.Timeout = 0
+	resp, err := waitClient.Do(req)
+	if err != nil {
+		return ContainerStatus{}, err
+	}
+	defer closeBody(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ContainerStatus{}, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ContainerStatus{}, DockerError{Method: http.MethodPost, Path: path, StatusCode: resp.StatusCode, Body: string(b)}
+	}
+	var out dockerWaitResponse
+	if len(b) > 0 {
+		if err := json.Unmarshal(b, &out); err != nil {
+			return ContainerStatus{}, err
+		}
+	}
+	status, err := d.Inspect(ctx, containerID)
+	if err != nil {
+		return ContainerStatus{}, err
+	}
+	if status.ExitCode == nil && out.StatusCode != 0 {
+		code := out.StatusCode
+		status.ExitCode = &code
+	}
+	if status.Error == "" && out.Error.Message != "" {
+		status.Error = out.Error.Message
+	}
+	return status, nil
 }
 
 func (d *DockerBackend) Inspect(ctx context.Context, containerID string) (ContainerStatus, error) {
@@ -333,15 +375,34 @@ func (d *DockerBackend) doWithContentType(ctx context.Context, method, path stri
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if readErr != nil {
-			return fmt.Errorf("docker %s %s failed: status %d: read error body: %w", method, path, resp.StatusCode, readErr)
+			return DockerError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: "read error body: " + readErr.Error()}
 		}
-		return fmt.Errorf("docker %s %s failed: status %d: %s", method, path, resp.StatusCode, string(b))
+		return DockerError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: string(b)}
 	}
 	if out != nil {
 		_, err = io.Copy(out, resp.Body)
 		return err
 	}
 	return nil
+}
+
+type DockerError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Body       string
+}
+
+func (e DockerError) Error() string {
+	return fmt.Sprintf("docker %s %s failed: status %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+func DockerStatusCode(err error) (int, bool) {
+	var dockerErr DockerError
+	if errors.As(err, &dockerErr) {
+		return dockerErr.StatusCode, true
+	}
+	return 0, false
 }
 
 func singleFileTar(name string, contents []byte, mode int64) ([]byte, error) {
@@ -399,6 +460,13 @@ type dockerInspectResponse struct {
 		StartedAt  string `json:"StartedAt"`
 		FinishedAt string `json:"FinishedAt"`
 	} `json:"State"`
+}
+
+type dockerWaitResponse struct {
+	StatusCode int `json:"StatusCode"`
+	Error      struct {
+		Message string `json:"Message"`
+	} `json:"Error"`
 }
 
 func envList(env map[string]string) []string {

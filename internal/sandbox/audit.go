@@ -29,6 +29,9 @@ type AuditEvent struct {
 	Parameters       map[string]any `json:"parameters,omitempty"`
 	Status           string         `json:"status,omitempty"`
 	ExitCode         *int           `json:"exit_code,omitempty"`
+	Terminal         bool           `json:"terminal,omitempty"`
+	FinalizeReason   string         `json:"finalize_reason,omitempty"`
+	TerminalSource   string         `json:"terminal_source,omitempty"`
 	Decision         string         `json:"decision"`
 	Error            string         `json:"error,omitempty"`
 }

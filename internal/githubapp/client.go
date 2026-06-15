@@ -45,6 +45,23 @@ type tokenResponse struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+type APIError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e APIError) Error() string {
+	return fmt.Sprintf("github api failed: status %d: %s", e.StatusCode, e.Body)
+}
+
+func (e APIError) RateLimited() bool {
+	if e.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	body := strings.ToLower(e.Body)
+	return strings.Contains(body, "rate limit") || strings.Contains(body, "secondary rate")
+}
+
 func New(cfg config.GitHubConfig) (*Client, error) {
 	c := &Client{
 		cfg:  cfg,
@@ -104,7 +121,7 @@ func (c *Client) InstallationToken(appName string, installationID int64) (string
 		return "", err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("github token exchange failed: status %d: %s", resp.StatusCode, string(body))
+		return "", APIError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 	var tr tokenResponse
 	if err := json.Unmarshal(body, &tr); err != nil {
@@ -930,7 +947,7 @@ func (c *Client) doJSONStatus(appName, method, path string, installationID int64
 		return resp.StatusCode, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return resp.StatusCode, fmt.Errorf("github api failed: status %d: %s", resp.StatusCode, string(b))
+		return resp.StatusCode, APIError{StatusCode: resp.StatusCode, Body: string(b)}
 	}
 	if out == nil {
 		return resp.StatusCode, nil

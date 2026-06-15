@@ -432,12 +432,9 @@ func TestCompletionStatusFileWrittenForConfiguredTemplate(t *testing.T) {
 	}
 	runtime.finish(out.RunID, 0, "")
 
-	status, err := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
-	if err != nil {
-		t.Fatalf("GetAgentStatus() error = %v", err)
-	}
-	if status.Status != StatusStopped {
-		t.Fatalf("status = %+v, want stopped", status)
+	meta := waitForMetadataStatus(t, cfg, out.RunID, StatusStopped)
+	if meta.Status != StatusStopped {
+		t.Fatalf("status = %+v, want stopped", meta)
 	}
 	var statusFile completionStatusFile
 	if err := json.Unmarshal(runtime.writtenFile("/data/intake/curator-status.json"), &statusFile); err != nil {
@@ -451,6 +448,77 @@ func TestCompletionStatusFileWrittenForConfiguredTemplate(t *testing.T) {
 	}
 }
 
+func TestExitWatcherFinalizesRunAndWritesTerminalAudit(t *testing.T) {
+	cfg := baseTestConfig(t)
+	tmpl := cfg.Templates["worker"]
+	tmpl.CompletionStatusPath = "/data/intake/curator-status.json"
+	tmpl.ExtraMounts = []ExtraMount{{SourcePath: filepath.Join(filepath.Dir(cfg.RunsDir), "evidence"), MountPath: "/data/intake", ReadOnly: false}}
+	cfg.Templates["worker"] = tmpl
+	runtime := newFakeRuntime()
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := NewAuditLogger(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestAudit(t, auditLog)
+	service := NewService(cfg, runtime, auditLog)
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{Template: "worker", Task: "done", Repo: "owner/repo", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("LaunchAgent() error = %v", err)
+	}
+	runtime.finish(out.RunID, 0, "")
+	meta := waitForMetadataStatus(t, cfg, out.RunID, StatusStopped)
+	if meta.ExitCode == nil || *meta.ExitCode != 0 {
+		t.Fatalf("exit code = %+v, want 0", meta.ExitCode)
+	}
+	var statusFile completionStatusFile
+	if err := json.Unmarshal(runtime.writtenFile("/data/intake/curator-status.json"), &statusFile); err != nil {
+		t.Fatalf("decode completion status: %v", err)
+	}
+	if statusFile.Status != "success" || statusFile.ExitCode != 0 {
+		t.Fatalf("completion status = %+v", statusFile)
+	}
+	events := readSandboxAuditEvents(t, auditPath)
+	if !hasTerminalAudit(events, out.RunID, finalizeReasonWorkerExit, terminalSourceExited, StatusStopped) {
+		t.Fatalf("worker exit terminal audit missing from %+v", events)
+	}
+}
+
+func TestTimeoutStopAlreadyStoppedFinalizesExitedRun(t *testing.T) {
+	cfg := baseTestConfig(t)
+	tmpl := cfg.Templates["worker"]
+	tmpl.CompletionStatusPath = "/data/intake/curator-status.json"
+	tmpl.ExtraMounts = []ExtraMount{{SourcePath: filepath.Join(filepath.Dir(cfg.RunsDir), "evidence"), MountPath: "/data/intake", ReadOnly: false}}
+	cfg.Templates["worker"] = tmpl
+	runtime := newFakeRuntime()
+	code := 0
+	runtime.stopErr = DockerError{Method: "POST", Path: "/containers/test/stop?t=2", StatusCode: 304}
+	runtime.stopExitCode = &code
+	service := NewService(cfg, runtime, testAudit(t))
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{Template: "worker", Task: "race", Repo: "owner/repo", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("LaunchAgent() error = %v", err)
+	}
+	service.watchTimeout(context.Background(), out.RunID, time.Now().Add(10*time.Millisecond))
+	status, err := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatalf("GetAgentStatus() error = %v", err)
+	}
+	if status.Status != StatusStopped || status.ExitCode == nil || *status.ExitCode != 0 {
+		t.Fatalf("status = %+v, want stopped exit 0", status)
+	}
+	if strings.Contains(status.Error, "run exceeded deadline") {
+		t.Fatalf("stop 304 race was misreported as timeout: %+v", status)
+	}
+	var statusFile completionStatusFile
+	if err := json.Unmarshal(runtime.writtenFile("/data/intake/curator-status.json"), &statusFile); err != nil {
+		t.Fatalf("decode completion status: %v", err)
+	}
+	if statusFile.Status != "success" || statusFile.ExitCode != 0 {
+		t.Fatalf("completion status = %+v", statusFile)
+	}
+}
+
 func requireCollectedFile(t *testing.T, collection CollectionOutput, path string) FileManifest {
 	t.Helper()
 	for _, file := range collection.Files {
@@ -460,6 +528,56 @@ func requireCollectedFile(t *testing.T, collection CollectionOutput, path string
 	}
 	t.Fatalf("file %q missing from %+v", path, collection.Files)
 	return FileManifest{}
+}
+
+func waitForMetadataStatus(t *testing.T, cfg Config, runID, want string) RunMetadata {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last RunMetadata
+	for time.Now().Before(deadline) {
+		meta, err := readMetadata(filepath.Join(cfg.RunsDir, runID, "metadata.json"))
+		if err != nil {
+			t.Fatalf("read metadata: %v", err)
+		}
+		last = meta
+		if meta.Status == want {
+			return meta
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("metadata status = %+v, want %s", last, want)
+	return RunMetadata{}
+}
+
+func readSandboxAuditEvents(t *testing.T, path string) []AuditEvent {
+	t.Helper()
+	// #nosec G304 -- test helper reads the audit path created by the test.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	events := make([]AuditEvent, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var ev AuditEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("decode audit line %q: %v", line, err)
+		}
+		events = append(events, ev)
+	}
+	return events
+}
+
+func hasTerminalAudit(events []AuditEvent, runID, reason, source, status string) bool {
+	for _, ev := range events {
+		if ev.Operation == "run_finalized" && ev.RunID == runID && ev.Terminal && ev.FinalizeReason == reason && ev.TerminalSource == source && ev.Status == status {
+			return true
+		}
+	}
+	return false
 }
 
 func baseTestConfig(t *testing.T) Config {
@@ -580,16 +698,20 @@ func assertMount(t *testing.T, mounts []Mount, source, target string, readonly b
 }
 
 type fakeRuntime struct {
-	mu      sync.Mutex
-	specs   []RuntimeSpec
-	logs    string
-	started map[string]bool
-	exits   map[string]ContainerStatus
-	writes  map[string][]byte
+	mu           sync.Mutex
+	specs        []RuntimeSpec
+	logs         string
+	started      map[string]bool
+	exits        map[string]ContainerStatus
+	writes       map[string][]byte
+	waiters      map[string]chan struct{}
+	waitClosed   map[string]bool
+	stopErr      error
+	stopExitCode *int
 }
 
 func newFakeRuntime() *fakeRuntime {
-	return &fakeRuntime{started: map[string]bool{}, exits: map[string]ContainerStatus{}, writes: map[string][]byte{}}
+	return &fakeRuntime{started: map[string]bool{}, exits: map[string]ContainerStatus{}, writes: map[string][]byte{}, waiters: map[string]chan struct{}{}, waitClosed: map[string]bool{}}
 }
 
 func (f *fakeRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
@@ -597,7 +719,9 @@ func (f *fakeRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerIn
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.specs = append(f.specs, spec)
-	return ContainerInfo{ID: "container-" + spec.RunID, ImageDigest: spec.Image}, nil
+	containerID := "container-" + spec.RunID
+	f.waiters[containerID] = make(chan struct{})
+	return ContainerInfo{ID: containerID, ImageDigest: spec.Image}, nil
 }
 
 func (f *fakeRuntime) Start(ctx context.Context, containerID string) error {
@@ -606,6 +730,27 @@ func (f *fakeRuntime) Start(ctx context.Context, containerID string) error {
 	defer f.mu.Unlock()
 	f.started[containerID] = true
 	return nil
+}
+
+func (f *fakeRuntime) Wait(ctx context.Context, containerID string) (ContainerStatus, error) {
+	for {
+		f.mu.Lock()
+		if status, ok := f.exits[containerID]; ok {
+			f.mu.Unlock()
+			return status, nil
+		}
+		if !f.started[containerID] {
+			f.mu.Unlock()
+			return ContainerStatus{ID: containerID, Running: false}, nil
+		}
+		ch := f.waiters[containerID]
+		f.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ContainerStatus{}, ctx.Err()
+		case <-ch:
+		}
+	}
 }
 
 func (f *fakeRuntime) Inspect(ctx context.Context, containerID string) (ContainerStatus, error) {
@@ -630,7 +775,17 @@ func (f *fakeRuntime) Stop(ctx context.Context, containerID string, grace time.D
 	_, _ = ctx, grace
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.stopErr != nil {
+		if f.stopExitCode != nil {
+			code := *f.stopExitCode
+			f.exits[containerID] = ContainerStatus{ID: containerID, Running: false, ExitCode: &code, EndedAt: time.Now().UTC()}
+		}
+		f.started[containerID] = false
+		f.closeWaiterLocked(containerID)
+		return f.stopErr
+	}
 	f.started[containerID] = false
+	f.closeWaiterLocked(containerID)
 	return nil
 }
 
@@ -672,10 +827,23 @@ func (f *fakeRuntime) finish(runID string, exitCode int, message string) {
 		EndedAt:  time.Now().UTC(),
 		Error:    message,
 	}
+	f.closeWaiterLocked(containerID)
 }
 
 func (f *fakeRuntime) writtenFile(path string) []byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]byte(nil), f.writes[path]...)
+}
+
+func (f *fakeRuntime) closeWaiterLocked(containerID string) {
+	if f.waitClosed[containerID] {
+		return
+	}
+	ch, ok := f.waiters[containerID]
+	if !ok {
+		return
+	}
+	close(ch)
+	f.waitClosed[containerID] = true
 }

@@ -3,10 +3,13 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1131,12 +1134,63 @@ func (s *Server) withReadAccess(w http.ResponseWriter, r *http.Request, repo, op
 	}
 	out, err := fn(opID, gh, appName, inst)
 	if err != nil {
-		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
-		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
+		brokerStatus, code, _, extra := classifyGitHubReadError(err)
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error(), Extra: extra})
+		writeJSON(w, brokerStatus, api.ErrorResponse{Code: code, Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
 		return
 	}
 	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: "ok"})
 	writeJSON(w, http.StatusOK, out)
+}
+
+func classifyGitHubReadError(err error) (int, string, string, map[string]interface{}) {
+	extra := map[string]interface{}{
+		"upstream": "github",
+	}
+	var apiErr githubapp.APIError
+	if errors.As(err, &apiErr) {
+		extra["github_status"] = apiErr.StatusCode
+		switch {
+		case apiErr.StatusCode == http.StatusNotFound:
+			extra["github_error_code"] = "github_not_found"
+			extra["github_error_category"] = "not_found"
+			extra["broker_status"] = http.StatusNotFound
+			return http.StatusNotFound, "github_not_found", "not_found", extra
+		case apiErr.RateLimited():
+			extra["github_error_code"] = "github_rate_limited"
+			extra["github_error_category"] = "rate_limited"
+			extra["broker_status"] = http.StatusTooManyRequests
+			return http.StatusTooManyRequests, "github_rate_limited", "rate_limited", extra
+		case apiErr.StatusCode == http.StatusForbidden:
+			extra["github_error_code"] = "github_forbidden"
+			extra["github_error_category"] = "forbidden"
+			extra["broker_status"] = http.StatusForbidden
+			return http.StatusForbidden, "github_forbidden", "forbidden", extra
+		default:
+			extra["github_error_code"] = "github_error"
+			extra["github_error_category"] = "upstream_error"
+			extra["broker_status"] = http.StatusBadGateway
+			return http.StatusBadGateway, "github_error", "upstream_error", extra
+		}
+	}
+	if isTimeoutError(err) {
+		extra["github_error_code"] = "github_timeout"
+		extra["github_error_category"] = "timeout"
+		extra["broker_status"] = http.StatusGatewayTimeout
+		return http.StatusGatewayTimeout, "github_timeout", "timeout", extra
+	}
+	extra["github_error_code"] = "github_error"
+	extra["github_error_category"] = "transport_error"
+	extra["broker_status"] = http.StatusBadGateway
+	return http.StatusBadGateway, "github_error", "transport_error", extra
+}
+
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func replayIdempotent(w http.ResponseWriter, cfg config.IdempotencyConfig, key string) (bool, error) {
