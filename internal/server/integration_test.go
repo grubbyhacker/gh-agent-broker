@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -337,6 +338,68 @@ func TestFakeGitHubReadRESTIntegration(t *testing.T) {
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/issues?body_marker=ykm/test", nil), http.StatusOK)
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/commits/abc/status", nil), http.StatusOK)
 	assertStatus(t, brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/commits/abc/check-runs", nil), http.StatusOK)
+}
+
+func TestReadAccessMapsGitHubNotFoundAndAuditsCategory(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/42/access_tokens":
+			writeTestJSON(t, w, map[string]string{
+				"token":      "fake-install-token",
+				"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/99":
+			requireBearer(t, r)
+			w.WriteHeader(http.StatusNotFound)
+			writeTestJSON(t, w, map[string]string{"message": "Not Found", "status": "404"})
+		default:
+			t.Fatalf("unexpected fake GitHub read request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer apiServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:           "agent-1",
+		Enabled:      true,
+		Secret:       "agent-secret",
+		Repositories: []string{"owner/repo"},
+		Operations:   []string{"issue.read"},
+	})
+	resp := brokerRequest(t, broker, http.MethodGet, "/v1/repos/owner/repo/issues/99", nil)
+	assertStatus(t, resp, http.StatusNotFound)
+	var body api.ErrorResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if body.Code != "github_not_found" {
+		t.Fatalf("code = %q, want github_not_found; body=%s", body.Code, resp.Body.String())
+	}
+	events := readBrokerAuditEvents(t, broker.cfg.Audit.Path)
+	ev := lastAuditEventForOperation(t, events, "issue.read")
+	if ev.Extra["github_error_code"] != "github_not_found" || ev.Extra["github_error_category"] != "not_found" || ev.Extra["broker_status"] != float64(http.StatusNotFound) || ev.Extra["github_status"] != float64(http.StatusNotFound) {
+		t.Fatalf("audit extra = %#v", ev.Extra)
+	}
+}
+
+func TestClassifyGitHubReadError(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "forbidden", err: githubapp.APIError{StatusCode: http.StatusForbidden, Body: `{"message":"Forbidden"}`}, wantStatus: http.StatusForbidden, wantCode: "github_forbidden"},
+		{name: "rate limited status", err: githubapp.APIError{StatusCode: http.StatusTooManyRequests, Body: `{"message":"rate limit"}`}, wantStatus: http.StatusTooManyRequests, wantCode: "github_rate_limited"},
+		{name: "rate limited body", err: githubapp.APIError{StatusCode: http.StatusForbidden, Body: `{"message":"API rate limit exceeded"}`}, wantStatus: http.StatusTooManyRequests, wantCode: "github_rate_limited"},
+		{name: "timeout", err: context.DeadlineExceeded, wantStatus: http.StatusGatewayTimeout, wantCode: "github_timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotStatus, gotCode, _, extra := classifyGitHubReadError(tc.err)
+			if gotStatus != tc.wantStatus || gotCode != tc.wantCode {
+				t.Fatalf("classify = status %d code %q extra %#v, want status %d code %q", gotStatus, gotCode, extra, tc.wantStatus, tc.wantCode)
+			}
+		})
+	}
 }
 
 func TestPullReviewWriteDenials(t *testing.T) {
@@ -846,6 +909,39 @@ func assertStatus(t *testing.T, resp *httptest.ResponseRecorder, want int) {
 	if resp.Code != want {
 		t.Fatalf("status = %d, want %d; body=%s", resp.Code, want, resp.Body.String())
 	}
+}
+
+func readBrokerAuditEvents(t *testing.T, path string) []audit.Event {
+	t.Helper()
+	// #nosec G304 -- test helper reads the audit path created by the test broker.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	events := make([]audit.Event, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var ev audit.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("decode audit line %q: %v", line, err)
+		}
+		events = append(events, ev)
+	}
+	return events
+}
+
+func lastAuditEventForOperation(t *testing.T, events []audit.Event, operation string) audit.Event {
+	t.Helper()
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Operation == operation {
+			return events[i]
+		}
+	}
+	t.Fatalf("audit operation %q missing from %+v", operation, events)
+	return audit.Event{}
 }
 
 func requireBearer(t *testing.T, r *http.Request) {

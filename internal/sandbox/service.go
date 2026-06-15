@@ -5,10 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -27,12 +27,34 @@ const (
 	StatusCleaned  = "cleaned"
 )
 
+const (
+	finalizeReasonWorkerExit                = "worker_exit"
+	finalizeReasonStatusPollExited          = "status_poll_exited"
+	finalizeReasonStatusPollDeadline        = "status_poll_deadline"
+	finalizeReasonReconcileExited           = "reconcile_exited"
+	finalizeReasonReconcileDeadline         = "reconcile_deadline"
+	finalizeReasonReconcileMissing          = "reconcile_container_missing"
+	finalizeReasonDeadline                  = "deadline"
+	finalizeReasonDeadlineAlreadyExited     = "deadline_already_exited"
+	finalizeReasonDeadlineStopAlreadyExited = "deadline_stop_already_exited"
+	finalizeReasonDeadlineStopFailed        = "deadline_stop_failed"
+	finalizeReasonManualStop                = "manual_stop"
+	finalizeReasonLaunchCreateFailed        = "launch_create_failed"
+	finalizeReasonLaunchStartFailed         = "launch_start_failed"
+
+	terminalSourceExited         = "exited"
+	terminalSourceTimedOut       = "timed_out"
+	terminalSourceManualStop     = "manual_stop"
+	terminalSourceStartupFailure = "startup_failure"
+)
+
 type Service struct {
-	cfg     Config
-	runtime RuntimeBackend
-	audit   *AuditLogger
-	mu      sync.Mutex
-	runs    map[string]*RunMetadata
+	cfg        Config
+	runtime    RuntimeBackend
+	audit      *AuditLogger
+	mu         sync.Mutex
+	runs       map[string]*RunMetadata
+	finalizing map[string]bool
 }
 
 type pathPermissionFixer interface {
@@ -60,6 +82,8 @@ type RunMetadata struct {
 	ImageDigest      string         `json:"image_digest,omitempty"`
 	Status           string         `json:"status"`
 	ExitCode         *int           `json:"exit_code,omitempty"`
+	FinalizeReason   string         `json:"finalize_reason,omitempty"`
+	TerminalSource   string         `json:"terminal_source,omitempty"`
 	Error            string         `json:"error,omitempty"`
 	Deliverables     []string       `json:"deliverables,omitempty"`
 	Parameters       map[string]any `json:"parameters,omitempty"`
@@ -216,10 +240,11 @@ func NewService(cfg Config, runtime RuntimeBackend, auditLog *AuditLogger) *Serv
 		cfg.StampLoaded(time.Now().UTC())
 	}
 	return &Service{
-		cfg:     cfg,
-		runtime: runtime,
-		audit:   auditLog,
-		runs:    map[string]*RunMetadata{},
+		cfg:        cfg,
+		runtime:    runtime,
+		audit:      auditLog,
+		runs:       map[string]*RunMetadata{},
+		finalizing: map[string]bool{},
 	}
 }
 
@@ -242,22 +267,45 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		if meta.ContainerID != "" && meta.Status == StatusRunning {
 			status, err := s.runtime.Inspect(ctx, meta.ContainerID)
 			if err != nil {
-				meta.Status = StatusFailed
-				meta.Error = "container missing during startup reconciliation"
-				meta.EndedAt = time.Now().UTC()
+				finalized, _, finalizeErr := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonReconcileMissing, terminalSourceStartupFailure, func(current RunMetadata) RunMetadata {
+					current.Status = StatusFailed
+					current.TerminalSource = terminalSourceStartupFailure
+					current.Error = "container missing during startup reconciliation"
+					current.EndedAt = time.Now().UTC()
+					return current
+				})
+				if finalizeErr != nil {
+					return finalizeErr
+				}
+				meta = finalized
 			} else if !status.Running {
-				meta = s.finalizeExitedRun(ctx, meta, status)
+				finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonReconcileExited, terminalSourceExited, func(current RunMetadata) RunMetadata {
+					return s.finalizeExitedRun(ctx, current, status)
+				})
+				if err != nil {
+					return err
+				}
+				meta = finalized
 			} else if time.Now().After(meta.Deadline) {
-				meta = s.markTimedOut(ctx, meta)
-			}
-			if err := s.writeMetadata(meta); err != nil {
-				return err
+				finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonReconcileDeadline, terminalSourceTimedOut, func(current RunMetadata) RunMetadata {
+					return s.markTimedOut(ctx, current)
+				})
+				if err != nil {
+					return err
+				}
+				meta = finalized
 			}
 		}
 		s.mu.Lock()
 		cp := meta
 		s.runs[meta.RunID] = &cp
 		s.mu.Unlock()
+		if meta.Status == StatusRunning {
+			go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
+			if meta.ContainerID != "" {
+				go s.watchExit(context.WithoutCancel(ctx), meta.RunID, meta.ContainerID)
+			}
+		}
 	}
 	return nil
 }
@@ -422,18 +470,8 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 	s.logSandboxCreation(meta, time.Since(createStarted), err)
 	if err != nil {
 		meta.Status = StatusFailed
-		meta.Error = err.Error()
-		meta.EndedAt = time.Now().UTC()
-		if writeErr := s.writeMetadata(meta); writeErr != nil {
-			return LaunchAgentOutput{}, writeErr
-		}
-		s.audit.Log(s.auditEvent("launch_agent", meta, "deny", err), redactor)
-		return LaunchAgentOutput{}, err
-	}
-	meta.ContainerID = info.ID
-	meta.ImageDigest = info.ImageDigest
-	if err := s.runtime.Start(ctx, info.ID); err != nil {
-		meta.Status = StatusFailed
+		meta.FinalizeReason = finalizeReasonLaunchCreateFailed
+		meta.TerminalSource = terminalSourceStartupFailure
 		meta.Error = err.Error()
 		meta.EndedAt = time.Now().UTC()
 		s.writeCompletionStatus(ctx, meta)
@@ -441,6 +479,23 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 			return LaunchAgentOutput{}, writeErr
 		}
 		s.audit.Log(s.auditEvent("launch_agent", meta, "deny", err), redactor)
+		s.auditTerminalEvent(meta, finalizeReasonLaunchCreateFailed, terminalSourceStartupFailure, err)
+		return LaunchAgentOutput{}, err
+	}
+	meta.ContainerID = info.ID
+	meta.ImageDigest = info.ImageDigest
+	if err := s.runtime.Start(ctx, info.ID); err != nil {
+		meta.Status = StatusFailed
+		meta.FinalizeReason = finalizeReasonLaunchStartFailed
+		meta.TerminalSource = terminalSourceStartupFailure
+		meta.Error = err.Error()
+		meta.EndedAt = time.Now().UTC()
+		s.writeCompletionStatus(ctx, meta)
+		if writeErr := s.writeMetadata(meta); writeErr != nil {
+			return LaunchAgentOutput{}, writeErr
+		}
+		s.audit.Log(s.auditEvent("launch_agent", meta, "deny", err), redactor)
+		s.auditTerminalEvent(meta, finalizeReasonLaunchStartFailed, terminalSourceStartupFailure, err)
 		return LaunchAgentOutput{}, err
 	}
 	meta.Status = StatusRunning
@@ -452,6 +507,7 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 	s.mu.Unlock()
 	s.audit.Log(s.auditEvent("launch_agent", meta, "allow", nil), redactor)
 	go s.watchTimeout(context.WithoutCancel(ctx), runID, deadline)
+	go s.watchExit(context.WithoutCancel(ctx), runID, info.ID)
 	return LaunchAgentOutput{RunID: runID, WorkerAgentID: meta.WorkerAgentID, Repo: meta.Repo, Branch: meta.Branch, Status: meta.Status, Deadline: meta.Deadline}, nil
 }
 
@@ -485,15 +541,21 @@ func (s *Service) GetAgentStatus(ctx context.Context, in RunInput) (StatusOutput
 	if meta.ContainerID != "" && meta.Status == StatusRunning {
 		status, err := s.runtime.Inspect(ctx, meta.ContainerID)
 		if err == nil && status.Running && time.Now().UTC().After(meta.Deadline) {
-			meta = s.markTimedOut(ctx, meta)
-			if err := s.writeMetadata(meta); err != nil {
+			finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonStatusPollDeadline, terminalSourceTimedOut, func(current RunMetadata) RunMetadata {
+				return s.markTimedOut(ctx, current)
+			})
+			if err != nil {
 				return StatusOutput{}, err
 			}
+			meta = finalized
 		} else if err == nil && !status.Running {
-			meta = s.finalizeExitedRun(ctx, meta, status)
-			if err := s.writeMetadata(meta); err != nil {
+			finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonStatusPollExited, terminalSourceExited, func(current RunMetadata) RunMetadata {
+				return s.finalizeExitedRun(ctx, current, status)
+			})
+			if err != nil {
 				return StatusOutput{}, err
 			}
+			meta = finalized
 		}
 	}
 	return s.statusOutput(meta), nil
@@ -527,10 +589,27 @@ func (s *Service) StopAgent(ctx context.Context, in RunInput) (StatusOutput, err
 			return StatusOutput{}, err
 		}
 	}
-	meta.Status = StatusStopped
-	meta.EndedAt = time.Now().UTC()
-	if err := s.writeMetadata(meta); err != nil {
-		return StatusOutput{}, err
+	if meta.Status == StatusRunning {
+		finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonManualStop, terminalSourceManualStop, func(current RunMetadata) RunMetadata {
+			if current.ContainerID != "" {
+				if status, inspectErr := s.runtime.Inspect(ctx, current.ContainerID); inspectErr == nil && status.ExitCode != nil {
+					current.ExitCode = status.ExitCode
+					current.EndedAt = status.EndedAt
+				}
+			}
+			current.Status = StatusStopped
+			current.FinalizeReason = finalizeReasonManualStop
+			current.TerminalSource = terminalSourceManualStop
+			if current.EndedAt.IsZero() {
+				current.EndedAt = time.Now().UTC()
+			}
+			current.Error = ""
+			return current
+		})
+		if err != nil {
+			return StatusOutput{}, err
+		}
+		meta = finalized
 	}
 	s.audit.Log(s.auditEvent("stop_agent", meta, "allow", nil), redactor)
 	return s.statusOutput(meta), nil
@@ -737,6 +816,17 @@ func (s *Service) lookupRun(runID string) (RunMetadata, error) {
 }
 
 func (s *Service) writeMetadata(meta RunMetadata) error {
+	if err := s.writeMetadataFile(meta); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	cp := meta
+	s.runs[meta.RunID] = &cp
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Service) writeMetadataFile(meta RunMetadata) error {
 	path := filepath.Join(s.runDir(meta.RunID), "metadata.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -748,10 +838,6 @@ func (s *Service) writeMetadata(meta RunMetadata) error {
 	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	cp := meta
-	s.runs[meta.RunID] = &cp
-	s.mu.Unlock()
 	return nil
 }
 
@@ -885,6 +971,8 @@ func (s *Service) auditEvent(operation string, meta RunMetadata, decision string
 		Parameters:       cloneParameters(meta.Parameters),
 		Status:           meta.Status,
 		ExitCode:         meta.ExitCode,
+		FinalizeReason:   meta.FinalizeReason,
+		TerminalSource:   meta.TerminalSource,
 		Decision:         decision,
 	}
 	if err != nil {
@@ -893,34 +981,161 @@ func (s *Service) auditEvent(operation string, meta RunMetadata, decision string
 	return ev
 }
 
+func (s *Service) auditTerminalEvent(meta RunMetadata, reason, source string, err error) {
+	ev := s.auditEvent("run_finalized", meta, "allow", err)
+	ev.Terminal = true
+	ev.FinalizeReason = reason
+	ev.TerminalSource = source
+	s.audit.Log(ev, s.redactor(meta))
+}
+
+func (s *Service) auditFinalizeFailure(runID, reason, source string, err error) {
+	meta, lookupErr := s.lookupRun(runID)
+	if lookupErr != nil {
+		log.Printf(`{"event":"run_finalized","job_id":%q,"success":false,"finalize_reason":%q,"terminal_source":%q,"error":%q}`,
+			runID, reason, source, err.Error())
+		return
+	}
+	ev := s.auditEvent("run_finalized", meta, "deny", err)
+	ev.Terminal = true
+	ev.FinalizeReason = reason
+	ev.TerminalSource = source
+	s.audit.Log(ev, s.redactor(meta))
+}
+
+func terminalSourceForStatus(status, fallback string) string {
+	switch status {
+	case StatusTimedOut:
+		return terminalSourceTimedOut
+	case StatusStopped, StatusFailed:
+		if fallback != "" {
+			return fallback
+		}
+		return terminalSourceExited
+	default:
+		return fallback
+	}
+}
+
 func (s *Service) watchTimeout(parent context.Context, runID string, deadline time.Time) {
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	<-timer.C
-	meta, err := s.lookupRun(runID)
-	if err != nil || meta.Status != StatusRunning {
-		return
-	}
 	ctx, cancel := context.WithTimeout(parent, s.cfg.StopGrace.Duration+5*time.Second)
 	defer cancel()
-	meta = s.markTimedOut(ctx, meta)
-	if err := s.writeMetadata(meta); err != nil {
-		meta.Error = err.Error()
+	if _, _, err := s.finalizeTerminalRun(ctx, runID, finalizeReasonDeadline, terminalSourceTimedOut, func(meta RunMetadata) RunMetadata {
+		return s.markTimedOut(ctx, meta)
+	}); err != nil {
+		s.auditFinalizeFailure(runID, finalizeReasonDeadline, terminalSourceTimedOut, err)
 	}
-	if meta.Status == StatusTimedOut {
-		s.audit.Log(s.auditEvent("timeout", meta, "allow", errors.New("run exceeded deadline")), s.redactor(meta))
+}
+
+func (s *Service) watchExit(parent context.Context, runID, containerID string) {
+	status, err := s.runtime.Wait(parent, containerID)
+	if err != nil {
+		if status, inspectErr := s.runtime.Inspect(parent, containerID); inspectErr == nil && !status.Running {
+			if _, _, finalizeErr := s.finalizeTerminalRun(parent, runID, finalizeReasonWorkerExit, terminalSourceExited, func(meta RunMetadata) RunMetadata {
+				return s.finalizeExitedRun(parent, meta, status)
+			}); finalizeErr != nil {
+				s.auditFinalizeFailure(runID, finalizeReasonWorkerExit, terminalSourceExited, finalizeErr)
+			}
+			return
+		}
+		meta, lookupErr := s.lookupRun(runID)
+		if lookupErr == nil && meta.Status == StatusRunning {
+			ev := s.auditEvent("run_wait", meta, "deny", err)
+			ev.FinalizeReason = finalizeReasonWorkerExit
+			ev.TerminalSource = terminalSourceExited
+			s.audit.Log(ev, s.redactor(meta))
+		}
+		return
+	}
+	if _, _, err := s.finalizeTerminalRun(parent, runID, finalizeReasonWorkerExit, terminalSourceExited, func(meta RunMetadata) RunMetadata {
+		return s.finalizeExitedRun(parent, meta, status)
+	}); err != nil {
+		s.auditFinalizeFailure(runID, finalizeReasonWorkerExit, terminalSourceExited, err)
+	}
+}
+
+func (s *Service) finalizeTerminalRun(ctx context.Context, runID, reason, source string, update func(RunMetadata) RunMetadata) (RunMetadata, bool, error) {
+	meta, err := s.lookupRun(runID)
+	if err != nil {
+		return RunMetadata{}, false, err
+	}
+	if meta.Status != StatusRunning {
+		return meta, false, nil
+	}
+	s.mu.Lock()
+	current, ok := s.runs[runID]
+	if ok {
+		meta = *current
+	}
+	if meta.Status != StatusRunning || s.finalizing[runID] {
+		s.mu.Unlock()
+		return meta, false, nil
+	}
+	s.finalizing[runID] = true
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.finalizing, runID)
+		s.mu.Unlock()
+	}()
+
+	next := update(meta)
+	if next.Status == StatusRunning {
+		return next, false, nil
+	}
+	if next.FinalizeReason != "" {
+		reason = next.FinalizeReason
 	} else {
-		s.audit.Log(s.auditEvent("run_finalized", meta, "allow", nil), s.redactor(meta))
+		next.FinalizeReason = reason
 	}
+	if next.TerminalSource != "" {
+		source = next.TerminalSource
+	}
+	source = terminalSourceForStatus(next.Status, source)
+	next.TerminalSource = source
+	s.mu.Lock()
+	current, ok = s.runs[runID]
+	if ok && current.Status != StatusRunning {
+		done := *current
+		s.mu.Unlock()
+		return done, false, nil
+	}
+	cp := next
+	s.runs[runID] = &cp
+	s.mu.Unlock()
+	s.writeCompletionStatus(ctx, next)
+	if err := s.writeMetadataFile(next); err != nil {
+		ev := s.auditEvent("run_finalized", next, "deny", err)
+		ev.Terminal = true
+		ev.FinalizeReason = reason
+		ev.TerminalSource = source
+		s.audit.Log(ev, s.redactor(next))
+		return next, true, err
+	}
+	s.auditTerminalEvent(next, reason, source, nil)
+	return next, true, nil
 }
 
 func (s *Service) markTimedOut(ctx context.Context, meta RunMetadata) RunMetadata {
 	if meta.ContainerID != "" {
 		status, err := s.runtime.Inspect(ctx, meta.ContainerID)
 		if err == nil && !status.Running {
+			meta.FinalizeReason = finalizeReasonDeadlineAlreadyExited
 			return s.finalizeExitedRun(ctx, meta, status)
 		}
 		if err := s.runtime.Stop(ctx, meta.ContainerID, s.cfg.StopGrace.Duration); err != nil {
+			if code, ok := DockerStatusCode(err); ok && code == http.StatusNotModified {
+				status, inspectErr := s.runtime.Inspect(ctx, meta.ContainerID)
+				if inspectErr == nil && !status.Running {
+					meta.FinalizeReason = finalizeReasonDeadlineStopAlreadyExited
+					return s.finalizeExitedRun(ctx, meta, status)
+				}
+			}
+			meta.FinalizeReason = finalizeReasonDeadlineStopFailed
 			meta.Error = "run exceeded deadline; stop failed: " + err.Error()
 		} else {
 			status, err := s.runtime.Inspect(ctx, meta.ContainerID)
@@ -929,19 +1144,23 @@ func (s *Service) markTimedOut(ctx context.Context, meta RunMetadata) RunMetadat
 			}
 		}
 	}
+	if meta.FinalizeReason == "" {
+		meta.FinalizeReason = finalizeReasonDeadline
+	}
 	if meta.Error == "" {
 		meta.Error = "run exceeded deadline"
 	}
 	meta.Status = StatusTimedOut
+	meta.TerminalSource = terminalSourceTimedOut
 	meta.EndedAt = time.Now().UTC()
 	if err := s.ensureFailureDiagnostics(meta, meta.Error); err != nil && !strings.Contains(meta.Error, err.Error()) {
 		meta.Error = meta.Error + "; diagnostics write failed: " + err.Error()
 	}
-	s.writeCompletionStatus(ctx, meta)
 	return meta
 }
 
 func (s *Service) finalizeExitedRun(ctx context.Context, meta RunMetadata, status ContainerStatus) RunMetadata {
+	meta.TerminalSource = terminalSourceExited
 	meta.ExitCode = status.ExitCode
 	meta.EndedAt = status.EndedAt
 	if meta.EndedAt.IsZero() {
@@ -950,7 +1169,6 @@ func (s *Service) finalizeExitedRun(ctx context.Context, meta RunMetadata, statu
 	if status.ExitCode != nil && *status.ExitCode == 0 {
 		meta.Status = StatusStopped
 		meta.Error = ""
-		s.writeCompletionStatus(ctx, meta)
 		return meta
 	}
 	meta.Status = StatusFailed
@@ -958,7 +1176,6 @@ func (s *Service) finalizeExitedRun(ctx context.Context, meta RunMetadata, statu
 	if diagErr := s.ensureFailureDiagnostics(meta, meta.Error); diagErr != nil && meta.Error == "" {
 		meta.Error = diagErr.Error()
 	}
-	s.writeCompletionStatus(ctx, meta)
 	return meta
 }
 
