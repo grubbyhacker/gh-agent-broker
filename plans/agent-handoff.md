@@ -4,21 +4,18 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
-Current deploy outcome telemetry enhancement:
+Current deploy outcome telemetry refactor:
 
-- Current branch `feature/deploy-success-telemetry` adds production deploy
-  success telemetry so issue `#54` contains comparable `OK` and `FAIL` rows by
-  runner egress IP range.
-- New helper `scripts/log-deploy-event.py` handles shared JSON rendering,
-  GitHub Actions CIDR matching from `gh api meta --jq '.actions[]'`, summary
-  line formatting, and durable issue comment posting. It is non-blocking and
-  emits `::warning::` annotations for meta/label/issue/comment failures.
-- `.github/workflows/deploy-production.yml` now checks out the helper only
-  after the deploy step with `continue-on-error: true`, then logs lightweight
-  success telemetry with `if: success()` or rich SSH failure telemetry with
-  `if: failure()`. Failure JSON keeps `ssh_error`, `error_class`,
-  `time_to_fail_s`, `tcp22`, and `mtr`, and both outcomes include
-  `matched_actions_cidr` and `ip_16`.
+- Current branch `refactor/use-vps-ops-deploy-telemetry` removes the local
+  `scripts/log-deploy-event.py` copy and uses the reusable composite action
+  from checked-out `vps-ops` at `.github/actions/deploy-telemetry`.
+- `.github/workflows/deploy-production.yml` calls the action twice after the
+  Ansible deploy step: `if: success()` with `outcome: success`, and
+  `if: failure()` with `outcome: failure` plus the production SSH endpoint and
+  `/tmp/hermes-deploy` key path. Both calls pass
+  `service_label: gh-agent-broker` and `${{ github.token }}`.
+- The action defaults keep using label `ssh-deploy-flakiness`, so telemetry
+  history remains continuous in issue `#54`.
 
 Current production SSH diagnostics hardening:
 
