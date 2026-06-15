@@ -60,124 +60,25 @@ jobs:
             -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ github.event.workflow_run.head_sha }}" \
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
 
-      - name: Checkout deploy telemetry helper
-        if: always()
-        continue-on-error: true
-        uses: actions/checkout@v6
-        with:
-          repository: grubbyhacker/gh-agent-broker
-          ref: ${{ github.event.workflow_run.head_sha }}
-          path: gh-agent-broker
-
       - name: Log successful deploy telemetry
         if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DEPLOY_EVENT_OUTCOME: success
-          DEPLOY_EVENT_RUN_ID: ${{ github.run_id }}
-          DEPLOY_EVENT_RUN_ATTEMPT: ${{ github.run_attempt }}
-          DEPLOY_EVENT_JOB: ${{ github.job }}
-          DEPLOY_EVENT_WORKFLOW: ${{ github.workflow }}
-          DEPLOY_EVENT_RUNNER_NAME: ${{ runner.name }}
-        run: |
-          set +e
-          export DEPLOY_EVENT_RUNNER_ENV="$RUNNER_ENVIRONMENT"
-          python3 gh-agent-broker/scripts/log-deploy-event.py || echo "::warning::Deploy success telemetry helper failed to run"
+        uses: ./vps-ops/.github/actions/deploy-telemetry
+        with:
+          outcome: success
+          service_label: gh-agent-broker
+          github_token: ${{ github.token }}
 
       - name: Capture SSH failure diagnostics
         if: failure()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DEPLOY_EVENT_OUTCOME: failure
-          DEPLOY_EVENT_RUN_ID: ${{ github.run_id }}
-          DEPLOY_EVENT_RUN_ATTEMPT: ${{ github.run_attempt }}
-          DEPLOY_EVENT_JOB: ${{ github.job }}
-          DEPLOY_EVENT_WORKFLOW: ${{ github.workflow }}
-          DEPLOY_EVENT_RUNNER_NAME: ${{ runner.name }}
-        run: |
-          set +e
-
-          warn() {
-            echo "::warning::$*"
-          }
-
-          compact_file() {
-            tr '\r\n' '  ' < "$1" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-500
-          }
-
-          install_diag_package() {
-            local tool="$1"
-            local package="$2"
-            local suffix="$3"
-
-            if command -v "$tool" >/dev/null 2>&1; then
-              return 0
-            fi
-
-            if ! sudo apt-get update >"/tmp/ssh-diag-apt-update-${suffix}.log" 2>&1; then
-              warn "Unable to update apt metadata for ${package}: $(compact_file "/tmp/ssh-diag-apt-update-${suffix}.log")"
-            fi
-
-            if ! sudo apt-get install -y "$package" >"/tmp/ssh-diag-${package}-install.log" 2>&1; then
-              warn "Unable to install ${package}: $(compact_file "/tmp/ssh-diag-${package}-install.log")"
-            fi
-          }
-
-          host="srv1656293.hstgr.cloud"
-          port="22"
-          user="github-deployer"
-
-          ssh_start="$(date +%s)"
-          ssh_error="$(
-            ssh -vvv \
-              -o BatchMode=yes \
-              -o ConnectTimeout=10 \
-              -o ConnectionAttempts=1 \
-              -o StrictHostKeyChecking=accept-new \
-              -o AddressFamily=inet \
-              -i /tmp/hermes-deploy \
-              -p "$port" \
-              "${user}@${host}" \
-              'echo ok' 2>&1
-          )"
-          ssh_end="$(date +%s)"
-          time_to_fail_s="$((ssh_end - ssh_start))"
-
-          if grep -qi "Connection refused" <<<"$ssh_error"; then
-            error_class="refused"
-          elif grep -Eqi "Connection timed out|Operation timed out" <<<"$ssh_error"; then
-            error_class="timed_out"
-          elif grep -qi "Connection reset" <<<"$ssh_error"; then
-            error_class="reset"
-          elif grep -Eqi "Permission denied|publickey" <<<"$ssh_error"; then
-            error_class="auth"
-          elif grep -Eqi "Could not resolve|Name or service not known" <<<"$ssh_error"; then
-            error_class="dns"
-          else
-            error_class="other"
-          fi
-
-          install_diag_package "nc" "netcat-openbsd" "netcat"
-          if command -v nc >/dev/null 2>&1; then
-            tcp22="$(nc -vz -w5 "$host" "$port" 2>&1)"
-          else
-            tcp22="nc unavailable"
-          fi
-
-          install_diag_package "mtr" "mtr-tiny" "mtr"
-          if command -v mtr >/dev/null 2>&1; then
-            mtr_output="$(mtr -T -P "$port" -c 10 --report "$host" 2>&1)"
-          else
-            mtr_output="mtr unavailable"
-          fi
-
-          export DEPLOY_EVENT_RUNNER_ENV="$RUNNER_ENVIRONMENT"
-          export DEPLOY_EVENT_SSH_ERROR="$ssh_error"
-          export DEPLOY_EVENT_ERROR_CLASS="$error_class"
-          export DEPLOY_EVENT_TIME_TO_FAIL_S="$time_to_fail_s"
-          export DEPLOY_EVENT_TCP22="$tcp22"
-          export DEPLOY_EVENT_MTR="$mtr_output"
-          python3 gh-agent-broker/scripts/log-deploy-event.py || echo "::warning::Deploy failure telemetry helper failed to run"
+        uses: ./vps-ops/.github/actions/deploy-telemetry
+        with:
+          outcome: failure
+          ssh_host: srv1656293.hstgr.cloud
+          ssh_user: github-deployer
+          ssh_port: "22"
+          ssh_key_path: /tmp/hermes-deploy
+          service_label: gh-agent-broker
+          github_token: ${{ github.token }}
 
       - name: Clean up secrets
         if: always()
