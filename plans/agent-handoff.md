@@ -4,6 +4,22 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current deploy outcome telemetry enhancement:
+
+- Current branch `feature/deploy-success-telemetry` adds production deploy
+  success telemetry so issue `#54` contains comparable `OK` and `FAIL` rows by
+  runner egress IP range.
+- New helper `scripts/log-deploy-event.py` handles shared JSON rendering,
+  GitHub Actions CIDR matching from `gh api meta --jq '.actions[]'`, summary
+  line formatting, and durable issue comment posting. It is non-blocking and
+  emits `::warning::` annotations for meta/label/issue/comment failures.
+- `.github/workflows/deploy-production.yml` now checks out the helper only
+  after the deploy step with `continue-on-error: true`, then logs lightweight
+  success telemetry with `if: success()` or rich SSH failure telemetry with
+  `if: failure()`. Failure JSON keeps `ssh_error`, `error_class`,
+  `time_to_fail_s`, `tcp22`, and `mtr`, and both outcomes include
+  `matched_actions_cidr` and `ip_16`.
+
 Current production SSH diagnostics hardening:
 
 - Failed production run `27569598853`, job `81502348587`, was the expected

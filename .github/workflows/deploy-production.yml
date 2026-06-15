@@ -60,10 +60,40 @@ jobs:
             -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ github.event.workflow_run.head_sha }}" \
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
 
+      - name: Checkout deploy telemetry helper
+        if: always()
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          repository: grubbyhacker/gh-agent-broker
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: gh-agent-broker
+
+      - name: Log successful deploy telemetry
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_EVENT_OUTCOME: success
+          DEPLOY_EVENT_RUN_ID: ${{ github.run_id }}
+          DEPLOY_EVENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          DEPLOY_EVENT_JOB: ${{ github.job }}
+          DEPLOY_EVENT_WORKFLOW: ${{ github.workflow }}
+          DEPLOY_EVENT_RUNNER_NAME: ${{ runner.name }}
+        run: |
+          set +e
+          export DEPLOY_EVENT_RUNNER_ENV="$RUNNER_ENVIRONMENT"
+          python3 gh-agent-broker/scripts/log-deploy-event.py || echo "::warning::Deploy success telemetry helper failed to run"
+
       - name: Capture SSH failure diagnostics
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
+          DEPLOY_EVENT_OUTCOME: failure
+          DEPLOY_EVENT_RUN_ID: ${{ github.run_id }}
+          DEPLOY_EVENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+          DEPLOY_EVENT_JOB: ${{ github.job }}
+          DEPLOY_EVENT_WORKFLOW: ${{ github.workflow }}
+          DEPLOY_EVENT_RUNNER_NAME: ${{ runner.name }}
         run: |
           set +e
 
@@ -96,13 +126,6 @@ jobs:
           host="srv1656293.hstgr.cloud"
           port="22"
           user="github-deployer"
-          label="ssh-deploy-flakiness"
-          issue_title="SSH deploy flakiness log"
-
-          ts_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          runner_ip_ipify="$(curl -s --max-time 5 https://api.ipify.org 2>&1)"
-          runner_ip_ifconfig="$(curl -s --max-time 5 https://ifconfig.me 2>&1)"
-          runner_ip_summary="$(printf '%s' "${runner_ip_ipify:-unknown}" | tr -d '\r\n')"
 
           ssh_start="$(date +%s)"
           ssh_error="$(
@@ -148,141 +171,13 @@ jobs:
             mtr_output="mtr unavailable"
           fi
 
-          export SSH_DIAG_TS_UTC="$ts_utc"
-          export SSH_DIAG_RUNNER_IP_IPIFY="$runner_ip_ipify"
-          export SSH_DIAG_RUNNER_IP_IFCONFIG="$runner_ip_ifconfig"
-          export SSH_DIAG_SSH_ERROR="$ssh_error"
-          export SSH_DIAG_ERROR_CLASS="$error_class"
-          export SSH_DIAG_TIME_TO_FAIL_S="$time_to_fail_s"
-          export SSH_DIAG_TCP22="$tcp22"
-          export SSH_DIAG_MTR="$mtr_output"
-          export SSH_DIAG_RUN_ID="${{ github.run_id }}"
-          export SSH_DIAG_RUN_ATTEMPT="${{ github.run_attempt }}"
-          export SSH_DIAG_JOB="${{ github.job }}"
-          export SSH_DIAG_WORKFLOW="${{ github.workflow }}"
-          export SSH_DIAG_RUNNER_NAME="${{ runner.name }}"
-          export SSH_DIAG_RUNNER_ENV="$RUNNER_ENVIRONMENT"
-
-          diagnostics_json="$(
-            python3 - <<'PY'
-          import json
-          import os
-
-          def env(name):
-              return os.environ.get(name, "")
-
-          try:
-              time_to_fail_s = int(env("SSH_DIAG_TIME_TO_FAIL_S"))
-          except ValueError:
-              time_to_fail_s = 0
-
-          print(json.dumps({
-              "ts_utc": env("SSH_DIAG_TS_UTC"),
-              "runner_ip": {
-                  "api_ipify_org": env("SSH_DIAG_RUNNER_IP_IPIFY"),
-                  "ifconfig_me": env("SSH_DIAG_RUNNER_IP_IFCONFIG"),
-              },
-              "ssh_error": env("SSH_DIAG_SSH_ERROR"),
-              "error_class": env("SSH_DIAG_ERROR_CLASS"),
-              "time_to_fail_s": time_to_fail_s,
-              "tcp22": env("SSH_DIAG_TCP22"),
-              "mtr": env("SSH_DIAG_MTR"),
-              "gh": {
-                  "run_id": env("SSH_DIAG_RUN_ID"),
-                  "run_attempt": env("SSH_DIAG_RUN_ATTEMPT"),
-                  "job": env("SSH_DIAG_JOB"),
-                  "workflow": env("SSH_DIAG_WORKFLOW"),
-                  "runner_name": env("SSH_DIAG_RUNNER_NAME"),
-                  "runner_env": env("SSH_DIAG_RUNNER_ENV"),
-              },
-          }, indent=2))
-          PY
-          )"
-          if [[ -z "$diagnostics_json" ]]; then
-            warn "Unable to render SSH diagnostics JSON"
-            diagnostics_json="{}"
-          fi
-
-          echo '```json'
-          printf '%s\n' "$diagnostics_json"
-          echo '```'
-
-          summary="FAIL ${error_class} runner=${runner_ip_summary:-unknown} ${ts_utc} attempt=${{ github.run_attempt }}"
-          comment_body="$(mktemp)"
-          {
-            printf '%s\n\n' "$summary"
-            echo '```json'
-            printf '%s\n' "$diagnostics_json"
-            echo '```'
-          } > "$comment_body"
-
-          gh_error="$(mktemp)"
-          label_names="$(
-            gh label list \
-              --repo "$GITHUB_REPOSITORY" \
-              --search "$label" \
-              --json name \
-              --jq '.[].name' 2>"$gh_error"
-          )"
-          label_list_status="$?"
-          if [[ "$label_list_status" -ne 0 ]]; then
-            warn "Unable to list GitHub labels, durable SSH diagnostics may not be logged: $(compact_file "$gh_error")"
-            label_exists=""
-          else
-            label_exists="$(awk -v label="$label" '$0 == label { print; exit }' <<<"$label_names")"
-          fi
-
-          if [[ "$label_list_status" -eq 0 && -z "$label_exists" ]]; then
-            if ! gh label create "$label" \
-              --repo "$GITHUB_REPOSITORY" \
-              --description "SSH deploy flakiness diagnostics" \
-              --color "d73a4a" > /dev/null 2>"$gh_error"; then
-              warn "Unable to create GitHub label '${label}', durable SSH diagnostics may not be logged: $(compact_file "$gh_error")"
-            fi
-          fi
-
-          issue_number="$(
-            gh issue list \
-              --repo "$GITHUB_REPOSITORY" \
-              --state open \
-              --label "$label" \
-              --json number \
-              --jq '.[0].number // empty' 2>"$gh_error"
-          )"
-          issue_list_status="$?"
-          if [[ "$issue_list_status" -ne 0 ]]; then
-            warn "Unable to list SSH deploy flakiness tracking issues: $(compact_file "$gh_error")"
-            issue_number=""
-          fi
-
-          if [[ -z "$issue_number" ]]; then
-            issue_url="$(
-              gh issue create \
-                --repo "$GITHUB_REPOSITORY" \
-                --title "$issue_title" \
-                --body "Durable log for intermittent production deploy SSH failures." \
-                --label "$label" 2>"$gh_error"
-            )"
-            issue_create_status="$?"
-            if [[ "$issue_create_status" -eq 0 ]]; then
-              issue_number="${issue_url##*/}"
-            else
-              warn "Unable to create SSH deploy flakiness tracking issue: $(compact_file "$gh_error")"
-              issue_number=""
-            fi
-          fi
-
-          if [[ -n "$issue_number" ]]; then
-            if gh issue comment "$issue_number" \
-              --repo "$GITHUB_REPOSITORY" \
-              --body-file "$comment_body" > /dev/null 2>"$gh_error"; then
-              echo "Posted SSH failure diagnostics to issue #${issue_number}"
-            else
-              warn "Unable to post SSH diagnostics comment to issue #${issue_number}: $(compact_file "$gh_error")"
-            fi
-          else
-            warn "Skipping durable SSH diagnostics comment because no tracking issue was available"
-          fi
+          export DEPLOY_EVENT_RUNNER_ENV="$RUNNER_ENVIRONMENT"
+          export DEPLOY_EVENT_SSH_ERROR="$ssh_error"
+          export DEPLOY_EVENT_ERROR_CLASS="$error_class"
+          export DEPLOY_EVENT_TIME_TO_FAIL_S="$time_to_fail_s"
+          export DEPLOY_EVENT_TCP22="$tcp22"
+          export DEPLOY_EVENT_MTR="$mtr_output"
+          python3 gh-agent-broker/scripts/log-deploy-event.py || echo "::warning::Deploy failure telemetry helper failed to run"
 
       - name: Clean up secrets
         if: always()
