@@ -54,7 +54,7 @@ type Service struct {
 	audit      *AuditLogger
 	mu         sync.Mutex
 	runs       map[string]*RunMetadata
-	finalizing map[string]bool
+	finalizing map[string]chan struct{}
 }
 
 type pathPermissionFixer interface {
@@ -244,7 +244,7 @@ func NewService(cfg Config, runtime RuntimeBackend, auditLog *AuditLogger) *Serv
 		runtime:    runtime,
 		audit:      auditLog,
 		runs:       map[string]*RunMetadata{},
-		finalizing: map[string]bool{},
+		finalizing: map[string]chan struct{}{},
 	}
 }
 
@@ -1070,16 +1070,28 @@ func (s *Service) finalizeTerminalRun(ctx context.Context, runID, reason, source
 	if ok {
 		meta = *current
 	}
-	if meta.Status != StatusRunning || s.finalizing[runID] {
+	if meta.Status != StatusRunning {
 		s.mu.Unlock()
 		return meta, false, nil
 	}
-	s.finalizing[runID] = true
+	if done, ok := s.finalizing[runID]; ok {
+		s.mu.Unlock()
+		select {
+		case <-done:
+			finalized, err := s.lookupRun(runID)
+			return finalized, false, err
+		case <-ctx.Done():
+			return meta, false, ctx.Err()
+		}
+	}
+	done := make(chan struct{})
+	s.finalizing[runID] = done
 	s.mu.Unlock()
 
 	defer func() {
 		s.mu.Lock()
 		delete(s.finalizing, runID)
+		close(done)
 		s.mu.Unlock()
 	}()
 
