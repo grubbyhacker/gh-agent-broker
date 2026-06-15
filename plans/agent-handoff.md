@@ -4,6 +4,20 @@
 
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
+Current main CI repair:
+
+- Current branch `fix/sandbox-terminal-audit-race` repairs failed main CI run
+  `27578004362`, job `81531181595`. The failed workflow was `CI`, job `check`,
+  step `Run hygiene gate` (`make ci`), not the production deploy workflow.
+- Root cause was not PR `#57` actionlint/workflow validation. `go test ./...`
+  failed in `internal/sandbox` because
+  `TestExitWatcherFinalizesRunAndWritesTerminalAudit` observed stopped
+  metadata before the async exit watcher had written the terminal audit row.
+- The test now waits explicitly for the expected terminal audit event instead
+  of assuming metadata visibility implies the audit write is already visible.
+  Latest verification passed: focused test with `-count=100` and full
+  `make ci`.
+
 Current deploy outcome telemetry refactor:
 
 - Current branch `refactor/use-vps-ops-deploy-telemetry` removes the local
