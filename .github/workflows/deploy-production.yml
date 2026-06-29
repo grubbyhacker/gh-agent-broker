@@ -19,6 +19,8 @@ jobs:
     name: Deploy gh-agent-broker
     runs-on: ubuntu-latest
     environment: production
+    env:
+      DEPLOY_PORT: "443"
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
 
     steps:
@@ -58,6 +60,7 @@ jobs:
         run: |
           ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
             -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ github.event.workflow_run.head_sha }}" \
+            -e "ansible_port=${DEPLOY_PORT}" \
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
 
       - name: Log successful deploy telemetry
@@ -75,7 +78,7 @@ jobs:
           outcome: failure
           ssh_host: srv1656293.hstgr.cloud
           ssh_user: github-deployer
-          ssh_port: "22"
+          ssh_port: ${{ env.DEPLOY_PORT }}
           ssh_key_path: /tmp/hermes-deploy
           service_label: gh-agent-broker
           github_token: ${{ github.token }}
