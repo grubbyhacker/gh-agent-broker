@@ -77,7 +77,7 @@ jobs:
           set -euo pipefail
           run_ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
           body="AUTO-RERUN requested for SSH timeout run=${RUN_ID} attempt=${RUN_ATTEMPT} at ${run_ts}; matched TCP/443 timeout. Rerun limited to one automatic attempt. ${RUN_URL}"
-          gh issue comment 54 --body "${body}"
+          gh issue comment --repo "${{ github.repository }}" 54 --body "${body}"
 
       - name: Rerun failed jobs in deploy run
         if: steps.inspect.outputs.retryable == 'true'
