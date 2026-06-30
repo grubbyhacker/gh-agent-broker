@@ -1,0 +1,93 @@
+name: Deploy Production Watchdog
+
+# Intentionally narrow: only retry failed Deploy Production runs when the failure is
+# the known SSH TCP timeout and only on first attempt. This avoids rerunning other
+# legitimate deploy failures.
+on:
+  workflow_run:
+    workflows:
+      - "Deploy Production"
+    types:
+      - completed
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+jobs:
+  rerun-ssh-timeout:
+    name: Rerun SSH timeout failure once
+    # Never rerun non-failures, non-main deploys, or second+ attempts.
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt == 1 &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect failed deploy logs for retryable SSH timeout
+        id: inspect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          tmpdir="$(mktemp -d)"
+          archive="$tmpdir/workflow-logs.zip"
+          extracted="$tmpdir/logs"
+          mkdir -p "$extracted"
+
+          echo "Downloading logs for run ${RUN_ID}."
+          gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/logs" > "$archive"
+          unzip -q "$archive" -d "$extracted"
+
+          if rg -a -i -q 'error_class"\s*:\s*"timed_out"' "$extracted"; then
+            has_class_timeout=true
+          else
+            has_class_timeout=false
+          fi
+
+          if rg -a -i -q 'connect to host .* port 443: Connection timed out' "$extracted"; then
+            has_tcp443_timeout=true
+          else
+            has_tcp443_timeout=false
+          fi
+
+          if [[ "$has_tcp443_timeout" == "true" ]]; then
+            if [[ "$has_class_timeout" == "true" ]]; then
+              echo "Retryable SSH timeout detected with telemetry error_class=timed_out; requesting rerun."
+            else
+              echo "Retryable SSH timeout detected by TCP/443 signature; requesting rerun."
+            fi
+            echo "retryable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Known SSH timeout signature not found; skipping rerun."
+            echo "retryable=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post auto-rerun watchnote to deploy telemetry issue
+        if: steps.inspect.outputs.retryable == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          run_ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          body="AUTO-RERUN requested for SSH timeout run=${RUN_ID} attempt=${RUN_ATTEMPT} at ${run_ts}; matched TCP/443 timeout. Rerun limited to one automatic attempt. ${RUN_URL}"
+          gh issue comment 54 --body "${body}"
+
+      - name: Rerun failed jobs in deploy run
+        if: steps.inspect.outputs.retryable == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          gh api \
+            -X POST \
+            "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/rerun-failed-jobs"
