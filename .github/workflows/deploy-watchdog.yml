@@ -48,38 +48,23 @@ jobs:
             has_class_timeout=false
           fi
 
-          if rg -a -i -q 'destination port 443' "$extracted"; then
-            has_dest_port=true
+          if rg -a -i -q 'connect to host .* port 443: Connection timed out' "$extracted"; then
+            has_tcp443_timeout=true
           else
-            has_dest_port=false
+            has_tcp443_timeout=false
           fi
 
-          if rg -a -i -q 'connect to host .* port 443: Connection timed out|Connection timed out' "$extracted"; then
-            has_connect_timeout=true
-          else
-            has_connect_timeout=false
-          fi
-
-          if [[ "$has_class_timeout" == "true" || ( "$has_dest_port" == "true" && "$has_connect_timeout" == "true" ) ]]; then
-            echo "Retryable SSH timeout detected; requesting rerun."
+          if [[ "$has_tcp443_timeout" == "true" ]]; then
+            if [[ "$has_class_timeout" == "true" ]]; then
+              echo "Retryable SSH timeout detected with telemetry error_class=timed_out; requesting rerun."
+            else
+              echo "Retryable SSH timeout detected by TCP/443 signature; requesting rerun."
+            fi
             echo "retryable=true" >> "$GITHUB_OUTPUT"
           else
             echo "Known SSH timeout signature not found; skipping rerun."
             echo "retryable=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Rerun failed jobs in deploy run
-        if: steps.inspect.outputs.retryable == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          RUN_URL: ${{ github.event.workflow_run.html_url }}
-        run: |
-          set -euo pipefail
-          gh api \
-            -X POST \
-            "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/rerun-failed-jobs"
 
       - name: Post auto-rerun watchnote to deploy telemetry issue
         if: steps.inspect.outputs.retryable == 'true'
@@ -93,3 +78,16 @@ jobs:
           run_ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
           body="AUTO-RERUN requested for SSH timeout run=${RUN_ID} attempt=${RUN_ATTEMPT} at ${run_ts}; matched TCP/443 timeout. Rerun limited to one automatic attempt. ${RUN_URL}"
           gh issue comment 54 --body "${body}"
+
+      - name: Rerun failed jobs in deploy run
+        if: steps.inspect.outputs.retryable == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          gh api \
+            -X POST \
+            "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/rerun-failed-jobs"
