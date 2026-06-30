@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -18,11 +20,42 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "configs/sandbox.example.yaml", "path to sandbox broker YAML config")
-	allowPublicBind := flag.Bool("allow-public-bind", false, "allow binding to 0.0.0.0 or :PORT")
-	dockerSocket := flag.String("docker-socket", "/var/run/docker.sock", "Docker Engine API socket")
-	flag.Parse()
+	if command, args, ok := parseSubcommand(os.Args[1:]); ok {
+		switch command {
+		case "prune-runs":
+			runPruneRuns(args)
+		default:
+			usage()
+			os.Exit(2)
+		}
+		return
+	}
+	runServerCommand(os.Args[1:])
+}
 
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage: sandbox-broker [flags] | prune-runs [flags]")
+	fmt.Fprintln(os.Stderr, "  server flags: -config, -allow-public-bind, -docker-socket")
+	fmt.Fprintln(os.Stderr, "  prune-runs flags:")
+	fmt.Fprintln(os.Stderr, "    -config <path>")
+	fmt.Fprintln(os.Stderr, "    -docker-socket <path>")
+	fmt.Fprintln(os.Stderr, "    -max-age <duration>")
+	fmt.Fprintln(os.Stderr, "    -keep-newest <n>")
+	fmt.Fprintln(os.Stderr, "    -terminal-only")
+	fmt.Fprintln(os.Stderr, "    -max-bytes <bytes>")
+	fmt.Fprintln(os.Stderr, "    -dry-run")
+	fmt.Fprintln(os.Stderr, "    -max-output <n>")
+}
+
+func runServerCommand(args []string) {
+	fs := flag.NewFlagSet("sandbox-broker", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	configPath := fs.String("config", "configs/sandbox.example.yaml", "path to sandbox broker YAML config")
+	allowPublicBind := fs.Bool("allow-public-bind", false, "allow binding to 0.0.0.0 or :PORT")
+	dockerSocket := fs.String("docker-socket", "/var/run/docker.sock", "Docker Engine API socket")
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("parse server flags: %v", err)
+	}
 	cfg, err := sandbox.Load(*configPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
@@ -81,6 +114,83 @@ func main() {
 	}
 	if err := httpServer.ListenAndServe(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+type pruneCommand struct {
+	ConfigPath   string
+	DockerSocket string
+	Policy       sandbox.RetentionPolicy
+}
+
+func parseSubcommand(args []string) (string, []string, bool) {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return "", nil, false
+	}
+	return args[0], args, true
+}
+
+func parsePruneCommand(args []string) (pruneCommand, error) {
+	fs := flag.NewFlagSet("prune-runs", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cmd := pruneCommand{
+		ConfigPath:   "configs/sandbox.example.yaml",
+		DockerSocket: "/var/run/docker.sock",
+		Policy: sandbox.RetentionPolicy{
+			MaxAge:       24 * time.Hour,
+			KeepNewest:   0,
+			TerminalOnly: true,
+			MaxBytes:     0,
+			DryRun:       false,
+			MaxOutput:    200,
+		},
+	}
+	fs.StringVar(&cmd.ConfigPath, "config", cmd.ConfigPath, "path to sandbox broker YAML config")
+	fs.StringVar(&cmd.DockerSocket, "docker-socket", cmd.DockerSocket, "Docker Engine API socket")
+	fs.DurationVar(&cmd.Policy.MaxAge, "max-age", cmd.Policy.MaxAge, "maximum run age to keep before cleanup")
+	fs.IntVar(&cmd.Policy.KeepNewest, "keep-newest", cmd.Policy.KeepNewest, "number of newest terminal runs to keep")
+	fs.BoolVar(&cmd.Policy.TerminalOnly, "terminal-only", cmd.Policy.TerminalOnly, "only prune terminal-status runs")
+	fs.Int64Var(&cmd.Policy.MaxBytes, "max-bytes", cmd.Policy.MaxBytes, "optional terminal run byte budget for retained run dirs")
+	fs.BoolVar(&cmd.Policy.DryRun, "dry-run", cmd.Policy.DryRun, "log what would be pruned without deleting")
+	fs.IntVar(&cmd.Policy.MaxOutput, "max-output", cmd.Policy.MaxOutput, "cap number of per-run entries in command output")
+	if err := fs.Parse(args[1:]); err != nil {
+		return pruneCommand{}, err
+	}
+	if cmd.Policy.MaxOutput < 1 {
+		cmd.Policy.MaxOutput = 200
+	}
+	return cmd, nil
+}
+
+func runPruneRuns(args []string) {
+	cmd, err := parsePruneCommand(args)
+	if err != nil {
+		log.Fatalf("invalid prune-runs arguments: %v", err)
+	}
+
+	cfg, err := sandbox.Load(cmd.ConfigPath)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+	auditLog, err := sandbox.NewAuditLogger(cfg.Audit.Path)
+	if err != nil {
+		log.Fatalf("open audit log: %v", err)
+	}
+	defer func() {
+		if err := auditLog.Close(); err != nil {
+			log.Printf("close audit log: %v", err)
+		}
+	}()
+
+	service := sandbox.NewService(cfg, sandbox.NewDockerBackend(cmd.DockerSocket), auditLog)
+	report, err := service.PruneRuns(context.Background(), cmd.Policy)
+	out, marshalErr := json.MarshalIndent(report, "", "  ")
+	if marshalErr != nil {
+		log.Fatalf("encode prune report: %v", marshalErr)
+	}
+	fmt.Println(string(out))
+	if err != nil {
+		log.Fatalf("prune failed: %v", err)
 	}
 }
 
