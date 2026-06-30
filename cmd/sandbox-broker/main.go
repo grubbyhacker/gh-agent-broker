@@ -24,6 +24,8 @@ func main() {
 		switch command {
 		case "prune-runs":
 			runPruneRuns(args)
+		case "slim-runs":
+			runSlimRuns(args)
 		default:
 			usage()
 			os.Exit(2)
@@ -34,7 +36,16 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: sandbox-broker [flags] | prune-runs [flags]")
+	fmt.Fprintln(os.Stderr, "usage: sandbox-broker [server flags] | prune-runs [flags] | slim-runs [flags]")
+	fmt.Fprintln(os.Stderr, "  slim-runs flags:")
+	fmt.Fprintln(os.Stderr, "    -config <path>")
+	fmt.Fprintln(os.Stderr, "    -docker-socket <path>")
+	fmt.Fprintln(os.Stderr, "    -max-age <duration>")
+	fmt.Fprintln(os.Stderr, "    -keep-newest <n>")
+	fmt.Fprintln(os.Stderr, "    -terminal-only")
+	fmt.Fprintln(os.Stderr, "    -max-bytes <bytes> (retained runs budget check before slimming)")
+	fmt.Fprintln(os.Stderr, "    -dry-run")
+	fmt.Fprintln(os.Stderr, "    -max-output <n>")
 	fmt.Fprintln(os.Stderr, "  server flags: -config, -allow-public-bind, -docker-socket")
 	fmt.Fprintln(os.Stderr, "  prune-runs flags:")
 	fmt.Fprintln(os.Stderr, "    -config <path>")
@@ -162,6 +173,10 @@ func parsePruneCommand(args []string) (pruneCommand, error) {
 	return cmd, nil
 }
 
+func parseSlimCommand(args []string) (pruneCommand, error) {
+	return parsePruneCommand(args)
+}
+
 func runPruneRuns(args []string) {
 	cmd, err := parsePruneCommand(args)
 	if err != nil {
@@ -191,6 +206,38 @@ func runPruneRuns(args []string) {
 	fmt.Println(string(out))
 	if err != nil {
 		log.Fatalf("prune failed: %v", err)
+	}
+}
+
+func runSlimRuns(args []string) {
+	cmd, err := parseSlimCommand(args)
+	if err != nil {
+		log.Fatalf("invalid slim-runs arguments: %v", err)
+	}
+
+	cfg, err := sandbox.Load(cmd.ConfigPath)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+	auditLog, err := sandbox.NewAuditLogger(cfg.Audit.Path)
+	if err != nil {
+		log.Fatalf("open audit log: %v", err)
+	}
+	defer func() {
+		if err := auditLog.Close(); err != nil {
+			log.Printf("close audit log: %v", err)
+		}
+	}()
+
+	service := sandbox.NewService(cfg, sandbox.NewDockerBackend(cmd.DockerSocket), auditLog)
+	report, err := service.SlimRuns(context.Background(), cmd.Policy)
+	out, marshalErr := json.MarshalIndent(report, "", "  ")
+	if marshalErr != nil {
+		log.Fatalf("encode slim report: %v", marshalErr)
+	}
+	fmt.Println(string(out))
+	if err != nil {
+		log.Fatalf("slim failed: %v", err)
 	}
 }
 
