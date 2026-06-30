@@ -2,6 +2,20 @@
 
 ## Current State
 
+Current broker retention workstream (this branch):
+
+- Added `sandbox-broker prune-runs` as the broker-owned retention execution interface.
+- Implemented `internal/sandbox.PruneRuns` with terminal-only default, max age, keep
+  newest N, optional max-byte budget, dry-run mode, malformed-entry tolerance,
+  path confinement enforcement, bounded report output, and per-run prune audit.
+- Added tests for retention selection/safety (`internal/sandbox/retention_test.go`) and
+  CLI parsing (`cmd/sandbox-broker/main_test.go`).
+- Added design/contract doc `docs/sandbox-retention-policy.md` including vps-ops
+  scheduling guidance.
+- Next handoff target: `vps-ops` should run `sandbox-broker prune-runs` via
+  systemd timer using explicit `-max-age`, `-keep-newest`, `-terminal-only`,
+  and optional `-max-bytes`.
+
 The repository is a greenfield Go implementation of a GitHub Agent Access Broker.
 
 Current main CI repair:
