@@ -42,13 +42,13 @@ jobs:
           gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/logs" > "$archive"
           unzip -q "$archive" -d "$extracted"
 
-          if rg -a -i -q 'error_class"\s*:\s*"timed_out"' "$extracted"; then
+          if grep -Rai --binary-files=text -m 1 -q -E 'error_class"[[:space:]]*:[[:space:]]*"timed_out"' "$extracted"; then
             has_class_timeout=true
           else
             has_class_timeout=false
           fi
 
-          if rg -a -i -q 'connect to host .* port 443: Connection timed out' "$extracted"; then
+          if grep -Rai --binary-files=text -m 1 -q -E 'connect to host .* port 443: Connection timed out' "$extracted"; then
             has_tcp443_timeout=true
           else
             has_tcp443_timeout=false
