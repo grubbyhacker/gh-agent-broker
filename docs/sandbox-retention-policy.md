@@ -1,89 +1,109 @@
-# Sandbox run retention and prune interface
+# Sandbox run retention and prune/slim interfaces
 
-This document defines the broker-owned retention semantics for sandbox run cleanup.
-The design is implemented by `cmd/sandbox-broker prune-runs` and
-`internal/sandbox.PruneRuns`.
+This document defines retention and post-run space-control semantics in
+`internal/sandbox`, exposed via CLI subcommands:
+
+- `prune-runs` (`PruneRuns`)
+- `slim-runs` (`SlimRuns`)
+
+`slim-runs` is designed to preserve reviewable outputs while removing bulky
+reconstructible state after terminal completion.
 
 ## Policy inputs
 
-Inputs are provided by the `prune-runs` CLI subcommand and emitted as
-`PruneReport.Policy`.
+Inputs are provided by `prune-runs`/`slim-runs` CLI flags and emitted as
+`PruneReport.Policy` / `SlimReport.Policy`.
+
+For both commands:
 
 - `max_age` (`time.Duration`, default `24h`)  
-  Only terminal runs older than this age are eligible for deletion.
+  Only terminal runs older than this age are eligible.
 - `keep_newest` (`int`, default `0`)  
-  Preserve the newest `N` terminal-eligible runs before any age-based prune.
+  Preserve the newest `N` terminal-eligible runs before age/budget-driven action.
 - `terminal-only` (`bool`, default `true`)  
-  If `true`, non-terminal runs are never deleted (including failed metadata states
-  and pending/running runs).
+  If `true`, non-terminal runs are never affected.
 - `max_bytes` (`int64`, default `0`)  
-  Optional disk budget in bytes. After age filtering and `keep_newest`, prune the
-  oldest eligible runs until remaining selected bytes are `<= max_bytes`.
+  Optional aggregate disk budget in bytes after candidate selection. Older
+  candidates are removed until budget is met.
 - `dry-run` (`bool`, default `false`)  
-  Report what would be deleted, do not delete.
+  Report what would change; do not mutate disk.
 - `max_output` (`int`, default `200`)  
-  Bound output list length in JSON report to `report.entries`.
+  Truncates JSON report entries.
+
+## Slim behavior
+
+`slim-runs` follows the same terminal/age/budget candidate selection as
+`prune-runs` and then performs run-local reconstruction-aware cleanup.
+
+- Kept inputs:
+  - `metadata.json`
+  - run `input` tree
+  - configured `deliverables` under `/output` and `/lessons`
+  - `/output/wrapper-diagnostics.json` when present
+  - `/output/slim-artifacts-manifest.json` (always generated after slimming)
+  - `/logs` and `logs/slim-run.log` (best-effort snapshot capture)
+- Removed by default:
+  - `/work` and subtrees (e.g. `/work/home`, checkout caches, `.git`, build caches)
+  - non-deliverable `/output` entries, including nested agent workspaces or
+    reconstructed artifacts
+- No path leaves `cfg.runs_dir`; the traversal logic applies `escapesBase` checks
+  for all runtime paths.
+- Symlinks are never followed; they are treated as path entries and removed only when
+  outside the keep map.
+
+The command emits `SlimReport` entries with:
+- `removed_paths` (relative to the run root),
+- `removed_entries` and `removed_bytes`,
+- `artifact_manifest_path`,
+- `log_snapshot_path`,
+- `size_after_bytes`.
+
+`reason` examples include:
+`keep_newest`, `within_budget`, `slim_budget`, `would_slim`, `slimmed`,
+`slim_noop`, `not_terminal`, `active`, `not_slimmed`.
+
+`slim-run` failures are logged via `audit`:
+- `operation: slim_run`
+- `decision: allow|deny`
+- decision-scoped `run_id`, template, status, and redacted errors.
 
 ## Safety constraints
 
-The prune behavior must be safe-by-default:
+`slim-runs` is safe-by-default:
 
-- Never delete:
-  - active/running entries
-  - entries that fail metadata parsing
-  - non-directory/symlink entries
-  - malformed run IDs
-  - run paths that escape configured `runs_dir`
-- Only delete under exact configured `runs_dir` (`cfg.runs_dir`) and enforce
-  `escapesBase` checks before deletion.
-- Use existing `CleanupRun` semantics for deletion and audit event emission, so all
-  run directory/removal invariants are shared with explicit `cleanup` behavior.
-- Missing/corrupt metadata is skipped and counted in the report; it does not abort
-  the job.
-- Keep audit records for each successful/failed deletion attempt with operation
-  `prune_run`.
+- It does not touch non-terminal runs when `terminal-only=true`.
+- It does not process non-directories, symlinks, malformed IDs, or paths that escape
+  `runs_dir`.
+- It preserves terminal runs that fail metadata reads as skipped/skippable.
+- It never uses raw deletes rooted outside the configured run directory.
 
-## Machine-readable report shape
+## Report output contract
 
-`prune-runs` prints newline-separated JSON (`pretty` via `json.MarshalIndent`) to
-stdout with:
+`slim-runs` prints JSON via `json.MarshalIndent` with:
 
 - `timestamp`
 - `runs_dir`
 - `policy`
-- `scanned`, `considered`, `deleted`, `failed`, `skipped`
+- `scanned`, `considered`, `slimmed`, `failed`, `skipped`
 - `budget_before_bytes`, `budget_after_bytes`
 - `entries` (bounded by `max_output`)
-- `errors` (non-fatal and summary error details)
-
-Each entry contains `run_id`, `status`, `template`, `repo`, `branch`,
-`last_activity_at`, `age_seconds`, `size_bytes`, `keep`, `delete`, `reason`, and
-`error` where applicable.
-
-`reason` examples:
-`keep_newest`, `delete_age`, `delete_budget`, `would_delete`,
-`delete_failed`, `not_terminal`, `active`, `retained`.
+- `errors`
 
 ## Execution interface recommendation
 
-Recommended interface for vps-ops integration:
+`slim-runs` is currently CLI-only. Automatic runtime on terminal transition is
+explicitly deferred to keep behavior deterministic and observable.
 
-- Use a local CLI subcommand invoked from a systemd timer:
-  `sandbox-broker prune-runs ...`
-- Reason:
-  - no new remote attack surface
-  - clear operational operator boundary
-  - deterministic machine-readable output can be routed to journald
-  - easy environment-driven config paths per host/slot
+Recommended vps-ops integration:
 
-Alternative `localhost` admin HTTP endpoint is intentionally not used in this phase.
+- Run `sandbox-broker slim-runs` from a one-shot service + timer.
+- Keep `--dry-run` in staging and dry-run validation.
+- Persist `slim-runs` JSON output to journald or an artifact file for auditability.
 
-## vps-ops scheduling and config contract
-
-`vps-ops` should treat retention as a timed host task with explicit CLI flags:
+Example:
 
 ```text
-sandbox-broker prune-runs \
+sandbox-broker slim-runs \
   -config /srv/hermes-sandbox-broker/configs/sandbox.yaml \
   -max-age 12h \
   -keep-newest 20 \
@@ -91,10 +111,5 @@ sandbox-broker prune-runs \
   -terminal-only=true
 ```
 
-- Add scheduling cadence in timer/service units (example guidance):
-  - service runs as one-shot and exits after print/report.
-  - timer every `12h` or aligned with VPS usage windows.
-  - keep `--dry-run` in non-production validation first.
-- Pass `-docker-socket` explicitly if the run environment differs from default.
-- Persist output for observability (unit test artifacts can assert against report JSON,
-  and journald can be scraped by future scraper jobs).
+If you want true terminal-time automation later, gate it behind a new `RunFinalized`
+hook and preserve the same policy/dry-run defaults used by the CLI.
