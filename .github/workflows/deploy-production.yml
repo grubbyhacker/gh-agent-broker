@@ -9,6 +9,11 @@ on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      image_sha:
+        description: Optional Git SHA to deploy; defaults to the workflow dispatch ref SHA.
+        required: false
 
 permissions:
   contents: read
@@ -21,9 +26,30 @@ jobs:
     environment: production
     env:
       DEPLOY_PORT: "443"
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
 
     steps:
+      - name: Resolve deployment inputs
+        id: deploy_inputs
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            deploy_sha="${{ github.event.inputs.image_sha || github.sha }}"
+            deploy_branch="${{ github.ref_name }}"
+            deploy_source="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            deploy_sha="${{ github.event.workflow_run.head_sha }}"
+            deploy_branch="${{ github.event.workflow_run.head_branch }}"
+            deploy_source="${{ github.event.workflow_run.html_url }}"
+          fi
+
+          echo "deploy_sha=$deploy_sha" >> "$GITHUB_OUTPUT"
+          echo "deploy_branch=$deploy_branch" >> "$GITHUB_OUTPUT"
+          echo "deploy_source=$deploy_source" >> "$GITHUB_OUTPUT"
+
       - name: Checkout vps-ops
         uses: actions/checkout@v7
         with:
@@ -59,7 +85,7 @@ jobs:
         working-directory: vps-ops
         run: |
           ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
-            -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ github.event.workflow_run.head_sha }}" \
+            -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ steps.deploy_inputs.outputs.deploy_sha }}" \
             -e "ansible_port=${DEPLOY_PORT}" \
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
 
