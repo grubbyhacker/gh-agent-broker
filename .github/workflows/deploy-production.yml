@@ -1,7 +1,7 @@
 name: Deploy Production
 
 # Required repository secrets:
-# - DEPLOY_SSH_PRIVATE_KEY: ed25519 private key for github-deployer@srv1656293.hstgr.cloud.
+# - DEPLOY_SSH_PRIVATE_KEY: ed25519 private key for github-deployer@100.66.40.39.
 # - VPS_OPS_READ_TOKEN: fine-grained PAT with read access to grubbyhacker/vps-ops.
 # - ANSIBLE_VAULT_PASSWORD: password for decrypting ansible-vault secrets in vps-ops.
 
@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     env:
-      DEPLOY_PORT: "443"
+      DEPLOY_PORT: "22"
     if: >-
       (github.event_name == 'workflow_dispatch' && github.ref_name == 'main') ||
       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
@@ -57,6 +57,14 @@ jobs:
           token: ${{ secrets.VPS_OPS_READ_TOKEN }}
           path: vps-ops
 
+      - name: Connect to Tailnet
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:github-actions-deploy
+          ping: 100.66.40.39
+
       - name: Install Ansible
         run: |
           python3 -m pip install --user "ansible==10.*"
@@ -86,6 +94,7 @@ jobs:
         run: |
           ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
             -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ steps.deploy_inputs.outputs.deploy_sha }}" \
+            -e "ansible_host=100.66.40.39" \
             -e "ansible_port=${DEPLOY_PORT}" \
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
 
@@ -102,7 +111,7 @@ jobs:
         uses: ./vps-ops/.github/actions/deploy-telemetry
         with:
           outcome: failure
-          ssh_host: srv1656293.hstgr.cloud
+          ssh_host: 100.66.40.39
           ssh_user: github-deployer
           ssh_port: ${{ env.DEPLOY_PORT }}
           ssh_key_path: /tmp/hermes-deploy
