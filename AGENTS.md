@@ -31,6 +31,27 @@ Build a GitHub Agent Access Broker that lets agent containers use GitHub App acc
 - Keep `go.mod` and `go.sum` tidy.
 - Use `.mise.toml` or the dev container to satisfy repo toolchain requirements; keep `make check` as the source of truth.
 
+## Agent Workflow Expectations
+
+- Repo-mutating work should not end as loose local edits. The default completion pattern is:
+  - commit changes on a feature branch,
+  - push the feature branch,
+  - open a normal `ready-for-review` PR,
+  - report validation outputs and any blockers,
+  - leave the task worktree in a clean state.
+- Do not open draft PRs unless Roger explicitly requests draft mode.
+- Code review is a required human gate. Agents must not bypass review.
+- Keep judgment-heavy work out of rigid automation: use deterministic checks and scripts for repeatable chores, while preserving human review for behavioral decisions.
+- If an agent cannot produce a ready PR, they must explicitly report exact dirty files and the blocker(s), rather than leaving an uncommitted tree.
+- If a PR is merged, clean-up is part of the workflow:
+  - fetch and prune remotes,
+  - checkout `main`,
+  - fast-forward to `origin/main`,
+  - delete the local merged branch,
+  - push remote branch deletion if needed,
+  - remove the task worktree,
+  - verify clean/current repository state.
+
 ## Deployment
 
 - Production deploys through GitHub Actions on pushes to `main`, after CI passes.
