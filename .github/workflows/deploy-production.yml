@@ -2,6 +2,8 @@ name: Deploy Production
 
 # Required repository secrets:
 # - DEPLOY_SSH_PRIVATE_KEY: ed25519 private key for github-deployer@100.66.40.39.
+# - TS_OAUTH_CLIENT_ID: OAuth client ID for tailscale/github-action@v4.
+# - TS_OAUTH_SECRET: OAuth secret for tailscale/github-action@v4.
 # - VPS_OPS_READ_TOKEN: fine-grained PAT with read access to grubbyhacker/vps-ops.
 # - ANSIBLE_VAULT_PASSWORD: password for decrypting ansible-vault secrets in vps-ops.
 
