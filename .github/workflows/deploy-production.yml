@@ -5,6 +5,7 @@ name: Deploy Production
 # - TS_OAUTH_CLIENT_ID: OAuth client ID for tailscale/github-action@v4.
 # - TS_OAUTH_SECRET: OAuth secret for tailscale/github-action@v4.
 # - VPS_OPS_READ_TOKEN: fine-grained PAT with read access to grubbyhacker/vps-ops.
+# - VPS_OPS_* Doppler env-source runtime secrets consumed by the vps-ops deploy wrapper:
 # - VPS_OPS_GH_BROKER_ADMIN_SECRET
 # - VPS_OPS_GH_BROKER_REPORTER_01_SECRET
 # - VPS_OPS_GH_BROKER_SANDBOX_MCP_TOKEN
@@ -14,10 +15,14 @@ name: Deploy Production
 # - VPS_OPS_GH_BROKER_OPENROUTER_API_KEY
 # - VPS_OPS_GH_BROKER_REPORTER_APP_PEM
 # - VPS_OPS_GH_BROKER_YKM_CURATOR_APP_PEM
+# - VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_TIMER_TOKEN
+# - VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_ADMIN_TOKEN
+# - VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_STAGING_ADMIN_TOKEN
+# - VPS_OPS_GH_BROKER_OPENROUTER_CURATOR_API_KEY
+# - VPS_OPS_GH_BROKER_GH_AGENT_CODEX_PROXY_TOKEN
 # - VPS_OPS_DOPPLER_SOURCE: set to env in deploy step.
 # - VPS_OPS_DOPPLER_ROLES: set to gh-agent-broker in deploy step.
 # - VPS_OPS_SECRET_BACKEND: set to doppler in deploy step.
-# Note: this workflow requires vps-ops PR #113 to be merged before it can be deployed.
 
 on:
   workflow_run:
@@ -39,6 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     env:
+      DEPLOY_HOST: "100.66.40.39"
       DEPLOY_PORT: "22"
     if: >-
       (github.event_name == 'workflow_dispatch' && github.ref_name == 'main') ||
@@ -77,7 +83,7 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:github-actions-deploy
-          ping: 100.66.40.39
+          ping: ${{ env.DEPLOY_HOST }}
 
       - name: Install Ansible
         run: |
@@ -110,10 +116,15 @@ jobs:
           VPS_OPS_GH_BROKER_OPENROUTER_API_KEY: ${{ secrets.VPS_OPS_GH_BROKER_OPENROUTER_API_KEY }}
           VPS_OPS_GH_BROKER_REPORTER_APP_PEM: ${{ secrets.VPS_OPS_GH_BROKER_REPORTER_APP_PEM }}
           VPS_OPS_GH_BROKER_YKM_CURATOR_APP_PEM: ${{ secrets.VPS_OPS_GH_BROKER_YKM_CURATOR_APP_PEM }}
+          VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_TIMER_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_TIMER_TOKEN }}
+          VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_ADMIN_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_ADMIN_TOKEN }}
+          VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_STAGING_ADMIN_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_STAGING_ADMIN_TOKEN }}
+          VPS_OPS_GH_BROKER_OPENROUTER_CURATOR_API_KEY: ${{ secrets.VPS_OPS_GH_BROKER_OPENROUTER_CURATOR_API_KEY }}
+          VPS_OPS_GH_BROKER_GH_AGENT_CODEX_PROXY_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_GH_AGENT_CODEX_PROXY_TOKEN }}
         run: |
           scripts/run-ansible-playbook.sh -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
             -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ steps.deploy_inputs.outputs.deploy_sha }}" \
-            -e "ansible_host=100.66.40.39" \
+            -e "ansible_host=${DEPLOY_HOST}" \
             -e "ansible_port=${DEPLOY_PORT}" \
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
 
@@ -130,7 +141,7 @@ jobs:
         uses: ./vps-ops/.github/actions/deploy-telemetry
         with:
           outcome: failure
-          ssh_host: 100.66.40.39
+          ssh_host: ${{ env.DEPLOY_HOST }}
           ssh_user: github-deployer
           ssh_port: ${{ env.DEPLOY_PORT }}
           ssh_key_path: /tmp/hermes-deploy
