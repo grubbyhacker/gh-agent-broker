@@ -2,6 +2,18 @@
 
 ## Current State
 
+Current production deploy Doppler env-source fix:
+
+- Current branch `fleet/gh-agent-broker/239fbf7e` updates
+  `.github/workflows/deploy-production.yml` to match the current `vps-ops`
+  env-source Doppler wrapper path for the `gh-agent-broker` role.
+- The deploy workflow keeps the Tailnet deployment path
+  (`DEPLOY_HOST=100.66.40.39`, `DEPLOY_PORT=22`) and passes those values to
+  `scripts/run-ansible-playbook.sh` as Ansible SSH vars.
+- The workflow now exposes every current `gh-agent-broker` Doppler mapping from
+  `vps-ops/scripts/doppler-secret-mapping.json`, including the optional curator
+  timer/admin/staging, OpenRouter curator, and Codex proxy secrets.
+
 Current broker retention workstream (this branch):
 
 - Added `sandbox-broker prune-runs` as the broker-owned retention execution interface.
