@@ -5,7 +5,19 @@ name: Deploy Production
 # - TS_OAUTH_CLIENT_ID: OAuth client ID for tailscale/github-action@v4.
 # - TS_OAUTH_SECRET: OAuth secret for tailscale/github-action@v4.
 # - VPS_OPS_READ_TOKEN: fine-grained PAT with read access to grubbyhacker/vps-ops.
-# - ANSIBLE_VAULT_PASSWORD: password for decrypting ansible-vault secrets in vps-ops.
+# - VPS_OPS_GH_BROKER_ADMIN_SECRET
+# - VPS_OPS_GH_BROKER_REPORTER_01_SECRET
+# - VPS_OPS_GH_BROKER_SANDBOX_MCP_TOKEN
+# - VPS_OPS_GH_BROKER_YKM_CURATOR_BROKER_SECRET
+# - VPS_OPS_GH_BROKER_AGENT_PROXY_TOKEN
+# - VPS_OPS_GH_BROKER_LITELLM_MASTER_KEY
+# - VPS_OPS_GH_BROKER_OPENROUTER_API_KEY
+# - VPS_OPS_GH_BROKER_REPORTER_APP_PEM
+# - VPS_OPS_GH_BROKER_YKM_CURATOR_APP_PEM
+# - VPS_OPS_DOPPLER_SOURCE: set to env in deploy step.
+# - VPS_OPS_DOPPLER_ROLES: set to gh-agent-broker in deploy step.
+# - VPS_OPS_SECRET_BACKEND: set to doppler in deploy step.
+# Note: this workflow requires vps-ops PR #113 to be merged before it can be deployed.
 
 on:
   workflow_run:
@@ -83,18 +95,23 @@ jobs:
           install -m 0600 /dev/null /tmp/hermes-deploy
           printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > /tmp/hermes-deploy
 
-      - name: Write vault password
-        env:
-          ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
-        run: |
-          mkdir -p ~/.config/vps-ops
-          install -m 0600 /dev/null ~/.config/vps-ops/vault-password
-          printf '%s' "$ANSIBLE_VAULT_PASSWORD" > ~/.config/vps-ops/vault-password
-
       - name: Deploy gh-agent-broker
         working-directory: vps-ops
+        env:
+          VPS_OPS_SECRET_BACKEND: doppler
+          VPS_OPS_DOPPLER_SOURCE: env
+          VPS_OPS_DOPPLER_ROLES: gh-agent-broker
+          VPS_OPS_GH_BROKER_ADMIN_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_ADMIN_SECRET }}
+          VPS_OPS_GH_BROKER_REPORTER_01_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_REPORTER_01_SECRET }}
+          VPS_OPS_GH_BROKER_SANDBOX_MCP_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_SANDBOX_MCP_TOKEN }}
+          VPS_OPS_GH_BROKER_YKM_CURATOR_BROKER_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_YKM_CURATOR_BROKER_SECRET }}
+          VPS_OPS_GH_BROKER_AGENT_PROXY_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_AGENT_PROXY_TOKEN }}
+          VPS_OPS_GH_BROKER_LITELLM_MASTER_KEY: ${{ secrets.VPS_OPS_GH_BROKER_LITELLM_MASTER_KEY }}
+          VPS_OPS_GH_BROKER_OPENROUTER_API_KEY: ${{ secrets.VPS_OPS_GH_BROKER_OPENROUTER_API_KEY }}
+          VPS_OPS_GH_BROKER_REPORTER_APP_PEM: ${{ secrets.VPS_OPS_GH_BROKER_REPORTER_APP_PEM }}
+          VPS_OPS_GH_BROKER_YKM_CURATOR_APP_PEM: ${{ secrets.VPS_OPS_GH_BROKER_YKM_CURATOR_APP_PEM }}
         run: |
-          ansible-playbook -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
+          scripts/run-ansible-playbook.sh -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
             -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ steps.deploy_inputs.outputs.deploy_sha }}" \
             -e "ansible_host=100.66.40.39" \
             -e "ansible_port=${DEPLOY_PORT}" \
@@ -124,4 +141,3 @@ jobs:
         if: always()
         run: |
           rm -f /tmp/hermes-deploy
-          rm -f ~/.config/vps-ops/vault-password
