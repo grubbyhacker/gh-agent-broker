@@ -60,11 +60,13 @@ func TestLaunchAgentBuildsSandboxedRuntimeSpec(t *testing.T) {
 		path string
 		mode os.FileMode
 	}{
+		{path: filepath.Join(cfg.RunsDir, out.RunID), mode: 0o711},
 		{path: filepath.Join(cfg.RunsDir, out.RunID, "input"), mode: 0o755},
 		{path: filepath.Join(cfg.RunsDir, out.RunID, "input", "knowledge.md"), mode: 0o644},
 		{path: filepath.Join(cfg.RunsDir, out.RunID, "work"), mode: 0o777},
 		{path: filepath.Join(cfg.RunsDir, out.RunID, "output"), mode: 0o777},
 		{path: filepath.Join(cfg.RunsDir, out.RunID, "lessons"), mode: 0o777},
+		{path: filepath.Join(cfg.RunsDir, out.RunID, "logs"), mode: 0o700},
 	} {
 		info, err := os.Stat(tt.path)
 		if err != nil {

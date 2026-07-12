@@ -435,7 +435,12 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 		return LaunchAgentOutput{}, err
 	}
 	runDir := s.runDir(runID)
-	if err := os.MkdirAll(runDir, 0o700); err != nil {
+	//nolint:gosec // G301: artifact readers need traverse-only access to /output while logs stay private.
+	if err := os.MkdirAll(runDir, 0o711); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	//nolint:gosec // G302: preserve execute-only traversal if an existing run dir was created more narrowly.
+	if err := os.Chmod(runDir, 0o711); err != nil {
 		return LaunchAgentOutput{}, err
 	}
 	for _, dir := range []struct {
