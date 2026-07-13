@@ -8,8 +8,59 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
+  changed-paths:
+    runs-on: ubuntu-latest
+    outputs:
+      broker-image: ${{ steps.filter.outputs.broker_image }}
+      container-smoke: ${{ steps.filter.outputs.container_smoke }}
+      sandbox-e2e: ${{ steps.filter.outputs.sandbox_e2e }}
+      codex-worker-image: ${{ steps.filter.outputs.codex_worker_image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            broker_image:
+              - '.dockerignore'
+              - 'Dockerfile'
+              - 'go.mod'
+              - 'go.sum'
+              - 'cmd/**'
+              - 'internal/**'
+            container_smoke:
+              - '.github/workflows/ci.yml'
+              - '.dockerignore'
+              - 'Dockerfile'
+              - 'go.mod'
+              - 'go.sum'
+              - 'cmd/**'
+              - 'internal/**'
+              - 'scripts/container-smoke.sh'
+            sandbox_e2e:
+              - '.github/workflows/ci.yml'
+              - '.dockerignore'
+              - 'Dockerfile.sandbox-e2e'
+              - 'go.mod'
+              - 'go.sum'
+              - 'cmd/**'
+              - 'internal/**'
+              - 'scripts/sandbox-e2e.sh'
+            codex_worker_image:
+              - '.github/workflows/ci.yml'
+              - '.dockerignore'
+              - 'go.mod'
+              - 'go.sum'
+              - 'cmd/**'
+              - 'internal/**'
+              - 'workers/codex-implementation/**'
+
   check:
     runs-on: ubuntu-latest
     steps:
@@ -27,7 +78,8 @@ jobs:
 
   container-smoke:
     runs-on: ubuntu-latest
-    needs: check
+    needs: [check, changed-paths]
+    if: needs.changed-paths.outputs.container-smoke == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -37,7 +89,8 @@ jobs:
 
   sandbox-e2e:
     runs-on: ubuntu-latest
-    needs: check
+    needs: [check, changed-paths]
+    if: needs.changed-paths.outputs.sandbox-e2e == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -53,7 +106,8 @@ jobs:
 
   codex-worker-image:
     runs-on: ubuntu-latest
-    needs: check
+    needs: [check, changed-paths]
+    if: needs.changed-paths.outputs.codex-worker-image == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -63,8 +117,13 @@ jobs:
 
   publish-image:
     runs-on: ubuntu-latest
-    needs: [check, container-smoke, sandbox-e2e]
-    if: github.event_name == 'push'
+    needs: [changed-paths, check, container-smoke, sandbox-e2e]
+    if: >-
+      always() && github.event_name == 'push' &&
+      needs.changed-paths.outputs.broker-image == 'true' &&
+      needs.check.result == 'success' &&
+      needs.container-smoke.result == 'success' &&
+      (needs.sandbox-e2e.result == 'success' || needs.sandbox-e2e.result == 'skipped')
     permissions:
       contents: read
       packages: write
@@ -104,8 +163,14 @@ jobs:
 
   publish-codex-worker-image:
     runs-on: ubuntu-latest
-    needs: [check, container-smoke, sandbox-e2e, codex-worker-image]
-    if: github.event_name == 'push'
+    needs: [changed-paths, check, container-smoke, sandbox-e2e, codex-worker-image]
+    if: >-
+      always() && github.event_name == 'push' &&
+      needs.changed-paths.outputs.codex-worker-image == 'true' &&
+      needs.check.result == 'success' &&
+      (needs.container-smoke.result == 'success' || needs.container-smoke.result == 'skipped') &&
+      (needs.sandbox-e2e.result == 'success' || needs.sandbox-e2e.result == 'skipped') &&
+      needs.codex-worker-image.result == 'success'
     permissions:
       contents: read
       packages: write
