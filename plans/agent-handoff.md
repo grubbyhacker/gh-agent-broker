@@ -2,6 +2,18 @@
 
 ## Current State
 
+Current webhook-derived Codex worker design:
+
+- `plans/webhook-codex-worker-milestone.md` defines the next bounded milestone.
+- The first stimulus is `issues.labeled` with exact label `agent:implement`.
+- The first proof repository is `grubbyhacker/apple-jobs-matcher` using the
+  existing `hermes-agent-infra` GitHub/broker identity.
+- The worker uses a dedicated sandbox Codex OAuth session and real
+  noninteractive `codex exec`, not the metered model proxy.
+- Slice 1 is a manual fixed-profile broker launch; webhook dispatch is slice 2.
+- Existing Curator profiles, principals, credentials, mounts, and task JSON are
+  protected by an explicit non-regression validation contract.
+
 Current production deploy Doppler env-source fix:
 
 - Current branch `fleet/gh-agent-broker/239fbf7e` updates
