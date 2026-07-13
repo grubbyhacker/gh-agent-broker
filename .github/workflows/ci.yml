@@ -120,7 +120,6 @@ jobs:
     needs: [changed-paths, check, container-smoke, sandbox-e2e]
     if: >-
       always() && github.event_name == 'push' &&
-      needs.changed-paths.outputs.broker-image == 'true' &&
       needs.check.result == 'success' &&
       needs.container-smoke.result == 'success' &&
       (needs.sandbox-e2e.result == 'success' || needs.sandbox-e2e.result == 'skipped')
