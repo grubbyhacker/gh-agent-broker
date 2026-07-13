@@ -671,6 +671,7 @@ func testTemplate(image string) Template {
 
 func testLaunchProfile() LaunchProfile {
 	return LaunchProfile{
+		RequireIdempotencyKey: true,
 		LaunchAgentInput: LaunchAgentInput{
 			Template:          "worker",
 			Task:              "nightly task",

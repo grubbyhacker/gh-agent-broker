@@ -81,6 +81,32 @@ func TestRESTLaunchSameKeyChangedPayloadConflicts(t *testing.T) {
 	}
 }
 
+func TestRESTLaunchIdempotencyNamespaceIncludesPrincipalAndProfile(t *testing.T) {
+	cfg := restTestConfig(t)
+	cfg.OperatorPrincipals["peer"] = OperatorPrincipal{
+		Token: "peer-secret", AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"launch"}, RunScope: "owned",
+	}
+	runtime := newFakeRuntime()
+	handler := NewRESTHandler(newRESTTestService(t, cfg, runtime, testAudit(t)))
+	first := performLaunch(t, handler, "shared-key", nil)
+	req := restLaunchRequest("/v1/launch-profiles/nightly/launch", "peer-secret", "shared-key", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("peer launch status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	var second LaunchAgentOutput
+	if err := json.NewDecoder(resp.Body).Decode(&second); err != nil {
+		t.Fatal(err)
+	}
+	if first.RunID == second.RunID {
+		t.Fatalf("different principals shared run ID %q", first.RunID)
+	}
+	if len(runtime.specs) != 2 {
+		t.Fatalf("runtime creates=%d, want 2 principal-scoped launches", len(runtime.specs))
+	}
+}
+
 func TestRESTLaunchConcurrentDuplicateUsesOneRuntime(t *testing.T) {
 	cfg := restTestConfig(t)
 	runtime := newFakeRuntime()
@@ -124,6 +150,104 @@ func TestRESTLaunchConcurrentDuplicateUsesOneRuntime(t *testing.T) {
 		if out.RunID != runID {
 			t.Fatalf("run ID=%q, want %q", out.RunID, runID)
 		}
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if len(runtime.specs) != 1 {
+		t.Fatalf("runtime creates=%d, want 1", len(runtime.specs))
+	}
+}
+
+func TestLaunchIntentStoreConcurrentReservationAcrossConnections(t *testing.T) {
+	cfg := restTestConfig(t)
+	firstStore, err := OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := firstStore.Close(); err != nil {
+			t.Errorf("close first store: %v", err)
+		}
+	}()
+	secondStore, err := OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := secondStore.Close(); err != nil {
+			t.Errorf("close second store: %v", err)
+		}
+	}()
+
+	service := NewServiceWithLaunchIntents(cfg, newFakeRuntime(), testAudit(t), firstStore)
+	first := persistableIntent(t, service, firstStore, "cross-connection-key")
+	second := first
+	second.RunID = "20260713T120000Z-aaaaaaaaaaaaaaaa"
+	second.Metadata.RunID = second.RunID
+	second.Plan.Metadata.RunID = second.RunID
+
+	type result struct {
+		intent  launchIntent
+		created bool
+		err     error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for _, item := range []struct {
+		store  *LaunchIntentStore
+		intent launchIntent
+	}{{firstStore, first}, {secondStore, second}} {
+		go func() {
+			<-start
+			got, created, err := item.store.Create(context.Background(), item.intent, 0)
+			results <- result{intent: got, created: created, err: err}
+		}()
+	}
+	close(start)
+	created := 0
+	var runID string
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.created {
+			created++
+		}
+		if runID == "" {
+			runID = result.intent.RunID
+		} else if result.intent.RunID != runID {
+			t.Fatalf("reserved run IDs differ: %q and %q", runID, result.intent.RunID)
+		}
+	}
+	if created != 1 {
+		t.Fatalf("created reservations=%d, want 1", created)
+	}
+}
+
+func TestRESTLaunchReplayAfterRestartAndIndexReconstruction(t *testing.T) {
+	cfg := restTestConfig(t)
+	runtime := newFakeRuntime()
+	firstService := newRESTTestService(t, cfg, runtime, testAudit(t))
+	first := performLaunch(t, NewRESTHandler(firstService), "restart-replay-key", nil)
+	meta, err := readMetadata(filepath.Join(cfg.RunsDir, first.RunID, "metadata.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Principal != "timer" || meta.IdempotencyKeyDigest == "" || meta.RequestFingerprint == "" || meta.LaunchConfigVersion == "" {
+		t.Fatalf("launch ownership/index metadata incomplete: %+v", meta)
+	}
+	if _, err := firstService.launchIntents.db.ExecContext(context.Background(), "DELETE FROM launch_intents WHERE run_id=?", first.RunID); err != nil {
+		t.Fatal(err)
+	}
+
+	secondService := newRESTTestService(t, cfg, runtime, testAudit(t))
+	if err := secondService.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error=%v", err)
+	}
+	second := performLaunch(t, NewRESTHandler(secondService), "restart-replay-key", []byte("{}"))
+	if second.RunID != first.RunID || !second.Replay {
+		t.Fatalf("first=%+v second=%+v", first, second)
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
@@ -303,6 +427,16 @@ func persistRecoveryIntent(t *testing.T, service *Service, store *LaunchIntentSt
 	if _, created, err := store.Create(context.Background(), intent, 0); err != nil || !created {
 		t.Fatalf("create intent created=%v err=%v", created, err)
 	}
+	return intent
+}
+
+func persistableIntent(t *testing.T, service *Service, store *LaunchIntentStore, key string) launchIntent {
+	t.Helper()
+	intent := persistRecoveryIntent(t, service, store, intentStateCreated)
+	if _, err := store.db.ExecContext(context.Background(), "DELETE FROM launch_intents WHERE run_id=?", intent.RunID); err != nil {
+		t.Fatal(err)
+	}
+	intent.KeyDigest = store.digestKey(key)
 	return intent
 }
 

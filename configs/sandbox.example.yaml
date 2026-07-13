@@ -24,6 +24,9 @@ launch_profiles:
     task: "Run the configured nightly sandbox task and write the requested deliverables."
     focus: "nightly"
     max_runtime_minutes: 60
+    # Set true for dispatcher profiles such as codex-issue-implement. Profiles
+    # that omit it continue to allow non-idempotent manual launches.
+    require_idempotency_key: false
     deliverables:
       - "/output/final-summary.md"
       - "/lessons/run-summary.md"
@@ -57,6 +60,7 @@ operator_principals:
     allowed_actions:
       - "launch"
       - "dry_run"
+    run_scope: "owned"
   human-operator:
     token_env: "SANDBOX_OPERATOR_ADMIN_TOKEN"
     allowed_profiles:
@@ -69,6 +73,7 @@ operator_principals:
       - "artifacts"
       - "stop"
       - "cleanup"
+    run_scope: "profile"
 
 network_policies:
   worker-net:
