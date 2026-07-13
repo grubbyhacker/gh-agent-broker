@@ -37,6 +37,82 @@ fi
 /usr/local/bin/gh-agent-broker-cli health -broker "$BROKER_URL" >/output/broker-health.txt
 /usr/local/bin/gh-agent-broker-cli probe -repo "$SANDBOX_REPO" >/output/broker-repo-probe.json
 
+issue_number=$(python3 - <<'PY'
+import json
+import re
+from pathlib import Path
+
+contract = json.loads(Path("/input/task.json").read_text())
+params = contract.get("parameters") or {}
+issue_number = params.get("issue_number")
+delivery_id = params.get("source_delivery_id")
+if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number < 1:
+    raise SystemExit("typed task contract requires a positive integer issue_number")
+if not isinstance(delivery_id, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,128}", delivery_id):
+    raise SystemExit("typed task contract requires a valid source_delivery_id")
+print(issue_number)
+PY
+)
+
+/usr/local/bin/gh-agent-broker-cli issue -repo "$SANDBOX_REPO" -number "$issue_number" >/work/issue.json
+/usr/local/bin/gh-agent-broker-cli issue-comments -repo "$SANDBOX_REPO" -number "$issue_number" >/work/issue-comments.json
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+issue = json.loads(Path("/work/issue.json").read_text())
+comments = json.loads(Path("/work/issue-comments.json").read_text())
+if not isinstance(issue, dict) or "pull_request" in issue:
+    raise SystemExit("typed issue reference resolved to a pull request or invalid issue")
+if issue.get("state") != "open":
+    raise SystemExit("typed issue reference is not open")
+
+number = issue.get("number")
+title = issue.get("title")
+if not isinstance(number, int) or not isinstance(title, str) or not title.strip():
+    raise SystemExit("broker issue response is missing number or title")
+if not isinstance(comments, list):
+    raise SystemExit("broker issue comments response is invalid")
+
+remaining = 24 * 1024
+
+def clipped(value):
+    global remaining
+    if not isinstance(value, str) or remaining <= 0:
+        return ""
+    value = value.strip()
+    if len(value) <= remaining:
+        remaining -= len(value)
+        return value
+    result = value[:remaining] + "\n\n[truncated by worker input limit]"
+    remaining = 0
+    return result
+
+lines = [
+    "# Authoritative GitHub Issue",
+    "",
+    f"Issue: #{number} — {title.strip()}",
+    "",
+    "## Body",
+    "",
+    clipped(issue.get("body")) or "[no issue body]",
+]
+for comment in comments:
+    if remaining <= 0:
+        break
+    if not isinstance(comment, dict):
+        continue
+    user = comment.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
+    body = clipped(comment.get("body"))
+    if body:
+        lines.extend(["", f"## Comment from {author or 'unknown'}", "", body])
+
+Path("/work/issue-context.md").write_text("\n".join(lines) + "\n")
+Path("/work/issue-title.txt").write_text(title.strip() + "\n")
+PY
+
 cd /work/repo
 git init --quiet
 git remote add origin placeholder
@@ -51,6 +127,8 @@ git config user.email "${GIT_AUTHOR_EMAIL:-codex-sandbox@users.noreply.github.co
   cat /input/sandbox-rules.md
   printf '\n# Implementation Task\n\n'
   cat /input/task.md
+  printf '\n# Authoritative Issue Context\n\n'
+  cat /work/issue-context.md
   printf '\n# Execution Contract\n\n'
   printf '%s\n' '- Work only in this repository checkout.'
   printf '%s\n' '- Implement the requested change and keep the diff focused.'
@@ -79,7 +157,7 @@ git add --all
 git commit --quiet -m "Implement sandbox task ${SANDBOX_RUN_ID}"
 git push --quiet origin "HEAD:${SANDBOX_BRANCH}"
 
-pr_title="Implementation: $(sed -n '1p' /input/task.md | tr '\n' ' ' | cut -c1-96)"
+pr_title="Implementation: $(tr '\n' ' ' </work/issue-title.txt | cut -c1-96)"
 if [ "$pr_title" = "Implementation: " ]; then
   pr_title="Implementation: sandbox task"
 fi
@@ -100,6 +178,8 @@ from pathlib import Path
 result = {
     "run_id": os.environ["SANDBOX_RUN_ID"],
     "repository": os.environ["SANDBOX_REPO"],
+    "issue_number": json.loads(Path("/input/task.json").read_text())["parameters"]["issue_number"],
+    "source_delivery_id": json.loads(Path("/input/task.json").read_text())["parameters"]["source_delivery_id"],
     "base_branch": os.environ["SANDBOX_BASE_BRANCH"],
     "branch": os.environ["SANDBOX_BRANCH"],
     "validation": "uv run pytest -q",

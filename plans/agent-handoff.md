@@ -2,6 +2,20 @@
 
 ## Current State
 
+### Current Codex issue-reference contract
+
+- Manual production execution is proven: sandbox run
+  `20260713T044214Z-cd8308c5b89077a5` used the dedicated Codex OAuth bundle,
+  completed with exit code zero, and opened
+  `grubbyhacker/apple-jobs-matcher` PR #4.
+- The next worker-image change replaces the arbitrary manual task input with a
+  fixed profile that requires typed `issue_number` and `source_delivery_id`
+  parameters. The wrapper reads the authoritative open issue and its comments
+  through `gh-agent-broker-cli`, rejects pull-request references, bounds issue
+  context, and records the source metadata in its result artifact.
+- This is still Slice 1: no Signal Plane dispatcher or webhook-triggered launch
+  is enabled until the typed profile is deployed and manually proven.
+
 Current webhook-derived Codex worker design:
 
 - `plans/webhook-codex-worker-milestone.md` defines the next bounded milestone.
