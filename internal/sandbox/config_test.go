@@ -141,6 +141,16 @@ func TestConfigValidateLaunchProfilesAndOperatorPrincipals(t *testing.T) {
 	}
 
 	cfg = baseTestConfig(t)
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": testLaunchProfile()}
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"timer": {Token: "timer-secret", AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"launch"}, RunScope: "global"},
+	}
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "run_scope must be owned or profile") {
+		t.Fatalf("Validate() error = %v, want invalid run scope", err)
+	}
+
+	cfg = baseTestConfig(t)
 	profile := testLaunchProfile()
 	profile.AllowOverrides = []string{"env"}
 	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}

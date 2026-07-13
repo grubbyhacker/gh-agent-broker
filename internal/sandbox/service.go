@@ -67,6 +67,11 @@ type intentLock struct {
 	refs int
 }
 
+type launchValidationError struct{ err error }
+
+func (e *launchValidationError) Error() string { return e.err.Error() }
+func (e *launchValidationError) Unwrap() error { return e.err }
+
 type pathPermissionFixer interface {
 	MakeRemovable(ctx context.Context, image, path string) error
 }
@@ -76,30 +81,34 @@ type runtimeFileWriter interface {
 }
 
 type RunMetadata struct {
-	RunID            string         `json:"run_id"`
-	Profile          string         `json:"profile,omitempty"`
-	Template         string         `json:"template"`
-	Repo             string         `json:"repo"`
-	BaseBranch       string         `json:"base_branch"`
-	Branch           string         `json:"branch"`
-	Task             string         `json:"task"`
-	Focus            string         `json:"focus,omitempty"`
-	WorkerAgentID    string         `json:"worker_agent_id"`
-	BrokerAgentID    string         `json:"broker_agent_id"`
-	CredentialBundle string         `json:"credential_bundle,omitempty"`
-	ContainerID      string         `json:"container_id,omitempty"`
-	Image            string         `json:"image"`
-	ImageDigest      string         `json:"image_digest,omitempty"`
-	Status           string         `json:"status"`
-	ExitCode         *int           `json:"exit_code,omitempty"`
-	FinalizeReason   string         `json:"finalize_reason,omitempty"`
-	TerminalSource   string         `json:"terminal_source,omitempty"`
-	Error            string         `json:"error,omitempty"`
-	Deliverables     []string       `json:"deliverables,omitempty"`
-	Parameters       map[string]any `json:"parameters,omitempty"`
-	StartedAt        time.Time      `json:"started_at"`
-	Deadline         time.Time      `json:"deadline"`
-	EndedAt          time.Time      `json:"ended_at,omitempty"`
+	RunID                string         `json:"run_id"`
+	Profile              string         `json:"profile,omitempty"`
+	Principal            string         `json:"principal,omitempty"`
+	IdempotencyKeyDigest string         `json:"idempotency_key_digest,omitempty"`
+	RequestFingerprint   string         `json:"request_fingerprint,omitempty"`
+	LaunchConfigVersion  string         `json:"launch_config_version,omitempty"`
+	Template             string         `json:"template"`
+	Repo                 string         `json:"repo"`
+	BaseBranch           string         `json:"base_branch"`
+	Branch               string         `json:"branch"`
+	Task                 string         `json:"task"`
+	Focus                string         `json:"focus,omitempty"`
+	WorkerAgentID        string         `json:"worker_agent_id"`
+	BrokerAgentID        string         `json:"broker_agent_id"`
+	CredentialBundle     string         `json:"credential_bundle,omitempty"`
+	ContainerID          string         `json:"container_id,omitempty"`
+	Image                string         `json:"image"`
+	ImageDigest          string         `json:"image_digest,omitempty"`
+	Status               string         `json:"status"`
+	ExitCode             *int           `json:"exit_code,omitempty"`
+	FinalizeReason       string         `json:"finalize_reason,omitempty"`
+	TerminalSource       string         `json:"terminal_source,omitempty"`
+	Error                string         `json:"error,omitempty"`
+	Deliverables         []string       `json:"deliverables,omitempty"`
+	Parameters           map[string]any `json:"parameters,omitempty"`
+	StartedAt            time.Time      `json:"started_at"`
+	Deadline             time.Time      `json:"deadline"`
+	EndedAt              time.Time      `json:"ended_at,omitempty"`
 }
 
 type TaskContract struct {
@@ -286,6 +295,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		if err != nil {
 			continue
 		}
+		if s.launchIntents != nil {
+			if err := s.launchIntents.RestoreMetadata(ctx, meta); err != nil {
+				return fmt.Errorf("reconstruct launch intent index from run %q: %w", meta.RunID, err)
+			}
+		}
 		if meta.ContainerID != "" && meta.Status == StatusRunning {
 			status, err := s.runtime.Inspect(ctx, meta.ContainerID)
 			if err != nil {
@@ -439,10 +453,14 @@ func (s *Service) PreviewLaunch(ctx context.Context, in LaunchAgentInput) (Launc
 }
 
 func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchAgentOutput, error) {
+	return s.launchAgent(ctx, "", in)
+}
+
+func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAgentInput) (LaunchAgentOutput, error) {
 	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
 	if err != nil {
 		s.auditDeny("launch_agent", in, err)
-		return LaunchAgentOutput{}, err
+		return LaunchAgentOutput{}, &launchValidationError{err: err}
 	}
 	releaseProfileSlot, err := s.acquireProfileSlot(in.Profile)
 	if err != nil {
@@ -455,6 +473,7 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 	meta := RunMetadata{
 		RunID:            runID,
 		Profile:          in.Profile,
+		Principal:        principal,
 		Template:         in.Template,
 		Repo:             in.Repo,
 		BaseBranch:       in.BaseBranch,
@@ -472,7 +491,7 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 		Deadline:         deadline,
 	}
 	if err := s.validateTaskContract(s.taskContract(meta)); err != nil {
-		return LaunchAgentOutput{}, err
+		return LaunchAgentOutput{}, &launchValidationError{err: err}
 	}
 	runDir := s.runDir(runID)
 	//nolint:gosec // G301: artifact readers need traverse-only access to /output while logs stay private.
@@ -558,6 +577,9 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 }
 
 func (s *Service) LaunchProfile(ctx context.Context, principal, profile, rawKey, fingerprint string, in LaunchAgentInput) (LaunchAgentOutput, error) {
+	if rawKey == "" {
+		return s.launchAgent(ctx, principal, in)
+	}
 	if s.launchIntents == nil {
 		return LaunchAgentOutput{}, fmt.Errorf("durable launch intent store is unavailable")
 	}
@@ -583,18 +605,20 @@ func (s *Service) LaunchProfile(ctx context.Context, principal, profile, rawKey,
 
 	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
 	if err != nil {
-		return LaunchAgentOutput{}, err
+		return LaunchAgentOutput{}, &launchValidationError{err: err}
 	}
 	now := time.Now().UTC()
 	meta := RunMetadata{
-		RunID: runID, Profile: profile, Template: in.Template, Repo: in.Repo, BaseBranch: in.BaseBranch,
+		RunID: runID, Profile: profile, Principal: principal, IdempotencyKeyDigest: digest,
+		RequestFingerprint: fingerprint, LaunchConfigVersion: s.cfg.ConfigVersion,
+		Template: in.Template, Repo: in.Repo, BaseBranch: in.BaseBranch,
 		Branch: branch, Task: in.Task, Focus: in.Focus, WorkerAgentID: workerAgentID(tmpl, runID),
 		BrokerAgentID: tmpl.BrokerAgentID, CredentialBundle: tmpl.CredentialBundle, Image: tmpl.Image,
 		Status: StatusPending, Deliverables: deliverables(in.Deliverables, tmpl.Deliverables),
 		Parameters: cloneParameters(in.Parameters), StartedAt: now, Deadline: now.Add(runtimeLimit),
 	}
 	if err := s.validateTaskContract(s.taskContract(meta)); err != nil {
-		return LaunchAgentOutput{}, err
+		return LaunchAgentOutput{}, &launchValidationError{err: err}
 	}
 	intent = launchIntent{
 		Principal: principal, Profile: profile, KeyDigest: digest, RequestFingerprint: fingerprint,
@@ -843,7 +867,7 @@ func (s *Service) acquireProfileSlot(profile string) (func(), error) {
 		}
 	}
 	if active+s.profileReservations[profile] >= launchProfile.MaxConcurrentRuns {
-		return nil, fmt.Errorf("profile %q is busy; maximum concurrent runs is %d", profile, launchProfile.MaxConcurrentRuns)
+		return nil, &intentConflictError{Code: "profile_busy", Message: fmt.Sprintf("profile %q is busy; maximum concurrent runs is %d", profile, launchProfile.MaxConcurrentRuns)}
 	}
 	s.profileReservations[profile]++
 	return func() {
@@ -869,16 +893,19 @@ func (s *Service) ValidateTemplate(ctx context.Context, in ValidateTemplateInput
 }
 
 func (s *Service) ListAgents(ctx context.Context) (ListAgentsOutput, error) {
-	return s.listAgentsForProfiles(ctx, nil)
+	return s.listAgentsForPrincipal(ctx, "", nil, true)
 }
 
-func (s *Service) listAgentsForProfiles(ctx context.Context, profiles []string) (ListAgentsOutput, error) {
+func (s *Service) listAgentsForPrincipal(ctx context.Context, principal string, profiles []string, profileScope bool) (ListAgentsOutput, error) {
 	_ = ctx
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := ListAgentsOutput{Runs: make([]StatusOutput, 0, len(s.runs))}
 	for _, meta := range s.runs {
 		if profiles != nil && !contains(profiles, meta.Profile) {
+			continue
+		}
+		if !profileScope && meta.Principal != principal {
 			continue
 		}
 		out.Runs = append(out.Runs, s.statusOutput(*meta))
@@ -1720,7 +1747,7 @@ func (s *Service) logSandboxCreation(meta RunMetadata, duration time.Duration, e
 	success := err == nil
 	errorMessage := ""
 	if err != nil {
-		errorMessage = s.redactor(meta).Redact(err.Error())
+		errorMessage = "runtime_create_failed"
 	}
 	event := map[string]any{
 		"event":       "sandbox_creation",

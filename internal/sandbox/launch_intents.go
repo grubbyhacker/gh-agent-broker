@@ -202,12 +202,21 @@ func (s *LaunchIntentStore) Create(ctx context.Context, intent launchIntent, max
 	if err != nil {
 		return launchIntent{}, false, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return launchIntent{}, false, err
 	}
-	defer rollbackLaunchIntentTx(tx)
-	row := tx.QueryRowContext(ctx, `SELECT request_fingerprint, run_id, state, plan_json, metadata_json
+	defer closeLaunchIntentConn(conn)
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return launchIntent{}, false, fmt.Errorf("begin immediate launch intent transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			rollbackLaunchIntentConn(context.WithoutCancel(ctx), conn)
+		}
+	}()
+	row := conn.QueryRowContext(ctx, `SELECT request_fingerprint, run_id, state, plan_json, metadata_json
 		FROM launch_intents WHERE principal=? AND profile=? AND key_digest=?`, intent.Principal, intent.Profile, intent.KeyDigest)
 	existing, found, err := scanLaunchIntent(row, intent.Principal, intent.Profile, intent.KeyDigest)
 	if err != nil {
@@ -218,7 +227,7 @@ func (s *LaunchIntentStore) Create(ctx context.Context, intent launchIntent, max
 	}
 	if maxConcurrent > 0 {
 		var active int
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM launch_intents WHERE profile=? AND state<>?`, intent.Profile, intentStateTerminal).Scan(&active); err != nil {
+		if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM launch_intents WHERE profile=? AND state<>?`, intent.Profile, intentStateTerminal).Scan(&active); err != nil {
 			return launchIntent{}, false, err
 		}
 		if active >= maxConcurrent {
@@ -226,17 +235,52 @@ func (s *LaunchIntentStore) Create(ctx context.Context, intent launchIntent, max
 		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err = tx.ExecContext(ctx, `INSERT INTO launch_intents
+	_, err = conn.ExecContext(ctx, `INSERT INTO launch_intents
 		(principal, profile, key_digest, request_fingerprint, run_id, state, plan_json, metadata_json, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, intent.Principal, intent.Profile, intent.KeyDigest,
 		intent.RequestFingerprint, intent.RunID, intent.State, planJSON, metadataJSON, now, now)
 	if err != nil {
 		return launchIntent{}, false, fmt.Errorf("persist launch intent: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return launchIntent{}, false, fmt.Errorf("commit launch intent: %w", err)
 	}
+	committed = true
 	return intent, true, nil
+}
+
+func (s *LaunchIntentStore) RestoreMetadata(ctx context.Context, meta RunMetadata) error {
+	if meta.Principal == "" || meta.Profile == "" || meta.IdempotencyKeyDigest == "" || meta.RequestFingerprint == "" || meta.LaunchConfigVersion == "" {
+		return nil
+	}
+	state := intentStateCreated
+	switch {
+	case isTerminalStatus(meta.Status):
+		state = intentStateTerminal
+	case meta.Status == StatusRunning:
+		state = intentStateRunning
+	case meta.ContainerID != "":
+		state = intentStateStartPending
+	}
+	runtimeSeconds := int64(meta.Deadline.Sub(meta.StartedAt) / time.Second)
+	request := LaunchAgentInput{
+		Template: meta.Template, Task: meta.Task, Repo: meta.Repo, BaseBranch: meta.BaseBranch,
+		Branch: meta.Branch, MaxRuntimeSeconds: int(runtimeSeconds), Deliverables: append([]string(nil), meta.Deliverables...),
+		Focus: meta.Focus, Parameters: cloneParameters(meta.Parameters), Profile: meta.Profile,
+	}
+	intent := launchIntent{
+		Principal: meta.Principal, Profile: meta.Profile, KeyDigest: meta.IdempotencyKeyDigest,
+		RequestFingerprint: meta.RequestFingerprint, RunID: meta.RunID, State: state, Metadata: meta,
+		Plan: launchIntentPlan{Version: 1, ConfigVersion: meta.LaunchConfigVersion, Request: request, RuntimeSeconds: runtimeSeconds, Metadata: meta},
+	}
+	existing, created, err := s.Create(ctx, intent, 0)
+	if err != nil {
+		return fmt.Errorf("restore launch intent for run %q: %w", meta.RunID, err)
+	}
+	if !created && (existing.RunID != meta.RunID || existing.RequestFingerprint != meta.RequestFingerprint) {
+		return fmt.Errorf("run metadata for %q conflicts with durable launch intent for run %q", meta.RunID, existing.RunID)
+	}
+	return nil
 }
 
 func (s *LaunchIntentStore) Save(ctx context.Context, intent launchIntent) error {
@@ -299,6 +343,20 @@ func (s *LaunchIntentStore) Nonterminal(ctx context.Context) ([]launchIntent, er
 func rollbackLaunchIntentTx(tx *sql.Tx) {
 	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 		// The operation's primary error remains authoritative; SQLite will also roll back on close.
+		return
+	}
+}
+
+func rollbackLaunchIntentConn(ctx context.Context, conn *sql.Conn) {
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		// SQLite also rolls back the transaction when the connection closes.
+		return
+	}
+}
+
+func closeLaunchIntentConn(conn *sql.Conn) {
+	if err := conn.Close(); err != nil {
+		// The operation's primary result remains authoritative.
 		return
 	}
 }

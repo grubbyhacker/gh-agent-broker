@@ -35,10 +35,13 @@ Docker-launch functionality.
   explicitly allowlisted by field, merged into the profile request, then
   validated through existing `LaunchAgentInput` validation. No caller-supplied
   template, repo, or branch unless the profile explicitly allows that field.
-- Launch requests require one `Idempotency-Key` header containing 1-255 visible
-  ASCII characters. Keys are HMAC-digested at rest and scoped by operator
-  principal and profile. Reusing a key with the same canonical JSON request
-  replays the original run; reusing it with a different request returns `409`.
+- Profiles opt into mandatory keys with `require_idempotency_key: true`; the
+  `codex-issue-implement` dispatcher profile must enable it, while unrelated
+  profiles remain compatible when it is omitted. Supplied keys contain 1-255
+  visible ASCII characters, are HMAC-digested at rest, and are scoped by
+  operator principal and profile. Reusing a key with the same canonical JSON
+  request replays the original run; reusing it with a different request returns
+  structured `409 idempotency_conflict`.
 - Launch intents and resolved plans are stored durably in the configured
   `launch_intent_store_path` SQLite database. Container creation uses a
   deterministic run-specific name and exact launch-spec label so reconciliation
@@ -58,8 +61,10 @@ Docker-launch functionality.
 - Profile concurrency limits are enforced transactionally against nonterminal
   durable intents. Concurrent and post-restart replays return the same run ID
   and set `replay: true` without creating another container.
-- Run listing, status, logs, artifact/lesson reads, stop, and cleanup are scoped
-  to the principal's allowed profiles in addition to their action permission.
+- Run listing and reads are scoped to the launch principal and its allowed
+  profiles by default (`run_scope: owned`). Out-of-scope run reads return 404.
+  Human recovery principals can explicitly use `run_scope: profile` alongside
+  their action allowlist for profile-wide status/log/artifact/stop/cleanup.
 - Audit records include operation, token principal name, profile name, run ID
   when available, decision, repo, template, and branch. Do not log tokens, auth
   headers, broker secrets, provider credentials, or credential bundle contents.
@@ -91,7 +96,8 @@ Docker-launch functionality.
   - run status/log/artifact/lesson endpoints call existing service methods;
   - REST collection endpoints preserve existing traversal protections,
     redaction, and byte caps.
-  - callers cannot list or operate on runs outside their allowed profiles.
+  - callers cannot list or read runs owned by another principal or outside
+    their allowed profiles; explicit profile-scope recovery principals can.
 - Existing MCP tests continue to pass unchanged.
 - Run `make fmt`, focused sandbox/sandbox-broker tests, then `make check`.
 

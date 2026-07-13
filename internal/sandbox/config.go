@@ -106,10 +106,11 @@ type BranchPolicy struct {
 }
 
 type LaunchProfile struct {
-	LaunchAgentInput  `yaml:",inline"`
-	AllowOverrides    []string                        `yaml:"allow_overrides"`
-	Parameters        map[string]ParameterDeclaration `yaml:"parameters"`
-	MaxConcurrentRuns int                             `yaml:"max_concurrent_runs"`
+	LaunchAgentInput      `yaml:",inline"`
+	AllowOverrides        []string                        `yaml:"allow_overrides"`
+	Parameters            map[string]ParameterDeclaration `yaml:"parameters"`
+	MaxConcurrentRuns     int                             `yaml:"max_concurrent_runs"`
+	RequireIdempotencyKey bool                            `yaml:"require_idempotency_key"`
 }
 
 type ParameterDeclaration struct {
@@ -128,6 +129,7 @@ type OperatorPrincipal struct {
 	TokenEnv        string   `yaml:"token_env"`
 	AllowedProfiles []string `yaml:"allowed_profiles"`
 	AllowedActions  []string `yaml:"allowed_actions"`
+	RunScope        string   `yaml:"run_scope"`
 }
 
 type Duration struct {
@@ -538,6 +540,9 @@ func (c Config) validateOperatorPrincipal(name string, principal OperatorPrincip
 			errs = append(errs, fmt.Sprintf("operator principal %q has unsupported action %q", name, action))
 		}
 	}
+	if principal.RunScope != "" && principal.RunScope != "owned" && principal.RunScope != "profile" {
+		errs = append(errs, fmt.Sprintf("operator principal %q run_scope must be owned or profile", name))
+	}
 	return errs
 }
 
@@ -727,6 +732,7 @@ func (c Config) versionDigest() string {
 			"token_env":        principal.TokenEnv,
 			"allowed_profiles": principal.AllowedProfiles,
 			"allowed_actions":  principal.AllowedActions,
+			"run_scope":        principal.RunScope,
 		}
 	}
 	view := map[string]any{

@@ -11,25 +11,32 @@
 - `internal/deploycontract` deterministically verifies this export while
   preserving the Curator and Codex worker secret mappings.
 
-### Durable idempotent sandbox launch implementation (current branch)
+### Signal Plane Phase 5 broker contract (current branch)
 
-- REST profile launches now require `Idempotency-Key`; keys are validated,
+- REST profiles can require `Idempotency-Key` individually; the
+  `codex-issue-implement` deployment profile must enable the setting without
+  forcing it on unrelated profiles. Supplied keys are validated,
   HMAC-digested at rest, and scoped by operator principal plus profile.
   Canonically equivalent request bodies replay the original run with
   `replay: true`; changed payloads return structured `409
   idempotency_conflict` responses.
 - A broker-owned SQLite launch-intent store uses WAL, `synchronous=FULL`, an
-  integrity/version check, transactional profile-capacity enforcement, and
-  atomic intent state transitions. The raw idempotency key is never persisted
-  or audited.
+  integrity/version check, `BEGIN IMMEDIATE` reservation/profile-capacity
+  serialization across connections, and atomic intent state transitions. Run
+  identity and the safe digests needed to reconstruct a missing index row are
+  written to run metadata. The raw idempotency key is never persisted or
+  audited.
 - Docker creation is recoverable across ambiguous responses through
   deterministic run-specific names and an exact launch-spec label. Reconcile
   resumes create/start-pending intents, adopts only exact matches, preserves
   terminal outcomes, and restores watchers from durable running metadata.
 - Run metadata writes are atomic and directory-synced. Stale pending metadata
   cannot overwrite a recovered running intent.
-- REST run listing and every status/log/artifact/lesson/stop/cleanup operation
-  are now filtered or authorized against the principal's allowed profiles.
+- Launch principal ownership is persisted in every REST-created run. The
+  default `owned` run scope filters list/status access by principal plus allowed
+  profile and returns 404 for out-of-scope reads; explicit `profile` scope
+  preserves human recovery access. Dispatcher action policy remains unable to
+  read logs/artifacts or stop/cleanup runs.
 - Validation passed: focused sandbox tests, repeated focused race tests,
   `make fmt`, `make check` (full tests, race tests, lint, vulnerability scan,
   and builds), and `git diff --check`.

@@ -61,6 +61,60 @@ func TestRESTLaunchProfileAuthzAndLaunch(t *testing.T) {
 	}
 }
 
+func TestRESTOptionalIdempotencyDoesNotBreakUnrelatedProfile(t *testing.T) {
+	cfg := restTestConfig(t)
+	profile := cfg.LaunchProfiles["nightly"]
+	profile.RequireIdempotencyKey = false
+	cfg.LaunchProfiles["nightly"] = profile
+	runtime := newFakeRuntime()
+	handler := NewRESTHandler(newRESTTestService(t, cfg, runtime, testAudit(t)))
+
+	for range 2 {
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "timer-secret", nil))
+		if resp.Code != http.StatusOK {
+			t.Fatalf("optional idempotency launch status=%d body=%s", resp.Code, resp.Body.String())
+		}
+	}
+	if len(runtime.specs) != 2 {
+		t.Fatalf("runtime creates=%d, want 2 independent launches", len(runtime.specs))
+	}
+}
+
+func TestRESTOwnedRunScopeAndProfileRecoveryScope(t *testing.T) {
+	cfg := restTestConfig(t)
+	cfg.OperatorPrincipals["timer"] = OperatorPrincipal{
+		Token: "timer-secret", AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"launch", "status"}, RunScope: "owned",
+	}
+	cfg.OperatorPrincipals["peer"] = OperatorPrincipal{
+		Token: "peer-secret", AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"launch", "status"}, RunScope: "owned",
+	}
+	handler := NewRESTHandler(newRESTTestService(t, cfg, newFakeRuntime(), testAudit(t)))
+	timerRun := performLaunch(t, handler, "owned-key", nil)
+
+	peerList := httptest.NewRecorder()
+	handler.ServeHTTP(peerList, restRequest(http.MethodGet, "/v1/runs", "peer-secret", nil))
+	if peerList.Code != http.StatusOK || strings.Contains(peerList.Body.String(), timerRun.RunID) {
+		t.Fatalf("peer list status=%d body=%s", peerList.Code, peerList.Body.String())
+	}
+	peerRead := httptest.NewRecorder()
+	handler.ServeHTTP(peerRead, restRequest(http.MethodGet, "/v1/runs/"+timerRun.RunID, "peer-secret", nil))
+	if peerRead.Code != http.StatusNotFound || !strings.Contains(peerRead.Body.String(), `"code":"not_found"`) {
+		t.Fatalf("peer read status=%d body=%s", peerRead.Code, peerRead.Body.String())
+	}
+
+	adminList := httptest.NewRecorder()
+	handler.ServeHTTP(adminList, restRequest(http.MethodGet, "/v1/runs", "operator-secret", nil))
+	if adminList.Code != http.StatusOK || !strings.Contains(adminList.Body.String(), timerRun.RunID) {
+		t.Fatalf("admin list status=%d body=%s", adminList.Code, adminList.Body.String())
+	}
+	adminRead := httptest.NewRecorder()
+	handler.ServeHTTP(adminRead, restRequest(http.MethodGet, "/v1/runs/"+timerRun.RunID, "operator-secret", nil))
+	if adminRead.Code != http.StatusOK {
+		t.Fatalf("admin read status=%d body=%s", adminRead.Code, adminRead.Body.String())
+	}
+}
+
 func TestRESTDryRunAndOverridePolicy(t *testing.T) {
 	cfg := restTestConfig(t)
 	runtime := newFakeRuntime()
@@ -117,7 +171,7 @@ func TestRESTLaunchProfileEnforcesConcurrencyLimit(t *testing.T) {
 	second := restLaunchRequest("/v1/launch-profiles/nightly/launch", "timer-secret", "capacity-2", nil)
 	secondResponse := httptest.NewRecorder()
 	handler.ServeHTTP(secondResponse, second)
-	if secondResponse.Code != http.StatusConflict || !strings.Contains(secondResponse.Body.String(), "profile \\\"nightly\\\" is busy") {
+	if secondResponse.Code != http.StatusConflict || !strings.Contains(secondResponse.Body.String(), `"code":"profile_busy"`) {
 		t.Fatalf("second launch status = %d body=%s", secondResponse.Code, secondResponse.Body.String())
 	}
 }
@@ -327,7 +381,7 @@ func TestRESTRunOperationsAreScopedToAllowedProfiles(t *testing.T) {
 		req := restRequest(tt.method, tt.path, "operator-secret", nil)
 		resp := httptest.NewRecorder()
 		handler.ServeHTTP(resp, req)
-		if resp.Code != http.StatusForbidden {
+		if resp.Code != http.StatusNotFound {
 			t.Errorf("%s %s status=%d body=%s", tt.method, tt.path, resp.Code, resp.Body.String())
 		}
 	}
@@ -348,6 +402,7 @@ func restTestConfig(t *testing.T) Config {
 			Token:           "operator-secret",
 			AllowedProfiles: []string{"nightly"},
 			AllowedActions:  []string{"launch", "dry_run", "status", "logs", "artifacts", "stop", "cleanup"},
+			RunScope:        "profile",
 		},
 	}
 	return cfg
