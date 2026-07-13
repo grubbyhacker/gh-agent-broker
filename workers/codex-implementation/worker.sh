@@ -62,7 +62,7 @@ git config user.email "${GIT_AUTHOR_EMAIL:-codex-sandbox@users.noreply.github.co
 codex exec \
   --ephemeral \
   --model gpt-5.5 \
-  --sandbox workspace-write \
+  --dangerously-bypass-approvals-and-sandbox \
   --skip-git-repo-check \
   -C /work/repo \
   -o /output/codex-final.txt \
