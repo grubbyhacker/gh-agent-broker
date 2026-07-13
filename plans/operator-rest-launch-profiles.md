@@ -35,11 +35,19 @@ Docker-launch functionality.
   explicitly allowlisted by field, merged into the profile request, then
   validated through existing `LaunchAgentInput` validation. No caller-supplied
   template, repo, or branch unless the profile explicitly allows that field.
+- Launch requests require one `Idempotency-Key` header containing 1-255 visible
+  ASCII characters. Keys are HMAC-digested at rest and scoped by operator
+  principal and profile. Reusing a key with the same canonical JSON request
+  replays the original run; reusing it with a different request returns `409`.
+- Launch intents and resolved plans are stored durably in the configured
+  `launch_intent_store_path` SQLite database. Container creation uses a
+  deterministic run-specific name and exact launch-spec label so reconciliation
+  can safely adopt a container after an ambiguous create/start response.
 
 ## Behavior
 
 - systemd can trigger a profile with:
-  `curl -fsS -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8091/v1/launch-profiles/profile-name/launch`
+  `curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: $KEY" http://127.0.0.1:8091/v1/launch-profiles/profile-name/launch`
 - A timer token can be scoped to `launch,dry_run` only. A human operator token
   can separately receive read/stop/cleanup actions.
 - REST handlers reuse existing `sandbox.Service` methods. Do not duplicate
@@ -47,8 +55,11 @@ Docker-launch functionality.
 - Logs keep existing byte caps. Artifact and lesson collection reuse existing
   path traversal checks, symlink handling, redaction, hashing, and inline byte
   limits exactly.
-- V1 does not add profile-level concurrency dedupe. Repeated launches remain
-  auditable and rely on worker-level locking plus existing sandbox run tracking.
+- Profile concurrency limits are enforced transactionally against nonterminal
+  durable intents. Concurrent and post-restart replays return the same run ID
+  and set `replay: true` without creating another container.
+- Run listing, status, logs, artifact/lesson reads, stop, and cleanup are scoped
+  to the principal's allowed profiles in addition to their action permission.
 - Audit records include operation, token principal name, profile name, run ID
   when available, decision, repo, template, and branch. Do not log tokens, auth
   headers, broker secrets, provider credentials, or credential bundle contents.
@@ -68,7 +79,10 @@ Docker-launch functionality.
   - timer-style token can launch/dry-run but cannot read artifacts or
     stop/cleanup.
 - Launch behavior:
-  - profile launch calls existing `LaunchAgent`;
+  - launch without an idempotency key returns `428`;
+  - same-key canonical replays create one run/container and return one run ID;
+  - same-key changed payload returns `409`;
+  - persisted create/start ambiguity is recovered after restart;
   - dry-run does not create a run directory or container;
   - body overrides are rejected when `allow_overrides` is empty;
   - allowed overrides are merged and then validated by existing launch
@@ -77,6 +91,7 @@ Docker-launch functionality.
   - run status/log/artifact/lesson endpoints call existing service methods;
   - REST collection endpoints preserve existing traversal protections,
     redaction, and byte caps.
+  - callers cannot list or operate on runs outside their allowed profiles.
 - Existing MCP tests continue to pass unchanged.
 - Run `make fmt`, focused sandbox/sandbox-broker tests, then `make check`.
 

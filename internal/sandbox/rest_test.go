@@ -15,7 +15,7 @@ import (
 func TestRESTLaunchProfileAuthzAndLaunch(t *testing.T) {
 	cfg := restTestConfig(t)
 	runtime := newFakeRuntime()
-	service := NewService(cfg, runtime, testAudit(t))
+	service := newRESTTestService(t, cfg, runtime, testAudit(t))
 	handler := NewRESTHandler(service)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", nil)
@@ -25,7 +25,7 @@ func TestRESTLaunchProfileAuthzAndLaunch(t *testing.T) {
 		t.Fatalf("missing token status = %d, want 401", resp.Code)
 	}
 
-	req = restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "timer-secret", nil)
+	req = restLaunchRequest("/v1/launch-profiles/nightly/launch", "timer-secret", "launch-1", nil)
 	resp = httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -64,7 +64,7 @@ func TestRESTLaunchProfileAuthzAndLaunch(t *testing.T) {
 func TestRESTDryRunAndOverridePolicy(t *testing.T) {
 	cfg := restTestConfig(t)
 	runtime := newFakeRuntime()
-	service := NewService(cfg, runtime, testAudit(t))
+	service := newRESTTestService(t, cfg, runtime, testAudit(t))
 	handler := NewRESTHandler(service)
 
 	body := []byte(`{"overrides":{"task":"override task","repo":"owner/other"}}`)
@@ -99,25 +99,25 @@ func TestRESTLaunchProfileEnforcesConcurrencyLimit(t *testing.T) {
 	profile.MaxConcurrentRuns = 1
 	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
 	runtime := newFakeRuntime()
-	service := NewService(cfg, runtime, testAudit(t))
+	service := newRESTTestService(t, cfg, runtime, testAudit(t))
 	handler := NewRESTHandler(service)
 
-	first := restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "timer-secret", nil)
+	first := restLaunchRequest("/v1/launch-profiles/nightly/launch", "timer-secret", "capacity-1", nil)
 	firstResponse := httptest.NewRecorder()
 	handler.ServeHTTP(firstResponse, first)
 	if firstResponse.Code != http.StatusOK {
 		t.Fatalf("first launch status = %d body=%s", firstResponse.Code, firstResponse.Body.String())
 	}
-	service = NewService(cfg, runtime, testAudit(t))
+	service = newRESTTestService(t, cfg, runtime, testAudit(t))
 	if err := service.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
 	handler = NewRESTHandler(service)
 
-	second := restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "timer-secret", nil)
+	second := restLaunchRequest("/v1/launch-profiles/nightly/launch", "timer-secret", "capacity-2", nil)
 	secondResponse := httptest.NewRecorder()
 	handler.ServeHTTP(secondResponse, second)
-	if secondResponse.Code != http.StatusForbidden || !strings.Contains(secondResponse.Body.String(), "profile \\\"nightly\\\" is busy") {
+	if secondResponse.Code != http.StatusConflict || !strings.Contains(secondResponse.Body.String(), "profile \\\"nightly\\\" is busy") {
 		t.Fatalf("second launch status = %d body=%s", secondResponse.Code, secondResponse.Body.String())
 	}
 }
@@ -141,7 +141,7 @@ func TestRESTParameterizedPreviewAndLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := NewService(cfg, runtime, auditLog)
+	service := newRESTTestService(t, cfg, runtime, auditLog)
 	handler := NewRESTHandler(service)
 
 	body := []byte(`{"parameters":{"upload_ids":["upl_123","upl_456"]}}`)
@@ -169,7 +169,7 @@ func TestRESTParameterizedPreviewAndLaunch(t *testing.T) {
 		t.Fatalf("incomplete preview = %+v", preview)
 	}
 
-	req = restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "timer-secret", body)
+	req = restLaunchRequest("/v1/launch-profiles/nightly/launch", "timer-secret", "parameters-1", body)
 	resp = httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -216,11 +216,11 @@ func TestRESTParameterizedLaunchRejectsInvalidParametersBeforeRunCreation(t *tes
 	}
 	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
 	runtime := newFakeRuntime()
-	service := NewService(cfg, runtime, testAudit(t))
+	service := newRESTTestService(t, cfg, runtime, testAudit(t))
 	handler := NewRESTHandler(service)
 
 	body := []byte(`{"parameters":{"upload_ids":["valid","too_many"]}}`)
-	req := restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "timer-secret", body)
+	req := restLaunchRequest("/v1/launch-profiles/nightly/launch", "timer-secret", "invalid-parameters", body)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusBadRequest {
@@ -244,10 +244,10 @@ func TestRESTParameterizedLaunchRejectsInvalidParametersBeforeRunCreation(t *tes
 
 func TestRESTRunCollectionsReuseServiceProtections(t *testing.T) {
 	cfg := restTestConfig(t)
-	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	service := newRESTTestService(t, cfg, newFakeRuntime(), testAudit(t))
 	handler := NewRESTHandler(service)
 
-	launchReq := restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "operator-secret", nil)
+	launchReq := restLaunchRequest("/v1/launch-profiles/nightly/launch", "operator-secret", "collections-1", nil)
 	launchResp := httptest.NewRecorder()
 	handler.ServeHTTP(launchResp, launchReq)
 	if launchResp.Code != http.StatusOK {
@@ -283,9 +283,60 @@ func TestRESTRunCollectionsReuseServiceProtections(t *testing.T) {
 	}
 }
 
+func TestRESTRunOperationsAreScopedToAllowedProfiles(t *testing.T) {
+	cfg := restTestConfig(t)
+	hidden := testLaunchProfile()
+	cfg.LaunchProfiles["hidden"] = hidden
+	cfg.OperatorPrincipals["hidden-launcher"] = OperatorPrincipal{
+		Token:           "hidden-secret",
+		AllowedProfiles: []string{"hidden"},
+		AllowedActions:  []string{"launch"},
+	}
+	service := newRESTTestService(t, cfg, newFakeRuntime(), testAudit(t))
+	handler := NewRESTHandler(service)
+
+	launchReq := restLaunchRequest("/v1/launch-profiles/hidden/launch", "hidden-secret", "hidden-run", nil)
+	launchResp := httptest.NewRecorder()
+	handler.ServeHTTP(launchResp, launchReq)
+	if launchResp.Code != http.StatusOK {
+		t.Fatalf("hidden launch status=%d body=%s", launchResp.Code, launchResp.Body.String())
+	}
+	var launched LaunchAgentOutput
+	if err := json.NewDecoder(launchResp.Body).Decode(&launched); err != nil {
+		t.Fatal(err)
+	}
+
+	listReq := restRequest(http.MethodGet, "/v1/runs", "operator-secret", nil)
+	listResp := httptest.NewRecorder()
+	handler.ServeHTTP(listResp, listReq)
+	if listResp.Code != http.StatusOK || strings.Contains(listResp.Body.String(), launched.RunID) {
+		t.Fatalf("scoped list status=%d body=%s", listResp.Code, listResp.Body.String())
+	}
+
+	for _, tt := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/v1/runs/" + launched.RunID},
+		{http.MethodGet, "/v1/runs/" + launched.RunID + "/logs"},
+		{http.MethodGet, "/v1/runs/" + launched.RunID + "/artifacts"},
+		{http.MethodGet, "/v1/runs/" + launched.RunID + "/lessons"},
+		{http.MethodPost, "/v1/runs/" + launched.RunID + "/stop"},
+		{http.MethodPost, "/v1/runs/" + launched.RunID + "/cleanup"},
+	} {
+		req := restRequest(tt.method, tt.path, "operator-secret", nil)
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusForbidden {
+			t.Errorf("%s %s status=%d body=%s", tt.method, tt.path, resp.Code, resp.Body.String())
+		}
+	}
+}
+
 func restTestConfig(t *testing.T) Config {
 	t.Helper()
 	cfg := baseTestConfig(t)
+	cfg.LaunchIntentStore = filepath.Join(filepath.Dir(cfg.RunsDir), "state", "launch-intents.sqlite")
 	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": testLaunchProfile()}
 	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
 		"timer": {
@@ -311,4 +362,25 @@ func restRequest(method, target, token string, body []byte) *http.Request {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	return req
+}
+
+func restLaunchRequest(target, token, key string, body []byte) *http.Request {
+	req := restRequest(http.MethodPost, target, token, body)
+	req.Header.Set("Idempotency-Key", key)
+	return req
+}
+
+func newRESTTestService(t *testing.T, cfg Config, runtime RuntimeBackend, audit *AuditLogger) *Service {
+	t.Helper()
+	cfg.ApplyDefaults()
+	store, err := OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close launch intent store: %v", err)
+		}
+	})
+	return NewServiceWithLaunchIntents(cfg, runtime, audit, store)
 }

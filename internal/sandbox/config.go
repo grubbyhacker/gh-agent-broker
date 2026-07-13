@@ -31,6 +31,7 @@ type Config struct {
 	AuthToken          string                       `yaml:"auth_token"`
 	AuthTokenEnv       string                       `yaml:"auth_token_env"`
 	RunsDir            string                       `yaml:"runs_dir"`
+	LaunchIntentStore  string                       `yaml:"launch_intent_store_path"`
 	BrokerURL          string                       `yaml:"broker_url"`
 	Production         bool                         `yaml:"production"`
 	Repositories       []string                     `yaml:"repositories"`
@@ -187,6 +188,9 @@ func (c *Config) ApplyDefaults() {
 	if c.RunsDir == "" {
 		c.RunsDir = defaultRunsDir
 	}
+	if c.LaunchIntentStore == "" {
+		c.LaunchIntentStore = filepath.Join(c.RunsDir, "launch-intents.sqlite")
+	}
 	if c.MaxTaskBytes == 0 {
 		c.MaxTaskBytes = defaultMaxTaskBytes
 	}
@@ -229,6 +233,9 @@ func (c *Config) Validate() error {
 	}
 	if !filepath.IsAbs(c.RunsDir) {
 		errs = append(errs, "runs_dir must be an absolute path")
+	}
+	if c.LaunchIntentStore != "" && !filepath.IsAbs(c.LaunchIntentStore) {
+		errs = append(errs, "launch_intent_store_path must be an absolute path")
 	}
 	if c.MaxTaskBytes < 1 {
 		errs = append(errs, "max_task_bytes must be positive")

@@ -229,9 +229,11 @@ The metered model proxy remains a fallback, not the default for this milestone.
 
 ## Idempotency And Lifecycle
 
-GitHub may redeliver webhooks, and sandbox launch profiles currently do not
-deduplicate repeated launches. The dispatcher therefore owns launch
-idempotency before automatic launch is enabled.
+GitHub may redeliver webhooks. Sandbox launch profiles now durably deduplicate
+requests by operator principal, profile, `Idempotency-Key`, and canonical
+request fingerprint. The dispatcher still owns the issue-level business rule
+and passes its stable issue key to the broker; the broker owns exactly-once
+run/container correlation across ambiguous responses and restarts.
 
 Milestone-one idempotency key:
 
@@ -257,11 +259,13 @@ Minimum durable job record:
 - terminal reason and timestamps.
 
 JetStream remains the durable event transport, not this semantic job store.
-Use a dispatcher-owned SQLite database with a unique idempotency-key constraint
-and transactional state transitions for milestone one. Do not infer job state
-from JetStream consumer acknowledgement, sandbox logs, branches, or PRs. The
-database lives on a dedicated managed volume; `vps-ops` must declare its
-retention and backup/restore policy before production enablement.
+Use a dispatcher-owned SQLite database with a unique issue-level idempotency-key
+constraint and transactional state transitions for milestone one. The broker's
+separate launch-intent SQLite store is the authority for request-to-run and
+run-to-container recovery. Do not infer job state from JetStream consumer
+acknowledgement, sandbox logs, branches, or PRs. Both databases live on managed
+state volumes; `vps-ops` must declare their retention and backup/restore policy
+before production enablement.
 
 ## Curator Non-Regression Guardrail
 
