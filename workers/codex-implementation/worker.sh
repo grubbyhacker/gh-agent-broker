@@ -14,7 +14,6 @@ require_file /input/task.md
 require_file /input/task.json
 require_file /input/sandbox-rules.md
 require_file /credentials/codex/auth.json
-require_file /credentials/codex/config.toml
 
 if sh -c 'echo should-not-write >/credentials/codex/write-test' 2>/tmp/credential-write.err; then
   fail "credential bundle is writable"
@@ -22,8 +21,11 @@ fi
 
 mkdir -p /work/home/.codex /work/repo /output /lessons
 cp /credentials/codex/auth.json /work/home/.codex/auth.json
-cp /credentials/codex/config.toml /work/home/.codex/config.toml
-chmod 0600 /work/home/.codex/auth.json /work/home/.codex/config.toml
+chmod 0600 /work/home/.codex/auth.json
+if [ -f /credentials/codex/config.toml ]; then
+  cp /credentials/codex/config.toml /work/home/.codex/config.toml
+  chmod 0600 /work/home/.codex/config.toml
+fi
 
 export HOME=/work/home
 export CODEX_HOME=/work/home/.codex

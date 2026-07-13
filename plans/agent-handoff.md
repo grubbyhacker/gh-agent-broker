@@ -324,7 +324,7 @@ Current Codex-compatible proxy surface implementation:
 
 Latest sandbox-broker operator REST launch profile implementation:
 
-- Codex implementation worker foundation (pending PR):
+- Codex implementation worker foundation (PR `#77` merged):
   `workers/codex-implementation/` provides the production-shaped worker image
   for the manual fixed-profile proof. It pins Codex CLI `0.130.0`, uv `0.6.10`,
   and a managed Python `3.12`; includes only the broker CLI, Git, and normal
@@ -335,6 +335,9 @@ Latest sandbox-broker operator REST launch profile implementation:
   It never receives GitHub/App credentials and does not modify any live
   sandbox profile. CI builds it on every PR and publishes a separately
   SHA-pinned `gh-agent-broker-codex-worker` image after `main` passes.
+  The minimal credential bundle requires only `auth.json`; `config.toml` is
+  copied when supplied but is optional, because a fresh isolated `codex login`
+  session does not necessarily create it.
 
 - Profile concurrency foundation (PR `#76`): launch profiles now support an
   optional `max_concurrent_runs` cap. The sandbox broker denies excess launches
