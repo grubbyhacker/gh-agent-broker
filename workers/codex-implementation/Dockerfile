@@ -14,7 +14,17 @@ ARG UV_VERSION=0.6.10
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends ca-certificates git python3 python3-pip python3-venv \
+	&& apt-get install -y --no-install-recommends \
+		bash \
+		build-essential \
+		ca-certificates \
+		curl \
+		git \
+		jq \
+		python3 \
+		python3-pip \
+		python3-venv \
+		ripgrep \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& npm install -g @openai/codex@${CODEX_VERSION} \
 	&& python3 -m pip install --break-system-packages uv==${UV_VERSION} \
