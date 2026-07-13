@@ -332,6 +332,8 @@ Latest sandbox-broker operator REST launch profile implementation:
   toolchain); and runs as non-root. Its wrapper copies a read-only
   dedicated Codex bundle to run-local `CODEX_HOME`, initializes a brokered Git
   remote, explicitly selects the ChatGPT OAuth-compatible `gpt-5.5` model,
+  and bypasses Codex's nested sandbox because the worker already runs in the
+  fixed Docker sandbox profile,
   asks Codex to make a focused change, requires `uv run pytest -q`,
   then performs the commit, push, and ready-for-review PR through the broker.
   It never receives GitHub/App credentials and does not modify any live
