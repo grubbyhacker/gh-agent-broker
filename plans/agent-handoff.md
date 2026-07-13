@@ -328,7 +328,8 @@ Latest sandbox-broker operator REST launch profile implementation:
   `workers/codex-implementation/` provides the production-shaped worker image
   for the manual fixed-profile proof. It pins Codex CLI `0.130.0`, uv `0.6.10`,
   and a managed Python `3.12`; includes only the broker CLI, Git, and normal
-  developer tooling; and runs as non-root. Its wrapper copies a read-only
+  developer tooling (`bash`, `curl`, `jq`, `ripgrep`, and a native build
+  toolchain); and runs as non-root. Its wrapper copies a read-only
   dedicated Codex bundle to run-local `CODEX_HOME`, initializes a brokered Git
   remote, asks Codex to make a focused change, requires `uv run pytest -q`,
   then performs the commit, push, and ready-for-review PR through the broker.
