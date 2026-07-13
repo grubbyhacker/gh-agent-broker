@@ -324,6 +324,15 @@ Current Codex-compatible proxy surface implementation:
 
 Latest sandbox-broker operator REST launch profile implementation:
 
+- Profile concurrency foundation (PR `#76`): launch profiles now support an
+  optional `max_concurrent_runs` cap. The sandbox broker denies excess launches
+  while counting both reconciled pending/running runs and in-process launch
+  reservations, so a process restart cannot reopen a single-slot profile. The
+  cap is omitted/zero for existing profiles, preserving Curator behavior until
+  a new profile explicitly opts in. This is the prerequisite for the planned
+  single-slot `codex-issue-implement` profile; no Curator template, principal,
+  credential bundle, or launch path changed.
+
 - PR `#32` is merged and deployed to the VPS as
   `ghcr.io/grubbyhacker/gh-agent-broker:sha-89590202fcba9d51e5095b1bf7790b36bbbfd755`.
   The live stack is healthy for `broker`, `issue-reporter`, `sandbox-broker`,
