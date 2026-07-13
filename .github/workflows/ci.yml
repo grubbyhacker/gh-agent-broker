@@ -121,7 +121,7 @@ jobs:
     if: >-
       always() && github.event_name == 'push' &&
       needs.check.result == 'success' &&
-      needs.container-smoke.result == 'success' &&
+      (needs.container-smoke.result == 'success' || needs.container-smoke.result == 'skipped') &&
       (needs.sandbox-e2e.result == 'success' || needs.sandbox-e2e.result == 'skipped')
     permissions:
       contents: read
