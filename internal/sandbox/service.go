@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -56,6 +57,14 @@ type Service struct {
 	runs                map[string]*RunMetadata
 	finalizing          map[string]chan struct{}
 	profileReservations map[string]int
+	launchIntents       *LaunchIntentStore
+	intentLocksMu       sync.Mutex
+	intentLocks         map[string]*intentLock
+}
+
+type intentLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type pathPermissionFixer interface {
@@ -158,6 +167,7 @@ type LaunchAgentOutput struct {
 	Branch        string    `json:"branch"`
 	Status        string    `json:"status"`
 	Deadline      time.Time `json:"deadline"`
+	Replay        bool      `json:"replay"`
 }
 
 type LaunchPreviewOutput struct {
@@ -236,6 +246,10 @@ type ListAgentsOutput struct {
 }
 
 func NewService(cfg Config, runtime RuntimeBackend, auditLog *AuditLogger) *Service {
+	return NewServiceWithLaunchIntents(cfg, runtime, auditLog, nil)
+}
+
+func NewServiceWithLaunchIntents(cfg Config, runtime RuntimeBackend, auditLog *AuditLogger, store *LaunchIntentStore) *Service {
 	cfg.ApplyDefaults()
 	if cfg.ConfigLoadedAt.IsZero() || cfg.ConfigVersion == "" {
 		cfg.StampLoaded(time.Now().UTC())
@@ -247,6 +261,8 @@ func NewService(cfg Config, runtime RuntimeBackend, auditLog *AuditLogger) *Serv
 		runs:                map[string]*RunMetadata{},
 		finalizing:          map[string]chan struct{}{},
 		profileReservations: map[string]int{},
+		launchIntents:       store,
+		intentLocks:         map[string]*intentLock{},
 	}
 }
 
@@ -254,9 +270,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	entries, err := os.ReadDir(s.cfg.RunsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return os.MkdirAll(s.cfg.RunsDir, 0o700)
+			if err := os.MkdirAll(s.cfg.RunsDir, 0o700); err != nil {
+				return err
+			}
+			entries = nil
+		} else {
+			return err
 		}
-		return err
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -303,11 +323,23 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		s.runs[meta.RunID] = &cp
 		s.mu.Unlock()
 		if meta.Status == StatusRunning {
-			go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
-			if meta.ContainerID != "" {
-				go s.watchExit(context.WithoutCancel(ctx), meta.RunID, meta.ContainerID)
+			durable := false
+			if s.launchIntents != nil {
+				durable, err = s.launchIntents.IsNonterminalRun(ctx, meta.RunID)
+				if err != nil {
+					return fmt.Errorf("identify durable run %q: %w", meta.RunID, err)
+				}
+			}
+			if !durable {
+				go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
+				if meta.ContainerID != "" {
+					go s.watchExit(context.WithoutCancel(ctx), meta.RunID, meta.ContainerID)
+				}
 			}
 		}
+	}
+	if err := s.reconcileLaunchIntents(ctx); err != nil {
+		return fmt.Errorf("reconcile durable launch intents: %w", err)
 	}
 	return nil
 }
@@ -448,6 +480,7 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 		return LaunchAgentOutput{}, err
 	}
 	//nolint:gosec // G302: preserve execute-only traversal if an existing run dir was created more narrowly.
+	//nolint:gosec // G302: artifact readers need traverse-only access while run files retain stricter modes.
 	if err := os.Chmod(runDir, 0o711); err != nil {
 		return LaunchAgentOutput{}, err
 	}
@@ -524,6 +557,274 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 	return LaunchAgentOutput{RunID: runID, WorkerAgentID: meta.WorkerAgentID, Repo: meta.Repo, Branch: meta.Branch, Status: meta.Status, Deadline: meta.Deadline}, nil
 }
 
+func (s *Service) LaunchProfile(ctx context.Context, principal, profile, rawKey, fingerprint string, in LaunchAgentInput) (LaunchAgentOutput, error) {
+	if s.launchIntents == nil {
+		return LaunchAgentOutput{}, fmt.Errorf("durable launch intent store is unavailable")
+	}
+	digest := s.launchIntents.digestKey(rawKey)
+	unlock := s.lockLaunchIntent(principal + "\x00" + profile + "\x00" + digest)
+	defer unlock()
+
+	intent, found, err := s.launchIntents.Lookup(ctx, principal, profile, digest)
+	if err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	if found {
+		if intent.RequestFingerprint != fingerprint {
+			return LaunchAgentOutput{}, &intentConflictError{
+				Code:    "idempotency_conflict",
+				Message: "Idempotency-Key was already used for a different canonical request",
+			}
+		}
+		out, err := s.resumeLaunchIntent(ctx, &intent, false)
+		out.Replay = true
+		return out, err
+	}
+
+	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
+	if err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	now := time.Now().UTC()
+	meta := RunMetadata{
+		RunID: runID, Profile: profile, Template: in.Template, Repo: in.Repo, BaseBranch: in.BaseBranch,
+		Branch: branch, Task: in.Task, Focus: in.Focus, WorkerAgentID: workerAgentID(tmpl, runID),
+		BrokerAgentID: tmpl.BrokerAgentID, CredentialBundle: tmpl.CredentialBundle, Image: tmpl.Image,
+		Status: StatusPending, Deliverables: deliverables(in.Deliverables, tmpl.Deliverables),
+		Parameters: cloneParameters(in.Parameters), StartedAt: now, Deadline: now.Add(runtimeLimit),
+	}
+	if err := s.validateTaskContract(s.taskContract(meta)); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	intent = launchIntent{
+		Principal: principal, Profile: profile, KeyDigest: digest, RequestFingerprint: fingerprint,
+		RunID: runID, State: intentStateCreated, Metadata: meta,
+		Plan: launchIntentPlan{Version: 1, ConfigVersion: s.cfg.ConfigVersion, Request: in, RuntimeSeconds: int64(runtimeLimit / time.Second), Metadata: meta},
+	}
+	maxConcurrent := s.cfg.LaunchProfiles[profile].MaxConcurrentRuns
+	persisted, created, err := s.launchIntents.Create(ctx, intent, maxConcurrent)
+	if err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	if !created {
+		if persisted.RequestFingerprint != fingerprint {
+			return LaunchAgentOutput{}, &intentConflictError{Code: "idempotency_conflict", Message: "Idempotency-Key was already used for a different canonical request"}
+		}
+		intent = persisted
+	}
+	out, err := s.resumeLaunchIntent(ctx, &intent, false)
+	out.Replay = !created
+	return out, err
+}
+
+func (s *Service) reconcileLaunchIntents(ctx context.Context) error {
+	if s.launchIntents == nil {
+		return nil
+	}
+	intents, err := s.launchIntents.Nonterminal(ctx)
+	if err != nil {
+		return err
+	}
+	for i := range intents {
+		if intents[i].Plan.ConfigVersion != s.cfg.ConfigVersion {
+			return fmt.Errorf("incomplete launch intent %q was resolved with config version %q, current version is %q", intents[i].RunID, intents[i].Plan.ConfigVersion, s.cfg.ConfigVersion)
+		}
+		if _, err := s.resumeLaunchIntent(ctx, &intents[i], true); err != nil {
+			return fmt.Errorf("recover launch intent %q: %w", intents[i].RunID, err)
+		}
+	}
+	return nil
+}
+
+func (s *Service) resumeLaunchIntent(ctx context.Context, intent *launchIntent, recovering bool) (LaunchAgentOutput, error) {
+	if intent.Plan.ConfigVersion != s.cfg.ConfigVersion {
+		return LaunchAgentOutput{}, fmt.Errorf("launch intent config version mismatch")
+	}
+	meta := intent.Metadata
+	if isTerminalStatus(meta.Status) || intent.State == intentStateTerminal {
+		return launchOutput(meta), nil
+	}
+	tmpl, ok := s.cfg.Templates[meta.Template]
+	if !ok {
+		return LaunchAgentOutput{}, fmt.Errorf("launch intent references unknown template %q", meta.Template)
+	}
+	if intent.State == intentStateRunning {
+		s.mu.Lock()
+		cp := meta
+		s.runs[meta.RunID] = &cp
+		s.mu.Unlock()
+		if meta.ContainerID != "" {
+			status, err := s.runtime.Inspect(ctx, meta.ContainerID)
+			if err != nil {
+				return LaunchAgentOutput{}, err
+			}
+			if !status.Running {
+				finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonReconcileExited, terminalSourceExited, func(current RunMetadata) RunMetadata {
+					return s.finalizeExitedRun(ctx, current, status)
+				})
+				return launchOutput(finalized), err
+			}
+		}
+		if recovering {
+			go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
+			if meta.ContainerID != "" {
+				go s.watchExit(context.WithoutCancel(ctx), meta.RunID, meta.ContainerID)
+			}
+		}
+		return launchOutput(meta), nil
+	}
+	if err := s.prepareDurableRun(meta, tmpl); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	spec, redactor, err := s.runtimeSpec(meta, tmpl)
+	if err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	var info ContainerInfo
+	if intent.State == intentStateContainerMade || intent.State == intentStateStartPending {
+		status, inspectErr := s.runtime.Inspect(ctx, meta.ContainerID)
+		if inspectErr != nil {
+			return LaunchAgentOutput{}, fmt.Errorf("inspect persisted sandbox container %q: %w", meta.ContainerID, inspectErr)
+		}
+		lifecycle := ContainerExited
+		if status.StartedAt.IsZero() {
+			lifecycle = ContainerNeverStarted
+		} else if status.Running {
+			lifecycle = ContainerRunning
+		}
+		info = ContainerInfo{ID: meta.ContainerID, ImageDigest: meta.ImageDigest, Existing: true, Lifecycle: lifecycle, Status: status}
+	} else {
+		intent.State = intentStateCreatePending
+		if err := s.launchIntents.Save(ctx, *intent); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		createStarted := time.Now()
+		info, err = s.runtime.Create(ctx, spec)
+		s.logSandboxCreation(meta, time.Since(createStarted), err)
+		if err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		meta.ContainerID = info.ID
+		meta.ImageDigest = info.ImageDigest
+		intent.Metadata = meta
+		intent.State = intentStateContainerMade
+		if err := s.launchIntents.Save(ctx, *intent); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+	}
+	if info.Lifecycle == ContainerRunning {
+		return s.commitRunningIntent(ctx, intent, meta, redactor)
+	}
+	if info.Lifecycle == ContainerExited {
+		return s.commitExitedIntent(ctx, intent, meta, info.Status)
+	}
+	intent.State = intentStateStartPending
+	intent.Metadata = meta
+	if err := s.launchIntents.Save(ctx, *intent); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	if err := s.runtime.Start(ctx, meta.ContainerID); err != nil {
+		status, inspectErr := s.runtime.Inspect(ctx, meta.ContainerID)
+		if inspectErr == nil && status.Running {
+			return s.commitRunningIntent(ctx, intent, meta, redactor)
+		}
+		if inspectErr == nil && !status.StartedAt.IsZero() {
+			return s.commitExitedIntent(ctx, intent, meta, status)
+		}
+		return LaunchAgentOutput{}, err
+	}
+	return s.commitRunningIntent(ctx, intent, meta, redactor)
+}
+
+func (s *Service) prepareDurableRun(meta RunMetadata, tmpl Template) error {
+	runDir := s.runDir(meta.RunID)
+	//nolint:gosec // G301: artifact readers need traverse-only access to /output while logs stay private.
+	if err := os.MkdirAll(runDir, 0o711); err != nil {
+		return err
+	}
+	//nolint:gosec // G302: artifact readers need traverse-only access while run files retain stricter modes.
+	if err := os.Chmod(runDir, 0o711); err != nil {
+		return err
+	}
+	for _, dir := range []struct {
+		name string
+		mode os.FileMode
+	}{{"input", 0o755}, {"work", 0o777}, {"output", 0o777}, {"lessons", 0o777}, {"logs", 0o700}} {
+		path := filepath.Join(runDir, dir.name)
+		if err := os.MkdirAll(path, dir.mode); err != nil {
+			return err
+		}
+		if err := os.Chmod(path, dir.mode); err != nil {
+			return err
+		}
+	}
+	if err := copyKnowledgeSnapshots(tmpl.KnowledgeSnapshots, filepath.Join(runDir, "input")); err != nil {
+		return err
+	}
+	if err := s.writeTaskInputs(meta); err != nil {
+		return err
+	}
+	return s.writeMetadataFile(meta)
+}
+
+func (s *Service) commitRunningIntent(ctx context.Context, intent *launchIntent, meta RunMetadata, redactor Redactor) (LaunchAgentOutput, error) {
+	meta.Status = StatusRunning
+	intent.State = intentStateRunning
+	intent.Metadata = meta
+	if err := s.launchIntents.Save(ctx, *intent); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	if err := s.writeMetadata(meta); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	s.audit.Log(s.auditEvent("launch_agent", meta, "allow", nil), redactor)
+	go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
+	go s.watchExit(context.WithoutCancel(ctx), meta.RunID, meta.ContainerID)
+	return launchOutput(meta), nil
+}
+
+func (s *Service) commitExitedIntent(ctx context.Context, intent *launchIntent, meta RunMetadata, status ContainerStatus) (LaunchAgentOutput, error) {
+	meta.Status = StatusRunning
+	s.mu.Lock()
+	cp := meta
+	s.runs[meta.RunID] = &cp
+	s.mu.Unlock()
+	finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonReconcileExited, terminalSourceExited, func(current RunMetadata) RunMetadata {
+		return s.finalizeExitedRun(ctx, current, status)
+	})
+	intent.Metadata = finalized
+	intent.State = intentStateTerminal
+	if saveErr := s.launchIntents.Save(ctx, *intent); saveErr != nil && err == nil {
+		err = saveErr
+	}
+	return launchOutput(finalized), err
+}
+
+func launchOutput(meta RunMetadata) LaunchAgentOutput {
+	return LaunchAgentOutput{RunID: meta.RunID, WorkerAgentID: meta.WorkerAgentID, Repo: meta.Repo, Branch: meta.Branch, Status: meta.Status, Deadline: meta.Deadline}
+}
+
+func (s *Service) lockLaunchIntent(scope string) func() {
+	s.intentLocksMu.Lock()
+	lock := s.intentLocks[scope]
+	if lock == nil {
+		lock = &intentLock{}
+		s.intentLocks[scope] = lock
+	}
+	lock.refs++
+	s.intentLocksMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		s.intentLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(s.intentLocks, scope)
+		}
+		s.intentLocksMu.Unlock()
+	}
+}
+
 func (s *Service) acquireProfileSlot(profile string) (func(), error) {
 	if profile == "" {
 		return func() {}, nil
@@ -568,11 +869,18 @@ func (s *Service) ValidateTemplate(ctx context.Context, in ValidateTemplateInput
 }
 
 func (s *Service) ListAgents(ctx context.Context) (ListAgentsOutput, error) {
+	return s.listAgentsForProfiles(ctx, nil)
+}
+
+func (s *Service) listAgentsForProfiles(ctx context.Context, profiles []string) (ListAgentsOutput, error) {
 	_ = ctx
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := ListAgentsOutput{Runs: make([]StatusOutput, 0, len(s.runs))}
 	for _, meta := range s.runs {
+		if profiles != nil && !contains(profiles, meta.Profile) {
+			continue
+		}
 		out.Runs = append(out.Runs, s.statusOutput(*meta))
 	}
 	return out, nil
@@ -864,6 +1172,11 @@ func (s *Service) writeMetadata(meta RunMetadata) error {
 	if err := s.writeMetadataFile(meta); err != nil {
 		return err
 	}
+	if s.launchIntents != nil {
+		if err := s.launchIntents.SaveMetadata(context.Background(), meta); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	cp := meta
 	s.runs[meta.RunID] = &cp
@@ -880,10 +1193,43 @@ func (s *Service) writeMetadataFile(meta RunMetadata) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
+	return atomicWriteFile(path, append(b, '\n'), 0o600)
+}
+
+func atomicWriteFile(path string, contents []byte, mode os.FileMode) (retErr error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".metadata-*")
+	if err != nil {
 		return err
 	}
-	return nil
+	tmpPath := tmp.Name()
+	defer func() {
+		if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+			retErr = errors.Join(retErr, fmt.Errorf("remove temporary metadata: %w", err))
+		}
+	}()
+	if err := tmp.Chmod(mode); err != nil {
+		return errors.Join(err, tmp.Close())
+	}
+	if _, err := tmp.Write(contents); err != nil {
+		return errors.Join(err, tmp.Close())
+	}
+	if err := tmp.Sync(); err != nil {
+		return errors.Join(err, tmp.Close())
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	//nolint:gosec // G304: dir is the configured run metadata directory derived from path.
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, dirFile.Close()) }()
+	return dirFile.Sync()
 }
 
 func (s *Service) writeTaskInputs(meta RunMetadata) error {
@@ -1172,6 +1518,11 @@ func (s *Service) finalizeTerminalRun(ctx context.Context, runID, reason, source
 		ev.TerminalSource = source
 		s.audit.Log(ev, s.redactor(next))
 		return next, true, err
+	}
+	if s.launchIntents != nil {
+		if err := s.launchIntents.SaveMetadata(ctx, next); err != nil {
+			return next, true, err
+		}
 	}
 	s.auditTerminalEvent(next, reason, source, nil)
 	return next, true, nil

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,7 +51,18 @@ type Mount struct {
 type ContainerInfo struct {
 	ID          string
 	ImageDigest string
+	Existing    bool
+	Lifecycle   ContainerLifecycle
+	Status      ContainerStatus
 }
+
+type ContainerLifecycle string
+
+const (
+	ContainerNeverStarted ContainerLifecycle = "never_started"
+	ContainerRunning      ContainerLifecycle = "running"
+	ContainerExited       ContainerLifecycle = "exited"
+)
 
 type ContainerStatus struct {
 	ID        string
@@ -80,6 +92,12 @@ func NewDockerBackend(socket string) *DockerBackend {
 }
 
 func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
+	spec.Labels = cloneStringMap(spec.Labels)
+	specDigest, err := runtimeSpecDigest(spec)
+	if err != nil {
+		return ContainerInfo{}, fmt.Errorf("fingerprint sandbox runtime spec: %w", err)
+	}
+	spec.Labels["gh-agent-broker.launch_spec"] = specDigest
 	imageDigest, err := d.imageDigest(ctx, spec.Image)
 	if err != nil {
 		imageDigest = spec.Image
@@ -111,9 +129,36 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 	}
 	path := "/containers/create?name=" + url.QueryEscape("sandbox-"+spec.RunID)
 	if err := d.doJSON(ctx, http.MethodPost, path, reqBody, &out); err != nil {
+		if code, ok := DockerStatusCode(err); ok && code == http.StatusConflict {
+			return d.adopt(ctx, spec)
+		}
 		return ContainerInfo{}, err
 	}
-	return ContainerInfo{ID: out.ID, ImageDigest: imageDigest}, nil
+	return ContainerInfo{ID: out.ID, ImageDigest: imageDigest, Lifecycle: ContainerNeverStarted}, nil
+}
+
+func (d *DockerBackend) adopt(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
+	name := "sandbox-" + spec.RunID
+	var out dockerInspectResponse
+	if err := d.doJSON(ctx, http.MethodGet, "/containers/"+url.PathEscape(name)+"/json", nil, &out); err != nil {
+		return ContainerInfo{}, fmt.Errorf("inspect colliding sandbox container: %w", err)
+	}
+	wantDigest, err := runtimeSpecDigest(spec)
+	if err != nil {
+		return ContainerInfo{}, fmt.Errorf("fingerprint sandbox runtime spec: %w", err)
+	}
+	if out.Name != "/"+name || out.Config.Labels["gh-agent-broker.run_id"] != spec.RunID ||
+		out.Config.Labels["gh-agent-broker.launch_spec"] != wantDigest {
+		return ContainerInfo{}, fmt.Errorf("sandbox container name collision for run %q does not exactly match durable launch intent", spec.RunID)
+	}
+	status := dockerContainerStatus(out)
+	lifecycle := ContainerExited
+	if status.StartedAt.IsZero() {
+		lifecycle = ContainerNeverStarted
+	} else if status.Running {
+		lifecycle = ContainerRunning
+	}
+	return ContainerInfo{ID: out.ID, ImageDigest: out.Image, Existing: true, Lifecycle: lifecycle, Status: status}, nil
 }
 
 func (d *DockerBackend) Start(ctx context.Context, containerID string) error {
@@ -165,6 +210,10 @@ func (d *DockerBackend) Inspect(ctx context.Context, containerID string) (Contai
 	if err := d.doJSON(ctx, http.MethodGet, "/containers/"+url.PathEscape(containerID)+"/json", nil, &out); err != nil {
 		return ContainerStatus{}, err
 	}
+	return dockerContainerStatus(out), nil
+}
+
+func dockerContainerStatus(out dockerInspectResponse) ContainerStatus {
 	status := ContainerStatus{ID: out.ID, Running: out.State.Running, Error: out.State.Error}
 	if !out.State.Running {
 		exit := out.State.ExitCode
@@ -172,7 +221,7 @@ func (d *DockerBackend) Inspect(ctx context.Context, containerID string) (Contai
 	}
 	status.StartedAt = parseDockerTime(out.State.StartedAt)
 	status.EndedAt = parseDockerTime(out.State.FinishedAt)
-	return status, nil
+	return status
 }
 
 func (d *DockerBackend) Logs(ctx context.Context, containerID string, limitBytes int) (string, error) {
@@ -452,7 +501,13 @@ type dockerHostConfig struct {
 }
 
 type dockerInspectResponse struct {
-	ID    string `json:"Id"`
+	ID     string `json:"Id"`
+	Name   string `json:"Name"`
+	Image  string `json:"Image"`
+	Config struct {
+		Image  string            `json:"Image"`
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
 	State struct {
 		Running    bool   `json:"Running"`
 		ExitCode   int    `json:"ExitCode"`
@@ -460,6 +515,26 @@ type dockerInspectResponse struct {
 		StartedAt  string `json:"StartedAt"`
 		FinishedAt string `json:"FinishedAt"`
 	} `json:"State"`
+}
+
+func runtimeSpecDigest(spec RuntimeSpec) (string, error) {
+	copySpec := spec
+	copySpec.Labels = cloneStringMap(spec.Labels)
+	delete(copySpec.Labels, "gh-agent-broker.launch_spec")
+	b, err := json.Marshal(copySpec)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("v1:%x", sum[:]), nil
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in)+1)
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 type dockerWaitResponse struct {

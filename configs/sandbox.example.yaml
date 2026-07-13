@@ -2,6 +2,7 @@ listen: "127.0.0.1:8091"
 mcp_path: "/mcp"
 auth_token_env: "SANDBOX_MCP_TOKEN"
 runs_dir: "/srv/hermes-sandbox-broker/runs"
+launch_intent_store_path: "/srv/hermes-sandbox-broker/state/launch-intents.sqlite"
 broker_url: "http://broker:8080"
 production: false
 max_task_bytes: 65536

@@ -85,7 +85,16 @@ func runServerCommand(args []string) {
 			log.Printf("close audit log: %v", err)
 		}
 	}()
-	service := sandbox.NewService(cfg, sandbox.NewDockerBackend(*dockerSocket), auditLog)
+	intentStore, err := sandbox.OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+	if err != nil {
+		log.Fatalf("open durable launch intent store: %v", err)
+	}
+	defer func() {
+		if err := intentStore.Close(); err != nil {
+			log.Printf("close durable launch intent store: %v", err)
+		}
+	}()
+	service := sandbox.NewServiceWithLaunchIntents(cfg, sandbox.NewDockerBackend(*dockerSocket), auditLog, intentStore)
 	if err := service.Reconcile(context.Background()); err != nil {
 		log.Fatalf("reconcile runs: %v", err)
 	}

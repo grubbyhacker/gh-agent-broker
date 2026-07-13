@@ -1,8 +1,10 @@
 package sandbox
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,6 +35,7 @@ type launchProfilesOutput struct {
 
 type restError struct {
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
 
 func NewRESTHandler(service *Service) http.Handler {
@@ -115,6 +118,30 @@ func (h *restHandler) handleLaunchProfileAction(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
+	fingerprint := ""
+	idempotencyKey := ""
+	if action == "launch" {
+		var keyErr error
+		idempotencyKey, keyErr = requireIdempotencyKey(r)
+		if keyErr != nil {
+			status := http.StatusBadRequest
+			code := "invalid_idempotency_key"
+			if errors.Is(keyErr, errMissingIdempotencyKey) {
+				status = http.StatusPreconditionRequired
+				code = "idempotency_key_required"
+			}
+			h.audit(operation, identity.Name, name, "", profile.Template, profile.Repo, profile.Branch, "deny", keyErr, nil)
+			writeRESTCodeError(w, status, code, keyErr.Error())
+			return
+		}
+		canonical, canonicalErr := canonicalizeRequestBody(r, h.service.cfg.MaxParameterBytes)
+		if canonicalErr != nil {
+			h.audit(operation, identity.Name, name, "", profile.Template, profile.Repo, profile.Branch, "deny", canonicalErr, nil)
+			writeRESTError(w, http.StatusBadRequest, canonicalErr.Error())
+			return
+		}
+		fingerprint = requestFingerprint(canonical)
+	}
 	in, params, err := resolveLaunchProfileRequest(profile, r, h.service.cfg.MaxParameterBytes)
 	if err != nil {
 		h.audit(operation, identity.Name, name, "", profile.Template, profile.Repo, profile.Branch, "deny", err, params)
@@ -142,10 +169,15 @@ func (h *restHandler) handleLaunchProfileAction(w http.ResponseWriter, r *http.R
 		out, err = h.service.DryRunLaunch(r.Context(), in)
 	} else {
 		in.Profile = name
-		out, err = h.service.LaunchAgent(r.Context(), in)
+		out, err = h.service.LaunchProfile(r.Context(), identity.Name, name, idempotencyKey, fingerprint, in)
 	}
 	if err != nil {
 		h.audit(operation, identity.Name, name, "", in.Template, in.Repo, in.Branch, "deny", err, params)
+		var conflict *intentConflictError
+		if errors.As(err, &conflict) {
+			writeRESTCodeError(w, http.StatusConflict, conflict.Code, conflict.Message)
+			return
+		}
 		writeRESTError(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -165,7 +197,7 @@ func (h *restHandler) handleRuns(w http.ResponseWriter, r *http.Request) {
 	if !h.authorizeAction(w, identity, "status", "runs.list") {
 		return
 	}
-	out, err := h.service.ListAgents(r.Context())
+	out, err := h.service.listAgentsForProfiles(r.Context(), identity.Principal.AllowedProfiles)
 	if err != nil {
 		h.audit("runs.list", identity.Name, "", "", "", "", "", "deny", err, nil)
 		writeRESTError(w, http.StatusInternalServerError, err.Error())
@@ -218,6 +250,9 @@ func (h *restHandler) runStatus(w http.ResponseWriter, r *http.Request, runID st
 	if !h.authorizeAction(w, identity, "status", "runs.status") {
 		return
 	}
+	if !h.authorizeRunProfile(w, identity, runID, "runs.status") {
+		return
+	}
 	out, err := h.service.GetAgentStatus(r.Context(), RunInput{RunID: runID})
 	if err != nil {
 		h.audit("runs.status", identity.Name, "", runID, "", "", "", "deny", err, nil)
@@ -238,6 +273,9 @@ func (h *restHandler) runLogs(w http.ResponseWriter, r *http.Request, runID stri
 		return
 	}
 	if !h.authorizeAction(w, identity, "logs", "runs.logs") {
+		return
+	}
+	if !h.authorizeRunProfile(w, identity, runID, "runs.logs") {
 		return
 	}
 	maxBytes := 0
@@ -272,6 +310,9 @@ func (h *restHandler) runCollection(w http.ResponseWriter, r *http.Request, runI
 	if !h.authorizeAction(w, identity, "artifacts", operation) {
 		return
 	}
+	if !h.authorizeRunProfile(w, identity, runID, operation) {
+		return
+	}
 	var (
 		out CollectionOutput
 		err error
@@ -301,6 +342,9 @@ func (h *restHandler) runMutation(w http.ResponseWriter, r *http.Request, runID,
 		return
 	}
 	if !h.authorizeAction(w, identity, action, operation) {
+		return
+	}
+	if !h.authorizeRunProfile(w, identity, runID, operation) {
 		return
 	}
 	var (
@@ -356,6 +400,22 @@ func (h *restHandler) authorizeAction(w http.ResponseWriter, identity operatorId
 	}
 	err := fmt.Errorf("forbidden")
 	h.audit(operation, identity.Name, "", "", "", "", "", "deny", err, nil)
+	writeRESTError(w, http.StatusForbidden, "forbidden")
+	return false
+}
+
+func (h *restHandler) authorizeRunProfile(w http.ResponseWriter, identity operatorIdentity, runID, operation string) bool {
+	meta, err := h.service.lookupRun(runID)
+	if err != nil {
+		h.audit(operation, identity.Name, "", runID, "", "", "", "deny", err, nil)
+		writeRESTError(w, http.StatusNotFound, err.Error())
+		return false
+	}
+	if contains(identity.Principal.AllowedProfiles, meta.Profile) {
+		return true
+	}
+	err = fmt.Errorf("forbidden")
+	h.audit(operation, identity.Name, meta.Profile, runID, meta.Template, meta.Repo, meta.Branch, "deny", err, nil)
 	writeRESTError(w, http.StatusForbidden, "forbidden")
 	return false
 }
@@ -494,6 +554,68 @@ func secureTokenEqual(got, want string) bool {
 
 func writeRESTError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, restError{Error: message})
+}
+
+func writeRESTCodeError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, restError{Error: message, Code: code})
+}
+
+var errMissingIdempotencyKey = errors.New("Idempotency-Key header is required")
+
+func requireIdempotencyKey(r *http.Request) (string, error) {
+	values := r.Header.Values("Idempotency-Key")
+	if len(values) == 0 {
+		return "", errMissingIdempotencyKey
+	}
+	if len(values) != 1 || len(values[0]) < 1 || len(values[0]) > 255 {
+		return "", fmt.Errorf("Idempotency-Key must be a single value of 1 to 255 visible ASCII characters")
+	}
+	for _, char := range []byte(values[0]) {
+		if char < 0x21 || char > 0x7e {
+			return "", fmt.Errorf("Idempotency-Key must contain only visible ASCII characters")
+		}
+	}
+	return values[0], nil
+}
+
+func canonicalizeRequestBody(r *http.Request, maxBytes int) ([]byte, error) {
+	if r.Body == nil || r.ContentLength == 0 {
+		r.Body = io.NopCloser(bytes.NewReader(nil))
+		r.ContentLength = 0
+		return []byte("{}"), nil
+	}
+	if maxBytes < 1 {
+		maxBytes = defaultMaxParamBytes
+	}
+	b, err := io.ReadAll(io.LimitReader(r.Body, int64(maxBytes)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxBytes {
+		return nil, fmt.Errorf("request body exceeds max_parameter_bytes %d", maxBytes)
+	}
+	r.Body = io.NopCloser(bytes.NewReader(b))
+	r.ContentLength = int64(len(b))
+	if len(b) == 0 {
+		return []byte("{}"), nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("request body must contain exactly one JSON value")
+		}
+		return nil, err
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("request body must be a JSON object")
+	}
+	return json.Marshal(object)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

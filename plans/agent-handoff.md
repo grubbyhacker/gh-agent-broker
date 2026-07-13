@@ -2,6 +2,29 @@
 
 ## Current State
 
+### Durable idempotent sandbox launch implementation (current branch)
+
+- REST profile launches now require `Idempotency-Key`; keys are validated,
+  HMAC-digested at rest, and scoped by operator principal plus profile.
+  Canonically equivalent request bodies replay the original run with
+  `replay: true`; changed payloads return structured `409
+  idempotency_conflict` responses.
+- A broker-owned SQLite launch-intent store uses WAL, `synchronous=FULL`, an
+  integrity/version check, transactional profile-capacity enforcement, and
+  atomic intent state transitions. The raw idempotency key is never persisted
+  or audited.
+- Docker creation is recoverable across ambiguous responses through
+  deterministic run-specific names and an exact launch-spec label. Reconcile
+  resumes create/start-pending intents, adopts only exact matches, preserves
+  terminal outcomes, and restores watchers from durable running metadata.
+- Run metadata writes are atomic and directory-synced. Stale pending metadata
+  cannot overwrite a recovered running intent.
+- REST run listing and every status/log/artifact/lesson/stop/cleanup operation
+  are now filtered or authorized against the principal's allowed profiles.
+- Validation passed: focused sandbox tests, repeated focused race tests,
+  `make fmt`, `make check` (full tests, race tests, lint, vulnerability scan,
+  and builds), and `git diff --check`.
+
 ### Current Codex issue-reference contract
 
 - Manual production execution is proven: sandbox run
