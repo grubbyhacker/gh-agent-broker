@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -89,6 +90,35 @@ func TestRESTDryRunAndOverridePolicy(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(cfg.RunsDir); err == nil && len(entries) != 0 {
 		t.Fatalf("dry-run created run dir entries: %+v", entries)
+	}
+}
+
+func TestRESTLaunchProfileEnforcesConcurrencyLimit(t *testing.T) {
+	cfg := restTestConfig(t)
+	profile := testLaunchProfile()
+	profile.MaxConcurrentRuns = 1
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	runtime := newFakeRuntime()
+	service := NewService(cfg, runtime, testAudit(t))
+	handler := NewRESTHandler(service)
+
+	first := restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "timer-secret", nil)
+	firstResponse := httptest.NewRecorder()
+	handler.ServeHTTP(firstResponse, first)
+	if firstResponse.Code != http.StatusOK {
+		t.Fatalf("first launch status = %d body=%s", firstResponse.Code, firstResponse.Body.String())
+	}
+	service = NewService(cfg, runtime, testAudit(t))
+	if err := service.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	handler = NewRESTHandler(service)
+
+	second := restRequest(http.MethodPost, "/v1/launch-profiles/nightly/launch", "timer-secret", nil)
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, second)
+	if secondResponse.Code != http.StatusForbidden || !strings.Contains(secondResponse.Body.String(), "profile \\\"nightly\\\" is busy") {
+		t.Fatalf("second launch status = %d body=%s", secondResponse.Code, secondResponse.Body.String())
 	}
 }
 

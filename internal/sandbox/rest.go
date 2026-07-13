@@ -20,10 +20,11 @@ type operatorIdentity struct {
 }
 
 type launchProfileSummary struct {
-	Name           string                          `json:"name"`
-	Request        LaunchAgentInput                `json:"request"`
-	AllowOverrides []string                        `json:"allow_overrides,omitempty"`
-	Parameters     map[string]ParameterDeclaration `json:"parameters,omitempty"`
+	Name              string                          `json:"name"`
+	Request           LaunchAgentInput                `json:"request"`
+	AllowOverrides    []string                        `json:"allow_overrides,omitempty"`
+	Parameters        map[string]ParameterDeclaration `json:"parameters,omitempty"`
+	MaxConcurrentRuns int                             `json:"max_concurrent_runs,omitempty"`
 }
 
 type launchProfilesOutput struct {
@@ -70,10 +71,11 @@ func (h *restHandler) handleLaunchProfiles(w http.ResponseWriter, r *http.Reques
 			continue
 		}
 		profiles = append(profiles, launchProfileSummary{
-			Name:           name,
-			Request:        profile.LaunchAgentInput,
-			AllowOverrides: append([]string(nil), profile.AllowOverrides...),
-			Parameters:     profile.Parameters,
+			Name:              name,
+			Request:           profile.LaunchAgentInput,
+			AllowOverrides:    append([]string(nil), profile.AllowOverrides...),
+			Parameters:        profile.Parameters,
+			MaxConcurrentRuns: profile.MaxConcurrentRuns,
 		})
 	}
 	h.audit("launch_profiles.list", identity.Name, "", "", "", "", "", "allow", nil, nil)
