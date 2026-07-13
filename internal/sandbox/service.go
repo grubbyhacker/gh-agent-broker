@@ -49,12 +49,13 @@ const (
 )
 
 type Service struct {
-	cfg        Config
-	runtime    RuntimeBackend
-	audit      *AuditLogger
-	mu         sync.Mutex
-	runs       map[string]*RunMetadata
-	finalizing map[string]chan struct{}
+	cfg                 Config
+	runtime             RuntimeBackend
+	audit               *AuditLogger
+	mu                  sync.Mutex
+	runs                map[string]*RunMetadata
+	finalizing          map[string]chan struct{}
+	profileReservations map[string]int
 }
 
 type pathPermissionFixer interface {
@@ -240,11 +241,12 @@ func NewService(cfg Config, runtime RuntimeBackend, auditLog *AuditLogger) *Serv
 		cfg.StampLoaded(time.Now().UTC())
 	}
 	return &Service{
-		cfg:        cfg,
-		runtime:    runtime,
-		audit:      auditLog,
-		runs:       map[string]*RunMetadata{},
-		finalizing: map[string]chan struct{}{},
+		cfg:                 cfg,
+		runtime:             runtime,
+		audit:               auditLog,
+		runs:                map[string]*RunMetadata{},
+		finalizing:          map[string]chan struct{}{},
+		profileReservations: map[string]int{},
 	}
 }
 
@@ -410,6 +412,12 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 		s.auditDeny("launch_agent", in, err)
 		return LaunchAgentOutput{}, err
 	}
+	releaseProfileSlot, err := s.acquireProfileSlot(in.Profile)
+	if err != nil {
+		s.auditDeny("launch_agent", in, err)
+		return LaunchAgentOutput{}, err
+	}
+	defer releaseProfileSlot()
 	now := time.Now().UTC()
 	deadline := now.Add(runtimeLimit)
 	meta := RunMetadata{
@@ -514,6 +522,38 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 	go s.watchTimeout(context.WithoutCancel(ctx), runID, deadline)
 	go s.watchExit(context.WithoutCancel(ctx), runID, info.ID)
 	return LaunchAgentOutput{RunID: runID, WorkerAgentID: meta.WorkerAgentID, Repo: meta.Repo, Branch: meta.Branch, Status: meta.Status, Deadline: meta.Deadline}, nil
+}
+
+func (s *Service) acquireProfileSlot(profile string) (func(), error) {
+	if profile == "" {
+		return func() {}, nil
+	}
+	launchProfile, ok := s.cfg.LaunchProfiles[profile]
+	if !ok || launchProfile.MaxConcurrentRuns == 0 {
+		return func() {}, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active := 0
+	for _, meta := range s.runs {
+		if meta.Profile == profile && (meta.Status == StatusPending || meta.Status == StatusRunning) {
+			active++
+		}
+	}
+	if active+s.profileReservations[profile] >= launchProfile.MaxConcurrentRuns {
+		return nil, fmt.Errorf("profile %q is busy; maximum concurrent runs is %d", profile, launchProfile.MaxConcurrentRuns)
+	}
+	s.profileReservations[profile]++
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.profileReservations[profile] <= 1 {
+			delete(s.profileReservations, profile)
+			return
+		}
+		s.profileReservations[profile]--
+	}, nil
 }
 
 func (s *Service) ValidateTemplate(ctx context.Context, in ValidateTemplateInput) (TemplateOutput, error) {

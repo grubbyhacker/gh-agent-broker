@@ -161,6 +161,15 @@ func TestConfigValidateLaunchProfilesAndOperatorPrincipals(t *testing.T) {
 
 	cfg = baseTestConfig(t)
 	profile = testLaunchProfile()
+	profile.MaxConcurrentRuns = -1
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "max_concurrent_runs must not be negative") {
+		t.Fatalf("Validate() error = %v, want negative concurrency rejection", err)
+	}
+
+	cfg = baseTestConfig(t)
+	profile = testLaunchProfile()
 	profile.MaxRuntimeSeconds = 30
 	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
 	err = cfg.Validate()

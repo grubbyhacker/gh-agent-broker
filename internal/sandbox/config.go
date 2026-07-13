@@ -105,9 +105,10 @@ type BranchPolicy struct {
 }
 
 type LaunchProfile struct {
-	LaunchAgentInput `yaml:",inline"`
-	AllowOverrides   []string                        `yaml:"allow_overrides"`
-	Parameters       map[string]ParameterDeclaration `yaml:"parameters"`
+	LaunchAgentInput  `yaml:",inline"`
+	AllowOverrides    []string                        `yaml:"allow_overrides"`
+	Parameters        map[string]ParameterDeclaration `yaml:"parameters"`
+	MaxConcurrentRuns int                             `yaml:"max_concurrent_runs"`
 }
 
 type ParameterDeclaration struct {
@@ -432,6 +433,9 @@ func (c Config) validateLaunchProfile(name string, profile LaunchProfile) []stri
 	}
 	if strings.TrimSpace(profile.BaseBranch) == "" {
 		errs = append(errs, fmt.Sprintf("launch profile %q base_branch is required", name))
+	}
+	if profile.MaxConcurrentRuns < 0 {
+		errs = append(errs, fmt.Sprintf("launch profile %q max_concurrent_runs must not be negative", name))
 	}
 	if ok {
 		if len(tmpl.BranchPolicy.BaseBranches) > 0 && !contains(tmpl.BranchPolicy.BaseBranches, profile.BaseBranch) {
