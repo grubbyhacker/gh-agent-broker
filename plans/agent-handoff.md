@@ -2,6 +2,15 @@
 
 ## Current State
 
+### Signal Plane dispatcher broker deployment contract
+
+- The production deploy workflow exports the scoped
+  `VPS_OPS_SIGNAL_PLANE_DISPATCHER_BROKER_TOKEN` GitHub secret to the `vps-ops`
+  Doppler env-source wrapper. The paired `vps-ops` mapping supplies it to the
+  `github-task-dispatcher` and broker only; no secret value is stored here.
+- `internal/deploycontract` deterministically verifies this export while
+  preserving the Curator and Codex worker secret mappings.
+
 ### Durable idempotent sandbox launch implementation (current branch)
 
 - REST profile launches now require `Idempotency-Key`; keys are validated,
