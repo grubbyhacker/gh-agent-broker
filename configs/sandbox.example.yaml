@@ -14,18 +14,19 @@ audit:
   path: "/srv/hermes-sandbox-broker/audit/sandbox-audit.jsonl"
 
 repositories:
-  - "example-org/example-repo"
+  # Synthetic fixture only; this is not a production repository.
+  - "example/automation-target"
 
 launch_profiles:
   hermes-nightly:
     template: "hermes-task-worker"
-    repo: "example-org/example-repo"
+    repo: "example/automation-target"
     base_branch: "main"
     task: "Run the configured nightly sandbox task and write the requested deliverables."
     focus: "nightly"
     max_runtime_minutes: 60
-    # Set true for dispatcher profiles such as codex-issue-implement. Profiles
-    # that omit it continue to allow non-idempotent manual launches.
+    # Automated dispatcher profiles should require replay-safe launches. Profiles
+    # that omit this setting continue to allow non-idempotent manual launches.
     require_idempotency_key: false
     deliverables:
       - "/output/final-summary.md"
@@ -36,7 +37,7 @@ launch_profiles:
       - "max_runtime_minutes"
   # ykm-curator-upload-batch:
   #   template: "ykm-curator-dry-run"
-  #   repo: "example-org/ykmcorpus"
+  #   repo: "example/automation-target"
   #   base_branch: "main"
   #   task: "Process the opaque upload selectors supplied in task.json parameters."
   #   focus: "upload-intake"

@@ -3,6 +3,7 @@ package deploycontract
 import (
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -35,11 +36,24 @@ func TestProductionDeploySecretExports(t *testing.T) {
 		"VPS_OPS_GH_BROKER_GH_AGENT_CODEX_PROXY_TOKEN",
 		"VPS_OPS_GH_BROKER_CODEX_WORKER_AUTH_JSON",
 		"VPS_OPS_GH_BROKER_CODEX_WORKER_OPERATOR_TOKEN",
-		"VPS_OPS_SIGNAL_PLANE_DISPATCHER_BROKER_TOKEN",
 	} {
 		pattern := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(secretName) + `:\s*\$\{\{\s*secrets\.` + regexp.QuoteMeta(secretName) + `\s*\}\}\s*$`)
 		if !pattern.Match(workflow) {
 			t.Errorf("production deploy workflow must export %s to vps-ops", secretName)
 		}
+	}
+}
+
+func TestProductionDeployOmitsRetiredSignalPlaneDispatcherSecret(t *testing.T) {
+	t.Parallel()
+
+	workflow, err := os.ReadFile("../../.github/workflows/deploy-production.yml")
+	if err != nil {
+		t.Fatalf("read production deploy workflow: %v", err)
+	}
+
+	retiredName := strings.Join([]string{"VPS_OPS_SIGNAL_PLANE_DISPATCHER", "BROKER_TOKEN"}, "_")
+	if regexp.MustCompile(regexp.QuoteMeta(retiredName)).Match(workflow) {
+		t.Fatalf("production deploy workflow must not export retired secret %s", retiredName)
 	}
 }
