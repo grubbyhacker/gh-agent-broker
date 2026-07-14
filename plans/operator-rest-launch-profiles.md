@@ -35,9 +35,9 @@ Docker-launch functionality.
   explicitly allowlisted by field, merged into the profile request, then
   validated through existing `LaunchAgentInput` validation. No caller-supplied
   template, repo, or branch unless the profile explicitly allows that field.
-- Profiles opt into mandatory keys with `require_idempotency_key: true`; the
-  `codex-issue-implement` dispatcher profile must enable it, while unrelated
-  profiles remain compatible when it is omitted. Supplied keys contain 1-255
+- Profiles opt into mandatory keys with `require_idempotency_key: true`;
+  automated dispatcher profiles must enable it, while manual profiles remain
+  compatible when it is omitted. Supplied keys contain 1-255
   visible ASCII characters, are HMAC-digested at rest, and are scoped by
   operator principal and profile. Reusing a key with the same canonical JSON
   request replays the original run; reusing it with a different request returns
