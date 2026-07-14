@@ -34,8 +34,6 @@ func TestProductionDeploySecretExports(t *testing.T) {
 		"VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_STAGING_ADMIN_TOKEN",
 		"VPS_OPS_GH_BROKER_OPENROUTER_CURATOR_API_KEY",
 		"VPS_OPS_GH_BROKER_GH_AGENT_CODEX_PROXY_TOKEN",
-		"VPS_OPS_GH_BROKER_CODEX_WORKER_AUTH_JSON",
-		"VPS_OPS_GH_BROKER_CODEX_WORKER_OPERATOR_TOKEN",
 	} {
 		pattern := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(secretName) + `:\s*\$\{\{\s*secrets\.` + regexp.QuoteMeta(secretName) + `\s*\}\}\s*$`)
 		if !pattern.Match(workflow) {
@@ -44,7 +42,7 @@ func TestProductionDeploySecretExports(t *testing.T) {
 	}
 }
 
-func TestProductionDeployOmitsRetiredSignalPlaneDispatcherSecret(t *testing.T) {
+func TestProductionDeployOmitsRetiredProofSecrets(t *testing.T) {
 	t.Parallel()
 
 	workflow, err := os.ReadFile("../../.github/workflows/deploy-production.yml")
@@ -52,8 +50,15 @@ func TestProductionDeployOmitsRetiredSignalPlaneDispatcherSecret(t *testing.T) {
 		t.Fatalf("read production deploy workflow: %v", err)
 	}
 
-	retiredName := strings.Join([]string{"VPS_OPS_SIGNAL_PLANE_DISPATCHER", "BROKER_TOKEN"}, "_")
-	if regexp.MustCompile(regexp.QuoteMeta(retiredName)).Match(workflow) {
-		t.Fatalf("production deploy workflow must not export retired secret %s", retiredName)
+	retiredNames := [][]string{
+		{"VPS_OPS_SIGNAL_PLANE_DISPATCHER", "BROKER", "TOKEN"},
+		{"VPS_OPS_GH_BROKER_CODEX_WORKER", "AUTH", "JSON"},
+		{"VPS_OPS_GH_BROKER_CODEX_WORKER", "OPERATOR", "TOKEN"},
+	}
+	for _, parts := range retiredNames {
+		retiredName := strings.Join(parts, "_")
+		if regexp.MustCompile(regexp.QuoteMeta(retiredName)).Match(workflow) {
+			t.Errorf("production deploy workflow must not export retired secret %s", retiredName)
+		}
 	}
 }

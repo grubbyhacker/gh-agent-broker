@@ -129,8 +129,6 @@ jobs:
           VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_STAGING_ADMIN_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_STAGING_ADMIN_TOKEN }}
           VPS_OPS_GH_BROKER_OPENROUTER_CURATOR_API_KEY: ${{ secrets.VPS_OPS_GH_BROKER_OPENROUTER_CURATOR_API_KEY }}
           VPS_OPS_GH_BROKER_GH_AGENT_CODEX_PROXY_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_GH_AGENT_CODEX_PROXY_TOKEN }}
-          VPS_OPS_GH_BROKER_CODEX_WORKER_AUTH_JSON: ${{ secrets.VPS_OPS_GH_BROKER_CODEX_WORKER_AUTH_JSON }}
-          VPS_OPS_GH_BROKER_CODEX_WORKER_OPERATOR_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_CODEX_WORKER_OPERATOR_TOKEN }}
         run: |
           scripts/run-ansible-playbook.sh -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
             -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ steps.deploy_inputs.outputs.deploy_sha }}" \

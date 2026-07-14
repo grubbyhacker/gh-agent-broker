@@ -16,8 +16,9 @@ interface, and deterministic deploy-contract tests.
 The narrow Phase 5 webhook-derived Codex worker proof is retired:
 
 - the production deploy workflow no longer exports the retired Signal Plane
-  dispatcher broker token to `vps-ops`;
-- the deploy-contract test no longer requires that token;
+  dispatcher broker token or the proof-only Codex worker credential/operator
+  secrets to `vps-ops`;
+- the deploy-contract test rejects all three retired exports;
 - the former milestone document is retained only as an explicitly retired
   historical record and cannot be used as active configuration or future
   implementation guidance;
@@ -43,8 +44,10 @@ that identity as the sole remaining authority for the repository.
 - The SQLite launch-intent store preserves durable run/container correlation and
   supports safe reconciliation after ambiguous create/start responses.
 - Launch principal ownership and profile scope constrain run list/status access.
-- Existing Curator and Codex worker identities, credentials, worker contracts,
-  and recovery tests remain unchanged by the proof-route retirement.
+- Existing Curator identities and credentials remain unchanged. The reusable
+  Codex worker image, its noninteractive authority contract tests, and broker
+  recovery tests remain available without the retired production profile or
+  credential bundle.
 
 ## Next Slice: Authority Bootstrap Inputs
 
