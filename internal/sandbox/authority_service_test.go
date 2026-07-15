@@ -185,6 +185,16 @@ func TestAuthorityWorkerRequestRejectsAuthorityOverrides(t *testing.T) {
 	}
 }
 
+func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
+	cfg := authorityTestConfig(t)
+	profile := cfg.AuthorityProfiles["writer"]
+	worker := AuthorityWorker{WorkerID: "entrypoint", Profile: "writer", ProfileVersion: "version", PolicyDigest: "policy"}
+	runtime := authorityWorkerRuntimeSpec(authoritySpec(worker, profile, cfg), "secret", nil)
+	if !equalStrings(runtime.Entrypoint, fixedAgentdCommand) || len(runtime.Command) != 0 {
+		t.Fatalf("runtime entrypoint=%q command=%q", runtime.Entrypoint, runtime.Command)
+	}
+}
+
 func TestAuthorityWorkerLifecycleCapacityDrainReleaseAndReplacement(t *testing.T) {
 	ctx := context.Background()
 	cfg := authorityTestConfig(t)
