@@ -14,26 +14,31 @@ type AuditLogger struct {
 }
 
 type AuditEvent struct {
-	Timestamp        time.Time      `json:"timestamp"`
-	Operation        string         `json:"operation"`
-	RunID            string         `json:"run_id,omitempty"`
-	Principal        string         `json:"principal,omitempty"`
-	Profile          string         `json:"profile,omitempty"`
-	Template         string         `json:"template,omitempty"`
-	ParentAgentID    string         `json:"parent_agent_id,omitempty"`
-	WorkerAgentID    string         `json:"worker_agent_id,omitempty"`
-	Repo             string         `json:"repo,omitempty"`
-	Branch           string         `json:"branch,omitempty"`
-	ImageDigest      string         `json:"image_digest,omitempty"`
-	CredentialBundle string         `json:"credential_bundle,omitempty"`
-	Parameters       map[string]any `json:"parameters,omitempty"`
-	Status           string         `json:"status,omitempty"`
-	ExitCode         *int           `json:"exit_code,omitempty"`
-	Terminal         bool           `json:"terminal,omitempty"`
-	FinalizeReason   string         `json:"finalize_reason,omitempty"`
-	TerminalSource   string         `json:"terminal_source,omitempty"`
-	Decision         string         `json:"decision"`
-	Error            string         `json:"error,omitempty"`
+	Timestamp         time.Time      `json:"timestamp"`
+	Operation         string         `json:"operation"`
+	RunID             string         `json:"run_id,omitempty"`
+	Principal         string         `json:"principal,omitempty"`
+	Profile           string         `json:"profile,omitempty"`
+	Template          string         `json:"template,omitempty"`
+	ParentAgentID     string         `json:"parent_agent_id,omitempty"`
+	WorkerAgentID     string         `json:"worker_agent_id,omitempty"`
+	AuthorityWorkerID string         `json:"authority_worker_id,omitempty"`
+	ProfileVersion    string         `json:"profile_version,omitempty"`
+	PolicyDigest      string         `json:"policy_digest,omitempty"`
+	Generation        int            `json:"generation,omitempty"`
+	AssignedSessions  int            `json:"assigned_sessions,omitempty"`
+	Repo              string         `json:"repo,omitempty"`
+	Branch            string         `json:"branch,omitempty"`
+	ImageDigest       string         `json:"image_digest,omitempty"`
+	CredentialBundle  string         `json:"credential_bundle,omitempty"`
+	Parameters        map[string]any `json:"parameters,omitempty"`
+	Status            string         `json:"status,omitempty"`
+	ExitCode          *int           `json:"exit_code,omitempty"`
+	Terminal          bool           `json:"terminal,omitempty"`
+	FinalizeReason    string         `json:"finalize_reason,omitempty"`
+	TerminalSource    string         `json:"terminal_source,omitempty"`
+	Decision          string         `json:"decision"`
+	Error             string         `json:"error,omitempty"`
 }
 
 func NewAuditLogger(path string) (*AuditLogger, error) {
