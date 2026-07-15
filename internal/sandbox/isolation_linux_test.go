@@ -42,16 +42,19 @@ func TestSessionWorkspaceCrossUIDIsolation(t *testing.T) {
 		uid, gid uint32
 		target   string
 	}{{22001, 22001, filepath.Join(root, "two", "private")}, {22002, 22002, filepath.Join(root, "one", "private")}} {
+		//nolint:gosec // The fixed test binary receives a path created by this test to prove kernel UID isolation.
 		cmd := exec.Command("/usr/bin/test", "-r", check.target)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: check.uid, Gid: check.gid}}
 		if err := cmd.Run(); err == nil {
 			t.Fatalf("uid %d read across session boundary %s", check.uid, check.target)
 		}
+		//nolint:gosec // The fixed test binary receives a path created by this test to prove kernel UID isolation.
 		cmd = exec.Command("/usr/bin/test", "-w", check.target)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: check.uid, Gid: check.gid}}
 		if err := cmd.Run(); err == nil {
 			t.Fatalf("uid %d wrote across session boundary %s", check.uid, check.target)
 		}
+		//nolint:gosec // The fixed test binary receives a path created by this test to prove kernel UID isolation.
 		cmd = exec.Command("/usr/bin/test", "-x", filepath.Dir(check.target))
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: check.uid, Gid: check.gid}}
 		if err := cmd.Run(); err == nil {
