@@ -226,6 +226,26 @@ func (s *AuthorityWorkerStore) GetWorker(ctx context.Context, workerID string) (
 	return scanAuthorityWorker(s.db.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at FROM authority_workers WHERE worker_id=?`, workerID))
 }
 
+func (s *AuthorityWorkerStore) ListLiveWorkers(ctx context.Context) ([]AuthorityWorker, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at FROM authority_workers WHERE state IN (?,?,?) ORDER BY profile,generation,worker_id`, AuthorityWorkerStarting, AuthorityWorkerReady, AuthorityWorkerUnhealthy)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		//nolint:errcheck // Result rows are exhausted before close.
+		_ = rows.Close()
+	}()
+	var workers []AuthorityWorker
+	for rows.Next() {
+		worker, err := scanAuthorityWorker(rows)
+		if err != nil {
+			return nil, err
+		}
+		workers = append(workers, worker)
+	}
+	return workers, rows.Err()
+}
+
 func (s *AuthorityWorkerStore) UpdateWorkerRuntime(ctx context.Context, workerID, containerID, imageDigest string) (AuthorityWorker, error) {
 	result, err := s.db.ExecContext(ctx, `UPDATE authority_workers SET container_id=?,image_digest=?,state=?,updated_at=? WHERE worker_id=? AND state=?`, containerID, imageDigest, AuthorityWorkerStarting, formatAuthorityTime(time.Now().UTC()), workerID, AuthorityWorkerProvisioning)
 	if err != nil {
@@ -468,6 +488,32 @@ func (s *AuthorityWorkerStore) GetLease(ctx context.Context, principal, sessionB
 		return AuthorityLease{}, err
 	}
 	return lease, nil
+}
+
+func (s *AuthorityWorkerStore) ListActiveLeases(ctx context.Context, workerID string) ([]AuthorityLease, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT principal,profile,worker_id,binding_digest,idempotency_digest,created_at FROM authority_session_leases WHERE worker_id=? AND released_at='' ORDER BY created_at,binding_digest`, workerID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		//nolint:errcheck // Read-only rows are already exhausted; no recovery action exists on close.
+		_ = rows.Close()
+	}()
+	var out []AuthorityLease
+	for rows.Next() {
+		var lease AuthorityLease
+		var created string
+		if err := rows.Scan(&lease.Principal, &lease.Profile, &lease.WorkerID, &lease.BindingDigest, &lease.IdempotencyDigest, &created); err != nil {
+			return nil, err
+		}
+		var err error
+		lease.CreatedAt, err = parseAuthorityTime(created)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, lease)
+	}
+	return out, rows.Err()
 }
 
 func (s *AuthorityWorkerStore) Drain(ctx context.Context, workerID, reason string) (AuthorityWorker, error) {

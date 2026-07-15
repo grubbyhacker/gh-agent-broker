@@ -98,6 +98,21 @@ func runServerCommand(args []string) {
 	if err := service.Reconcile(context.Background()); err != nil {
 		log.Fatalf("reconcile runs: %v", err)
 	}
+	var authorityHandler http.Handler
+	var authorityStore *sandbox.AuthorityWorkerStore
+	if len(cfg.AuthorityProfiles) > 0 {
+		authorityStore, err = sandbox.OpenAuthorityWorkerStore(context.Background(), cfg.AuthorityStore)
+		if err != nil {
+			log.Fatalf("open authority worker store: %v", err)
+		}
+		defer func() {
+			if err := authorityStore.Close(); err != nil {
+				log.Printf("close authority worker store: %v", err)
+			}
+		}()
+		authorityService := sandbox.NewAuthorityWorkerService(cfg, authorityStore, sandbox.NewDockerAuthorityRuntime(*dockerSocket), auditLog).WithCheckpointStore(sandbox.NewCheckpointStore(cfg, authorityStore))
+		authorityHandler = sandbox.NewAuthorityRESTHandler(authorityService)
+	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "gh-agent-sandbox-broker", Version: "v1"}, nil)
 	registerTools(mcpServer, service)
@@ -122,6 +137,10 @@ func runServerCommand(args []string) {
 		return mcpServer
 	}, &mcp.StreamableHTTPOptions{Stateless: true})))
 	mux.Handle("/v1/", sandbox.NewRESTHandler(service))
+	if authorityHandler != nil {
+		mux.Handle("/v1/authority-workers", authorityHandler)
+		mux.Handle("/v1/authority-workers/", authorityHandler)
+	}
 
 	log.Printf("sandbox broker listening on %s, mcp path %s", cfg.Listen, cfg.MCPPath)
 	httpServer := &http.Server{

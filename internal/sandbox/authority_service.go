@@ -41,15 +41,20 @@ type AuthorityWorkerSpec struct {
 	ProfileVersion   string
 	PolicyDigest     string
 	Image            string
+	Command          []string
 	Resources        Resources
 	Network          NetworkPolicy
 	BrokerAgentID    string
 	BrokerSecretEnv  string
 	CredentialBundle string
+	CredentialMount  Mount
 	Repositories     []string
 	BranchPolicy     BranchPolicy
 	Operations       []string
 	ExtraMounts      []ExtraMount
+	SessionIsolation SessionIsolation
+	Checkpoint       CheckpointPolicy
+	Storage          AuthorityStorage
 	SessionCapacity  int
 }
 
@@ -66,15 +71,17 @@ type AuthorityRuntimeResult struct {
 type AuthorityWorkerRuntime interface {
 	Create(context.Context, AuthorityWorkerSpec) (AuthorityRuntimeResult, error)
 	Stop(context.Context, string) error
+	Healthy(context.Context, string) (bool, string, error)
 }
 
 type AuthorityWorkerService struct {
-	cfg     Config
-	store   *AuthorityWorkerStore
-	runtime AuthorityWorkerRuntime
-	audit   *AuditLogger
-	now     func() time.Time
-	newID   func() (string, error)
+	cfg         Config
+	store       *AuthorityWorkerStore
+	runtime     AuthorityWorkerRuntime
+	audit       *AuditLogger
+	now         func() time.Time
+	newID       func() (string, error)
+	checkpoints *CheckpointStore
 }
 
 func NewAuthorityWorkerService(cfg Config, store *AuthorityWorkerStore, runtime AuthorityWorkerRuntime, audit *AuditLogger) *AuthorityWorkerService {
@@ -83,6 +90,59 @@ func NewAuthorityWorkerService(cfg Config, store *AuthorityWorkerStore, runtime 
 		now:   func() time.Time { return time.Now().UTC() },
 		newID: newRunID,
 	}
+}
+
+func (s *AuthorityWorkerService) WithCheckpointStore(store *CheckpointStore) *AuthorityWorkerService {
+	s.checkpoints = store
+	return s
+}
+
+func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string) error {
+	workers, err := s.store.ListLiveWorkers(ctx)
+	if err != nil {
+		return err
+	}
+	for _, worker := range workers {
+		if _, err := s.authorize(principal, worker.Profile, "health"); err != nil {
+			return err
+		}
+		if worker.ContainerID == "" {
+			continue
+		}
+		healthy, evidence, inspectErr := s.runtime.Healthy(ctx, worker.ContainerID)
+		if inspectErr != nil {
+			healthy, evidence = false, "runtime_inspect_failed"
+		}
+		if healthy {
+			if _, err := s.SetHealth(ctx, principal, worker.WorkerID, evidence, true); err != nil {
+				return err
+			}
+			continue
+		}
+		if s.checkpoints != nil {
+			if err := s.checkpoints.CheckpointWorker(ctx, worker); err != nil {
+				return err
+			}
+		}
+		if _, err := s.SetHealth(ctx, principal, worker.WorkerID, evidence, false); err != nil {
+			return err
+		}
+		if _, err := s.Replace(ctx, principal, worker.WorkerID, "runtime_unhealthy"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *AuthorityWorkerService) GetWorker(ctx context.Context, principal, workerID string) (AuthorityWorker, error) {
+	worker, err := s.store.GetWorker(ctx, workerID)
+	if err != nil {
+		return AuthorityWorker{}, err
+	}
+	if _, err := s.authorize(principal, worker.Profile, "health"); err != nil {
+		return AuthorityWorker{}, err
+	}
+	return worker, nil
 }
 
 func (s *AuthorityWorkerService) Provision(ctx context.Context, principal, profileName string) (AuthorityWorker, error) {
@@ -105,7 +165,7 @@ func (s *AuthorityWorkerService) Provision(ctx context.Context, principal, profi
 		s.log("authority_worker.provision", principal, profileName, worker, "deny", err)
 		return AuthorityWorker{}, err
 	}
-	result, err := s.runtime.Create(ctx, authoritySpec(worker, profile, s.cfg.Networks[profile.NetworkPolicy]))
+	result, err := s.runtime.Create(ctx, authoritySpec(worker, profile, s.cfg))
 	if err != nil {
 		markErr := s.store.MarkFailed(context.WithoutCancel(ctx), worker.WorkerID, "runtime_create_failed")
 		s.log("authority_worker.provision", principal, profileName, worker, "deny", fmt.Errorf("runtime create failed"))
@@ -184,6 +244,13 @@ func (s *AuthorityWorkerService) Drain(ctx context.Context, principal, workerID,
 	if strings.TrimSpace(reason) == "" || len(reason) > 256 {
 		return AuthorityWorker{}, fmt.Errorf("bounded drain reason is required")
 	}
+	// A drain never abandons a lease. Each extant lease receives an encrypted
+	// broker-owned checkpoint evidence record before the worker leaves admission.
+	if s.checkpoints != nil {
+		if err := s.checkpoints.CheckpointWorker(ctx, worker); err != nil {
+			return AuthorityWorker{}, err
+		}
+	}
 	worker, err = s.store.Drain(ctx, workerID, reason)
 	s.log("authority_worker.drain", principal, worker.Profile, worker, decision(err), err)
 	return worker, err
@@ -224,7 +291,7 @@ func (s *AuthorityWorkerService) Replace(ctx context.Context, principal, workerI
 		s.log("authority_worker.replace", principal, old.Profile, replacement, "allow", nil)
 		return replacement, nil
 	}
-	result, err := s.runtime.Create(ctx, authoritySpec(replacement, profile, s.cfg.Networks[profile.NetworkPolicy]))
+	result, err := s.runtime.Create(ctx, authoritySpec(replacement, profile, s.cfg))
 	if err != nil {
 		markErr := s.store.FailReplacement(context.WithoutCancel(ctx), old.WorkerID, replacement.WorkerID, "runtime_create_failed")
 		s.log("authority_worker.replace", principal, old.Profile, replacement, "deny", fmt.Errorf("runtime create failed"))
@@ -268,8 +335,12 @@ func validateAuthorityRequest(request AuthorityWorkerRequest) error {
 	return nil
 }
 
-func authoritySpec(worker AuthorityWorker, profile AuthorityProfile, network NetworkPolicy) AuthorityWorkerSpec {
-	return AuthorityWorkerSpec{WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, Image: profile.Image, Resources: profile.Resources, Network: network, BrokerAgentID: profile.BrokerAgentID, BrokerSecretEnv: profile.BrokerSecretEnv, CredentialBundle: profile.CredentialBundle, Repositories: append([]string(nil), profile.Repositories...), BranchPolicy: profile.BranchPolicy, Operations: append([]string(nil), profile.Operations...), ExtraMounts: append([]ExtraMount(nil), profile.ExtraMounts...), SessionCapacity: profile.SessionCapacity}
+func authoritySpec(worker AuthorityWorker, profile AuthorityProfile, cfg Config) AuthorityWorkerSpec {
+	spec := AuthorityWorkerSpec{WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, Image: profile.Image, Command: append([]string(nil), profile.Command...), Resources: profile.Resources, Network: cfg.Networks[profile.NetworkPolicy], BrokerAgentID: profile.BrokerAgentID, BrokerSecretEnv: profile.BrokerSecretEnv, CredentialBundle: profile.CredentialBundle, Repositories: append([]string(nil), profile.Repositories...), BranchPolicy: profile.BranchPolicy, Operations: append([]string(nil), profile.Operations...), ExtraMounts: append([]ExtraMount(nil), profile.ExtraMounts...), SessionIsolation: profile.SessionIsolation, Checkpoint: profile.Checkpoint, Storage: profile.Storage, SessionCapacity: profile.SessionCapacity}
+	if bundle, ok := cfg.Bundles[profile.CredentialBundle]; ok {
+		spec.CredentialMount = Mount{Source: bundle.SourcePath, Target: bundle.MountPath, ReadOnly: bundle.ReadOnly}
+	}
+	return spec
 }
 
 func decision(err error) string {

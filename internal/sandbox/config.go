@@ -230,6 +230,12 @@ func (c *Config) ResolveSecrets() {
 			c.OperatorPrincipals[name] = principal
 		}
 	}
+	for name, principal := range c.AuthorityPrincipals {
+		if principal.Token == "" && principal.TokenEnv != "" {
+			principal.Token = os.Getenv(principal.TokenEnv)
+			c.AuthorityPrincipals[name] = principal
+		}
+	}
 }
 
 func (c *Config) Validate() error {
