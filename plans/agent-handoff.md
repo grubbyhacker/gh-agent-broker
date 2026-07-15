@@ -84,6 +84,12 @@ principal/profile/action scoping, health state, draining, idempotent release,
 and retry-safe replacement generations that keep the old worker available
 until the replacement reports ready.
 
+Replacement reconciliation uses the durable worker ID as the runtime identity:
+retrying a persisted provisioning intent must ensure the same physical worker.
+The ready transition requires the replacement's durable predecessor link and
+atomically moves the predecessor to draining; hung or unhealthy replacements
+therefore cannot remove the old worker from capacity admission.
+
 No public REST or MCP operation, production profile, startup wiring, real
 worker runtime, or `agentd` readiness claim is included. The synthetic runtime
 interface deliberately omits both an `agentd` command and a session-isolation
