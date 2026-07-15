@@ -236,7 +236,19 @@ func (s *AuthorityWorkerStore) UpdateWorkerRuntime(ctx context.Context, workerID
 		return AuthorityWorker{}, err
 	}
 	if rows != 1 {
-		return AuthorityWorker{}, fmt.Errorf("worker %q is not provisioning", workerID)
+		worker, getErr := s.GetWorker(ctx, workerID)
+		if getErr != nil {
+			return AuthorityWorker{}, getErr
+		}
+		if worker.ContainerID != containerID || worker.ImageDigest != imageDigest {
+			return AuthorityWorker{}, fmt.Errorf("worker %q runtime identity conflicts with its durable record", workerID)
+		}
+		switch worker.State {
+		case AuthorityWorkerStarting, AuthorityWorkerReady, AuthorityWorkerUnhealthy, AuthorityWorkerDraining:
+			return worker, nil
+		default:
+			return AuthorityWorker{}, fmt.Errorf("worker %q cannot reconcile runtime identity from state %q", workerID, worker.State)
+		}
 	}
 	return s.GetWorker(ctx, workerID)
 }
@@ -271,6 +283,17 @@ func (s *AuthorityWorkerStore) SetWorkerHealth(ctx context.Context, workerID, he
 			rollbackAuthorityConn(context.WithoutCancel(ctx), conn)
 		}
 	}()
+	var generation int
+	if err := conn.QueryRowContext(ctx, `SELECT generation FROM authority_workers WHERE worker_id=?`, workerID).Scan(&generation); err != nil {
+		return AuthorityWorker{}, err
+	}
+	var predecessorLinks int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM authority_workers WHERE replacement_worker_id=?`, workerID).Scan(&predecessorLinks); err != nil {
+		return AuthorityWorker{}, err
+	}
+	if generation > 1 && predecessorLinks != 1 {
+		return AuthorityWorker{}, fmt.Errorf("replacement worker %q has %d predecessor links; refusing readiness cutover", workerID, predecessorLinks)
+	}
 	result, err := conn.ExecContext(ctx, `UPDATE authority_workers SET state=?,health=?,heartbeat_at=?,updated_at=? WHERE worker_id=? AND state IN (?,?,?)`, AuthorityWorkerReady, health, formatAuthorityTime(now), formatAuthorityTime(now), workerID, AuthorityWorkerStarting, AuthorityWorkerReady, AuthorityWorkerUnhealthy)
 	if err != nil {
 		return AuthorityWorker{}, err

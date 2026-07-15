@@ -16,21 +16,35 @@ type fakeAuthorityRuntime struct {
 	mu          sync.Mutex
 	created     []AuthorityWorkerSpec
 	stopped     []string
+	workers     map[string]AuthorityRuntimeResult
+	physical    int
 	err         error
 	afterCreate func()
 }
 
 func (f *fakeAuthorityRuntime) Create(_ context.Context, spec AuthorityWorkerSpec) (AuthorityRuntimeResult, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.created = append(f.created, spec)
 	if f.err != nil {
-		return AuthorityRuntimeResult{}, f.err
+		err := f.err
+		f.mu.Unlock()
+		return AuthorityRuntimeResult{}, err
 	}
-	if f.afterCreate != nil {
-		f.afterCreate()
+	if f.workers == nil {
+		f.workers = make(map[string]AuthorityRuntimeResult)
 	}
-	return AuthorityRuntimeResult{ContainerID: "container-" + spec.WorkerID, ImageDigest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"}, nil
+	result, ok := f.workers[spec.WorkerID]
+	if !ok {
+		result = AuthorityRuntimeResult{ContainerID: "container-" + spec.WorkerID, ImageDigest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"}
+		f.workers[spec.WorkerID] = result
+		f.physical++
+	}
+	afterCreate := f.afterCreate
+	f.mu.Unlock()
+	if afterCreate != nil {
+		afterCreate()
+	}
+	return result, nil
 }
 
 func (f *fakeAuthorityRuntime) Stop(_ context.Context, containerID string) error {
@@ -352,13 +366,26 @@ func TestAuthorityWorkerReplacementReconcilesPersistedProvisioningIntent(t *test
 	if _, created, err := store.LinkReplacement(ctx, old.WorkerID, planned, profile.MaxWorkers); err != nil || !created {
 		t.Fatalf("LinkReplacement() created=%v err=%v", created, err)
 	}
+	createdBeforeCrash, err := runtime.Create(ctx, authoritySpec(planned, profile, cfg.Networks[profile.NetworkPolicy]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.physical != 2 {
+		t.Fatalf("physical workers before crash = %d, want old plus replacement", runtime.physical)
+	}
+	// Simulate a broker crash after the idempotent runtime creation succeeds but
+	// before its identity is recorded in SQLite. The retry must ensure the same
+	// WorkerID instead of creating another physical worker.
 	service.newID = func() (string, error) { return "unused-new-id", nil }
 	reconciled, err := service.Replace(ctx, "coordinator", old.WorkerID, "reconcile")
 	if err != nil {
 		t.Fatalf("Replace() reconciliation error = %v", err)
 	}
-	if reconciled.WorkerID != planned.WorkerID || reconciled.State != AuthorityWorkerStarting || len(runtime.created) != 2 || runtime.created[1].WorkerID != planned.WorkerID {
+	if reconciled.WorkerID != planned.WorkerID || reconciled.ContainerID != createdBeforeCrash.ContainerID || reconciled.State != AuthorityWorkerStarting || len(runtime.created) != 3 || runtime.created[2].WorkerID != planned.WorkerID {
 		t.Fatalf("reconciled=%+v runtime creates=%+v", reconciled, runtime.created)
+	}
+	if runtime.physical != 2 {
+		t.Fatalf("physical workers after reconciliation = %d, want no duplicate", runtime.physical)
 	}
 	old, err = store.GetWorker(ctx, old.WorkerID)
 	if err != nil {
@@ -366,6 +393,160 @@ func TestAuthorityWorkerReplacementReconcilesPersistedProvisioningIntent(t *test
 	}
 	if old.State != AuthorityWorkerReady {
 		t.Fatalf("old worker drained before replacement readiness: %+v", old)
+	}
+}
+
+func TestAuthorityWorkerConcurrentReplacementReconciliationSharesRuntimeIdentity(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &fakeAuthorityRuntime{}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service.newID = func() (string, error) { return "old-concurrent", nil }
+	old, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetHealth(ctx, "coordinator", old.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	profile := cfg.AuthorityProfiles["writer"]
+	profileVersion, policyDigest, err := authorityProfileDigest("writer", profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned := AuthorityWorker{WorkerID: "concurrent-replacement", Profile: "writer", ProfileVersion: profileVersion, PolicyDigest: policyDigest, ImageReference: profile.Image, Generation: 2, State: AuthorityWorkerProvisioning, Capacity: profile.SessionCapacity, DrainReason: "reconcile concurrently"}
+	if _, created, err := store.LinkReplacement(ctx, old.WorkerID, planned, profile.MaxWorkers); err != nil || !created {
+		t.Fatalf("LinkReplacement() created=%v err=%v", created, err)
+	}
+
+	arrived := make(chan struct{}, 2)
+	release := make(chan struct{})
+	runtime.afterCreate = func() {
+		arrived <- struct{}{}
+		<-release
+	}
+	service.newID = func() (string, error) { return "unused-concurrent-id", nil }
+	type replaceResult struct {
+		worker AuthorityWorker
+		err    error
+	}
+	results := make(chan replaceResult, 2)
+	for range 2 {
+		go func() {
+			worker, err := service.Replace(ctx, "coordinator", old.WorkerID, "reconcile concurrently")
+			results <- replaceResult{worker: worker, err: err}
+		}()
+	}
+	<-arrived
+	<-arrived
+	close(release)
+	for range 2 {
+		result := <-results
+		if result.err != nil || result.worker.WorkerID != planned.WorkerID || result.worker.ContainerID != "container-"+planned.WorkerID {
+			t.Fatalf("concurrent reconciliation = %+v err=%v", result.worker, result.err)
+		}
+	}
+	if runtime.physical != 2 || len(runtime.stopped) != 0 {
+		t.Fatalf("physical workers=%d compensating stops=%v", runtime.physical, runtime.stopped)
+	}
+	old, err = store.GetWorker(ctx, old.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := store.GetWorker(ctx, planned.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.State != AuthorityWorkerReady || old.ReplacementWorker != planned.WorkerID || replacement.State != AuthorityWorkerStarting {
+		t.Fatalf("post-reconciliation old=%+v replacement=%+v", old, replacement)
+	}
+}
+
+func TestAuthorityWorkerHungAndUnhealthyReplacementPreservesOldCapacityUntilReady(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &fakeAuthorityRuntime{}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	ids := []string{"old-capacity", "replacement-capacity"}
+	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
+	old, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetHealth(ctx, "coordinator", old.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := service.Replace(ctx, "coordinator", old.WorkerID, "health replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "hung-1", SessionBinding: "hung-session-1"})
+	if err != nil || first.WorkerID != old.WorkerID {
+		t.Fatalf("acquire while replacement hung = %+v err=%v", first, err)
+	}
+	if _, err := service.SetHealth(ctx, "coordinator", replacement.WorkerID, "startup probe failed", false); err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "hung-2", SessionBinding: "hung-session-2"})
+	if err != nil || second.WorkerID != old.WorkerID {
+		t.Fatalf("acquire while replacement unhealthy = %+v err=%v", second, err)
+	}
+	old, err = store.GetWorker(ctx, old.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.State != AuthorityWorkerReady || old.AssignedSessions != old.Capacity {
+		t.Fatalf("old worker before readiness cutover = %+v", old)
+	}
+
+	if _, err := service.SetHealth(ctx, "coordinator", replacement.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	third, err := service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "ready-3", SessionBinding: "ready-session-3"})
+	if err != nil || third.WorkerID != replacement.WorkerID {
+		t.Fatalf("acquire after readiness cutover = %+v err=%v", third, err)
+	}
+	old, err = store.GetWorker(ctx, old.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err = store.GetWorker(ctx, replacement.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.State != AuthorityWorkerDraining || replacement.State != AuthorityWorkerReady || replacement.AssignedSessions != 1 {
+		t.Fatalf("readiness cutover old=%+v replacement=%+v", old, replacement)
+	}
+}
+
+func TestAuthorityWorkerReplacementReadinessRequiresDurablePredecessorLink(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	profile := cfg.AuthorityProfiles["writer"]
+	profileVersion, policyDigest, err := authorityProfileDigest("writer", profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan := AuthorityWorker{WorkerID: "orphan-generation", Profile: "writer", ProfileVersion: profileVersion, PolicyDigest: policyDigest, ImageReference: profile.Image, Generation: 2, State: AuthorityWorkerProvisioning, Capacity: profile.SessionCapacity}
+	if _, err := store.CreateWorker(ctx, orphan, profile.MaxWorkers); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateWorkerRuntime(ctx, orphan.WorkerID, "container-orphan", "sha256:2222222222222222222222222222222222222222222222222222222222222222"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetWorkerHealth(ctx, orphan.WorkerID, "ready", true); err == nil || !strings.Contains(err.Error(), "refusing readiness cutover") {
+		t.Fatalf("SetWorkerHealth() error = %v, want missing predecessor denial", err)
+	}
+	stored, err := store.GetWorker(ctx, orphan.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != AuthorityWorkerStarting {
+		t.Fatalf("orphan replacement state = %q, want starting", stored.State)
 	}
 }
 
