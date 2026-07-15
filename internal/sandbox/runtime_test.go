@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -21,6 +22,9 @@ func TestDockerCreatePassesPlatform(t *testing.T) {
 			if body.Platform != "linux/amd64" {
 				t.Fatalf("platform=%q", body.Platform)
 			}
+			if got, want := body.Entrypoint, []string{"bun", "run", "src/cli.ts", "serve"}; !reflect.DeepEqual(got, want) || len(body.Cmd) != 0 {
+				t.Fatalf("entrypoint=%q cmd=%q", got, body.Cmd)
+			}
 			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"created"}`)), Header: make(http.Header)}, nil
 		case "/images/worker:latest/json":
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"Id":"sha256:image"}`)), Header: make(http.Header)}, nil
@@ -29,7 +33,7 @@ func TestDockerCreatePassesPlatform(t *testing.T) {
 			return nil, fmt.Errorf("unexpected request path")
 		}
 	})}}
-	info, err := backend.Create(context.Background(), RuntimeSpec{RunID: "platform", Image: "worker:latest", Platform: "linux/amd64", Labels: map[string]string{}})
+	info, err := backend.Create(context.Background(), RuntimeSpec{RunID: "platform", Image: "worker:latest", Platform: "linux/amd64", Entrypoint: []string{"bun", "run", "src/cli.ts", "serve"}, Labels: map[string]string{}})
 	if err != nil || info.ID != "created" {
 		t.Fatalf("Create()=%+v err=%v", info, err)
 	}
