@@ -23,6 +23,11 @@ type ServerConfig struct {
 	Listen         string `yaml:"listen"`
 	AdminSecret    string `yaml:"admin_secret"`
 	AdminSecretEnv string `yaml:"admin_secret_env"`
+	// LocalSandboxOnly is an explicit staging-only escape hatch for the
+	// sandbox broker. It disables all broker GitHub authority rather than
+	// weakening normal broker validation.
+	LocalSandboxOnly bool `yaml:"local_sandbox_only"`
+	Production       bool `yaml:"production"`
 }
 
 type AuditConfig struct {
@@ -141,7 +146,17 @@ func (c *Config) resolveSecrets() error {
 func (c *Config) Validate() error {
 	var errs []string
 	apps := c.GitHub.AppContexts()
-	if len(apps) == 0 {
+	if c.Server.LocalSandboxOnly {
+		if c.Server.Production {
+			errs = append(errs, "local_sandbox_only cannot be enabled in production")
+		}
+		if len(apps) != 0 {
+			errs = append(errs, "local_sandbox_only must not configure github apps")
+		}
+		if len(c.Agents) != 0 {
+			errs = append(errs, "local_sandbox_only must not configure broker agents")
+		}
+	} else if len(apps) == 0 {
 		errs = append(errs, "github app context is required: configure legacy github.app_id/private_key_path/installations or github.apps")
 	}
 	for name, app := range apps {
