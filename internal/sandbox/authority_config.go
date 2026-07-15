@@ -16,21 +16,51 @@ import (
 // until those production contracts are versioned; callers can only select a
 // registered profile.
 type AuthorityProfile struct {
-	Image            string       `json:"image" yaml:"image"`
-	Resources        Resources    `json:"resources" yaml:"resources"`
-	NetworkPolicy    string       `json:"network_policy" yaml:"network_policy"`
-	BrokerAgentID    string       `json:"broker_agent_id" yaml:"broker_agent_id"`
-	BrokerSecretEnv  string       `json:"broker_agent_secret_env" yaml:"broker_agent_secret_env"`
-	CredentialBundle string       `json:"credential_bundle,omitempty" yaml:"credential_bundle"`
-	Repositories     []string     `json:"repositories" yaml:"repositories"`
-	BranchPolicy     BranchPolicy `json:"branch_policy" yaml:"branch_policy"`
-	Operations       []string     `json:"operations" yaml:"operations"`
-	ExtraMounts      []ExtraMount `json:"extra_mounts,omitempty" yaml:"extra_mounts"`
-	MaxWorkers       int          `json:"max_workers" yaml:"max_workers"`
-	SessionCapacity  int          `json:"session_capacity" yaml:"session_capacity"`
+	Image string `json:"image" yaml:"image"`
+	// Command is deliberately not configurable by callers.  The only accepted
+	// authority worker process is the agentd bootstrap command from agentd's
+	// immutable OCI contract.
+	Command          []string         `json:"command" yaml:"command"`
+	Resources        Resources        `json:"resources" yaml:"resources"`
+	NetworkPolicy    string           `json:"network_policy" yaml:"network_policy"`
+	BrokerAgentID    string           `json:"broker_agent_id" yaml:"broker_agent_id"`
+	BrokerSecretEnv  string           `json:"broker_agent_secret_env" yaml:"broker_agent_secret_env"`
+	CredentialBundle string           `json:"credential_bundle,omitempty" yaml:"credential_bundle"`
+	Repositories     []string         `json:"repositories" yaml:"repositories"`
+	BranchPolicy     BranchPolicy     `json:"branch_policy" yaml:"branch_policy"`
+	Operations       []string         `json:"operations" yaml:"operations"`
+	ExtraMounts      []ExtraMount     `json:"extra_mounts,omitempty" yaml:"extra_mounts"`
+	SessionIsolation SessionIsolation `json:"session_isolation" yaml:"session_isolation"`
+	Checkpoint       CheckpointPolicy `json:"checkpoint" yaml:"checkpoint"`
+	Storage          AuthorityStorage `json:"storage" yaml:"storage"`
+	MaxWorkers       int              `json:"max_workers" yaml:"max_workers"`
+	SessionCapacity  int              `json:"session_capacity" yaml:"session_capacity"`
 }
 
+// SessionIsolation is immutable worker policy. PR 8 intentionally allocates
+// the UID/GID range but does not create logical sessions; PR 9 consumes it.
+type SessionIsolation struct {
+	Primitive     string `json:"primitive" yaml:"primitive"`
+	WorkspaceRoot string `json:"workspace_root" yaml:"workspace_root"`
+	UIDStart      int    `json:"uid_start" yaml:"uid_start"`
+	GIDStart      int    `json:"gid_start" yaml:"gid_start"`
+}
+
+type CheckpointPolicy struct {
+	Directory string `json:"directory" yaml:"directory"`
+	KeyEnv    string `json:"key_env" yaml:"key_env"`
+}
+type AuthorityStorage struct {
+	SessionVolume    string `json:"session_volume" yaml:"session_volume"`
+	CheckpointVolume string `json:"checkpoint_volume" yaml:"checkpoint_volume"`
+	EvidenceVolume   string `json:"evidence_volume" yaml:"evidence_volume"`
+}
+
+var fixedAgentdCommand = []string{"bun", "run", "src/cli.ts", "serve"}
+
 type AuthorityPrincipal struct {
+	Token           string   `json:"-" yaml:"token"`
+	TokenEnv        string   `json:"-" yaml:"token_env"`
 	AllowedProfiles []string `json:"allowed_profiles" yaml:"allowed_profiles"`
 	AllowedActions  []string `json:"allowed_actions" yaml:"allowed_actions"`
 }
@@ -44,6 +74,9 @@ func (c Config) validateAuthorityProfile(name string, profile AuthorityProfile) 
 		errs = append(errs, fmt.Sprintf("authority profile %q image is required", name))
 	} else if c.Production && !regexp.MustCompile(`@sha256:[0-9a-f]{64}$`).MatchString(profile.Image) {
 		errs = append(errs, fmt.Sprintf("authority profile %q image must be pinned by digest in production mode", name))
+	}
+	if !equalStrings(profile.Command, fixedAgentdCommand) {
+		errs = append(errs, fmt.Sprintf("authority profile %q command must be the fixed agentd command", name))
 	}
 	if _, ok := c.Networks[profile.NetworkPolicy]; !ok {
 		errs = append(errs, fmt.Sprintf("authority profile %q references unknown network_policy %q", name, profile.NetworkPolicy))
@@ -90,6 +123,15 @@ func (c Config) validateAuthorityProfile(name string, profile AuthorityProfile) 
 	for i, mount := range profile.ExtraMounts {
 		errs = append(errs, validateAuthorityMount(name, i, mount)...)
 	}
+	if profile.SessionIsolation.Primitive != "uid_gid_0700" || !filepath.IsAbs(profile.SessionIsolation.WorkspaceRoot) || profile.SessionIsolation.UIDStart < 10000 || profile.SessionIsolation.GIDStart < 10000 {
+		errs = append(errs, fmt.Sprintf("authority profile %q must use uid_gid_0700 with an absolute workspace root and non-system UID/GID range", name))
+	}
+	if !safeAuthorityName(profile.Storage.SessionVolume) || !safeAuthorityName(profile.Storage.CheckpointVolume) || !safeAuthorityName(profile.Storage.EvidenceVolume) {
+		errs = append(errs, fmt.Sprintf("authority profile %q storage must name managed session, checkpoint, and evidence volumes", name))
+	}
+	if !filepath.IsAbs(profile.Checkpoint.Directory) || !regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`).MatchString(profile.Checkpoint.KeyEnv) {
+		errs = append(errs, fmt.Sprintf("authority profile %q checkpoint must set absolute directory and key_env", name))
+	}
 	if profile.CredentialBundle != "" {
 		bundle, ok := c.Bundles[profile.CredentialBundle]
 		if !ok {
@@ -99,6 +141,18 @@ func (c Config) validateAuthorityProfile(name string, profile AuthorityProfile) 
 		}
 	}
 	return errs
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func validateAuthorityMount(profile string, index int, mount ExtraMount) []string {
@@ -121,6 +175,9 @@ func (c Config) validateAuthorityPrincipal(name string, principal AuthorityPrinc
 	var errs []string
 	if !safeAuthorityName(name) {
 		errs = append(errs, fmt.Sprintf("authority principal %q has an invalid name", name))
+	}
+	if strings.TrimSpace(principal.Token) == "" {
+		errs = append(errs, fmt.Sprintf("authority principal %q token or token_env is required", name))
 	}
 	if len(principal.AllowedProfiles) == 0 {
 		errs = append(errs, fmt.Sprintf("authority principal %q allowed_profiles must not be empty", name))

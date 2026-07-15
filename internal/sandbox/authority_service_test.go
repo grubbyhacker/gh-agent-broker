@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ type fakeAuthorityRuntime struct {
 	workers     map[string]AuthorityRuntimeResult
 	physical    int
 	err         error
+	unhealthy   bool
 	afterCreate func()
 }
 
@@ -52,6 +54,63 @@ func (f *fakeAuthorityRuntime) Stop(_ context.Context, containerID string) error
 	defer f.mu.Unlock()
 	f.stopped = append(f.stopped, containerID)
 	return nil
+}
+
+func (f *fakeAuthorityRuntime) Healthy(_ context.Context, _ string) (bool, string, error) {
+	if f.unhealthy {
+		return false, "synthetic_unhealthy", nil
+	}
+	if f.err != nil {
+		return false, "synthetic_unhealthy", f.err
+	}
+	return true, "synthetic_liveness_ok", nil
+}
+
+func TestAuthorityReconcileUnhealthyCheckpointsAndReplaces(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	profile := cfg.AuthorityProfiles["writer"]
+	profile.Checkpoint.Directory = t.TempDir()
+	cfg.AuthorityProfiles["writer"] = profile
+	key := make([]byte, 32)
+	key[0] = 1
+	t.Setenv(profile.Checkpoint.KeyEnv, base64.StdEncoding.EncodeToString(key))
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &fakeAuthorityRuntime{}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil).WithCheckpointStore(NewCheckpointStore(cfg, store))
+	ids := []string{"old-reconcile-health", "new-reconcile-health"}
+	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
+	old, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "reconcile-health", SessionBinding: "reconcile-health-session"}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.unhealthy = true
+	if err := service.Reconcile(ctx, "coordinator"); err != nil {
+		t.Fatal(err)
+	}
+	old, err = store.GetWorker(ctx, old.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.State != AuthorityWorkerUnhealthy {
+		t.Fatalf("old=%+v", old)
+	}
+	entries, err := os.ReadDir(profile.Checkpoint.Directory)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("evidence entries=%v err=%v", entries, err)
+	}
+	if err := VerifyCheckpoint(filepath.Join(profile.Checkpoint.Directory, entries[0].Name()), profile, old); err != nil {
+		t.Fatalf("checkpoint verify after unhealthy reconcile: %v", err)
+	}
+	if old.ReplacementWorker == "" {
+		t.Fatal("unhealthy worker was not replaced")
+	}
 }
 
 func TestAuthorityProfileValidationAndDigest(t *testing.T) {
@@ -366,7 +425,7 @@ func TestAuthorityWorkerReplacementReconcilesPersistedProvisioningIntent(t *test
 	if _, created, err := store.LinkReplacement(ctx, old.WorkerID, planned, profile.MaxWorkers); err != nil || !created {
 		t.Fatalf("LinkReplacement() created=%v err=%v", created, err)
 	}
-	createdBeforeCrash, err := runtime.Create(ctx, authoritySpec(planned, profile, cfg.Networks[profile.NetworkPolicy]))
+	createdBeforeCrash, err := runtime.Create(ctx, authoritySpec(planned, profile, cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,6 +664,59 @@ func TestAuthorityWorkerReleaseAuthorizesBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestDrainWritesEncryptedCheckpointEvidenceAndRestoreFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	checkpointDir := t.TempDir()
+	profile := cfg.AuthorityProfiles["writer"]
+	profile.Checkpoint.Directory = checkpointDir
+	cfg.AuthorityProfiles["writer"] = profile
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	t.Setenv(profile.Checkpoint.KeyEnv, base64.StdEncoding.EncodeToString(key))
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	service := NewAuthorityWorkerService(cfg, store, &fakeAuthorityRuntime{}, nil).WithCheckpointStore(NewCheckpointStore(cfg, store))
+	service.newID = func() (string, error) { return "checkpoint-worker", nil }
+	worker, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetHealth(ctx, "coordinator", worker.WorkerID, "liveness_ok_session_admission_deferred", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "checkpoint-idem", SessionBinding: "checkpoint-session"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Drain(ctx, "coordinator", worker.WorkerID, "replacement"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(checkpointDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("checkpoint entries=%v err=%v", entries, err)
+	}
+	path := filepath.Join(checkpointDir, entries[0].Name())
+	if err := VerifyCheckpoint(path, profile, worker); err != nil {
+		t.Fatalf("verify checkpoint: %v", err)
+	}
+	wrong := worker
+	wrong.ProfileVersion = "wrong-profile"
+	if err := VerifyCheckpoint(path, profile, wrong); err == nil {
+		t.Fatal("checkpoint accepted wrong profile")
+	}
+	t.Setenv(profile.Checkpoint.KeyEnv, base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err := VerifyCheckpoint(path, profile, worker); err == nil {
+		t.Fatal("checkpoint accepted wrong cryptographic material")
+	}
+	if err := os.WriteFile(path, []byte(`{"schema_version":999}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyCheckpoint(path, profile, worker); err == nil {
+		t.Fatal("checkpoint accepted unknown schema")
+	}
+}
+
 func authorityTestConfig(t *testing.T) Config {
 	t.Helper()
 	cfg := baseTestConfig(t)
@@ -615,16 +727,20 @@ func authorityTestConfig(t *testing.T) Config {
 	cfg.AuthorityProfiles = map[string]AuthorityProfile{
 		"writer": {
 			Image:         "example.com/agentd@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			Command:       []string{"bun", "run", "src/cli.ts", "serve"},
 			Resources:     Resources{CPUShares: 128, MemoryMB: 512, PidsLimit: 128},
 			NetworkPolicy: "sandbox", BrokerAgentID: "writer", BrokerSecretEnv: "WRITER_BROKER_CREDENTIAL",
 			Repositories: []string{"owner/repo", "owner/other"},
 			BranchPolicy: BranchPolicy{AllowedPatterns: []string{`^agent/writer/[A-Za-z0-9_.:-]+$`}, BaseBranches: []string{"main"}, GeneratePrefix: "agent/writer"},
 			Operations:   []string{"git.receive-pack", "pull.create"}, MaxWorkers: 2, SessionCapacity: 2,
+			SessionIsolation: SessionIsolation{Primitive: "uid_gid_0700", WorkspaceRoot: "/var/lib/agentd/sessions", UIDStart: 20000, GIDStart: 20000},
+			Checkpoint:       CheckpointPolicy{Directory: "/var/lib/agentd/checkpoints", KeyEnv: "AUTHORITY_CHECKPOINT_KEY"},
+			Storage:          AuthorityStorage{SessionVolume: "authority-sessions", CheckpointVolume: "authority-checkpoints", EvidenceVolume: "authority-evidence"},
 		},
 	}
 	cfg.AuthorityPrincipals = map[string]AuthorityPrincipal{
-		"coordinator":  {AllowedProfiles: []string{"writer"}, AllowedActions: []string{"provision", "health", "acquire", "release", "drain", "replace"}},
-		"session-only": {AllowedProfiles: []string{"writer"}, AllowedActions: []string{"acquire", "release"}},
+		"coordinator":  {Token: "coordinator-test-token", AllowedProfiles: []string{"writer"}, AllowedActions: []string{"provision", "health", "acquire", "release", "drain", "replace"}},
+		"session-only": {Token: "session-test-token", AllowedProfiles: []string{"writer"}, AllowedActions: []string{"acquire", "release"}},
 	}
 	return cfg
 }

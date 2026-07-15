@@ -108,6 +108,30 @@ transport and health contract, and the accepted distinct-UID/GID or stronger
 isolation decision. `ImageReference` records reviewed configuration while
 `ImageDigest` remains empty until a runtime resolves the created image.
 
+## PR 8 Authority-Worker Lifecycle
+
+Authority profiles are now production-wired only when `authority_profiles` is
+nonempty. The sandbox broker starts a Docker authority runtime and exposes
+authenticated lifecycle controls under `/v1/authority-workers`; caller JSON
+can select only a reviewed profile and is rejected if it tries to supply an
+image, command, credential, mount, network, repository, operation, user, or
+isolation field.
+
+Each profile fixes the digest-pinned `agentd` image and exact
+`bun run src/cli.ts serve` command, broker credential, mount set, network,
+repository and operation policy, resources, capacity, distinct UID/GID 0700
+session-isolation allocation, and named session/checkpoint/evidence volumes.
+Drain writes AES-GCM encrypted broker checkpoint evidence for extant leases
+before rejecting new admission. Verification binds schema, key fingerprint,
+worker ID, profile version, and policy digest and fails closed on a mismatch.
+
+`agentd /healthz` may establish worker lifecycle liveness. Its bootstrap
+`/readyz` intentionally remains unavailable, so the public lease endpoint
+returns `session_admission_deferred_until_pr9`: PR 8 has no coordinator,
+logical session, turn, runtime adapter, or Fleet package dependency. PR 9 can
+consume the fixed profile, lifecycle, storage, checkpoint, and isolation
+contract after the versioned agentd session protocol is released.
+
 ## Validation
 
 Run `make fmt` after changing Go code and `make check` before handoff. Also run
