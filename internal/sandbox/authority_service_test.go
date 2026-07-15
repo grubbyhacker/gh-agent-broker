@@ -142,6 +142,14 @@ func TestAuthorityProfileValidationAndDigest(t *testing.T) {
 
 	cfg = authorityTestConfig(t)
 	profile = cfg.AuthorityProfiles["writer"]
+	profile.Platform = "linux/arm64"
+	cfg.AuthorityProfiles["writer"] = profile
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "platform must be linux/amd64") {
+		t.Fatalf("Validate() error = %v, want platform denial", err)
+	}
+
+	cfg = authorityTestConfig(t)
+	profile = cfg.AuthorityProfiles["writer"]
 	profile.ExtraMounts = []ExtraMount{{SourcePath: "/var/run/docker.sock", MountPath: "/runtime/docker.sock"}}
 	cfg.AuthorityProfiles["writer"] = profile
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "Docker socket") {
@@ -164,7 +172,7 @@ func TestAuthorityProfileValidationAndDigest(t *testing.T) {
 }
 
 func TestAuthorityWorkerRequestRejectsAuthorityOverrides(t *testing.T) {
-	for _, field := range []string{"image", "command", "credentials", "mounts", "network", "repo", "operations", "user", "isolation"} {
+	for _, field := range []string{"image", "platform", "command", "credentials", "mounts", "network", "repo", "operations", "user", "isolation"} {
 		body := `{"profile":"writer","idempotency_key":"one","session_binding":"session-1","` + field + `":"forbidden"}`
 		var request AuthorityWorkerRequest
 		if err := json.Unmarshal([]byte(body), &request); err == nil || !strings.Contains(err.Error(), "unknown field") {
@@ -206,7 +214,7 @@ func TestAuthorityWorkerLifecycleCapacityDrainReleaseAndReplacement(t *testing.T
 	if worker.ImageReference != cfg.AuthorityProfiles["writer"].Image || worker.ImageDigest != "sha256:2222222222222222222222222222222222222222222222222222222222222222" {
 		t.Fatalf("image identity = %+v", worker)
 	}
-	if len(runtime.created) != 1 || runtime.created[0].Image != cfg.AuthorityProfiles["writer"].Image || runtime.created[0].BrokerSecretEnv != "WRITER_BROKER_CREDENTIAL" {
+	if len(runtime.created) != 1 || runtime.created[0].Image != cfg.AuthorityProfiles["writer"].Image || runtime.created[0].Platform != "linux/amd64" || runtime.created[0].BrokerSecretEnv != "WRITER_BROKER_CREDENTIAL" {
 		t.Fatalf("immutable runtime spec = %+v", runtime.created)
 	}
 	worker, err = service.SetHealth(ctx, "coordinator", worker.WorkerID, "synthetic_ready", true)
@@ -727,6 +735,7 @@ func authorityTestConfig(t *testing.T) Config {
 	cfg.AuthorityProfiles = map[string]AuthorityProfile{
 		"writer": {
 			Image:         "example.com/agentd@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			Platform:      "linux/amd64",
 			Command:       []string{"bun", "run", "src/cli.ts", "serve"},
 			Resources:     Resources{CPUShares: 128, MemoryMB: 512, PidsLimit: 128},
 			NetworkPolicy: "sandbox", BrokerAgentID: "writer", BrokerSecretEnv: "WRITER_BROKER_CREDENTIAL",

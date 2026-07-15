@@ -2,11 +2,38 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 )
+
+func TestDockerCreatePassesPlatform(t *testing.T) {
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/containers/create":
+			var body dockerCreateRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Platform != "linux/amd64" {
+				t.Fatalf("platform=%q", body.Platform)
+			}
+			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"created"}`)), Header: make(http.Header)}, nil
+		case "/images/worker:latest/json":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"Id":"sha256:image"}`)), Header: make(http.Header)}, nil
+		default:
+			t.Fatalf("request path=%s", req.URL.Path)
+			return nil, fmt.Errorf("unexpected request path")
+		}
+	})}}
+	info, err := backend.Create(context.Background(), RuntimeSpec{RunID: "platform", Image: "worker:latest", Platform: "linux/amd64", Labels: map[string]string{}})
+	if err != nil || info.ID != "created" {
+		t.Fatalf("Create()=%+v err=%v", info, err)
+	}
+}
 
 func TestDockerAdoptRequiresExactDurableLaunchIdentity(t *testing.T) {
 	spec := RuntimeSpec{

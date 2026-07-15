@@ -31,6 +31,7 @@ type RuntimeBackend interface {
 type RuntimeSpec struct {
 	RunID      string
 	Image      string
+	Platform   string
 	Command    []string
 	User       string
 	Env        map[string]string
@@ -104,6 +105,7 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 	}
 	reqBody := dockerCreateRequest{
 		Image:      spec.Image,
+		Platform:   spec.Platform,
 		Cmd:        spec.Command,
 		User:       spec.User,
 		Env:        envList(spec.Env),
@@ -477,6 +479,7 @@ func singleFileTar(name string, contents []byte, mode int64) ([]byte, error) {
 
 type dockerCreateRequest struct {
 	Image      string            `json:"Image"`
+	Platform   string            `json:"Platform,omitempty"`
 	Entrypoint []string          `json:"Entrypoint,omitempty"`
 	Cmd        []string          `json:"Cmd,omitempty"`
 	User       string            `json:"User"`
