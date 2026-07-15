@@ -3,8 +3,43 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestLoadAllowsExplicitLocalSandboxOnlyWithoutGitHubApps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, `
+server:
+  local_sandbox_only: true
+audit:
+  path: audit.jsonl
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Server.LocalSandboxOnly || len(cfg.GitHub.AppContexts()) != 0 || len(cfg.Agents) != 0 {
+		t.Fatalf("unexpected local sandbox config: %+v", cfg)
+	}
+}
+
+func TestLocalSandboxOnlyRejectsProductionAndGitHubAuthority(t *testing.T) {
+	for name, body := range map[string]string{
+		"production": "server:\n  local_sandbox_only: true\n  production: true\n",
+		"app":        "server:\n  local_sandbox_only: true\ngithub:\n  app_id: 1\n  private_key_path: key.pem\n  installations: {owner/repo: 2}\n",
+		"agent":      "server:\n  local_sandbox_only: true\nagents:\n  - id: agent\n    enabled: false\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			writeFile(t, path, body)
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), "local_sandbox_only") {
+				t.Fatalf("Load() error = %v", err)
+			}
+		})
+	}
+}
 
 func TestLoadResolvesSecretsAndDefaults(t *testing.T) {
 	t.Setenv("TEST_AGENT_SECRET", "agent-secret")
