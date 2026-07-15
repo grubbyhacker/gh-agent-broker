@@ -534,6 +534,7 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 	info, err := s.runtime.Create(ctx, spec)
 	s.logSandboxCreation(meta, time.Since(createStarted), err)
 	if err != nil {
+		s.auditLifecycle(meta, "create_failed", nil, err)
 		meta.Status = StatusFailed
 		meta.FinalizeReason = finalizeReasonLaunchCreateFailed
 		meta.TerminalSource = terminalSourceStartupFailure
@@ -549,7 +550,9 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 	}
 	meta.ContainerID = info.ID
 	meta.ImageDigest = info.ImageDigest
+	s.auditLifecycle(meta, "created", nil, nil)
 	if err := s.runtime.Start(ctx, info.ID); err != nil {
+		s.auditLifecycle(meta, "start_failed", nil, err)
 		meta.Status = StatusFailed
 		meta.FinalizeReason = finalizeReasonLaunchStartFailed
 		meta.TerminalSource = terminalSourceStartupFailure
@@ -563,6 +566,7 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 		s.auditTerminalEvent(meta, finalizeReasonLaunchStartFailed, terminalSourceStartupFailure, err)
 		return LaunchAgentOutput{}, err
 	}
+	s.auditLifecycle(meta, "started", nil, nil)
 	meta.Status = StatusRunning
 	if err := s.writeMetadata(meta); err != nil {
 		return LaunchAgentOutput{}, err
@@ -726,10 +730,12 @@ func (s *Service) resumeLaunchIntent(ctx context.Context, intent *launchIntent, 
 		info, err = s.runtime.Create(ctx, spec)
 		s.logSandboxCreation(meta, time.Since(createStarted), err)
 		if err != nil {
+			s.auditLifecycle(meta, "create_failed", nil, err)
 			return LaunchAgentOutput{}, err
 		}
 		meta.ContainerID = info.ID
 		meta.ImageDigest = info.ImageDigest
+		s.auditLifecycle(meta, "created", nil, nil)
 		intent.Metadata = meta
 		intent.State = intentStateContainerMade
 		if err := s.launchIntents.Save(ctx, *intent); err != nil {
@@ -748,6 +754,7 @@ func (s *Service) resumeLaunchIntent(ctx context.Context, intent *launchIntent, 
 		return LaunchAgentOutput{}, err
 	}
 	if err := s.runtime.Start(ctx, meta.ContainerID); err != nil {
+		s.auditLifecycle(meta, "start_failed", nil, err)
 		status, inspectErr := s.runtime.Inspect(ctx, meta.ContainerID)
 		if inspectErr == nil && status.Running {
 			return s.commitRunningIntent(ctx, intent, meta, redactor)
@@ -757,6 +764,7 @@ func (s *Service) resumeLaunchIntent(ctx context.Context, intent *launchIntent, 
 		}
 		return LaunchAgentOutput{}, err
 	}
+	s.auditLifecycle(meta, "started", nil, nil)
 	return s.commitRunningIntent(ctx, intent, meta, redactor)
 }
 
@@ -801,6 +809,7 @@ func (s *Service) commitRunningIntent(ctx context.Context, intent *launchIntent,
 	if err := s.writeMetadata(meta); err != nil {
 		return LaunchAgentOutput{}, err
 	}
+	s.auditLifecycle(meta, "running_committed", nil, nil)
 	s.audit.Log(s.auditEvent("launch_agent", meta, "allow", nil), redactor)
 	go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
 	go s.watchExit(context.WithoutCancel(ctx), meta.RunID, meta.ContainerID)
@@ -1386,6 +1395,7 @@ func (s *Service) auditEvent(operation string, meta RunMetadata, decision string
 		Branch:           meta.Branch,
 		ImageDigest:      meta.ImageDigest,
 		CredentialBundle: meta.CredentialBundle,
+		ContainerID:      meta.ContainerID,
 		Parameters:       cloneParameters(meta.Parameters),
 		Status:           meta.Status,
 		ExitCode:         meta.ExitCode,
@@ -1397,6 +1407,23 @@ func (s *Service) auditEvent(operation string, meta RunMetadata, decision string
 		ev.Error = err.Error()
 	}
 	return ev
+}
+
+// auditLifecycle records a bounded, redacted runtime observation. These events
+// intentionally use stable stage names so operations can aggregate lifecycle
+// failures without parsing human-facing terminal messages.
+func (s *Service) auditLifecycle(meta RunMetadata, stage string, status *ContainerStatus, err error) {
+	ev := s.auditEvent("container_lifecycle", meta, "allow", err)
+	ev.LifecycleStage = stage
+	if err != nil {
+		ev.Decision = "deny"
+	}
+	if status != nil {
+		running := status.Running
+		ev.ContainerRunning = &running
+		ev.ContainerError = status.Error
+	}
+	s.audit.Log(ev, s.redactor(meta))
 }
 
 func (s *Service) auditTerminalEvent(meta RunMetadata, reason, source string, err error) {
@@ -1452,6 +1479,9 @@ func (s *Service) watchExit(parent context.Context, runID, containerID string) {
 	status, err := s.runtime.Wait(parent, containerID)
 	if err != nil {
 		if status, inspectErr := s.runtime.Inspect(parent, containerID); inspectErr == nil && !status.Running {
+			if meta, lookupErr := s.lookupRun(runID); lookupErr == nil {
+				s.auditLifecycle(meta, "wait_recovered_by_inspect", &status, err)
+			}
 			if _, _, finalizeErr := s.finalizeTerminalRun(parent, runID, finalizeReasonWorkerExit, terminalSourceExited, func(meta RunMetadata) RunMetadata {
 				return s.finalizeExitedRun(parent, meta, status)
 			}); finalizeErr != nil {
@@ -1461,12 +1491,12 @@ func (s *Service) watchExit(parent context.Context, runID, containerID string) {
 		}
 		meta, lookupErr := s.lookupRun(runID)
 		if lookupErr == nil && meta.Status == StatusRunning {
-			ev := s.auditEvent("run_wait", meta, "deny", err)
-			ev.FinalizeReason = finalizeReasonWorkerExit
-			ev.TerminalSource = terminalSourceExited
-			s.audit.Log(ev, s.redactor(meta))
+			s.auditLifecycle(meta, "wait_failed", nil, err)
 		}
 		return
+	}
+	if meta, lookupErr := s.lookupRun(runID); lookupErr == nil {
+		s.auditLifecycle(meta, "wait_completed", &status, nil)
 	}
 	if _, _, err := s.finalizeTerminalRun(parent, runID, finalizeReasonWorkerExit, terminalSourceExited, func(meta RunMetadata) RunMetadata {
 		return s.finalizeExitedRun(parent, meta, status)
@@ -1557,22 +1587,32 @@ func (s *Service) finalizeTerminalRun(ctx context.Context, runID, reason, source
 
 func (s *Service) markTimedOut(ctx context.Context, meta RunMetadata) RunMetadata {
 	if meta.ContainerID != "" {
-		status, err := s.runtime.Inspect(ctx, meta.ContainerID)
-		if err == nil && !status.Running {
+		status, inspectErr := s.runtime.Inspect(ctx, meta.ContainerID)
+		if inspectErr != nil {
+			s.auditLifecycle(meta, "deadline_inspect_failed", nil, inspectErr)
+			meta.Error = "run exceeded deadline; unable to inspect worker lifecycle: " + s.redactor(meta).Redact(inspectErr.Error())
+		} else if !status.Running {
+			s.auditLifecycle(meta, "deadline_already_exited", &status, nil)
 			meta.FinalizeReason = finalizeReasonDeadlineAlreadyExited
 			return s.finalizeExitedRun(ctx, meta, status)
+		} else {
+			s.auditLifecycle(meta, "deadline_running", &status, nil)
+			meta.Error = s.timeoutFailureMessage(ctx, meta, status)
 		}
 		if err := s.runtime.Stop(ctx, meta.ContainerID, s.cfg.StopGrace.Duration); err != nil {
+			s.auditLifecycle(meta, "deadline_stop_failed", nil, err)
 			if code, ok := DockerStatusCode(err); ok && code == http.StatusNotModified {
 				status, inspectErr := s.runtime.Inspect(ctx, meta.ContainerID)
 				if inspectErr == nil && !status.Running {
+					s.auditLifecycle(meta, "deadline_stop_already_exited", &status, nil)
 					meta.FinalizeReason = finalizeReasonDeadlineStopAlreadyExited
 					return s.finalizeExitedRun(ctx, meta, status)
 				}
 			}
 			meta.FinalizeReason = finalizeReasonDeadlineStopFailed
-			meta.Error = "run exceeded deadline; stop failed: " + err.Error()
+			meta.Error = strings.TrimSpace(meta.Error + "; stop failed: " + s.redactor(meta).Redact(err.Error()))
 		} else {
+			s.auditLifecycle(meta, "deadline_stop_requested", nil, nil)
 			status, err := s.runtime.Inspect(ctx, meta.ContainerID)
 			if err == nil && status.ExitCode != nil {
 				meta.ExitCode = status.ExitCode
@@ -1592,6 +1632,22 @@ func (s *Service) markTimedOut(ctx context.Context, meta RunMetadata) RunMetadat
 		meta.Error = meta.Error + "; diagnostics write failed: " + err.Error()
 	}
 	return meta
+}
+
+func (s *Service) timeoutFailureMessage(ctx context.Context, meta RunMetadata, status ContainerStatus) string {
+	message := "run exceeded deadline; worker remained running"
+	if detail := strings.TrimSpace(status.Error); detail != "" {
+		message += "; container error: " + s.redactor(meta).Redact(detail)
+	}
+	logs, err := s.runtime.Logs(ctx, meta.ContainerID, 2048)
+	if err != nil {
+		return message
+	}
+	logs = strings.TrimSpace(s.redactor(meta).Redact(logs))
+	if logs != "" {
+		message += "; worker log tail: " + abbreviate(logs, 500)
+	}
+	return message
 }
 
 func (s *Service) finalizeExitedRun(ctx context.Context, meta RunMetadata, status ContainerStatus) RunMetadata {

@@ -31,6 +31,10 @@ type AuditEvent struct {
 	Branch            string         `json:"branch,omitempty"`
 	ImageDigest       string         `json:"image_digest,omitempty"`
 	CredentialBundle  string         `json:"credential_bundle,omitempty"`
+	ContainerID       string         `json:"container_id,omitempty"`
+	LifecycleStage    string         `json:"lifecycle_stage,omitempty"`
+	ContainerRunning  *bool          `json:"container_running,omitempty"`
+	ContainerError    string         `json:"container_error,omitempty"`
 	Parameters        map[string]any `json:"parameters,omitempty"`
 	Status            string         `json:"status,omitempty"`
 	ExitCode          *int           `json:"exit_code,omitempty"`
@@ -72,6 +76,7 @@ func (l *AuditLogger) Log(ev AuditEvent, redactor Redactor) {
 	}
 	ev.Timestamp = time.Now().UTC()
 	ev.Error = redactor.Redact(ev.Error)
+	ev.ContainerError = redactor.Redact(ev.ContainerError)
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return
