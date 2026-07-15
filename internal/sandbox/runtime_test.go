@@ -22,7 +22,7 @@ func TestDockerCreatePassesPlatform(t *testing.T) {
 			if body.Platform != "linux/amd64" {
 				t.Fatalf("platform=%q", body.Platform)
 			}
-			if got, want := body.Entrypoint, []string{"bun", "run", "src/cli.ts", "serve"}; !reflect.DeepEqual(got, want) || len(body.Cmd) != 0 {
+			if got, want := body.Entrypoint, []string{"bun", "run", "src/cli.ts", "serve"}; !reflect.DeepEqual(got, want) || len(body.Cmd) != 0 || body.WorkingDir != "" {
 				t.Fatalf("entrypoint=%q cmd=%q", got, body.Cmd)
 			}
 			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"created"}`)), Header: make(http.Header)}, nil
