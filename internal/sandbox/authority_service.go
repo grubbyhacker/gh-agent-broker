@@ -41,6 +41,7 @@ type AuthorityWorkerSpec struct {
 	ProfileVersion   string
 	PolicyDigest     string
 	Image            string
+	Platform         string
 	Command          []string
 	Resources        Resources
 	Network          NetworkPolicy
@@ -336,7 +337,7 @@ func validateAuthorityRequest(request AuthorityWorkerRequest) error {
 }
 
 func authoritySpec(worker AuthorityWorker, profile AuthorityProfile, cfg Config) AuthorityWorkerSpec {
-	spec := AuthorityWorkerSpec{WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, Image: profile.Image, Command: append([]string(nil), profile.Command...), Resources: profile.Resources, Network: cfg.Networks[profile.NetworkPolicy], BrokerAgentID: profile.BrokerAgentID, BrokerSecretEnv: profile.BrokerSecretEnv, CredentialBundle: profile.CredentialBundle, Repositories: append([]string(nil), profile.Repositories...), BranchPolicy: profile.BranchPolicy, Operations: append([]string(nil), profile.Operations...), ExtraMounts: append([]ExtraMount(nil), profile.ExtraMounts...), SessionIsolation: profile.SessionIsolation, Checkpoint: profile.Checkpoint, Storage: profile.Storage, SessionCapacity: profile.SessionCapacity}
+	spec := AuthorityWorkerSpec{WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, Image: profile.Image, Platform: profile.Platform, Command: append([]string(nil), profile.Command...), Resources: profile.Resources, Network: cfg.Networks[profile.NetworkPolicy], BrokerAgentID: profile.BrokerAgentID, BrokerSecretEnv: profile.BrokerSecretEnv, CredentialBundle: profile.CredentialBundle, Repositories: append([]string(nil), profile.Repositories...), BranchPolicy: profile.BranchPolicy, Operations: append([]string(nil), profile.Operations...), ExtraMounts: append([]ExtraMount(nil), profile.ExtraMounts...), SessionIsolation: profile.SessionIsolation, Checkpoint: profile.Checkpoint, Storage: profile.Storage, SessionCapacity: profile.SessionCapacity}
 	if bundle, ok := cfg.Bundles[profile.CredentialBundle]; ok {
 		spec.CredentialMount = Mount{Source: bundle.SourcePath, Target: bundle.MountPath, ReadOnly: bundle.ReadOnly}
 	}

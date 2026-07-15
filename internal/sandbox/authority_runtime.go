@@ -28,7 +28,7 @@ func (r *DockerAuthorityRuntime) Create(ctx context.Context, spec AuthorityWorke
 	for _, mount := range spec.ExtraMounts {
 		mounts = append(mounts, Mount{Source: mount.SourcePath, Target: mount.MountPath, ReadOnly: mount.ReadOnly})
 	}
-	runtimeSpec := RuntimeSpec{RunID: "authority-" + spec.WorkerID, Image: spec.Image, Command: spec.Command, Env: map[string]string{spec.BrokerSecretEnv: secret}, Labels: map[string]string{"gh-agent-broker.authority_worker": "true", "gh-agent-broker.worker_id": spec.WorkerID, "gh-agent-broker.profile": spec.Profile, "gh-agent-broker.profile_version": spec.ProfileVersion, "gh-agent-broker.policy_digest": spec.PolicyDigest, "gh-agent-broker.session_isolation": spec.SessionIsolation.Primitive}, Mounts: mounts, Network: spec.Network, Resources: spec.Resources, WorkingDir: "/var/lib/agentd"}
+	runtimeSpec := RuntimeSpec{RunID: "authority-" + spec.WorkerID, Image: spec.Image, Platform: spec.Platform, Command: spec.Command, Env: map[string]string{spec.BrokerSecretEnv: secret}, Labels: map[string]string{"gh-agent-broker.authority_worker": "true", "gh-agent-broker.worker_id": spec.WorkerID, "gh-agent-broker.profile": spec.Profile, "gh-agent-broker.profile_version": spec.ProfileVersion, "gh-agent-broker.policy_digest": spec.PolicyDigest, "gh-agent-broker.session_isolation": spec.SessionIsolation.Primitive}, Mounts: mounts, Network: spec.Network, Resources: spec.Resources, WorkingDir: "/var/lib/agentd"}
 	info, err := r.docker.Create(ctx, runtimeSpec)
 	if err != nil {
 		return AuthorityRuntimeResult{}, err

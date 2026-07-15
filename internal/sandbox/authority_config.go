@@ -17,6 +17,9 @@ import (
 // registered profile.
 type AuthorityProfile struct {
 	Image string `json:"image" yaml:"image"`
+	// Platform is a reviewed runtime constraint, not a caller preference. The
+	// first authority-worker release is published only for linux/amd64.
+	Platform string `json:"platform" yaml:"platform"`
 	// Command is deliberately not configurable by callers.  The only accepted
 	// authority worker process is the agentd bootstrap command from agentd's
 	// immutable OCI contract.
@@ -74,6 +77,9 @@ func (c Config) validateAuthorityProfile(name string, profile AuthorityProfile) 
 		errs = append(errs, fmt.Sprintf("authority profile %q image is required", name))
 	} else if c.Production && !regexp.MustCompile(`@sha256:[0-9a-f]{64}$`).MatchString(profile.Image) {
 		errs = append(errs, fmt.Sprintf("authority profile %q image must be pinned by digest in production mode", name))
+	}
+	if profile.Platform != "linux/amd64" {
+		errs = append(errs, fmt.Sprintf("authority profile %q platform must be linux/amd64", name))
 	}
 	if !equalStrings(profile.Command, fixedAgentdCommand) {
 		errs = append(errs, fmt.Sprintf("authority profile %q command must be the fixed agentd command", name))
