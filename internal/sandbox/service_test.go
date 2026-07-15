@@ -309,7 +309,10 @@ func TestCleanupRejectsInvalidRunID(t *testing.T) {
 func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
 	cfg := baseTestConfig(t)
 	runtime := newFakeRuntime()
-	service := NewService(cfg, runtime, testAudit(t))
+	runtime.logs = "worker waiting for upstream; broker-secret\\n"
+	auditLog := testAudit(t)
+	defer closeTestAudit(t, auditLog)
+	service := NewService(cfg, runtime, auditLog)
 	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{Template: "worker", Task: "timeout", Repo: "owner/repo", BaseBranch: "main"})
 	if err != nil {
 		t.Fatalf("LaunchAgent() error = %v", err)
@@ -326,11 +329,24 @@ func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
 	if status.Status != StatusTimedOut {
 		t.Fatalf("status = %+v, want timed_out", status)
 	}
-	if status.Error != "run exceeded deadline" {
+	if !strings.Contains(status.Error, "run exceeded deadline; worker remained running") || !strings.Contains(status.Error, "worker waiting for upstream") {
 		t.Fatalf("timeout error = %q", status.Error)
 	}
-	if status.Diagnostics == nil || status.Diagnostics.Message != "run exceeded deadline" || status.Diagnostics.Source != "broker" {
+	if strings.Contains(status.Error, "broker-secret") {
+		t.Fatalf("timeout error leaked broker secret: %q", status.Error)
+	}
+	if status.Diagnostics == nil || !strings.Contains(status.Diagnostics.Message, "worker remained running") || status.Diagnostics.Source != "broker" {
 		t.Fatalf("timeout diagnostics = %+v", status.Diagnostics)
+	}
+	auditBytes, err := os.ReadFile(auditLog.file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(auditBytes), `"lifecycle_stage":"deadline_running"`) || !strings.Contains(string(auditBytes), `"container_running":true`) {
+		t.Fatalf("deadline lifecycle audit missing runtime state: %s", auditBytes)
+	}
+	if strings.Contains(string(auditBytes), "broker-secret") {
+		t.Fatalf("lifecycle audit leaked broker secret: %s", auditBytes)
 	}
 	artifacts, err := service.CollectArtifacts(context.Background(), RunInput{RunID: out.RunID})
 	if err != nil {
@@ -352,6 +368,21 @@ func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cfg.RunsDir, out.RunID)); !os.IsNotExist(err) {
 		t.Fatalf("run dir still exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestTimeoutFailureMessageRedactsContainerError(t *testing.T) {
+	cfg := baseTestConfig(t)
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	message := service.timeoutFailureMessage(context.Background(), RunMetadata{Template: "worker", ContainerID: "container-test"}, ContainerStatus{
+		Running: true,
+		Error:   "upstream rejected token broker-secret",
+	})
+	if strings.Contains(message, "broker-secret") {
+		t.Fatalf("timeout message leaked broker secret: %q", message)
+	}
+	if !strings.Contains(message, "upstream rejected token [REDACTED]") {
+		t.Fatalf("timeout message = %q", message)
 	}
 }
 

@@ -7,6 +7,16 @@ lifecycle management, fixed operator launch profiles, durable idempotent launch
 intents, recovery/reconciliation, scoped run visibility, and brokered GitHub
 operations without returning installation credentials to workers.
 
+### Curator lifecycle incident remediation
+
+Sandbox lifecycle audit records carry the Docker container ID and stable
+lifecycle stages. On a deadline, the broker records whether the worker was
+still running, captures a redacted bounded worker-log tail in terminal
+diagnostics, and records inspect/stop failures instead of replacing the cause
+with a bare timeout. The configured deadline remains unchanged. This makes a
+stalled Curator worker distinguishable from Docker inspect, wait, create, or
+stop failures in audit-derived metrics and the run status artifact.
+
 Runtime broker and sandbox configuration is owned by `vps-ops`. This repository
 owns the broker implementation, public examples, worker images, deploy workflow
 interface, and deterministic deploy-contract tests.
