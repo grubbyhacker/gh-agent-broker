@@ -26,28 +26,31 @@ const (
 )
 
 type Config struct {
-	Listen             string                       `yaml:"listen"`
-	MCPPath            string                       `yaml:"mcp_path"`
-	AuthToken          string                       `yaml:"auth_token"`
-	AuthTokenEnv       string                       `yaml:"auth_token_env"`
-	RunsDir            string                       `yaml:"runs_dir"`
-	LaunchIntentStore  string                       `yaml:"launch_intent_store_path"`
-	BrokerURL          string                       `yaml:"broker_url"`
-	Production         bool                         `yaml:"production"`
-	Repositories       []string                     `yaml:"repositories"`
-	Networks           map[string]NetworkPolicy     `yaml:"network_policies"`
-	Bundles            map[string]CredentialBundle  `yaml:"credential_bundles"`
-	Templates          map[string]Template          `yaml:"templates"`
-	LaunchProfiles     map[string]LaunchProfile     `yaml:"launch_profiles"`
-	OperatorPrincipals map[string]OperatorPrincipal `yaml:"operator_principals"`
-	Audit              SandboxAuditConfig           `yaml:"audit"`
-	MaxTaskBytes       int                          `yaml:"max_task_bytes"`
-	MaxParameterBytes  int                          `yaml:"max_parameter_bytes"`
-	LogByteLimit       int                          `yaml:"log_byte_limit"`
-	StopGrace          Duration                     `yaml:"stop_grace"`
-	ResolvedPaths      map[string]CredentialBundle  `yaml:"-"`
-	ConfigLoadedAt     time.Time                    `yaml:"-"`
-	ConfigVersion      string                       `yaml:"-"`
+	Listen              string                        `yaml:"listen"`
+	MCPPath             string                        `yaml:"mcp_path"`
+	AuthToken           string                        `yaml:"auth_token"`
+	AuthTokenEnv        string                        `yaml:"auth_token_env"`
+	RunsDir             string                        `yaml:"runs_dir"`
+	LaunchIntentStore   string                        `yaml:"launch_intent_store_path"`
+	AuthorityStore      string                        `yaml:"authority_worker_store_path"`
+	BrokerURL           string                        `yaml:"broker_url"`
+	Production          bool                          `yaml:"production"`
+	Repositories        []string                      `yaml:"repositories"`
+	Networks            map[string]NetworkPolicy      `yaml:"network_policies"`
+	Bundles             map[string]CredentialBundle   `yaml:"credential_bundles"`
+	Templates           map[string]Template           `yaml:"templates"`
+	LaunchProfiles      map[string]LaunchProfile      `yaml:"launch_profiles"`
+	AuthorityProfiles   map[string]AuthorityProfile   `yaml:"authority_profiles"`
+	AuthorityPrincipals map[string]AuthorityPrincipal `yaml:"authority_principals"`
+	OperatorPrincipals  map[string]OperatorPrincipal  `yaml:"operator_principals"`
+	Audit               SandboxAuditConfig            `yaml:"audit"`
+	MaxTaskBytes        int                           `yaml:"max_task_bytes"`
+	MaxParameterBytes   int                           `yaml:"max_parameter_bytes"`
+	LogByteLimit        int                           `yaml:"log_byte_limit"`
+	StopGrace           Duration                      `yaml:"stop_grace"`
+	ResolvedPaths       map[string]CredentialBundle   `yaml:"-"`
+	ConfigLoadedAt      time.Time                     `yaml:"-"`
+	ConfigVersion       string                        `yaml:"-"`
 }
 
 type SandboxAuditConfig struct {
@@ -60,12 +63,13 @@ type NetworkPolicy struct {
 }
 
 type CredentialBundle struct {
-	SourcePath       string   `yaml:"source_path"`
-	MountPath        string   `yaml:"mount_path"`
-	ReadOnly         bool     `yaml:"readonly"`
-	AllowedTemplates []string `yaml:"allowed_templates"`
-	SecretFiles      []string `yaml:"secret_files"`
-	RedactFiles      []string `yaml:"redact_files"`
+	SourcePath               string   `yaml:"source_path"`
+	MountPath                string   `yaml:"mount_path"`
+	ReadOnly                 bool     `yaml:"readonly"`
+	AllowedTemplates         []string `yaml:"allowed_templates"`
+	AllowedAuthorityProfiles []string `yaml:"allowed_authority_profiles"`
+	SecretFiles              []string `yaml:"secret_files"`
+	RedactFiles              []string `yaml:"redact_files"`
 }
 
 type Template struct {
@@ -193,6 +197,9 @@ func (c *Config) ApplyDefaults() {
 	if c.LaunchIntentStore == "" {
 		c.LaunchIntentStore = filepath.Join(c.RunsDir, "launch-intents.sqlite")
 	}
+	if c.AuthorityStore == "" {
+		c.AuthorityStore = filepath.Join(c.RunsDir, "authority-workers.sqlite")
+	}
 	if c.MaxTaskBytes == 0 {
 		c.MaxTaskBytes = defaultMaxTaskBytes
 	}
@@ -239,6 +246,9 @@ func (c *Config) Validate() error {
 	if c.LaunchIntentStore != "" && !filepath.IsAbs(c.LaunchIntentStore) {
 		errs = append(errs, "launch_intent_store_path must be an absolute path")
 	}
+	if c.AuthorityStore != "" && !filepath.IsAbs(c.AuthorityStore) {
+		errs = append(errs, "authority_worker_store_path must be an absolute path")
+	}
 	if c.MaxTaskBytes < 1 {
 		errs = append(errs, "max_task_bytes must be positive")
 	}
@@ -284,6 +294,12 @@ func (c *Config) Validate() error {
 	}
 	for name, profile := range c.LaunchProfiles {
 		errs = append(errs, c.validateLaunchProfile(name, profile)...)
+	}
+	for name, profile := range c.AuthorityProfiles {
+		errs = append(errs, c.validateAuthorityProfile(name, profile)...)
+	}
+	for name, principal := range c.AuthorityPrincipals {
+		errs = append(errs, c.validateAuthorityPrincipal(name, principal)...)
 	}
 	for name, principal := range c.OperatorPrincipals {
 		errs = append(errs, c.validateOperatorPrincipal(name, principal)...)
@@ -707,6 +723,17 @@ func safeParameterName(name string) bool {
 }
 
 func (c Config) versionDigest() string {
+	bundles := make(map[string]any, len(c.Bundles))
+	for name, bundle := range c.Bundles {
+		entry := map[string]any{
+			"SourcePath": bundle.SourcePath, "MountPath": bundle.MountPath, "ReadOnly": bundle.ReadOnly,
+			"AllowedTemplates": bundle.AllowedTemplates, "SecretFiles": bundle.SecretFiles, "RedactFiles": bundle.RedactFiles,
+		}
+		if len(bundle.AllowedAuthorityProfiles) > 0 {
+			entry["AllowedAuthorityProfiles"] = bundle.AllowedAuthorityProfiles
+		}
+		bundles[name] = entry
+	}
 	templates := make(map[string]any, len(c.Templates))
 	for name, tmpl := range c.Templates {
 		templates[name] = map[string]any{
@@ -736,23 +763,25 @@ func (c Config) versionDigest() string {
 		}
 	}
 	view := map[string]any{
-		"listen":              c.Listen,
-		"mcp_path":            c.MCPPath,
-		"auth_token_env":      c.AuthTokenEnv,
-		"runs_dir":            c.RunsDir,
-		"broker_url":          c.BrokerURL,
-		"production":          c.Production,
-		"repositories":        c.Repositories,
-		"network_policies":    c.Networks,
-		"credential_bundles":  c.Bundles,
-		"templates":           templates,
-		"launch_profiles":     c.LaunchProfiles,
-		"operator_principals": principals,
-		"audit":               c.Audit,
-		"max_task_bytes":      c.MaxTaskBytes,
-		"max_parameter_bytes": c.MaxParameterBytes,
-		"log_byte_limit":      c.LogByteLimit,
-		"stop_grace":          c.StopGrace,
+		"listen":               c.Listen,
+		"mcp_path":             c.MCPPath,
+		"auth_token_env":       c.AuthTokenEnv,
+		"runs_dir":             c.RunsDir,
+		"broker_url":           c.BrokerURL,
+		"production":           c.Production,
+		"repositories":         c.Repositories,
+		"network_policies":     c.Networks,
+		"credential_bundles":   bundles,
+		"templates":            templates,
+		"launch_profiles":      c.LaunchProfiles,
+		"authority_profiles":   c.AuthorityProfiles,
+		"authority_principals": c.AuthorityPrincipals,
+		"operator_principals":  principals,
+		"audit":                c.Audit,
+		"max_task_bytes":       c.MaxTaskBytes,
+		"max_parameter_bytes":  c.MaxParameterBytes,
+		"log_byte_limit":       c.LogByteLimit,
+		"stop_grace":           c.StopGrace,
 	}
 	b, err := json.Marshal(view)
 	if err != nil {

@@ -74,6 +74,24 @@ manifests that settle these exact inputs:
 Leave all new authorities inert until their consuming routes are separately
 reviewed and activated. The merge-capable App is explicitly deferred.
 
+## Authority-Worker Groundwork
+
+The broker now has an internal, inert authority-worker domain separate from
+run-oriented `Template` and `LaunchProfile` behavior. It defines reviewed
+authority profiles, immutable profile and repository-operation policy digests,
+durable SQLite worker and session-lease records, atomic capacity admission,
+principal/profile/action scoping, health state, draining, idempotent release,
+and retry-safe replacement generations that keep the old worker available
+until the replacement reports ready.
+
+No public REST or MCP operation, production profile, startup wiring, real
+worker runtime, or `agentd` readiness claim is included. The synthetic runtime
+interface deliberately omits both an `agentd` command and a session-isolation
+primitive. Those remain blocked on the versioned `agentd` owner/image,
+transport and health contract, and the accepted distinct-UID/GID or stronger
+isolation decision. `ImageReference` records reviewed configuration while
+`ImageDigest` remains empty until a runtime resolves the created image.
+
 ## Validation
 
 Run `make fmt` after changing Go code and `make check` before handoff. Also run
