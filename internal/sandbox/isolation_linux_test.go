@@ -42,10 +42,20 @@ func TestSessionWorkspaceCrossUIDIsolation(t *testing.T) {
 		uid, gid uint32
 		target   string
 	}{{22001, 22001, filepath.Join(root, "two", "private")}, {22002, 22002, filepath.Join(root, "one", "private")}} {
-		cmd := exec.Command("/bin/sh", "-c", "test -r \"$1\" || test -w \"$1\" || test -x \"$(dirname \"$1\")\"", "sh", check.target)
+		cmd := exec.Command("/usr/bin/test", "-r", check.target)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: check.uid, Gid: check.gid}}
 		if err := cmd.Run(); err == nil {
-			t.Fatalf("uid %d crossed session boundary %s", check.uid, check.target)
+			t.Fatalf("uid %d read across session boundary %s", check.uid, check.target)
+		}
+		cmd = exec.Command("/usr/bin/test", "-w", check.target)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: check.uid, Gid: check.gid}}
+		if err := cmd.Run(); err == nil {
+			t.Fatalf("uid %d wrote across session boundary %s", check.uid, check.target)
+		}
+		cmd = exec.Command("/usr/bin/test", "-x", filepath.Dir(check.target))
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: check.uid, Gid: check.gid}}
+		if err := cmd.Run(); err == nil {
+			t.Fatalf("uid %d traversed across session boundary %s", check.uid, check.target)
 		}
 	}
 }
