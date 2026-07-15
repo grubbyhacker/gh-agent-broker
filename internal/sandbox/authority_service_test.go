@@ -190,7 +190,7 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	profile := cfg.AuthorityProfiles["writer"]
 	worker := AuthorityWorker{WorkerID: "entrypoint", Profile: "writer", ProfileVersion: "version", PolicyDigest: "policy"}
 	runtime := authorityWorkerRuntimeSpec(authoritySpec(worker, profile, cfg), "secret", nil)
-	if !equalStrings(runtime.Entrypoint, fixedAgentdCommand) || len(runtime.Command) != 0 {
+	if !equalStrings(runtime.Entrypoint, fixedAgentdCommand) || len(runtime.Command) != 0 || runtime.WorkingDir != "" {
 		t.Fatalf("runtime entrypoint=%q command=%q", runtime.Entrypoint, runtime.Command)
 	}
 }
