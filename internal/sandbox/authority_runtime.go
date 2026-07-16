@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -48,7 +49,7 @@ func (r *DockerAuthorityRuntime) Create(ctx context.Context, spec AuthorityWorke
 func authorityWorkerRuntimeSpec(spec AuthorityWorkerSpec, secret, coordinatorToken string, mounts []Mount) RuntimeSpec {
 	// Keep agentd's OCI WORKDIR (/app): the immutable entrypoint references
 	// source relative to that directory. State mounts are absolute paths.
-	return RuntimeSpec{RunID: "authority-" + spec.WorkerID, Image: spec.Image, Platform: spec.Platform, Entrypoint: append([]string(nil), spec.Command...), Env: map[string]string{spec.BrokerSecretEnv: secret, "AGENTD_COORDINATOR_TOKEN": coordinatorToken}, Labels: map[string]string{"gh-agent-broker.authority_worker": "true", "gh-agent-broker.worker_id": spec.WorkerID, "gh-agent-broker.profile": spec.Profile, "gh-agent-broker.profile_version": spec.ProfileVersion, "gh-agent-broker.policy_digest": spec.PolicyDigest, "gh-agent-broker.session_isolation": spec.SessionIsolation.Primitive}, Mounts: mounts, Network: spec.Network, Resources: spec.Resources}
+	return RuntimeSpec{RunID: "authority-" + spec.WorkerID, Image: spec.Image, Platform: spec.Platform, Entrypoint: append([]string(nil), spec.Command...), Env: map[string]string{spec.BrokerSecretEnv: secret, "AGENTD_COORDINATOR_TOKEN": coordinatorToken, "AGENTD_STATE_PATH": filepath.Join(spec.SessionIsolation.WorkspaceRoot, "agentd.sqlite3")}, Labels: map[string]string{"gh-agent-broker.authority_worker": "true", "gh-agent-broker.worker_id": spec.WorkerID, "gh-agent-broker.profile": spec.Profile, "gh-agent-broker.profile_version": spec.ProfileVersion, "gh-agent-broker.policy_digest": spec.PolicyDigest, "gh-agent-broker.session_isolation": spec.SessionIsolation.Primitive}, Mounts: mounts, Network: spec.Network, Resources: spec.Resources}
 }
 
 func (r *DockerAuthorityRuntime) Stop(ctx context.Context, id string) error {

@@ -193,6 +193,9 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	if !equalStrings(runtime.Entrypoint, fixedAgentdCommand) || len(runtime.Command) != 0 || runtime.WorkingDir != "" {
 		t.Fatalf("runtime entrypoint=%q command=%q", runtime.Entrypoint, runtime.Command)
 	}
+	if got, want := runtime.Env["AGENTD_STATE_PATH"], "/var/lib/agentd/sessions/agentd.sqlite3"; got != want {
+		t.Fatalf("AGENTD_STATE_PATH=%q, want %q", got, want)
+	}
 }
 
 func TestAuthorityWorkerLifecycleCapacityDrainReleaseAndReplacement(t *testing.T) {
