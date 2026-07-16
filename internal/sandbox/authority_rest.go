@@ -6,8 +6,8 @@ import (
 	"strings"
 )
 
-// NewAuthorityRESTHandler exposes only broker lifecycle controls. It is not an
-// agentd protocol: lease admission intentionally returns deferred until PR 9.
+// NewAuthorityRESTHandler exposes broker lifecycle and authority-lease controls.
+// It never accepts caller-selected runtime, repository, or policy fields.
 func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := authorityRESTPrincipal(service.cfg, bearerToken(r))
@@ -36,7 +36,31 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			return
 		}
 		if r.Method == http.MethodPost && path == "leases" {
-			writeRESTCodeError(w, http.StatusConflict, "session_admission_deferred_until_pr9", "agentd session admission is unavailable until PR 9")
+			var in AuthorityWorkerRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.Acquire(r.Context(), principal, in)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusConflict, "lease_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		if r.Method == http.MethodPost && path == "leases/release" {
+			var in struct {
+				SessionBinding string `json:"session_binding"`
+			}
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.Release(r.Context(), principal, in.SessionBinding)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusConflict, "lease_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
 			return
 		}
 		parts := strings.Split(path, "/")
