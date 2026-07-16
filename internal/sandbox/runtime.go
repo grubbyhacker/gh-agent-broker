@@ -247,15 +247,17 @@ func (d *DockerBackend) InternalAddress(ctx context.Context, containerID string)
 	return "", nil
 }
 
-// EnsureVolumeSubpaths creates the opaque lineage directory through a short
-// lived helper that alone sees each full backing volume. Docker requires a
-// volume subpath to exist before the authority container is created.
+// EnsureVolumeSubpaths creates the opaque lineage directory through a short-
+// lived helper that alone sees each full backing volume. The 0711 root is
+// owner-only writable but traversable by the distinct per-session bun UID/GID;
+// Docker requires a volume subpath to exist before the authority container is
+// created.
 func (d *DockerBackend) EnsureVolumeSubpaths(ctx context.Context, image, lineageID string, mounts []Mount) error {
 	if !validOpaqueLineageID(lineageID) {
 		return fmt.Errorf("invalid volume storage lineage")
 	}
 	initMounts := make([]Mount, 0, len(mounts))
-	args := []string{"-d", "-o", "bun", "-g", "bun", "-m", "0700"}
+	args := []string{"-d", "-o", "bun", "-g", "bun", "-m", "0711"}
 	for index, mount := range mounts {
 		if !mount.Volume || mount.Source == "" || mount.VolumeSubpath != lineageID {
 			return fmt.Errorf("invalid authority volume subpath request")

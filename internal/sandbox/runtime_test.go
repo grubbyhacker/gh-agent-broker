@@ -124,6 +124,42 @@ func TestDockerCreateSerializesVolumeSubpathsWithoutFullVolumeBinds(t *testing.T
 	}
 }
 
+func TestDockerEnsureVolumeSubpathsUsesTraversableOpaqueRoot(t *testing.T) {
+	const lineage = "11111111111111111111111111111111"
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/images/worker:latest/json":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"Id":"sha256:image"}`)), Header: make(http.Header)}, nil
+		case req.Method == http.MethodPost && req.URL.Path == "/containers/create":
+			var body dockerCreateRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := body.Cmd, []string{"-d", "-o", "bun", "-g", "bun", "-m", "0711", "/lineage-volumes/0/" + lineage}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("initializer args=%q, want %q", got, want)
+			}
+			if body.User != "0:0" {
+				t.Fatalf("initializer user=%q, want 0:0", body.User)
+			}
+			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"initializer"}`)), Header: make(http.Header)}, nil
+		case req.Method == http.MethodPost && req.URL.Path == "/containers/initializer/start":
+			return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+		case req.Method == http.MethodPost && req.URL.Path == "/containers/initializer/wait":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"StatusCode":0}`)), Header: make(http.Header)}, nil
+		case req.Method == http.MethodGet && req.URL.Path == "/containers/initializer/json":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"Id":"initializer","State":{"ExitCode":0}}`)), Header: make(http.Header)}, nil
+		case req.Method == http.MethodDelete && req.URL.Path == "/containers/initializer":
+			return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+		default:
+			return nil, fmt.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+		}
+	})}}
+
+	if err := backend.EnsureVolumeSubpaths(context.Background(), "worker:latest", lineage, []Mount{{Source: "workspace", Volume: true, VolumeSubpath: lineage}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDockerAdoptRequiresExactDurableLaunchIdentity(t *testing.T) {
 	spec := RuntimeSpec{
 		RunID: "run-123",
