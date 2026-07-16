@@ -13,6 +13,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -215,13 +216,14 @@ type AgentdSessionValidation struct {
 }
 
 type AuthorityWorkerService struct {
-	cfg         Config
-	store       *AuthorityWorkerStore
-	runtime     AuthorityWorkerRuntime
-	audit       *AuditLogger
-	now         func() time.Time
-	newID       func() (string, error)
-	checkpoints *CheckpointStore
+	cfg          Config
+	store        *AuthorityWorkerStore
+	runtime      AuthorityWorkerRuntime
+	audit        *AuditLogger
+	now          func() time.Time
+	newID        func() (string, error)
+	checkpoints  *CheckpointStore
+	retirementMu sync.Mutex
 }
 
 type AuthoritySessionAdmission struct {
@@ -266,9 +268,11 @@ func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string
 	if err != nil {
 		return err
 	}
+	var reconcileErr error
 	for _, worker := range workers {
 		if _, err := s.authorize(principal, worker.Profile, "health"); err != nil {
-			return err
+			reconcileErr = errors.Join(reconcileErr, err)
+			continue
 		}
 		if worker.ContainerID == "" {
 			continue
@@ -281,7 +285,7 @@ func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string
 			profile := s.cfg.AuthorityProfiles[worker.Profile]
 			if configuredAgentdReadiness(profile).ContractVersion == "" {
 				if _, err := s.SetHealth(ctx, principal, worker.WorkerID, evidence, true); err != nil {
-					return err
+					reconcileErr = errors.Join(reconcileErr, err)
 				}
 				continue
 			}
@@ -294,32 +298,49 @@ func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string
 				continue
 			}
 			if _, err := s.SetHealth(ctx, principal, worker.WorkerID, readinessEvidence, true); err != nil {
-				return err
+				reconcileErr = errors.Join(reconcileErr, err)
 			}
 			continue
 		}
 		if s.checkpoints != nil {
 			if err := s.checkpoints.CheckpointWorker(ctx, worker); err != nil {
-				return err
+				reconcileErr = errors.Join(reconcileErr, err)
+				continue
 			}
 		}
 		if _, err := s.SetHealth(ctx, principal, worker.WorkerID, evidence, false); err != nil {
-			return err
+			reconcileErr = errors.Join(reconcileErr, err)
+			continue
 		}
 		if _, err := s.Replace(ctx, principal, worker.WorkerID, "runtime_unhealthy"); err != nil {
-			return err
+			reconcileErr = errors.Join(reconcileErr, err)
+		}
+	}
+	adoptions, err := s.store.UnconfirmedAgentdAdoptions(ctx)
+	if err != nil {
+		reconcileErr = errors.Join(reconcileErr, err)
+	} else {
+		for _, adoption := range adoptions {
+			if _, authErr := s.authorize(principal, adoption.AuthorityBinding, "reassign"); authErr != nil {
+				reconcileErr = errors.Join(reconcileErr, authErr)
+				continue
+			}
+			if adoptionErr := s.confirmAgentdAdoption(ctx, adoption); adoptionErr != nil {
+				reconcileErr = errors.Join(reconcileErr, adoptionErr)
+			}
 		}
 	}
 	replacements, err := s.store.ReadyReplacementWorkersWithDrainedPredecessors(ctx)
 	if err != nil {
-		return err
-	}
-	for _, replacementWorkerID := range replacements {
-		if err := s.retireDrainedPredecessor(ctx, replacementWorkerID); err != nil {
-			return err
+		reconcileErr = errors.Join(reconcileErr, err)
+	} else {
+		for _, replacementWorkerID := range replacements {
+			if retireErr := s.retireDrainedPredecessor(ctx, replacementWorkerID); retireErr != nil {
+				reconcileErr = errors.Join(reconcileErr, retireErr)
+			}
 		}
 	}
-	return nil
+	return reconcileErr
 }
 
 // ValidateAgentdSession is the authenticated, fail-closed fencing contract
@@ -434,6 +455,8 @@ func (s *AuthorityWorkerService) SetHealth(ctx context.Context, principal, worke
 }
 
 func (s *AuthorityWorkerService) retireDrainedPredecessor(ctx context.Context, replacementWorkerID string) error {
+	s.retirementMu.Lock()
+	defer s.retirementMu.Unlock()
 	predecessor, found, err := s.store.DrainedPredecessor(ctx, replacementWorkerID)
 	if err != nil || !found {
 		return err
@@ -486,11 +509,10 @@ func (s *AuthorityWorkerService) ReassignSession(ctx context.Context, principal 
 	if err != nil || !validAgentdID(workspace.AgentdSessionID) {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "session has no durable agentd identity")
 	}
-	rebinder, ok := s.runtime.(AuthorityAgentdRebinder)
-	if !ok {
+	if _, ok := s.runtime.(AuthorityAgentdRebinder); !ok {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
 	}
-	reassignment, err := s.store.Reassign(ctx, principal, request.SessionBinding, request.SessionLineageID, request.PredecessorWorkerID, request.PredecessorWorkerFenceEpoch, request.IdempotencyKey)
+	reassignment, err := s.store.Reassign(ctx, principal, request.SessionBinding, request.SessionLineageID, request.PredecessorWorkerID, request.PredecessorWorkerFenceEpoch, request.IdempotencyKey, workspace)
 	if err != nil {
 		worker := AuthorityWorker{WorkerID: reassignment.ReplacementWorkerID, Profile: lease.Profile}
 		s.log("authority_worker.reassign", principal, lease.Profile, worker, decision(err), err)
@@ -502,32 +524,18 @@ func (s *AuthorityWorkerService) ReassignSession(ctx context.Context, principal 
 		s.log("authority_worker.reassign", principal, lease.Profile, AuthorityWorker{WorkerID: reassignment.ReplacementWorkerID, Profile: lease.Profile}, "deny", err)
 		return reassignment, err
 	}
-	predecessorBinding := agentdWorkerBinding{WorkerID: predecessor.WorkerID, StorageLineageID: predecessor.WorkerStorageLineageID, FenceEpoch: predecessor.WorkerFenceEpoch}
-	successorBinding := agentdWorkerBinding{WorkerID: replacement.WorkerID, StorageLineageID: replacement.WorkerStorageLineageID, FenceEpoch: replacement.WorkerFenceEpoch}
-	rebindRequest := agentdRebindRequest{
-		IdempotencyKey: s.store.rebindIdempotencyKey(workspace.AgentdSessionID, predecessorBinding, successorBinding),
-		Predecessor:    predecessorBinding,
-		Successor:      successorBinding,
-	}
-	status, rebindErr := rebinder.RebindAgentdSession(ctx, replacement, workspace.AgentdSessionID, rebindRequest)
-	if rebindErr != nil {
-		var typed *agentdRebindError
-		if errors.As(rebindErr, &typed) && !typed.retryable {
-			err = reassignmentError(ReassignmentRebindConflict, "%s", typed.Error())
-		} else {
-			err = reassignmentError(ReassignmentRebindRetryable, "agentd rebind is temporarily unavailable")
-		}
+	adoption, err := s.store.AgentdAdoption(ctx, reassignment.Lease.BindingDigest)
+	if err != nil {
+		err = reassignmentError(ReassignmentRebindRetryable, "durable agentd adoption transition is temporarily unavailable")
 		s.log("authority_worker.reassign", principal, lease.Profile, replacement, "deny", err)
 		return reassignment, err
 	}
-	expectedWorkspace := agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID, BranchRef: status.Workspace.BranchRef, CheckpointRef: status.Workspace.CheckpointRef}
-	if !exactAgentdSessionStatus(status, workspace.AgentdSessionID, request.SessionBinding, lease.Profile, request.SessionLineageID, expectedWorkspace, successorBinding) {
-		err = reassignmentError(ReassignmentRebindRetryable, "agentd rebind returned an invalid successor status")
+	if err = s.confirmAgentdAdoption(ctx, adoption); err != nil {
 		s.log("authority_worker.reassign", principal, lease.Profile, replacement, "deny", err)
 		return reassignment, err
 	}
-	// Retirement is intentionally after agentd durably confirms the successor
-	// binding. A crash before this point leaves Reconcile able to retire later.
+	// Retirement is intentionally after the exact agentd status is durably
+	// confirmed. Every retirement query repeats that durable gate.
 	if retireErr := s.retireDrainedPredecessor(ctx, reassignment.ReplacementWorkerID); retireErr != nil {
 		err = reassignmentError(ReassignmentRebindRetryable, "predecessor retirement is temporarily unavailable")
 		s.log("authority_worker.reassign", principal, lease.Profile, replacement, "deny", err)
@@ -536,6 +544,58 @@ func (s *AuthorityWorkerService) ReassignSession(ctx context.Context, principal 
 	worker := replacement
 	s.log("authority_worker.reassign", principal, lease.Profile, worker, decision(err), err)
 	return reassignment, err
+}
+
+func (s *AuthorityWorkerService) confirmAgentdAdoption(ctx context.Context, adoption authorityAgentdAdoption) error {
+	switch adoption.State {
+	case authorityAdoptionConfirmed:
+		return nil
+	case authorityAdoptionConflict:
+		return reassignmentError(ReassignmentRebindConflict, "agentd adoption has terminal conflict %s", adoption.ErrorCode)
+	case authorityAdoptionLegacyUnresolved:
+		return reassignmentError(ReassignmentRebindConflict, "agentd adoption transition predates replayable recovery state and requires operator resolution")
+	case authorityAdoptionPending:
+	default:
+		return reassignmentError(ReassignmentRebindConflict, "agentd adoption transition has invalid durable state")
+	}
+	if !validAgentdID(adoption.AgentdSessionID) || !validAgentdID(adoption.SessionLineageID) ||
+		adoption.RebindIdempotencyKey != s.store.rebindIdempotencyKey(adoption.AgentdSessionID, adoption.Predecessor, adoption.Successor) {
+		return reassignmentError(ReassignmentRebindConflict, "agentd adoption transition identity is invalid")
+	}
+	replacement, err := s.store.GetWorker(ctx, adoption.Successor.WorkerID)
+	if err != nil || replacement.Profile != adoption.AuthorityBinding || replacement.WorkerStorageLineageID != adoption.Successor.StorageLineageID || replacement.WorkerFenceEpoch != adoption.Successor.FenceEpoch {
+		return reassignmentError(ReassignmentRebindRetryable, "broker-recorded adoption successor is temporarily unavailable")
+	}
+	rebinder, ok := s.runtime.(AuthorityAgentdRebinder)
+	if !ok {
+		return reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
+	}
+	request := agentdRebindRequest{IdempotencyKey: adoption.RebindIdempotencyKey, Predecessor: adoption.Predecessor, Successor: adoption.Successor}
+	status, rebindErr := rebinder.RebindAgentdSession(ctx, replacement, adoption.AgentdSessionID, request)
+	if rebindErr != nil {
+		var typed *agentdRebindError
+		if errors.As(rebindErr, &typed) && !typed.retryable {
+			code := typed.code
+			if code == "" {
+				code = "agentd_rebind_rejected"
+			}
+			if recordErr := s.store.RecordAgentdAdoptionConflict(context.WithoutCancel(ctx), adoption, code); recordErr != nil {
+				return reassignmentError(ReassignmentRebindRetryable, "agentd adoption conflict could not be recorded")
+			}
+			return reassignmentError(ReassignmentRebindConflict, "%s", typed.Error())
+		}
+		return reassignmentError(ReassignmentRebindRetryable, "agentd rebind is temporarily unavailable")
+	}
+	expectedWorkspace := adoption.Workspace
+	expectedWorkspace.BranchRef = status.Workspace.BranchRef
+	expectedWorkspace.CheckpointRef = status.Workspace.CheckpointRef
+	if !exactAgentdSessionStatus(status, adoption.AgentdSessionID, adoption.CoordinatorBinding, adoption.AuthorityBinding, adoption.SessionLineageID, expectedWorkspace, adoption.Successor) {
+		return reassignmentError(ReassignmentRebindRetryable, "agentd rebind returned an invalid successor status")
+	}
+	if err := s.store.ConfirmAgentdAdoption(context.WithoutCancel(ctx), adoption); err != nil {
+		return reassignmentError(ReassignmentRebindRetryable, "agentd adoption confirmation is temporarily unavailable")
+	}
+	return nil
 }
 
 func (s *AuthorityWorkerService) Release(ctx context.Context, principal, sessionBinding string) (AuthorityLease, error) {

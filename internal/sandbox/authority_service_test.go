@@ -1344,6 +1344,317 @@ func TestAuthoritySessionRebindRejectsMismatchedSuccessBeforeRetirement(t *testi
 	}
 }
 
+func TestAuthorityReconcileRecoversCrashBeforeAgentdAdoption(t *testing.T) {
+	fixture := newAuthorityAdoptionFixture(t, 1)
+	adoption := fixture.commit(t, 0)
+	if adoption.State != authorityAdoptionPending {
+		t.Fatalf("adoption state=%q, want pending", adoption.State)
+	}
+	originalKey := adoption.RebindIdempotencyKey
+	if err := fixture.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenAuthorityWorkerStore(context.Background(), fixture.cfg.AuthorityStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened store: %v", err)
+		}
+	})
+	fixture.store = reopened
+	fixture.service = NewAuthorityWorkerService(fixture.cfg, reopened, fixture.runtime, nil)
+
+	var calls []agentdRebindRequest
+	fixture.runtime.rebind = func(ctx context.Context, worker AuthorityWorker, sessionID string, request agentdRebindRequest) (agentdSessionStatus, error) {
+		calls = append(calls, request)
+		return successfulAgentdRebind(fixture.bindings[0], fixture.leases[0], fixture.workspaces[0])(ctx, worker, sessionID, request)
+	}
+	if err := fixture.service.Reconcile(context.Background(), "coordinator"); err != nil {
+		t.Fatal(err)
+	}
+	confirmed, err := reopened.AgentdAdoption(context.Background(), adoption.BindingDigest)
+	if err != nil || confirmed.State != authorityAdoptionConfirmed || confirmed.RebindIdempotencyKey != originalKey {
+		t.Fatalf("confirmed adoption=%+v err=%v", confirmed, err)
+	}
+	assertAuthorityRetiredExactlyOnce(t, fixture)
+	if len(calls) != 1 || calls[0].IdempotencyKey != originalKey {
+		t.Fatalf("recovery calls=%+v, want one stable replay", calls)
+	}
+}
+
+func TestAuthorityReconcileReplaysSuccessBeforeConfirmationMarker(t *testing.T) {
+	fixture := newAuthorityAdoptionFixture(t, 1)
+	adoption := fixture.commit(t, 0)
+	var calls []agentdRebindRequest
+	fixture.runtime.rebind = func(ctx context.Context, worker AuthorityWorker, sessionID string, request agentdRebindRequest) (agentdSessionStatus, error) {
+		calls = append(calls, request)
+		return successfulAgentdRebind(fixture.bindings[0], fixture.leases[0], fixture.workspaces[0])(ctx, worker, sessionID, request)
+	}
+	request := agentdRebindRequest{IdempotencyKey: adoption.RebindIdempotencyKey, Predecessor: adoption.Predecessor, Successor: adoption.Successor}
+	if _, err := fixture.runtime.RebindAgentdSession(context.Background(), fixture.successor, adoption.AgentdSessionID, request); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.service.Reconcile(context.Background(), "coordinator"); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || calls[0] != calls[1] {
+		t.Fatalf("success-before-marker replay calls=%+v", calls)
+	}
+	assertAuthorityRetiredExactlyOnce(t, fixture)
+	var records int
+	var confirmedAt string
+	if err := fixture.store.db.QueryRow(`SELECT count(*),max(adoption_confirmed_at) FROM authority_session_reassignments WHERE binding_digest=?`, adoption.BindingDigest).Scan(&records, &confirmedAt); err != nil {
+		t.Fatal(err)
+	}
+	if records != 1 || confirmedAt == "" {
+		t.Fatalf("records=%d confirmed_at=%q", records, confirmedAt)
+	}
+	if err := fixture.service.Reconcile(context.Background(), "coordinator"); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("confirmed transition replayed again: calls=%d", len(calls))
+	}
+}
+
+func TestAuthorityReconcileKeepsRetryableAndMismatchedAdoptionsPending(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		rebind func(agentdSessionStatus) (agentdSessionStatus, error)
+	}{
+		{name: "retryable", rebind: func(agentdSessionStatus) (agentdSessionStatus, error) {
+			return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+		}},
+		{name: "mismatched", rebind: func(status agentdSessionStatus) (agentdSessionStatus, error) {
+			status.WorkerID = "wrong-successor"
+			return status, nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newAuthorityAdoptionFixture(t, 1)
+			var calls []agentdRebindRequest
+			valid := successfulAgentdRebind(fixture.bindings[0], fixture.leases[0], fixture.workspaces[0])
+			fixture.runtime.rebind = func(ctx context.Context, worker AuthorityWorker, sessionID string, request agentdRebindRequest) (agentdSessionStatus, error) {
+				calls = append(calls, request)
+				status, err := valid(ctx, worker, sessionID, request)
+				if err != nil {
+					return status, err
+				}
+				return tc.rebind(status)
+			}
+			request := fixture.requests[0]
+			if _, err := fixture.service.ReassignSession(context.Background(), "coordinator", request); !isReassignmentCode(err, ReassignmentRebindRetryable) {
+				t.Fatalf("ReassignSession() error=%v", err)
+			}
+			if err := fixture.service.Reconcile(context.Background(), "coordinator"); !isReassignmentCode(err, ReassignmentRebindRetryable) {
+				t.Fatalf("Reconcile() error=%v", err)
+			}
+			adoption, err := fixture.store.AgentdAdoption(context.Background(), fixture.leases[0].BindingDigest)
+			if err != nil || adoption.State != authorityAdoptionPending {
+				t.Fatalf("adoption=%+v err=%v", adoption, err)
+			}
+			if len(calls) != 2 || calls[0] != calls[1] {
+				t.Fatalf("rebind calls=%+v, want stable request and reconcile replay", calls)
+			}
+			assertAuthorityNotRetired(t, fixture)
+		})
+	}
+}
+
+func TestAuthorityConcurrentHealthAndReconcileRetiresOnlyAfterConfirmation(t *testing.T) {
+	fixture := newAuthorityAdoptionFixture(t, 1)
+	fixture.commit(t, 0)
+	entered, proceed := make(chan struct{}), make(chan struct{})
+	fixture.runtime.rebind = func(ctx context.Context, worker AuthorityWorker, sessionID string, request agentdRebindRequest) (agentdSessionStatus, error) {
+		close(entered)
+		<-proceed
+		return successfulAgentdRebind(fixture.bindings[0], fixture.leases[0], fixture.workspaces[0])(ctx, worker, sessionID, request)
+	}
+	done := make(chan error, 1)
+	go func() { done <- fixture.service.Reconcile(context.Background(), "coordinator") }()
+	<-entered
+	if _, err := fixture.service.SetHealth(context.Background(), "coordinator", fixture.successor.WorkerID, "concurrent_ready", true); err != nil {
+		t.Fatal(err)
+	}
+	assertAuthorityNotRetired(t, fixture)
+	close(proceed)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	assertAuthorityRetiredExactlyOnce(t, fixture)
+}
+
+func TestAuthorityMultipleSessionsRequireEveryAdoptionConfirmation(t *testing.T) {
+	fixture := newAuthorityAdoptionFixture(t, 2)
+	first, second := fixture.commit(t, 0), fixture.commit(t, 1)
+	allowSecond := false
+	callCount := map[string]int{}
+	fixture.runtime.rebind = func(ctx context.Context, worker AuthorityWorker, sessionID string, request agentdRebindRequest) (agentdSessionStatus, error) {
+		callCount[sessionID]++
+		if sessionID == second.AgentdSessionID && !allowSecond {
+			return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+		}
+		index := 0
+		if sessionID == second.AgentdSessionID {
+			index = 1
+		}
+		return successfulAgentdRebind(fixture.bindings[index], fixture.leases[index], fixture.workspaces[index])(ctx, worker, sessionID, request)
+	}
+	if err := fixture.service.Reconcile(context.Background(), "coordinator"); !isReassignmentCode(err, ReassignmentRebindRetryable) {
+		t.Fatalf("first Reconcile() error=%v", err)
+	}
+	firstAfter, err := fixture.store.AgentdAdoption(context.Background(), first.BindingDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAfter, err := fixture.store.AgentdAdoption(context.Background(), second.BindingDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstAfter.State != authorityAdoptionConfirmed || secondAfter.State != authorityAdoptionPending {
+		t.Fatalf("first=%+v second=%+v", firstAfter, secondAfter)
+	}
+	assertAuthorityNotRetired(t, fixture)
+	allowSecond = true
+	if err := fixture.service.Reconcile(context.Background(), "coordinator"); err != nil {
+		t.Fatal(err)
+	}
+	if callCount[first.AgentdSessionID] != 1 || callCount[second.AgentdSessionID] != 2 {
+		t.Fatalf("rebind call count=%v", callCount)
+	}
+	assertAuthorityRetiredExactlyOnce(t, fixture)
+}
+
+func TestAuthorityTerminalAdoptionConflictRemainsActionable(t *testing.T) {
+	fixture := newAuthorityAdoptionFixture(t, 1)
+	calls := 0
+	fixture.runtime.rebind = func(context.Context, AuthorityWorker, string, agentdRebindRequest) (agentdSessionStatus, error) {
+		calls++
+		return agentdSessionStatus{}, &agentdRebindError{code: "rebind_conflict"}
+	}
+	if _, err := fixture.service.ReassignSession(context.Background(), "coordinator", fixture.requests[0]); !isReassignmentCode(err, ReassignmentRebindConflict) {
+		t.Fatalf("ReassignSession() error=%v", err)
+	}
+	if err := fixture.service.Reconcile(context.Background(), "coordinator"); !isReassignmentCode(err, ReassignmentRebindConflict) {
+		t.Fatalf("Reconcile() error=%v", err)
+	}
+	adoption, err := fixture.store.AgentdAdoption(context.Background(), fixture.leases[0].BindingDigest)
+	if err != nil || adoption.State != authorityAdoptionConflict || adoption.ErrorCode != "rebind_conflict" || calls != 1 {
+		t.Fatalf("adoption=%+v calls=%d err=%v", adoption, calls, err)
+	}
+	assertAuthorityNotRetired(t, fixture)
+}
+
+type authorityAdoptionFixture struct {
+	cfg         Config
+	store       *AuthorityWorkerStore
+	runtime     *fakeAuthorityRuntime
+	service     *AuthorityWorkerService
+	predecessor AuthorityWorker
+	successor   AuthorityWorker
+	bindings    []string
+	leases      []AuthorityLease
+	workspaces  []SessionWorkspace
+	requests    []AuthoritySessionReassignmentRequest
+}
+
+func newAuthorityAdoptionFixture(t *testing.T, sessions int) *authorityAdoptionFixture {
+	t.Helper()
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &fakeAuthorityRuntime{}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	ids := []string{"adoption-old", "adoption-successor"}
+	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
+	old, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	fixture := &authorityAdoptionFixture{cfg: cfg, store: store, runtime: runtime, service: service, predecessor: old}
+	for i := range sessions {
+		binding := fmt.Sprintf("adoption-session-%d", i)
+		lease, err := service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: fmt.Sprintf("adoption-lease-%d", i), SessionBinding: binding})
+		if err != nil {
+			t.Fatal(err)
+		}
+		workspace := SessionWorkspace{
+			UID:              20000 + i,
+			GID:              20000 + i,
+			Path:             fmt.Sprintf("/durable/adoption-%d", i),
+			SessionLineageID: lease.SessionLineageID,
+			AgentdSessionID:  fmt.Sprintf("agentd-adoption-%d", i),
+		}
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, workspace.UID, workspace.GID, workspace.Path, formatAuthorityTime(time.Now().UTC()), lease.SessionLineageID); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.BindAgentdSession(ctx, binding, workspace.AgentdSessionID); err != nil {
+			t.Fatal(err)
+		}
+		fixture.bindings = append(fixture.bindings, binding)
+		fixture.leases = append(fixture.leases, lease)
+		fixture.workspaces = append(fixture.workspaces, workspace)
+		fixture.requests = append(fixture.requests, AuthoritySessionReassignmentRequest{SessionBinding: binding, SessionLineageID: lease.SessionLineageID, PredecessorWorkerID: old.WorkerID, PredecessorWorkerFenceEpoch: old.WorkerFenceEpoch, IdempotencyKey: fmt.Sprintf("adoption-reassign-%d", i)})
+	}
+	if _, err := service.SetHealth(ctx, "coordinator", old.WorkerID, "lost", false); err != nil {
+		t.Fatal(err)
+	}
+	successor, err := service.Replace(ctx, "coordinator", old.WorkerID, "lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetHealth(ctx, "coordinator", successor.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	fixture.successor = successor
+	return fixture
+}
+
+func (f *authorityAdoptionFixture) commit(t *testing.T, index int) authorityAgentdAdoption {
+	t.Helper()
+	request := f.requests[index]
+	reassignment, err := f.store.Reassign(context.Background(), "coordinator", request.SessionBinding, request.SessionLineageID, request.PredecessorWorkerID, request.PredecessorWorkerFenceEpoch, request.IdempotencyKey, f.workspaces[index])
+	if err != nil {
+		t.Fatal(err)
+	}
+	adoption, err := f.store.AgentdAdoption(context.Background(), reassignment.Lease.BindingDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return adoption
+}
+
+func assertAuthorityNotRetired(t *testing.T, fixture *authorityAdoptionFixture) {
+	t.Helper()
+	worker, err := fixture.store.GetWorker(context.Background(), fixture.predecessor.WorkerID)
+	if err != nil || worker.State != AuthorityWorkerDraining {
+		t.Fatalf("predecessor=%+v err=%v, want draining", worker, err)
+	}
+	fixture.runtime.mu.Lock()
+	defer fixture.runtime.mu.Unlock()
+	if len(fixture.runtime.stopped) != 0 {
+		t.Fatalf("predecessor stopped before adoption confirmation: %v", fixture.runtime.stopped)
+	}
+}
+
+func assertAuthorityRetiredExactlyOnce(t *testing.T, fixture *authorityAdoptionFixture) {
+	t.Helper()
+	worker, err := fixture.store.GetWorker(context.Background(), fixture.predecessor.WorkerID)
+	if err != nil || worker.State != AuthorityWorkerStopped {
+		t.Fatalf("predecessor=%+v err=%v, want stopped", worker, err)
+	}
+	fixture.runtime.mu.Lock()
+	defer fixture.runtime.mu.Unlock()
+	if len(fixture.runtime.stopped) != 1 || fixture.runtime.stopped[0] != fixture.predecessor.ContainerID {
+		t.Fatalf("runtime stops=%v, want exactly %q", fixture.runtime.stopped, fixture.predecessor.ContainerID)
+	}
+}
+
 func isReassignmentCode(err error, want ReassignmentErrorCode) bool {
 	var reassignmentErr *ReassignmentError
 	return errors.As(err, &reassignmentErr) && reassignmentErr.Code == want

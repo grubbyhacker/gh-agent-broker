@@ -17,7 +17,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 6
+const authorityStoreSchemaVersion = 7
+
+const (
+	authorityAdoptionPending          = "pending"
+	authorityAdoptionConfirmed        = "confirmed"
+	authorityAdoptionConflict         = "conflict"
+	authorityAdoptionLegacyUnresolved = "legacy_unresolved"
+)
 
 type AuthorityWorkerState string
 
@@ -75,6 +82,23 @@ type AuthoritySessionReassignment struct {
 	PredecessorWorkerID string         `json:"predecessor_worker_id"`
 	ReplacementWorkerID string         `json:"replacement_worker_id"`
 	Replay              bool           `json:"replay"`
+}
+
+// authorityAgentdAdoption is the durable, replayable half of a reassignment.
+// Every value needed to reproduce and verify the agentd command is captured in
+// the same transaction as the lease/workspace CAS.
+type authorityAgentdAdoption struct {
+	BindingDigest        string
+	CoordinatorBinding   string
+	AuthorityBinding     string
+	SessionLineageID     string
+	AgentdSessionID      string
+	Predecessor          agentdWorkerBinding
+	Successor            agentdWorkerBinding
+	RebindIdempotencyKey string
+	Workspace            agentdSessionWorkspace
+	State                string
+	ErrorCode            string
 }
 
 // ReassignmentErrorCode is deliberately narrow so coordinators can decide
@@ -185,6 +209,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	}
 	if version == 5 {
 		if err := s.migrateV6(ctx); err != nil {
+			return err
+		}
+		version = 6
+	}
+	if version == 6 {
+		if err := s.migrateV7(ctx); err != nil {
 			return err
 		}
 	}
@@ -315,6 +345,32 @@ func (s *AuthorityWorkerStore) migrateV5(ctx context.Context) error {
 func (s *AuthorityWorkerStore) migrateV6(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `ALTER TABLE authority_session_workspaces ADD COLUMN agentd_session_id TEXT NOT NULL DEFAULT '';
 	PRAGMA user_version=6`)
+	return err
+}
+
+// V7 makes agentd adoption a durable, replayable transition. Existing
+// reassignment rows cannot recover the unhashed coordinator binding and are
+// deliberately left unresolved so they can never make a predecessor eligible
+// for automatic retirement.
+func (s *AuthorityWorkerStore) migrateV7(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE authority_session_reassignments ADD COLUMN coordinator_binding TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_reassignments ADD COLUMN authority_binding TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_reassignments ADD COLUMN session_lineage_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_reassignments ADD COLUMN agentd_session_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_reassignments ADD COLUMN predecessor_storage_lineage_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_reassignments ADD COLUMN predecessor_fence_epoch INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE authority_session_reassignments ADD COLUMN replacement_storage_lineage_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_reassignments ADD COLUMN replacement_fence_epoch INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE authority_session_reassignments ADD COLUMN rebind_idempotency_key TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_reassignments ADD COLUMN workspace_ref TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_reassignments ADD COLUMN workspace_uid INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE authority_session_reassignments ADD COLUMN workspace_gid INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE authority_session_reassignments ADD COLUMN adoption_state TEXT NOT NULL DEFAULT 'legacy_unresolved';
+	ALTER TABLE authority_session_reassignments ADD COLUMN adoption_error_code TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_reassignments ADD COLUMN adoption_confirmed_at TEXT NOT NULL DEFAULT '';
+	UPDATE authority_session_reassignments SET authority_binding=coalesce((SELECT profile FROM authority_session_leases lease WHERE lease.binding_digest=authority_session_reassignments.binding_digest),'');
+	CREATE INDEX authority_session_reassignments_adoption ON authority_session_reassignments(adoption_state,created_at,binding_digest);
+	PRAGMA user_version=7`)
 	return err
 }
 
@@ -686,7 +742,7 @@ func (s *AuthorityWorkerStore) ValidateSessionFence(ctx context.Context, workerI
 // Reassign moves an active lease only to the replacement durably linked to the
 // supplied predecessor.  Lease ownership, workspace ownership, and capacity
 // accounting commit together, so a process crash leaves either side intact.
-func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionBinding, sessionLineageID, predecessorWorkerID string, predecessorWorkerFenceEpoch int64, idempotencyKey string) (AuthoritySessionReassignment, error) {
+func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionBinding, sessionLineageID, predecessorWorkerID string, predecessorWorkerFenceEpoch int64, idempotencyKey string, workspace SessionWorkspace) (AuthoritySessionReassignment, error) {
 	binding := s.requestDigest(sessionBinding)
 	idem := s.requestDigest(idempotencyKey)
 	fingerprint := s.requestDigest(fmt.Sprintf("reassign:%s\x00%s\x00%s\x00%d", sessionBinding, sessionLineageID, predecessorWorkerID, predecessorWorkerFenceEpoch))
@@ -804,6 +860,14 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	if replacementAssigned >= replacementCapacity {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentCapacity, "broker-recorded replacement has no session capacity")
 	}
+	var durableAgentdSessionID, durableSessionLineageID, durableWorkspacePath string
+	var durableUID, durableGID int
+	if err := conn.QueryRowContext(ctx, `SELECT agentd_session_id,session_lineage_id,workspace_path,uid,gid FROM authority_session_workspaces WHERE binding_digest=? AND worker_id=?`, binding, predecessorWorkerID).Scan(&durableAgentdSessionID, &durableSessionLineageID, &durableWorkspacePath, &durableUID, &durableGID); err != nil {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "session workspace is missing or belongs to another worker")
+	}
+	if workspace.AgentdSessionID != durableAgentdSessionID || workspace.SessionLineageID != durableSessionLineageID || workspace.Path != durableWorkspacePath || workspace.UID != durableUID || workspace.GID != durableGID {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "session workspace identity changed before reassignment")
+	}
 	now := time.Now().UTC()
 	result, err := conn.ExecContext(ctx, `UPDATE authority_workers SET assigned_sessions=assigned_sessions-1,updated_at=? WHERE worker_id=? AND assigned_sessions>0`, formatAuthorityTime(now), predecessorWorkerID)
 	if err != nil {
@@ -837,7 +901,19 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	if err != nil || rows != 1 {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "session workspace is missing or belongs to another worker")
 	}
-	if _, err := conn.ExecContext(ctx, `INSERT INTO authority_session_reassignments(principal,idempotency_digest,request_fingerprint,binding_digest,predecessor_worker_id,replacement_worker_id,created_at) VALUES(?,?,?,?,?,?,?)`, principal, idem, fingerprint, binding, predecessorWorkerID, replacementID, formatAuthorityTime(now)); err != nil {
+	predecessorBinding := agentdWorkerBinding{WorkerID: predecessorWorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: predecessorWorkerFenceEpoch}
+	successorBinding := agentdWorkerBinding{WorkerID: replacementID, StorageLineageID: replacementStorageLineageID, FenceEpoch: replacementWorkerFenceEpoch}
+	rebindIdempotencyKey := s.rebindIdempotencyKey(workspace.AgentdSessionID, predecessorBinding, successorBinding)
+	if _, err := conn.ExecContext(ctx, `INSERT INTO authority_session_reassignments(
+		principal,idempotency_digest,request_fingerprint,binding_digest,predecessor_worker_id,replacement_worker_id,created_at,
+		coordinator_binding,authority_binding,session_lineage_id,agentd_session_id,
+		predecessor_storage_lineage_id,predecessor_fence_epoch,replacement_storage_lineage_id,replacement_fence_epoch,
+		rebind_idempotency_key,workspace_ref,workspace_uid,workspace_gid,adoption_state)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		principal, idem, fingerprint, binding, predecessorWorkerID, replacementID, formatAuthorityTime(now),
+		sessionBinding, lease.Profile, sessionLineageID, workspace.AgentdSessionID,
+		predecessorBinding.StorageLineageID, predecessorBinding.FenceEpoch, successorBinding.StorageLineageID, successorBinding.FenceEpoch,
+		rebindIdempotencyKey, workspace.Path, workspace.UID, workspace.GID, authorityAdoptionPending); err != nil {
 		return AuthoritySessionReassignment{}, err
 	}
 	lease.WorkerID = replacementID
@@ -868,6 +944,114 @@ func getLeaseByDigest(ctx context.Context, queryer interface {
 	}
 	lease.ReleasedAt, err = parseAuthorityTime(released)
 	return lease, err
+}
+
+const authorityAdoptionSelect = `SELECT binding_digest,coordinator_binding,authority_binding,session_lineage_id,agentd_session_id,
+	predecessor_worker_id,predecessor_storage_lineage_id,predecessor_fence_epoch,
+	replacement_worker_id,replacement_storage_lineage_id,replacement_fence_epoch,
+	rebind_idempotency_key,workspace_ref,workspace_uid,workspace_gid,adoption_state,adoption_error_code
+	FROM authority_session_reassignments`
+
+func scanAuthorityAgentdAdoption(scanner interface{ Scan(...any) error }) (authorityAgentdAdoption, error) {
+	var adoption authorityAgentdAdoption
+	err := scanner.Scan(
+		&adoption.BindingDigest, &adoption.CoordinatorBinding, &adoption.AuthorityBinding, &adoption.SessionLineageID, &adoption.AgentdSessionID,
+		&adoption.Predecessor.WorkerID, &adoption.Predecessor.StorageLineageID, &adoption.Predecessor.FenceEpoch,
+		&adoption.Successor.WorkerID, &adoption.Successor.StorageLineageID, &adoption.Successor.FenceEpoch,
+		&adoption.RebindIdempotencyKey, &adoption.Workspace.WorkspaceRef, &adoption.Workspace.UID, &adoption.Workspace.GID,
+		&adoption.State, &adoption.ErrorCode,
+	)
+	return adoption, err
+}
+
+func (s *AuthorityWorkerStore) AgentdAdoption(ctx context.Context, bindingDigest string) (authorityAgentdAdoption, error) {
+	return scanAuthorityAgentdAdoption(s.db.QueryRowContext(ctx, authorityAdoptionSelect+` WHERE binding_digest=?`, bindingDigest))
+}
+
+func (s *AuthorityWorkerStore) UnconfirmedAgentdAdoptions(ctx context.Context) ([]authorityAgentdAdoption, error) {
+	rows, err := s.db.QueryContext(ctx, authorityAdoptionSelect+` WHERE adoption_state<>? ORDER BY created_at,binding_digest`, authorityAdoptionConfirmed)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		//nolint:errcheck // Read-only rows are exhausted before close; no recovery action exists on close.
+		_ = rows.Close()
+	}()
+	var adoptions []authorityAgentdAdoption
+	for rows.Next() {
+		adoption, err := scanAuthorityAgentdAdoption(rows)
+		if err != nil {
+			return nil, err
+		}
+		adoptions = append(adoptions, adoption)
+	}
+	return adoptions, rows.Err()
+}
+
+func (s *AuthorityWorkerStore) ConfirmAgentdAdoption(ctx context.Context, adoption authorityAgentdAdoption) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE authority_session_reassignments SET adoption_state=?,adoption_error_code='',adoption_confirmed_at=?
+		WHERE binding_digest=? AND coordinator_binding=? AND authority_binding=? AND session_lineage_id=? AND agentd_session_id=?
+		AND predecessor_worker_id=? AND predecessor_storage_lineage_id=? AND predecessor_fence_epoch=?
+		AND replacement_worker_id=? AND replacement_storage_lineage_id=? AND replacement_fence_epoch=?
+		AND rebind_idempotency_key=? AND workspace_ref=? AND workspace_uid=? AND workspace_gid=? AND adoption_state=?`,
+		authorityAdoptionConfirmed, formatAuthorityTime(time.Now().UTC()),
+		adoption.BindingDigest, adoption.CoordinatorBinding, adoption.AuthorityBinding, adoption.SessionLineageID, adoption.AgentdSessionID,
+		adoption.Predecessor.WorkerID, adoption.Predecessor.StorageLineageID, adoption.Predecessor.FenceEpoch,
+		adoption.Successor.WorkerID, adoption.Successor.StorageLineageID, adoption.Successor.FenceEpoch,
+		adoption.RebindIdempotencyKey, adoption.Workspace.WorkspaceRef, adoption.Workspace.UID, adoption.Workspace.GID, authorityAdoptionPending)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 1 {
+		return nil
+	}
+	current, err := s.AgentdAdoption(ctx, adoption.BindingDigest)
+	if err == nil && current.State == authorityAdoptionConfirmed && current == adoptionWithState(adoption, authorityAdoptionConfirmed, "") {
+		return nil
+	}
+	return fmt.Errorf("agentd adoption transition changed before confirmation")
+}
+
+func adoptionWithState(adoption authorityAgentdAdoption, state, errorCode string) authorityAgentdAdoption {
+	adoption.State, adoption.ErrorCode = state, errorCode
+	return adoption
+}
+
+func (s *AuthorityWorkerStore) RecordAgentdAdoptionConflict(ctx context.Context, adoption authorityAgentdAdoption, code string) error {
+	if code != "rebind_conflict" && code != "session_fenced" && code != "agentd_rebind_rejected" {
+		return fmt.Errorf("invalid agentd adoption conflict code")
+	}
+	current, err := s.AgentdAdoption(ctx, adoption.BindingDigest)
+	if err != nil {
+		return err
+	}
+	if current.State == authorityAdoptionConflict && current.ErrorCode == code {
+		return nil
+	}
+	if current != adoptionWithState(adoption, authorityAdoptionPending, "") {
+		return fmt.Errorf("agentd adoption transition changed before conflict was recorded")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE authority_session_reassignments SET adoption_state=?,adoption_error_code=?
+		WHERE binding_digest=? AND adoption_state=?`, authorityAdoptionConflict, code, adoption.BindingDigest, authorityAdoptionPending)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 1 {
+		return nil
+	}
+	current, err = s.AgentdAdoption(ctx, adoption.BindingDigest)
+	if err == nil && current.State == authorityAdoptionConflict && current.ErrorCode == code {
+		return nil
+	}
+	return fmt.Errorf("agentd adoption transition changed before conflict was recorded")
 }
 
 func (s *AuthorityWorkerStore) ListActiveLeases(ctx context.Context, workerID string) ([]AuthorityLease, error) {
@@ -918,11 +1102,12 @@ func (s *AuthorityWorkerStore) Drain(ctx context.Context, workerID, reason strin
 	return s.GetWorker(ctx, workerID)
 }
 
-// DrainedPredecessor returns the zero-lease worker which was replaced by the
-// supplied worker.  A predecessor with active sessions must remain available
-// until its leases are released, so it is deliberately not returned here.
+// DrainedPredecessor returns a zero-lease worker only when every durable
+// reassignment from it has confirmed exact agentd adoption.
 func (s *AuthorityWorkerStore) DrainedPredecessor(ctx context.Context, replacementWorkerID string) (AuthorityWorker, bool, error) {
-	worker, err := scanAuthorityWorker(s.db.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE replacement_worker_id=? AND state=? AND assigned_sessions=0`, replacementWorkerID, AuthorityWorkerDraining))
+	worker, err := scanAuthorityWorker(s.db.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers predecessor
+		WHERE replacement_worker_id=? AND state=? AND assigned_sessions=0
+		AND NOT EXISTS (SELECT 1 FROM authority_session_reassignments transition WHERE transition.predecessor_worker_id=predecessor.worker_id AND transition.adoption_state<>?)`, replacementWorkerID, AuthorityWorkerDraining, authorityAdoptionConfirmed))
 	if errors.Is(err, sql.ErrNoRows) {
 		return AuthorityWorker{}, false, nil
 	}
@@ -937,7 +1122,8 @@ func (s *AuthorityWorkerStore) DrainedPredecessor(ctx context.Context, replaceme
 func (s *AuthorityWorkerStore) ReadyReplacementWorkersWithDrainedPredecessors(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT replacement_worker_id FROM authority_workers predecessor
 		WHERE predecessor.state=? AND predecessor.assigned_sessions=0 AND predecessor.replacement_worker_id<>''
-		AND EXISTS (SELECT 1 FROM authority_workers replacement WHERE replacement.worker_id=predecessor.replacement_worker_id AND replacement.state=?)`, AuthorityWorkerDraining, AuthorityWorkerReady)
+		AND EXISTS (SELECT 1 FROM authority_workers replacement WHERE replacement.worker_id=predecessor.replacement_worker_id AND replacement.state=?)
+		AND NOT EXISTS (SELECT 1 FROM authority_session_reassignments transition WHERE transition.predecessor_worker_id=predecessor.worker_id AND transition.adoption_state<>?)`, AuthorityWorkerDraining, AuthorityWorkerReady, authorityAdoptionConfirmed)
 	if err != nil {
 		return nil, err
 	}
@@ -960,7 +1146,8 @@ func (s *AuthorityWorkerStore) ReadyReplacementWorkersWithDrainedPredecessors(ct
 // zero-lease predecessor.  The conditional update keeps a concurrent lease or
 // state transition from being silently discarded.
 func (s *AuthorityWorkerStore) MarkDrainedStopped(ctx context.Context, workerID string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE authority_workers SET state=?,updated_at=? WHERE worker_id=? AND state=? AND assigned_sessions=0`, AuthorityWorkerStopped, formatAuthorityTime(time.Now().UTC()), workerID, AuthorityWorkerDraining)
+	result, err := s.db.ExecContext(ctx, `UPDATE authority_workers SET state=?,updated_at=? WHERE worker_id=? AND state=? AND assigned_sessions=0
+		AND NOT EXISTS (SELECT 1 FROM authority_session_reassignments transition WHERE transition.predecessor_worker_id=authority_workers.worker_id AND transition.adoption_state<>?)`, AuthorityWorkerStopped, formatAuthorityTime(time.Now().UTC()), workerID, AuthorityWorkerDraining, authorityAdoptionConfirmed)
 	if err != nil {
 		return err
 	}

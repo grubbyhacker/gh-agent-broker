@@ -269,8 +269,28 @@ the GHCR pull credential interface expected after vps-ops #244. No PAT,
 repository secret, Doppler credential, or container environment projection is
 introduced by this repository.
 
-A committed zero-lease draining predecessor is retired only after verified
-agentd rebind; reconciliation retries retirement after an interruption. REST errors remain structured as
+A schema-v7 reassignment row now captures the raw coordinator binding,
+authority profile, agentd/session lineage IDs, exact predecessor and successor
+worker/storage/epoch bindings, broker-derived rebind idempotency key, and
+workspace identity in the same transaction as the lease/workspace CAS. Its
+agentd adoption state starts `pending`; only a strictly matching HTTP 200
+status atomically changes it to `confirmed`. Semantic agentd conflicts are
+persisted as `conflict`, and migrated pre-v7 rows are `legacy_unresolved`
+because their hashed coordinator bindings cannot reconstruct an exact status
+check. Both states remain actionable and block automatic retirement.
+
+Reconciliation enumerates every non-confirmed transition and replays pending
+rows to the recorded successor with the exact stored body, independent of the
+original coordinator request key. A crash before the call or after agentd
+success is therefore recovered by the same idempotent command. Retryable,
+malformed, and mismatched responses remain pending. All predecessor retirement
+lookups and the final conditional stopped-state update require every transition
+from that predecessor to be confirmed; readiness and zero lease count alone
+are insufficient. Concurrent health/reconcile retirement is serialized within
+the service, and multiple sessions block retirement until all adoptions are
+confirmed.
+
+REST errors remain structured as
 `reassignment_not_ready`, `reassignment_stale_predecessor`,
 `reassignment_conflicting_replacement`, `reassignment_capacity`, and
 `reassignment_replay`, plus retryable `reassignment_rebind_retryable` and
