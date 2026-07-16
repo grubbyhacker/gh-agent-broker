@@ -189,7 +189,7 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	cfg := authorityTestConfig(t)
 	profile := cfg.AuthorityProfiles["writer"]
 	worker := AuthorityWorker{WorkerID: "entrypoint", Profile: "writer", ProfileVersion: "version", PolicyDigest: "policy"}
-	runtime := authorityWorkerRuntimeSpec(authoritySpec(worker, profile, cfg), "secret", nil)
+	runtime := authorityWorkerRuntimeSpec(authoritySpec(worker, profile, cfg), "secret", "coordinator-secret", nil)
 	if !equalStrings(runtime.Entrypoint, fixedAgentdCommand) || len(runtime.Command) != 0 || runtime.WorkingDir != "" {
 		t.Fatalf("runtime entrypoint=%q command=%q", runtime.Entrypoint, runtime.Command)
 	}
@@ -737,6 +737,7 @@ func TestDrainWritesEncryptedCheckpointEvidenceAndRestoreFailsClosed(t *testing.
 
 func authorityTestConfig(t *testing.T) Config {
 	t.Helper()
+	t.Setenv("AGENTD_COORDINATOR_TOKEN", "synthetic-agentd-coordinator-token")
 	cfg := baseTestConfig(t)
 	cfg.Repositories = []string{"owner/repo", "owner/other"}
 	cfg.ApplyDefaults()
@@ -748,7 +749,7 @@ func authorityTestConfig(t *testing.T) Config {
 			Platform:      "linux/amd64",
 			Command:       []string{"bun", "run", "src/cli.ts", "serve"},
 			Resources:     Resources{CPUShares: 128, MemoryMB: 512, PidsLimit: 128},
-			NetworkPolicy: "sandbox", BrokerAgentID: "writer", BrokerSecretEnv: "WRITER_BROKER_CREDENTIAL",
+			NetworkPolicy: "sandbox", BrokerAgentID: "writer", BrokerSecretEnv: "WRITER_BROKER_CREDENTIAL", CoordinatorTokenEnv: "AGENTD_COORDINATOR_TOKEN",
 			Repositories: []string{"owner/repo", "owner/other"},
 			BranchPolicy: BranchPolicy{AllowedPatterns: []string{`^agent/writer/[A-Za-z0-9_.:-]+$`}, BaseBranches: []string{"main"}, GeneratePrefix: "agent/writer"},
 			Operations:   []string{"git.receive-pack", "pull.create"}, MaxWorkers: 2, SessionCapacity: 2,

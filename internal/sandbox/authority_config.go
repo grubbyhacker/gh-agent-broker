@@ -23,21 +23,22 @@ type AuthorityProfile struct {
 	// Command is deliberately not configurable by callers.  The only accepted
 	// authority worker process is the agentd bootstrap command from agentd's
 	// immutable OCI contract.
-	Command          []string         `json:"command" yaml:"command"`
-	Resources        Resources        `json:"resources" yaml:"resources"`
-	NetworkPolicy    string           `json:"network_policy" yaml:"network_policy"`
-	BrokerAgentID    string           `json:"broker_agent_id" yaml:"broker_agent_id"`
-	BrokerSecretEnv  string           `json:"broker_agent_secret_env" yaml:"broker_agent_secret_env"`
-	CredentialBundle string           `json:"credential_bundle,omitempty" yaml:"credential_bundle"`
-	Repositories     []string         `json:"repositories" yaml:"repositories"`
-	BranchPolicy     BranchPolicy     `json:"branch_policy" yaml:"branch_policy"`
-	Operations       []string         `json:"operations" yaml:"operations"`
-	ExtraMounts      []ExtraMount     `json:"extra_mounts,omitempty" yaml:"extra_mounts"`
-	SessionIsolation SessionIsolation `json:"session_isolation" yaml:"session_isolation"`
-	Checkpoint       CheckpointPolicy `json:"checkpoint" yaml:"checkpoint"`
-	Storage          AuthorityStorage `json:"storage" yaml:"storage"`
-	MaxWorkers       int              `json:"max_workers" yaml:"max_workers"`
-	SessionCapacity  int              `json:"session_capacity" yaml:"session_capacity"`
+	Command             []string         `json:"command" yaml:"command"`
+	Resources           Resources        `json:"resources" yaml:"resources"`
+	NetworkPolicy       string           `json:"network_policy" yaml:"network_policy"`
+	BrokerAgentID       string           `json:"broker_agent_id" yaml:"broker_agent_id"`
+	BrokerSecretEnv     string           `json:"broker_agent_secret_env" yaml:"broker_agent_secret_env"`
+	CoordinatorTokenEnv string           `json:"coordinator_token_env" yaml:"coordinator_token_env"`
+	CredentialBundle    string           `json:"credential_bundle,omitempty" yaml:"credential_bundle"`
+	Repositories        []string         `json:"repositories" yaml:"repositories"`
+	BranchPolicy        BranchPolicy     `json:"branch_policy" yaml:"branch_policy"`
+	Operations          []string         `json:"operations" yaml:"operations"`
+	ExtraMounts         []ExtraMount     `json:"extra_mounts,omitempty" yaml:"extra_mounts"`
+	SessionIsolation    SessionIsolation `json:"session_isolation" yaml:"session_isolation"`
+	Checkpoint          CheckpointPolicy `json:"checkpoint" yaml:"checkpoint"`
+	Storage             AuthorityStorage `json:"storage" yaml:"storage"`
+	MaxWorkers          int              `json:"max_workers" yaml:"max_workers"`
+	SessionCapacity     int              `json:"session_capacity" yaml:"session_capacity"`
 }
 
 // SessionIsolation is immutable worker policy. PR 8 intentionally allocates
@@ -92,6 +93,9 @@ func (c Config) validateAuthorityProfile(name string, profile AuthorityProfile) 
 	}
 	if !regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`).MatchString(profile.BrokerSecretEnv) {
 		errs = append(errs, fmt.Sprintf("authority profile %q broker_agent_secret_env is required and must be an environment variable name", name))
+	}
+	if !regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`).MatchString(profile.CoordinatorTokenEnv) {
+		errs = append(errs, fmt.Sprintf("authority profile %q coordinator_token_env is required and must be an environment variable name", name))
 	}
 	if profile.MaxWorkers < 1 {
 		errs = append(errs, fmt.Sprintf("authority profile %q max_workers must be positive", name))

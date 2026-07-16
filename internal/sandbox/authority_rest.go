@@ -40,7 +40,7 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			if !decodeAuthorityJSON(w, r, &in) {
 				return
 			}
-			out, err := service.Acquire(r.Context(), principal, in)
+			out, err := service.AcquireSession(r.Context(), principal, in)
 			if err != nil {
 				writeRESTCodeError(w, http.StatusConflict, "lease_denied", err.Error())
 				return
@@ -61,6 +61,16 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 				return
 			}
 			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		if strings.HasPrefix(path, "leases/") && strings.HasSuffix(path, "/sessions") && r.Method == http.MethodPost {
+			binding := strings.TrimSuffix(strings.TrimPrefix(path, "leases/"), "/sessions")
+			out, err := service.CreateSession(r.Context(), principal, binding)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusConflict, "session_create_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusCreated, out)
 			return
 		}
 		parts := strings.Split(path, "/")

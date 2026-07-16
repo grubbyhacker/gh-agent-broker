@@ -21,6 +21,10 @@ func (r *DockerAuthorityRuntime) Create(ctx context.Context, spec AuthorityWorke
 	if secret == "" {
 		return AuthorityRuntimeResult{}, fmt.Errorf("authority worker broker credential is unavailable")
 	}
+	coordinatorToken := strings.TrimSpace(os.Getenv(spec.CoordinatorTokenEnv))
+	if coordinatorToken == "" {
+		return AuthorityRuntimeResult{}, fmt.Errorf("authority worker coordinator credential is unavailable")
+	}
 	mounts := []Mount{{Source: spec.Storage.SessionVolume, Target: spec.SessionIsolation.WorkspaceRoot, ReadOnly: false}, {Source: spec.Storage.CheckpointVolume, Target: spec.Checkpoint.Directory, ReadOnly: false}, {Source: spec.Storage.EvidenceVolume, Target: "/var/lib/agentd/evidence", ReadOnly: false}}
 	if spec.CredentialBundle != "" {
 		mounts = append(mounts, spec.CredentialMount)
@@ -28,7 +32,7 @@ func (r *DockerAuthorityRuntime) Create(ctx context.Context, spec AuthorityWorke
 	for _, mount := range spec.ExtraMounts {
 		mounts = append(mounts, Mount{Source: mount.SourcePath, Target: mount.MountPath, ReadOnly: mount.ReadOnly})
 	}
-	runtimeSpec := authorityWorkerRuntimeSpec(spec, secret, mounts)
+	runtimeSpec := authorityWorkerRuntimeSpec(spec, secret, coordinatorToken, mounts)
 	info, err := r.docker.Create(ctx, runtimeSpec)
 	if err != nil {
 		return AuthorityRuntimeResult{}, err
@@ -41,10 +45,10 @@ func (r *DockerAuthorityRuntime) Create(ctx context.Context, spec AuthorityWorke
 	return AuthorityRuntimeResult{ContainerID: info.ID, ImageDigest: imageDigestOnly(info.ImageDigest)}, nil
 }
 
-func authorityWorkerRuntimeSpec(spec AuthorityWorkerSpec, secret string, mounts []Mount) RuntimeSpec {
+func authorityWorkerRuntimeSpec(spec AuthorityWorkerSpec, secret, coordinatorToken string, mounts []Mount) RuntimeSpec {
 	// Keep agentd's OCI WORKDIR (/app): the immutable entrypoint references
 	// source relative to that directory. State mounts are absolute paths.
-	return RuntimeSpec{RunID: "authority-" + spec.WorkerID, Image: spec.Image, Platform: spec.Platform, Entrypoint: append([]string(nil), spec.Command...), Env: map[string]string{spec.BrokerSecretEnv: secret}, Labels: map[string]string{"gh-agent-broker.authority_worker": "true", "gh-agent-broker.worker_id": spec.WorkerID, "gh-agent-broker.profile": spec.Profile, "gh-agent-broker.profile_version": spec.ProfileVersion, "gh-agent-broker.policy_digest": spec.PolicyDigest, "gh-agent-broker.session_isolation": spec.SessionIsolation.Primitive}, Mounts: mounts, Network: spec.Network, Resources: spec.Resources}
+	return RuntimeSpec{RunID: "authority-" + spec.WorkerID, Image: spec.Image, Platform: spec.Platform, Entrypoint: append([]string(nil), spec.Command...), Env: map[string]string{spec.BrokerSecretEnv: secret, "AGENTD_COORDINATOR_TOKEN": coordinatorToken}, Labels: map[string]string{"gh-agent-broker.authority_worker": "true", "gh-agent-broker.worker_id": spec.WorkerID, "gh-agent-broker.profile": spec.Profile, "gh-agent-broker.profile_version": spec.ProfileVersion, "gh-agent-broker.policy_digest": spec.PolicyDigest, "gh-agent-broker.session_isolation": spec.SessionIsolation.Primitive}, Mounts: mounts, Network: spec.Network, Resources: spec.Resources}
 }
 
 func (r *DockerAuthorityRuntime) Stop(ctx context.Context, id string) error {
