@@ -324,6 +324,36 @@ func TestAuthorityProfileValidationAndDigest(t *testing.T) {
 	}
 }
 
+func TestAuthorityCredentialVolumeRejectsOtherProfileManagedStorage(t *testing.T) {
+	for _, storage := range []struct {
+		name   string
+		volume func(AuthorityStorage) string
+	}{
+		{name: "session", volume: func(storage AuthorityStorage) string { return storage.SessionVolume }},
+		{name: "checkpoint", volume: func(storage AuthorityStorage) string { return storage.CheckpointVolume }},
+		{name: "evidence", volume: func(storage AuthorityStorage) string { return storage.EvidenceVolume }},
+	} {
+		t.Run(storage.name, func(t *testing.T) {
+			cfg := authorityTestConfig(t)
+			cfg.AuthorityProfiles["reader"] = cfg.AuthorityProfiles["writer"]
+			reader := cfg.AuthorityProfiles["reader"]
+			reader.Storage.SessionVolume = "reader-sessions"
+			reader.Storage.CheckpointVolume = "reader-checkpoints"
+			reader.Storage.EvidenceVolume = "reader-evidence"
+			cfg.AuthorityProfiles["reader"] = reader
+
+			bundle := cfg.Bundles["agentd-staging-auth"]
+			bundle.AllowedAuthorityProfiles = []string{"writer"}
+			bundle.SourceVolume = storage.volume(reader.Storage)
+			cfg.Bundles["agentd-staging-auth"] = bundle
+
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), `authority profile "reader" managed storage volumes`) {
+				t.Fatalf("Validate() error = %v, want cross-profile managed storage denial", err)
+			}
+		})
+	}
+}
+
 func cloneCredentialBundles(in map[string]CredentialBundle) map[string]CredentialBundle {
 	out := make(map[string]CredentialBundle, len(in))
 	for name, bundle := range in {

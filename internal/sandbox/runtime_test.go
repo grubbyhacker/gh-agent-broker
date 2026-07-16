@@ -266,6 +266,50 @@ func TestDockerAdoptRequiresExactDurableLaunchIdentity(t *testing.T) {
 	}
 }
 
+func TestDockerCreateAdoptsLegacyOrdinaryCreatePendingIntentAfterConflict(t *testing.T) {
+	spec := RuntimeSpec{
+		RunID:   "legacy-pending",
+		Image:   "worker:latest",
+		Command: []string{"work"},
+		User:    "bun",
+		Env:     map[string]string{"BROKER_URL": "http://broker"},
+		Labels: map[string]string{
+			"gh-agent-broker.run_id": "legacy-pending",
+		},
+		Mounts: []Mount{{Source: "/runs/legacy-pending/work", Target: "/work"}},
+	}
+	// This label was emitted for the same ordinary-worker spec before
+	// RuntimeSpec and Mount gained authority-only fields.
+	const legacyDigest = "v1:39b7b62f5e8f5cbbe169dde305575e37960d269079ec681d9e4ca6801fb82e41"
+	if currentDigest, err := runtimeSpecDigest(spec); err != nil || currentDigest != legacyDigest {
+		t.Fatalf("ordinary spec digest=%q err=%v, want legacy digest %q", currentDigest, err, legacyDigest)
+	}
+
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/images/worker:latest/json":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"Id":"sha256:image"}`)), Header: make(http.Header)}, nil
+		case "/containers/create":
+			if req.Method != http.MethodPost || req.URL.Query().Get("name") != "sandbox-legacy-pending" {
+				t.Fatalf("create request=%s %s", req.Method, req.URL.String())
+			}
+			return &http.Response{StatusCode: http.StatusConflict, Body: io.NopCloser(strings.NewReader(`already exists`)), Header: make(http.Header)}, nil
+		case "/containers/sandbox-legacy-pending/json":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"Id":"container-id","Name":"/sandbox-legacy-pending","Image":"sha256:image","Config":{"Labels":{"gh-agent-broker.run_id":"legacy-pending","gh-agent-broker.launch_spec":"` + legacyDigest + `"}},"State":{}}`)), Header: make(http.Header)}, nil
+		default:
+			return nil, fmt.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
+		}
+	})}}
+
+	info, err := backend.Create(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("create_pending collision adoption failed: %v", err)
+	}
+	if !info.Existing || info.ID != "container-id" || info.Lifecycle != ContainerNeverStarted {
+		t.Fatalf("adopted container=%+v", info)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

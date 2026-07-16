@@ -646,12 +646,68 @@ func runtimeSpecDigest(spec RuntimeSpec) (string, error) {
 	copySpec := spec
 	copySpec.Labels = cloneStringMap(spec.Labels)
 	delete(copySpec.Labels, "gh-agent-broker.launch_spec")
-	b, err := json.Marshal(copySpec)
+	var value any = copySpec
+	if legacyOrdinaryRuntimeSpec(copySpec) {
+		value = legacyRuntimeSpec{
+			RunID: copySpec.RunID, Image: copySpec.Image, Command: copySpec.Command, User: copySpec.User,
+			Env: copySpec.Env, Labels: copySpec.Labels, Mounts: legacyMounts(copySpec.Mounts), Network: copySpec.Network,
+			Resources: copySpec.Resources, WorkingDir: copySpec.WorkingDir, Timeout: copySpec.Timeout,
+		}
+	}
+	b, err := json.Marshal(value)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(b)
 	return fmt.Sprintf("v1:%x", sum[:]), nil
+}
+
+// legacyRuntimeSpec is the launch-spec representation emitted before authority
+// workers added platform, entrypoint, named-volume, and privilege-transition
+// fields. Keep that representation for ordinary workers whose new fields are
+// all absent so a crash between Docker create and intent persistence can still
+// adopt its already-created container after an upgrade.
+type legacyRuntimeSpec struct {
+	RunID      string
+	Image      string
+	Command    []string
+	User       string
+	Env        map[string]string
+	Labels     map[string]string
+	Mounts     []legacyMount
+	Network    NetworkPolicy
+	Resources  Resources
+	WorkingDir string
+	Timeout    time.Duration
+}
+
+type legacyMount struct {
+	Source   string
+	Target   string
+	ReadOnly bool
+}
+
+func legacyOrdinaryRuntimeSpec(spec RuntimeSpec) bool {
+	if spec.Platform != "" || len(spec.Entrypoint) != 0 || spec.AllowAgentdSetuidLauncherPrivilegeTransition {
+		return false
+	}
+	for _, mount := range spec.Mounts {
+		if mount.Volume || mount.VolumeSubpath != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func legacyMounts(mounts []Mount) []legacyMount {
+	if mounts == nil {
+		return nil
+	}
+	out := make([]legacyMount, len(mounts))
+	for i, mount := range mounts {
+		out[i] = legacyMount{Source: mount.Source, Target: mount.Target, ReadOnly: mount.ReadOnly}
+	}
+	return out
 }
 
 func cloneStringMap(in map[string]string) map[string]string {

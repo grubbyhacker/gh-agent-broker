@@ -234,9 +234,14 @@ remains pending agentd ownership and is not invented here.
 Config versioning retains the exact pre-`source_volume` canonical digest shape
 when that field is empty, so ordinary-worker nonterminal launch intents remain
 reconcilable across upgrade. A nonempty named source volume is included in the
-digest. Staging credential source volumes must also be distinct from every
-allowed authority profile's broker-managed session, checkpoint, and evidence
-volumes.
+digest. Runtime launch-spec labels likewise retain their pre-authority-field
+canonical representation only for ordinary specs whose platform, entrypoint,
+volume/subpath mounts, and privilege-transition flag are all absent. This lets
+a persisted `create_pending` intent adopt its exact pre-upgrade Docker
+container; authority specs always use the full current representation.
+Staging credential source volumes must be distinct from every configured
+authority profile's broker-managed session, checkpoint, and evidence volumes,
+regardless of which profiles the credential bundle is allowed to reference.
 
 The production deploy workflow grants `packages: read` and passes the
 ephemeral `github.token` plus `github.actor` to only the vps-ops deploy step as

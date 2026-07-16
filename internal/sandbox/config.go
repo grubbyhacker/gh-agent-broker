@@ -358,15 +358,17 @@ func (c Config) validateBundle(name string, bundle CredentialBundle) []string {
 		}
 	}
 	for _, profile := range bundle.AllowedAuthorityProfiles {
-		authorityProfile, ok := c.AuthorityProfiles[profile]
-		if !ok {
+		if _, ok := c.AuthorityProfiles[profile]; !ok {
 			errs = append(errs, fmt.Sprintf("credential bundle %q allows unknown authority profile %q", name, profile))
-			continue
 		}
-		if hasVolume && (bundle.SourceVolume == authorityProfile.Storage.SessionVolume ||
-			bundle.SourceVolume == authorityProfile.Storage.CheckpointVolume ||
-			bundle.SourceVolume == authorityProfile.Storage.EvidenceVolume) {
-			errs = append(errs, fmt.Sprintf("credential bundle %q source_volume conflicts with authority profile %q managed storage volumes", name, profile))
+	}
+	if hasVolume {
+		for profileName, profile := range c.AuthorityProfiles {
+			if bundle.SourceVolume == profile.Storage.SessionVolume ||
+				bundle.SourceVolume == profile.Storage.CheckpointVolume ||
+				bundle.SourceVolume == profile.Storage.EvidenceVolume {
+				errs = append(errs, fmt.Sprintf("credential bundle %q source_volume conflicts with authority profile %q managed storage volumes", name, profileName))
+			}
 		}
 	}
 	for _, p := range append(bundle.SecretFiles, bundle.RedactFiles...) {
