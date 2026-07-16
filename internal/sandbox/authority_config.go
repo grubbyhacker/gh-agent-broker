@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -29,6 +30,7 @@ type AuthorityProfile struct {
 	BrokerAgentID       string           `json:"broker_agent_id" yaml:"broker_agent_id"`
 	BrokerSecretEnv     string           `json:"broker_agent_secret_env" yaml:"broker_agent_secret_env"`
 	CoordinatorTokenEnv string           `json:"coordinator_token_env" yaml:"coordinator_token_env"`
+	AgentdReadiness     *AgentdReadiness `json:"agentd_readiness,omitempty" yaml:"agentd_readiness,omitempty"`
 	CredentialBundle    string           `json:"credential_bundle,omitempty" yaml:"credential_bundle"`
 	Repositories        []string         `json:"repositories" yaml:"repositories"`
 	BranchPolicy        BranchPolicy     `json:"branch_policy" yaml:"branch_policy"`
@@ -39,6 +41,14 @@ type AuthorityProfile struct {
 	Storage             AuthorityStorage `json:"storage" yaml:"storage"`
 	MaxWorkers          int              `json:"max_workers" yaml:"max_workers"`
 	SessionCapacity     int              `json:"session_capacity" yaml:"session_capacity"`
+}
+
+// AgentdReadiness versions the authenticated worker-generation attestation.
+// An empty contract preserves legacy profiles; the v1 contract is fail closed.
+type AgentdReadiness struct {
+	ContractVersion string `json:"contract_version" yaml:"contract_version"`
+	Port            int    `json:"port" yaml:"port"`
+	Path            string `json:"path" yaml:"path"`
 }
 
 // SessionIsolation is immutable worker policy. PR 8 intentionally allocates
@@ -97,6 +107,19 @@ func (c Config) validateAuthorityProfile(name string, profile AuthorityProfile) 
 	if !regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`).MatchString(profile.CoordinatorTokenEnv) {
 		errs = append(errs, fmt.Sprintf("authority profile %q coordinator_token_env is required and must be an environment variable name", name))
 	}
+	readiness := configuredAgentdReadiness(profile)
+	switch readiness.ContractVersion {
+	case "":
+		if readiness.Port != 0 || readiness.Path != "" {
+			errs = append(errs, fmt.Sprintf("authority profile %q agentd_readiness requires a contract_version", name))
+		}
+	case "agentd/control/v1":
+		if readiness.Port < 1 || readiness.Port > 65535 || readiness.Path != "/readyz" {
+			errs = append(errs, fmt.Sprintf("authority profile %q agentd/control/v1 readiness requires a valid port and /readyz path", name))
+		}
+	default:
+		errs = append(errs, fmt.Sprintf("authority profile %q has unsupported agentd readiness contract %q", name, readiness.ContractVersion))
+	}
 	if profile.MaxWorkers < 1 {
 		errs = append(errs, fmt.Sprintf("authority profile %q max_workers must be positive", name))
 	}
@@ -153,16 +176,15 @@ func (c Config) validateAuthorityProfile(name string, profile AuthorityProfile) 
 	return errs
 }
 
+func configuredAgentdReadiness(profile AuthorityProfile) AgentdReadiness {
+	if profile.AgentdReadiness == nil {
+		return AgentdReadiness{}
+	}
+	return *profile.AgentdReadiness
+}
+
 func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(a, b)
 }
 
 func validateAuthorityMount(profile string, index int, mount ExtraMount) []string {

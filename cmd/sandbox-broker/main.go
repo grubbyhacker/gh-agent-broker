@@ -110,7 +110,7 @@ func runServerCommand(args []string) {
 				log.Printf("close authority worker store: %v", err)
 			}
 		}()
-		authorityService := sandbox.NewAuthorityWorkerService(cfg, authorityStore, sandbox.NewDockerAuthorityRuntime(*dockerSocket), auditLog).WithCheckpointStore(sandbox.NewCheckpointStore(cfg, authorityStore))
+		authorityService := sandbox.NewAuthorityWorkerService(cfg, authorityStore, sandbox.NewDockerAuthorityRuntime(*dockerSocket, cfg), auditLog).WithCheckpointStore(sandbox.NewCheckpointStore(cfg, authorityStore))
 		authorityHandler = sandbox.NewAuthorityRESTHandler(authorityService)
 	}
 

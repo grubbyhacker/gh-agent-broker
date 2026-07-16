@@ -39,6 +39,44 @@ func TestDockerCreatePassesPlatform(t *testing.T) {
 	}
 }
 
+func TestDockerCreateSerializesVolumeSubpathsWithoutFullVolumeBinds(t *testing.T) {
+	const lineage = "11111111111111111111111111111111"
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/containers/create":
+			var body dockerCreateRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := body.HostConfig.Binds, []string{"/host/credential:/run/credential:ro"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("binds=%q, want %q", got, want)
+			}
+			if len(body.HostConfig.Mounts) != 3 {
+				t.Fatalf("volume mounts=%+v", body.HostConfig.Mounts)
+			}
+			for _, mount := range body.HostConfig.Mounts {
+				if mount.Type != "volume" || mount.VolumeOptions == nil || mount.VolumeOptions.Subpath != lineage {
+					t.Fatalf("volume mount does not enforce lineage subpath: %+v", mount)
+				}
+			}
+			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"created"}`)), Header: make(http.Header)}, nil
+		case "/images/worker:latest/json":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"Id":"sha256:image"}`)), Header: make(http.Header)}, nil
+		default:
+			return nil, fmt.Errorf("unexpected request path %q", req.URL.Path)
+		}
+	})}}
+	mounts := []Mount{
+		{Source: "journal", Target: "/var/lib/agentd", Volume: true, VolumeSubpath: lineage},
+		{Source: "checkpoints", Target: "/var/lib/agentd/checkpoints", Volume: true, VolumeSubpath: lineage},
+		{Source: "evidence", Target: "/var/lib/agentd/evidence", Volume: true, VolumeSubpath: lineage},
+		{Source: "/host/credential", Target: "/run/credential", ReadOnly: true},
+	}
+	if _, err := backend.Create(context.Background(), RuntimeSpec{RunID: "subpaths", Image: "worker:latest", Labels: map[string]string{}, Mounts: mounts}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDockerAdoptRequiresExactDurableLaunchIdentity(t *testing.T) {
 	spec := RuntimeSpec{
 		RunID: "run-123",

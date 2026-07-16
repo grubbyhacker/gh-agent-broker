@@ -25,6 +25,16 @@ type fakeAuthorityRuntime struct {
 	afterCreate func()
 }
 
+type fakeAuthenticatedReadinessRuntime struct {
+	*fakeAuthorityRuntime
+	probed []string
+}
+
+func (f *fakeAuthenticatedReadinessRuntime) AgentdReady(_ context.Context, worker AuthorityWorker) (bool, string, error) {
+	f.probed = append(f.probed, worker.WorkerID)
+	return false, "synthetic_agentd_not_ready", nil
+}
+
 func (f *fakeAuthorityRuntime) Create(_ context.Context, spec AuthorityWorkerSpec) (AuthorityRuntimeResult, error) {
 	f.mu.Lock()
 	f.created = append(f.created, spec)
@@ -67,6 +77,61 @@ func (f *fakeAuthorityRuntime) Healthy(_ context.Context, _ string) (bool, strin
 	return true, "synthetic_liveness_ok", nil
 }
 
+func TestAuthorityReconcileAppliesAuthenticatedReadinessOnlyToConfiguredProfiles(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	agentdProfile := cfg.AuthorityProfiles["writer"]
+	agentdProfile.AgentdReadiness = &AgentdReadiness{ContractVersion: "agentd/control/v1", Port: 8080, Path: "/readyz"}
+	cfg.AuthorityProfiles["writer"] = agentdProfile
+	legacyProfile := agentdProfile
+	legacyProfile.BrokerAgentID = "legacy"
+	legacyProfile.AgentdReadiness = nil
+	cfg.AuthorityProfiles["legacy"] = legacyProfile
+	principal := cfg.AuthorityPrincipals["coordinator"]
+	principal.AllowedProfiles = append(principal.AllowedProfiles, "legacy")
+	cfg.AuthorityPrincipals["coordinator"] = principal
+
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &fakeAuthenticatedReadinessRuntime{fakeAuthorityRuntime: &fakeAuthorityRuntime{}}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	agentdWorker, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyWorker, err := service.Provision(ctx, "coordinator", "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Reconcile(ctx, "coordinator"); err != nil {
+		t.Fatal(err)
+	}
+	agentdWorker, err = store.GetWorker(ctx, agentdWorker.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyWorker, err = store.GetWorker(ctx, legacyWorker.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agentdWorker.State != AuthorityWorkerStarting || legacyWorker.State != AuthorityWorkerReady {
+		t.Fatalf("agentd state=%q legacy state=%q", agentdWorker.State, legacyWorker.State)
+	}
+	if got, want := runtime.probed, []string{agentdWorker.WorkerID}; !equalStrings(got, want) {
+		t.Fatalf("readiness probes=%q, want only applicable worker %q", got, want)
+	}
+}
+
+func TestLegacyAuthorityProfileDigestOmitsAgentdReadiness(t *testing.T) {
+	profile := authorityTestConfig(t).AuthorityProfiles["writer"]
+	encoded, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "agentd_readiness") {
+		t.Fatalf("legacy profile encoding changed: %s", encoded)
+	}
+}
+
 func TestAuthorityReconcileUnhealthyCheckpointsAndReplaces(t *testing.T) {
 	ctx := context.Background()
 	cfg := authorityTestConfig(t)
@@ -106,7 +171,11 @@ func TestAuthorityReconcileUnhealthyCheckpointsAndReplaces(t *testing.T) {
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("evidence entries=%v err=%v", entries, err)
 	}
-	if err := VerifyCheckpoint(filepath.Join(profile.Checkpoint.Directory, entries[0].Name()), profile, old); err != nil {
+	checkpointEntries, err := os.ReadDir(filepath.Join(profile.Checkpoint.Directory, entries[0].Name()))
+	if err != nil || len(checkpointEntries) != 1 {
+		t.Fatalf("lineage evidence entries=%v err=%v", checkpointEntries, err)
+	}
+	if err := VerifyCheckpoint(filepath.Join(profile.Checkpoint.Directory, entries[0].Name(), checkpointEntries[0].Name()), profile, old); err != nil {
 		t.Fatalf("checkpoint verify after unhealthy reconcile: %v", err)
 	}
 	if old.ReplacementWorker == "" {
@@ -189,13 +258,18 @@ func TestAuthorityWorkerRequestRejectsAuthorityOverrides(t *testing.T) {
 func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	cfg := authorityTestConfig(t)
 	profile := cfg.AuthorityProfiles["writer"]
-	worker := AuthorityWorker{WorkerID: "entrypoint", Profile: "writer", ProfileVersion: "version", PolicyDigest: "policy"}
+	worker := AuthorityWorker{WorkerID: "entrypoint", Profile: "writer", ProfileVersion: "version", PolicyDigest: "policy", WorkerStorageLineageID: "11111111111111111111111111111111", WorkerFenceEpoch: 7}
 	runtime := authorityWorkerRuntimeSpec(authoritySpec(worker, profile, cfg), "secret", "coordinator-secret", nil)
 	if !equalStrings(runtime.Entrypoint, fixedAgentdCommand) || len(runtime.Command) != 0 || runtime.WorkingDir != "" {
 		t.Fatalf("runtime entrypoint=%q command=%q", runtime.Entrypoint, runtime.Command)
 	}
 	if got, want := runtime.Env["AGENTD_STATE_PATH"], "/var/lib/agentd/sessions/agentd.sqlite3"; got != want {
 		t.Fatalf("AGENTD_STATE_PATH=%q, want %q", got, want)
+	}
+	for key, want := range map[string]string{"AGENTD_WORKER_ID": worker.WorkerID, "AGENTD_STORAGE_LINEAGE_ID": worker.WorkerStorageLineageID, "AGENTD_FENCE_EPOCH": "7"} {
+		if got := runtime.Env[key]; got != want {
+			t.Fatalf("%s=%q, want %q", key, got, want)
+		}
 	}
 }
 
@@ -284,6 +358,9 @@ func TestAuthorityWorkerLifecycleCapacityDrainReleaseAndReplacement(t *testing.T
 	replacement, err := service.Replace(ctx, "coordinator", worker.WorkerID, "profile_upgrade")
 	if err != nil || replacement.WorkerID != "worker-two" || replacement.Generation != 2 || replacement.State != AuthorityWorkerStarting || replacement.ProfileVersion != worker.ProfileVersion || replacement.PolicyDigest != worker.PolicyDigest {
 		t.Fatalf("Replace()=%+v err=%v", replacement, err)
+	}
+	if replacement.WorkerStorageLineageID != worker.WorkerStorageLineageID || replacement.WorkerFenceEpoch != worker.WorkerFenceEpoch+1 {
+		t.Fatalf("replacement storage generation old=%+v replacement=%+v", worker, replacement)
 	}
 	replayedReplacement, err := service.Replace(ctx, "coordinator", worker.WorkerID, "profile_upgrade")
 	if err != nil || replayedReplacement.WorkerID != replacement.WorkerID || len(runtime.created) != 2 {
@@ -614,8 +691,11 @@ func TestAuthorityWorkerReplacementReadinessRequiresDurablePredecessorLink(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	orphan := AuthorityWorker{WorkerID: "orphan-generation", Profile: "writer", ProfileVersion: profileVersion, PolicyDigest: policyDigest, ImageReference: profile.Image, Generation: 2, State: AuthorityWorkerProvisioning, Capacity: profile.SessionCapacity}
+	orphan := AuthorityWorker{WorkerID: "orphan-generation", Profile: "writer", ProfileVersion: profileVersion, PolicyDigest: policyDigest, ImageReference: profile.Image, Generation: 1, State: AuthorityWorkerProvisioning, Capacity: profile.SessionCapacity}
 	if _, err := store.CreateWorker(ctx, orphan, profile.MaxWorkers); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE authority_workers SET generation=2,worker_fence_epoch=2 WHERE worker_id=?`, orphan.WorkerID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.UpdateWorkerRuntime(ctx, orphan.WorkerID, "container-orphan", "sha256:2222222222222222222222222222222222222222222222222222222222222222"); err != nil {
@@ -720,7 +800,11 @@ func TestDrainWritesEncryptedCheckpointEvidenceAndRestoreFailsClosed(t *testing.
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("checkpoint entries=%v err=%v", entries, err)
 	}
-	path := filepath.Join(checkpointDir, entries[0].Name())
+	lineageEntries, err := os.ReadDir(filepath.Join(checkpointDir, entries[0].Name()))
+	if err != nil || len(lineageEntries) != 1 {
+		t.Fatalf("lineage checkpoint entries=%v err=%v", lineageEntries, err)
+	}
+	path := filepath.Join(checkpointDir, entries[0].Name(), lineageEntries[0].Name())
 	if err := VerifyCheckpoint(path, profile, worker); err != nil {
 		t.Fatalf("verify checkpoint: %v", err)
 	}
@@ -765,7 +849,7 @@ func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testin
 	}
 	// The workspace is durable session state; reassignment must preserve its
 	// allocation while transferring its worker association.
-	if _, err := store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 20000, 20000, "/durable/session", formatAuthorityTime(time.Now().UTC()), lease.LineageID); err != nil {
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 20000, 20000, "/durable/session", formatAuthorityTime(time.Now().UTC()), lease.SessionLineageID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.SetHealth(ctx, "coordinator", old.WorkerID, "abrupt_container_loss", false); err != nil {
@@ -778,13 +862,14 @@ func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testin
 	if _, err := service.SetHealth(ctx, "coordinator", replacement.WorkerID, "ready", true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Acquire(ctx, "session-only", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "filler-lease-idem", SessionBinding: "filler-logical-session"}); err != nil {
+	fillerLease, err := service.Acquire(ctx, "session-only", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "filler-lease-idem", SessionBinding: "filler-logical-session"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.ReassignSession(ctx, "session-only", AuthoritySessionReassignmentRequest{SessionBinding: "filler-logical-session", PredecessorWorkerID: old.WorkerID, PriorFenceEpoch: 1, IdempotencyKey: "other-reassign-idem"}); err == nil || !strings.Contains(err.Error(), "policy denial") {
+	if _, err := service.ReassignSession(ctx, "session-only", AuthoritySessionReassignmentRequest{SessionBinding: "filler-logical-session", SessionLineageID: fillerLease.SessionLineageID, PredecessorWorkerID: old.WorkerID, PredecessorWorkerFenceEpoch: old.WorkerFenceEpoch, IdempotencyKey: "other-reassign-idem"}); err == nil || !strings.Contains(err.Error(), "policy denial") {
 		t.Fatalf("cross-profile/principal escalation error=%v", err)
 	}
-	request := AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", PredecessorWorkerID: old.WorkerID, PriorFenceEpoch: lease.FenceEpoch, IdempotencyKey: "reassign-idem"}
+	request := AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", SessionLineageID: lease.SessionLineageID, PredecessorWorkerID: old.WorkerID, PredecessorWorkerFenceEpoch: lease.WorkerFenceEpoch, IdempotencyKey: "reassign-idem"}
 	if _, err := service.ReassignSession(ctx, "coordinator", request); err == nil || !isReassignmentCode(err, ReassignmentCapacity) {
 		t.Fatalf("capacity reassignment error=%v", err)
 	}
@@ -814,7 +899,7 @@ func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testin
 	if err != nil || oldAfter.AssignedSessions != 0 || newAfter.AssignedSessions != 1 || oldAfter.State != AuthorityWorkerStopped {
 		t.Fatalf("old=%+v new=%+v err=%v", oldAfter, newAfter, err)
 	}
-	if _, err := service.ReassignSession(ctx, "coordinator", AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", PredecessorWorkerID: "not-the-predecessor", PriorFenceEpoch: lease.FenceEpoch, IdempotencyKey: "stale-idem"}); err == nil || !isReassignmentCode(err, ReassignmentStalePredecessor) {
+	if _, err := service.ReassignSession(ctx, "coordinator", AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", SessionLineageID: lease.SessionLineageID, PredecessorWorkerID: "not-the-predecessor", PredecessorWorkerFenceEpoch: lease.WorkerFenceEpoch, IdempotencyKey: "stale-idem"}); err == nil || !isReassignmentCode(err, ReassignmentStalePredecessor) {
 		t.Fatalf("stale reassignment error=%v", err)
 	}
 }
@@ -838,13 +923,13 @@ func TestAuthoritySessionFenceDeniesPredecessorAndReplaysCutover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 20000, 20000, "/durable/fence-session", formatAuthorityTime(time.Now().UTC()), lease.LineageID); err != nil {
+	if _, err = store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 20000, 20000, "/durable/fence-session", formatAuthorityTime(time.Now().UTC()), lease.SessionLineageID); err != nil {
 		t.Fatal(err)
 	}
-	if lease.LineageID == "" || lease.FenceEpoch != 1 {
+	if lease.SessionLineageID == "" || lease.WorkerFenceEpoch != 1 || lease.WorkerStorageLineageID != old.WorkerStorageLineageID {
 		t.Fatalf("lineage lease=%+v", lease)
 	}
-	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: old.WorkerID, LineageID: lease.LineageID, FenceEpoch: 1}); err != nil || !got.Authorized {
+	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: old.WorkerID, WorkerStorageLineageID: old.WorkerStorageLineageID, WorkerFenceEpoch: old.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID}); err != nil || !got.Authorized {
 		t.Fatalf("pre-cutover validation=%+v err=%v", got, err)
 	}
 	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "lost", false); err != nil {
@@ -858,27 +943,27 @@ func TestAuthoritySessionFenceDeniesPredecessorAndReplaysCutover(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	request := AuthoritySessionReassignmentRequest{SessionBinding: "fence-session", PredecessorWorkerID: old.WorkerID, PriorFenceEpoch: 1, IdempotencyKey: "fence-reassign"}
+	request := AuthoritySessionReassignmentRequest{SessionBinding: "fence-session", SessionLineageID: lease.SessionLineageID, PredecessorWorkerID: old.WorkerID, PredecessorWorkerFenceEpoch: old.WorkerFenceEpoch, IdempotencyKey: "fence-reassign"}
 	// Before the CAS, a wrong predecessor epoch must not mutate lease/accounting.
 	wrong := request
-	wrong.PriorFenceEpoch = 2
+	wrong.PredecessorWorkerFenceEpoch = 2
 	wrong.IdempotencyKey = "before-cas"
 	if _, err = service.ReassignSession(ctx, "coordinator", wrong); !isReassignmentCode(err, ReassignmentStalePredecessor) {
 		t.Fatalf("before CAS error=%v", err)
 	}
 	assigned, err := service.ReassignSession(ctx, "coordinator", request)
-	if err != nil || assigned.Lease.FenceEpoch != 2 || assigned.Lease.LineageID != lease.LineageID {
+	if err != nil || assigned.Lease.WorkerFenceEpoch != 2 || assigned.Lease.SessionLineageID != lease.SessionLineageID || assigned.Lease.WorkerStorageLineageID != lease.WorkerStorageLineageID {
 		t.Fatalf("CAS result=%+v err=%v", assigned, err)
 	}
 	// This retry models a crash after durable CAS and before the HTTP response.
 	replay, err := service.ReassignSession(ctx, "coordinator", request)
-	if err != nil || !replay.Replay || replay.Lease.FenceEpoch != 2 {
+	if err != nil || !replay.Replay || replay.Lease.WorkerFenceEpoch != 2 {
 		t.Fatalf("post-CAS replay=%+v err=%v", replay, err)
 	}
-	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: old.WorkerID, LineageID: lease.LineageID, FenceEpoch: 1}); err != nil || got.Authorized || got.Code != "fenced" {
+	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: old.WorkerID, WorkerStorageLineageID: old.WorkerStorageLineageID, WorkerFenceEpoch: old.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID}); err != nil || got.Authorized || got.Code != "fenced" {
 		t.Fatalf("stale predecessor validation=%+v err=%v", got, err)
 	}
-	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: replacement.WorkerID, LineageID: lease.LineageID, FenceEpoch: 2}); err != nil || !got.Authorized {
+	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: replacement.WorkerID, WorkerStorageLineageID: replacement.WorkerStorageLineageID, WorkerFenceEpoch: replacement.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID}); err != nil || !got.Authorized {
 		t.Fatalf("successor validation=%+v err=%v", got, err)
 	}
 	stale := request

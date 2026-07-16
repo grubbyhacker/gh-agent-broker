@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 4
+const authorityStoreSchemaVersion = 5
 
 type AuthorityWorkerState string
 
@@ -32,36 +32,39 @@ const (
 )
 
 type AuthorityWorker struct {
-	WorkerID          string               `json:"worker_id"`
-	Profile           string               `json:"profile"`
-	ProfileVersion    string               `json:"profile_version"`
-	PolicyDigest      string               `json:"policy_digest"`
-	ImageReference    string               `json:"image_reference"`
-	ImageDigest       string               `json:"image_digest"`
-	Generation        int                  `json:"generation"`
-	ContainerID       string               `json:"container_id,omitempty"`
-	State             AuthorityWorkerState `json:"state"`
-	Capacity          int                  `json:"capacity"`
-	AssignedSessions  int                  `json:"assigned_sessions"`
-	Health            string               `json:"health,omitempty"`
-	DrainReason       string               `json:"drain_reason,omitempty"`
-	ReplacementWorker string               `json:"replacement_worker_id,omitempty"`
-	HeartbeatAt       time.Time            `json:"heartbeat_at,omitempty"`
-	CreatedAt         time.Time            `json:"created_at"`
-	UpdatedAt         time.Time            `json:"updated_at"`
+	WorkerID               string               `json:"worker_id"`
+	Profile                string               `json:"profile"`
+	ProfileVersion         string               `json:"profile_version"`
+	PolicyDigest           string               `json:"policy_digest"`
+	ImageReference         string               `json:"image_reference"`
+	ImageDigest            string               `json:"image_digest"`
+	Generation             int                  `json:"generation"`
+	ContainerID            string               `json:"container_id,omitempty"`
+	State                  AuthorityWorkerState `json:"state"`
+	Capacity               int                  `json:"capacity"`
+	AssignedSessions       int                  `json:"assigned_sessions"`
+	Health                 string               `json:"health,omitempty"`
+	DrainReason            string               `json:"drain_reason,omitempty"`
+	ReplacementWorker      string               `json:"replacement_worker_id,omitempty"`
+	HeartbeatAt            time.Time            `json:"heartbeat_at,omitempty"`
+	CreatedAt              time.Time            `json:"created_at"`
+	UpdatedAt              time.Time            `json:"updated_at"`
+	WorkerStorageLineageID string               `json:"worker_storage_lineage_id"`
+	WorkerFenceEpoch       int64                `json:"worker_fence_epoch"`
 }
 
 type AuthorityLease struct {
-	Principal         string    `json:"principal"`
-	Profile           string    `json:"profile"`
-	WorkerID          string    `json:"worker_id"`
-	LineageID         string    `json:"lineage_id"`
-	FenceEpoch        int64     `json:"fence_epoch"`
-	BindingDigest     string    `json:"session_binding_digest"`
-	IdempotencyDigest string    `json:"idempotency_key_digest"`
-	CreatedAt         time.Time `json:"created_at"`
-	ReleasedAt        time.Time `json:"released_at,omitempty"`
-	Replay            bool      `json:"replay"`
+	Principal              string    `json:"principal"`
+	Profile                string    `json:"profile"`
+	WorkerID               string    `json:"worker_id"`
+	SessionLineageID       string    `json:"session_lineage_id"`
+	WorkerStorageLineageID string    `json:"worker_storage_lineage_id"`
+	WorkerFenceEpoch       int64     `json:"worker_fence_epoch"`
+	BindingDigest          string    `json:"session_binding_digest"`
+	IdempotencyDigest      string    `json:"idempotency_key_digest"`
+	CreatedAt              time.Time `json:"created_at"`
+	ReleasedAt             time.Time `json:"released_at,omitempty"`
+	Replay                 bool      `json:"replay"`
 }
 
 // AuthoritySessionReassignment is the durable result of moving one logical
@@ -170,6 +173,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		if err := s.migrateV4(ctx); err != nil {
 			return err
 		}
+		version = 4
+	}
+	if version == 4 {
+		if err := s.migrateV5(ctx); err != nil {
+			return err
+		}
 	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
@@ -264,6 +273,34 @@ func (s *AuthorityWorkerStore) migrateV4(ctx context.Context) error {
 	return err
 }
 
+// V5 separates worker-generation storage fencing from logical session
+// identity. Existing linked replacement chains receive one durable storage
+// lineage and monotonically increasing worker epochs.
+func (s *AuthorityWorkerStore) migrateV5(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE authority_workers ADD COLUMN worker_storage_lineage_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_workers ADD COLUMN worker_fence_epoch INTEGER NOT NULL DEFAULT 1;
+	WITH RECURSIVE worker_chains(worker_id,worker_storage_lineage_id,worker_fence_epoch) AS (
+		SELECT root.worker_id,lower(hex(randomblob(16))),1 FROM authority_workers root
+		WHERE NOT EXISTS (SELECT 1 FROM authority_workers predecessor WHERE predecessor.replacement_worker_id=root.worker_id)
+		UNION ALL
+		SELECT replacement.worker_id,worker_chains.worker_storage_lineage_id,worker_chains.worker_fence_epoch+1
+		FROM worker_chains JOIN authority_workers predecessor ON predecessor.worker_id=worker_chains.worker_id
+		JOIN authority_workers replacement ON replacement.worker_id=predecessor.replacement_worker_id
+	)
+	UPDATE authority_workers SET
+		worker_storage_lineage_id=(SELECT worker_storage_lineage_id FROM worker_chains WHERE worker_chains.worker_id=authority_workers.worker_id),
+		worker_fence_epoch=(SELECT worker_fence_epoch FROM worker_chains WHERE worker_chains.worker_id=authority_workers.worker_id);
+	ALTER TABLE authority_session_leases RENAME COLUMN lineage_id TO session_lineage_id;
+	ALTER TABLE authority_session_workspaces RENAME COLUMN lineage_id TO session_lineage_id;
+	DROP INDEX authority_session_leases_lineage;
+	DROP INDEX authority_session_workspaces_lineage;
+	CREATE UNIQUE INDEX authority_session_leases_session_lineage ON authority_session_leases(session_lineage_id);
+	CREATE UNIQUE INDEX authority_session_workspaces_session_lineage ON authority_session_workspaces(session_lineage_id);
+	ALTER TABLE authority_session_leases DROP COLUMN fence_epoch;
+	PRAGMA user_version=5`)
+	return err
+}
+
 func (s *AuthorityWorkerStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
@@ -277,15 +314,30 @@ func (s *AuthorityWorkerStore) requestDigest(raw string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func newAuthorityLineageID() (string, error) {
+func newOpaqueLineageID(kind string) (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("generate session lineage: %w", err)
+		return "", fmt.Errorf("generate %s lineage: %w", kind, err)
 	}
 	return hex.EncodeToString(b), nil
 }
 
+func validOpaqueLineageID(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 16
+}
+
 func (s *AuthorityWorkerStore) CreateWorker(ctx context.Context, worker AuthorityWorker, maxWorkers int) (AuthorityWorker, error) {
+	if worker.WorkerStorageLineageID == "" {
+		lineageID, err := newOpaqueLineageID("worker storage")
+		if err != nil {
+			return AuthorityWorker{}, err
+		}
+		worker.WorkerStorageLineageID, worker.WorkerFenceEpoch = lineageID, 1
+	}
+	if !validOpaqueLineageID(worker.WorkerStorageLineageID) || worker.WorkerFenceEpoch != 1 || worker.Generation != 1 {
+		return AuthorityWorker{}, fmt.Errorf("initial authority worker requires an opaque storage lineage, generation 1, and worker fence epoch 1")
+	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return AuthorityWorker{}, err
@@ -310,10 +362,10 @@ func (s *AuthorityWorkerStore) CreateWorker(ctx context.Context, worker Authorit
 	now := time.Now().UTC()
 	worker.CreatedAt, worker.UpdatedAt = now, now
 	_, err = conn.ExecContext(ctx, `INSERT INTO authority_workers
-		(worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, worker.WorkerID, worker.Profile, worker.ProfileVersion,
+		(worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, worker.WorkerID, worker.Profile, worker.ProfileVersion,
 		worker.PolicyDigest, worker.ImageReference, worker.ImageDigest, worker.Generation, worker.ContainerID, worker.State, worker.Capacity,
-		worker.AssignedSessions, worker.Health, worker.DrainReason, worker.ReplacementWorker, formatAuthorityTime(worker.HeartbeatAt), formatAuthorityTime(now), formatAuthorityTime(now))
+		worker.AssignedSessions, worker.Health, worker.DrainReason, worker.ReplacementWorker, formatAuthorityTime(worker.HeartbeatAt), formatAuthorityTime(now), formatAuthorityTime(now), worker.WorkerStorageLineageID, worker.WorkerFenceEpoch)
 	if err != nil {
 		return AuthorityWorker{}, err
 	}
@@ -325,11 +377,11 @@ func (s *AuthorityWorkerStore) CreateWorker(ctx context.Context, worker Authorit
 }
 
 func (s *AuthorityWorkerStore) GetWorker(ctx context.Context, workerID string) (AuthorityWorker, error) {
-	return scanAuthorityWorker(s.db.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at FROM authority_workers WHERE worker_id=?`, workerID))
+	return scanAuthorityWorker(s.db.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE worker_id=?`, workerID))
 }
 
 func (s *AuthorityWorkerStore) ListLiveWorkers(ctx context.Context) ([]AuthorityWorker, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at FROM authority_workers WHERE state IN (?,?,?) ORDER BY profile,generation,worker_id`, AuthorityWorkerStarting, AuthorityWorkerReady, AuthorityWorkerUnhealthy)
+	rows, err := s.db.QueryContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE state IN (?,?,?) ORDER BY profile,generation,worker_id`, AuthorityWorkerStarting, AuthorityWorkerReady, AuthorityWorkerUnhealthy)
 	if err != nil {
 		return nil, err
 	}
@@ -434,7 +486,7 @@ func (s *AuthorityWorkerStore) SetWorkerHealth(ctx context.Context, workerID, he
 		return AuthorityWorker{}, err
 	}
 	committed = true
-	return scanAuthorityWorker(conn.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at FROM authority_workers WHERE worker_id=?`, workerID))
+	return scanAuthorityWorker(conn.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE worker_id=?`, workerID))
 }
 
 func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, request AuthorityWorkerRequest) (AuthorityLease, error) {
@@ -457,8 +509,8 @@ func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, re
 	}()
 	var lease AuthorityLease
 	var storedFingerprint, created, released string
-	err = conn.QueryRowContext(ctx, `SELECT profile,worker_id,lineage_id,fence_epoch,binding_digest,idempotency_digest,request_fingerprint,created_at,released_at FROM authority_session_leases WHERE principal=? AND profile=? AND idempotency_digest=?`, principal, request.Profile, idem).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.LineageID, &lease.FenceEpoch, &lease.BindingDigest, &lease.IdempotencyDigest, &storedFingerprint, &created, &released)
+	err = conn.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.binding_digest,l.idempotency_digest,l.request_fingerprint,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.profile=? AND l.idempotency_digest=?`, principal, request.Profile, idem).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.BindingDigest, &lease.IdempotencyDigest, &storedFingerprint, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch)
 	if err == nil {
 		if storedFingerprint != fingerprint {
 			return AuthorityLease{}, fmt.Errorf("idempotency conflict")
@@ -501,11 +553,11 @@ func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, re
 		return AuthorityLease{}, fmt.Errorf("authority worker capacity changed")
 	}
 	now := time.Now().UTC()
-	lineageID, err := newAuthorityLineageID()
+	lineageID, err := newOpaqueLineageID("session")
 	if err != nil {
 		return AuthorityLease{}, err
 	}
-	_, err = conn.ExecContext(ctx, `INSERT INTO authority_session_leases(principal,profile,idempotency_digest,request_fingerprint,binding_digest,worker_id,lineage_id,fence_epoch,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, principal, request.Profile, idem, fingerprint, binding, workerID, lineageID, 1, formatAuthorityTime(now))
+	_, err = conn.ExecContext(ctx, `INSERT INTO authority_session_leases(principal,profile,idempotency_digest,request_fingerprint,binding_digest,worker_id,session_lineage_id,created_at) VALUES(?,?,?,?,?,?,?,?)`, principal, request.Profile, idem, fingerprint, binding, workerID, lineageID, formatAuthorityTime(now))
 	if err != nil {
 		return AuthorityLease{}, err
 	}
@@ -513,7 +565,12 @@ func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, re
 		return AuthorityLease{}, err
 	}
 	committed = true
-	return AuthorityLease{Principal: principal, Profile: request.Profile, WorkerID: workerID, LineageID: lineageID, FenceEpoch: 1, BindingDigest: binding, IdempotencyDigest: idem, CreatedAt: now}, nil
+	var workerStorageLineageID string
+	var workerFenceEpoch int64
+	if err := conn.QueryRowContext(ctx, `SELECT worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE worker_id=?`, workerID).Scan(&workerStorageLineageID, &workerFenceEpoch); err != nil {
+		return AuthorityLease{}, err
+	}
+	return AuthorityLease{Principal: principal, Profile: request.Profile, WorkerID: workerID, SessionLineageID: lineageID, WorkerStorageLineageID: workerStorageLineageID, WorkerFenceEpoch: workerFenceEpoch, BindingDigest: binding, IdempotencyDigest: idem, CreatedAt: now}, nil
 }
 
 func (s *AuthorityWorkerStore) Release(ctx context.Context, principal, sessionBinding string) (AuthorityLease, error) {
@@ -534,8 +591,8 @@ func (s *AuthorityWorkerStore) Release(ctx context.Context, principal, sessionBi
 	}()
 	var lease AuthorityLease
 	var created, released string
-	err = conn.QueryRowContext(ctx, `SELECT profile,worker_id,lineage_id,fence_epoch,idempotency_digest,created_at,released_at FROM authority_session_leases WHERE principal=? AND binding_digest=?`, principal, binding).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.LineageID, &lease.FenceEpoch, &lease.IdempotencyDigest, &created, &released)
+	err = conn.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.idempotency_digest,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.binding_digest=?`, principal, binding).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.IdempotencyDigest, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch)
 	if err != nil {
 		return AuthorityLease{}, err
 	}
@@ -579,8 +636,8 @@ func (s *AuthorityWorkerStore) GetLease(ctx context.Context, principal, sessionB
 	binding := s.requestDigest(sessionBinding)
 	var lease AuthorityLease
 	var created, released string
-	err := s.db.QueryRowContext(ctx, `SELECT profile,worker_id,lineage_id,fence_epoch,idempotency_digest,created_at,released_at FROM authority_session_leases WHERE principal=? AND binding_digest=?`, principal, binding).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.LineageID, &lease.FenceEpoch, &lease.IdempotencyDigest, &created, &released)
+	err := s.db.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.idempotency_digest,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.binding_digest=?`, principal, binding).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.IdempotencyDigest, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch)
 	if err != nil {
 		return AuthorityLease{}, err
 	}
@@ -596,21 +653,22 @@ func (s *AuthorityWorkerStore) GetLease(ctx context.Context, principal, sessionB
 	return lease, nil
 }
 
-func (s *AuthorityWorkerStore) ValidateSessionFence(ctx context.Context, workerID, lineageID string, fenceEpoch int64) (bool, error) {
+func (s *AuthorityWorkerStore) ValidateSessionFence(ctx context.Context, workerID, sessionLineageID string, workerFenceEpoch int64) (bool, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM authority_session_leases l
-		JOIN authority_session_workspaces w ON w.lineage_id=l.lineage_id
-		WHERE l.worker_id=? AND l.lineage_id=? AND l.fence_epoch=? AND l.released_at='' AND w.worker_id=?`, workerID, lineageID, fenceEpoch, workerID).Scan(&count)
+		JOIN authority_session_workspaces sw ON sw.session_lineage_id=l.session_lineage_id
+		JOIN authority_workers aw ON aw.worker_id=l.worker_id
+		WHERE l.worker_id=? AND l.session_lineage_id=? AND aw.worker_fence_epoch=? AND l.released_at='' AND sw.worker_id=?`, workerID, sessionLineageID, workerFenceEpoch, workerID).Scan(&count)
 	return count == 1, err
 }
 
 // Reassign moves an active lease only to the replacement durably linked to the
 // supplied predecessor.  Lease ownership, workspace ownership, and capacity
 // accounting commit together, so a process crash leaves either side intact.
-func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionBinding, predecessorWorkerID string, priorFenceEpoch int64, idempotencyKey string) (AuthoritySessionReassignment, error) {
+func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionBinding, sessionLineageID, predecessorWorkerID string, predecessorWorkerFenceEpoch int64, idempotencyKey string) (AuthoritySessionReassignment, error) {
 	binding := s.requestDigest(sessionBinding)
 	idem := s.requestDigest(idempotencyKey)
-	fingerprint := s.requestDigest(fmt.Sprintf("reassign:%s\x00%s\x00%d", sessionBinding, predecessorWorkerID, priorFenceEpoch))
+	fingerprint := s.requestDigest(fmt.Sprintf("reassign:%s\x00%s\x00%s\x00%d", sessionBinding, sessionLineageID, predecessorWorkerID, predecessorWorkerFenceEpoch))
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return AuthoritySessionReassignment{}, err
@@ -660,7 +718,7 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 		}
 		return AuthoritySessionReassignment{}, err
 	}
-	if !lease.ReleasedAt.IsZero() || lease.WorkerID != predecessorWorkerID || lease.FenceEpoch != priorFenceEpoch {
+	if !lease.ReleasedAt.IsZero() || lease.WorkerID != predecessorWorkerID || lease.SessionLineageID != sessionLineageID || lease.WorkerFenceEpoch != predecessorWorkerFenceEpoch {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "session binding is not assigned to the supplied predecessor")
 	}
 	var replacementID string
@@ -674,10 +732,11 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	if replacementID == "" {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentNotReady, "predecessor has no broker-recorded replacement")
 	}
-	var replacementProfile, replacementProfileVersion, replacementPolicyDigest, replacementImage string
+	var replacementProfile, replacementProfileVersion, replacementPolicyDigest, replacementImage, replacementStorageLineageID string
 	var replacementState AuthorityWorkerState
 	var replacementCapacity, replacementAssigned int
-	if err := conn.QueryRowContext(ctx, `SELECT profile,profile_version,policy_digest,image_reference,state,capacity,assigned_sessions FROM authority_workers WHERE worker_id=?`, replacementID).Scan(&replacementProfile, &replacementProfileVersion, &replacementPolicyDigest, &replacementImage, &replacementState, &replacementCapacity, &replacementAssigned); err != nil {
+	var replacementWorkerFenceEpoch int64
+	if err := conn.QueryRowContext(ctx, `SELECT profile,profile_version,policy_digest,image_reference,state,capacity,assigned_sessions,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE worker_id=?`, replacementID).Scan(&replacementProfile, &replacementProfileVersion, &replacementPolicyDigest, &replacementImage, &replacementState, &replacementCapacity, &replacementAssigned, &replacementStorageLineageID, &replacementWorkerFenceEpoch); err != nil {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "broker-recorded replacement is unavailable")
 	}
 	var predecessorProfileVersion, predecessorPolicyDigest, predecessorImage string
@@ -687,6 +746,9 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	}
 	if replacementProfile != predecessorProfile || replacementProfileVersion != predecessorProfileVersion || replacementPolicyDigest != predecessorPolicyDigest || replacementImage != predecessorImage || replacementCapacity != predecessorCapacity {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "broker-recorded replacement has a different authority profile")
+	}
+	if replacementStorageLineageID != lease.WorkerStorageLineageID || replacementWorkerFenceEpoch != predecessorWorkerFenceEpoch+1 {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "replacement storage lineage or worker fence epoch is not the exact successor")
 	}
 	if replacementState != AuthorityWorkerReady {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentNotReady, "broker-recorded replacement is not ready")
@@ -711,7 +773,7 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	if err != nil || rows != 1 {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentCapacity, "broker-recorded replacement capacity changed")
 	}
-	result, err = conn.ExecContext(ctx, `UPDATE authority_session_leases SET worker_id=?,fence_epoch=fence_epoch+1 WHERE principal=? AND binding_digest=? AND worker_id=? AND fence_epoch=? AND released_at=''`, replacementID, principal, binding, predecessorWorkerID, priorFenceEpoch)
+	result, err = conn.ExecContext(ctx, `UPDATE authority_session_leases SET worker_id=? WHERE principal=? AND binding_digest=? AND session_lineage_id=? AND worker_id=? AND released_at=''`, replacementID, principal, binding, sessionLineageID, predecessorWorkerID)
 	if err != nil {
 		return AuthoritySessionReassignment{}, err
 	}
@@ -719,7 +781,7 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	if err != nil || rows != 1 {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "session lease changed during reassignment")
 	}
-	result, err = conn.ExecContext(ctx, `UPDATE authority_session_workspaces SET worker_id=? WHERE lineage_id=? AND binding_digest=? AND worker_id=?`, replacementID, lease.LineageID, binding, predecessorWorkerID)
+	result, err = conn.ExecContext(ctx, `UPDATE authority_session_workspaces SET worker_id=? WHERE session_lineage_id=? AND binding_digest=? AND worker_id=?`, replacementID, lease.SessionLineageID, binding, predecessorWorkerID)
 	if err != nil {
 		return AuthoritySessionReassignment{}, err
 	}
@@ -731,7 +793,8 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 		return AuthoritySessionReassignment{}, err
 	}
 	lease.WorkerID = replacementID
-	lease.FenceEpoch++
+	lease.WorkerStorageLineageID = replacementStorageLineageID
+	lease.WorkerFenceEpoch = replacementWorkerFenceEpoch
 	reassignment = AuthoritySessionReassignment{Lease: lease, PredecessorWorkerID: predecessorWorkerID, ReplacementWorkerID: replacementID}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return AuthoritySessionReassignment{}, err
@@ -746,8 +809,8 @@ func getLeaseByDigest(ctx context.Context, queryer interface {
 ) (AuthorityLease, error) {
 	var lease AuthorityLease
 	var created, released string
-	err := queryer.QueryRowContext(ctx, `SELECT profile,worker_id,lineage_id,fence_epoch,idempotency_digest,created_at,released_at FROM authority_session_leases WHERE principal=? AND binding_digest=?`, principal, binding).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.LineageID, &lease.FenceEpoch, &lease.IdempotencyDigest, &created, &released)
+	err := queryer.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.idempotency_digest,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.binding_digest=?`, principal, binding).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.IdempotencyDigest, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch)
 	if err != nil {
 		return AuthorityLease{}, err
 	}
@@ -760,7 +823,7 @@ func getLeaseByDigest(ctx context.Context, queryer interface {
 }
 
 func (s *AuthorityWorkerStore) ListActiveLeases(ctx context.Context, workerID string) ([]AuthorityLease, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT principal,profile,worker_id,binding_digest,idempotency_digest,created_at FROM authority_session_leases WHERE worker_id=? AND released_at='' ORDER BY created_at,binding_digest`, workerID)
+	rows, err := s.db.QueryContext(ctx, `SELECT l.principal,l.profile,l.worker_id,l.binding_digest,l.idempotency_digest,l.created_at,l.session_lineage_id,w.worker_storage_lineage_id,w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.worker_id=? AND l.released_at='' ORDER BY l.created_at,l.binding_digest`, workerID)
 	if err != nil {
 		return nil, err
 	}
@@ -772,7 +835,7 @@ func (s *AuthorityWorkerStore) ListActiveLeases(ctx context.Context, workerID st
 	for rows.Next() {
 		var lease AuthorityLease
 		var created string
-		if err := rows.Scan(&lease.Principal, &lease.Profile, &lease.WorkerID, &lease.BindingDigest, &lease.IdempotencyDigest, &created); err != nil {
+		if err := rows.Scan(&lease.Principal, &lease.Profile, &lease.WorkerID, &lease.BindingDigest, &lease.IdempotencyDigest, &created, &lease.SessionLineageID, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch); err != nil {
 			return nil, err
 		}
 		var err error
@@ -811,7 +874,7 @@ func (s *AuthorityWorkerStore) Drain(ctx context.Context, workerID, reason strin
 // supplied worker.  A predecessor with active sessions must remain available
 // until its leases are released, so it is deliberately not returned here.
 func (s *AuthorityWorkerStore) DrainedPredecessor(ctx context.Context, replacementWorkerID string) (AuthorityWorker, bool, error) {
-	worker, err := scanAuthorityWorker(s.db.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at FROM authority_workers WHERE replacement_worker_id=? AND state=? AND assigned_sessions=0`, replacementWorkerID, AuthorityWorkerDraining))
+	worker, err := scanAuthorityWorker(s.db.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE replacement_worker_id=? AND state=? AND assigned_sessions=0`, replacementWorkerID, AuthorityWorkerDraining))
 	if errors.Is(err, sql.ErrNoRows) {
 		return AuthorityWorker{}, false, nil
 	}
@@ -878,12 +941,13 @@ func (s *AuthorityWorkerStore) LinkReplacement(ctx context.Context, oldWorkerID 
 			rollbackAuthorityConn(context.WithoutCancel(ctx), conn)
 		}
 	}()
-	var existing string
-	if err := conn.QueryRowContext(ctx, `SELECT replacement_worker_id FROM authority_workers WHERE worker_id=?`, oldWorkerID).Scan(&existing); err != nil {
+	var existing, predecessorStorageLineageID string
+	var predecessorWorkerFenceEpoch int64
+	if err := conn.QueryRowContext(ctx, `SELECT replacement_worker_id,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE worker_id=?`, oldWorkerID).Scan(&existing, &predecessorStorageLineageID, &predecessorWorkerFenceEpoch); err != nil {
 		return AuthorityWorker{}, false, err
 	}
 	if existing != "" {
-		worker, err := scanAuthorityWorker(conn.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at FROM authority_workers WHERE worker_id=?`, existing))
+		worker, err := scanAuthorityWorker(conn.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE worker_id=?`, existing))
 		if err != nil {
 			return AuthorityWorker{}, false, err
 		}
@@ -902,7 +966,12 @@ func (s *AuthorityWorkerStore) LinkReplacement(ctx context.Context, oldWorkerID 
 	}
 	now := time.Now().UTC()
 	replacement.CreatedAt, replacement.UpdatedAt = now, now
-	_, err = conn.ExecContext(ctx, `INSERT INTO authority_workers(worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,state,capacity,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, replacement.WorkerID, replacement.Profile, replacement.ProfileVersion, replacement.PolicyDigest, replacement.ImageReference, replacement.ImageDigest, replacement.Generation, replacement.State, replacement.Capacity, formatAuthorityTime(now), formatAuthorityTime(now))
+	replacement.WorkerStorageLineageID = predecessorStorageLineageID
+	replacement.WorkerFenceEpoch = predecessorWorkerFenceEpoch + 1
+	if !validOpaqueLineageID(replacement.WorkerStorageLineageID) || replacement.WorkerFenceEpoch < 2 {
+		return AuthorityWorker{}, false, fmt.Errorf("predecessor worker storage lineage is invalid")
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO authority_workers(worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,state,capacity,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, replacement.WorkerID, replacement.Profile, replacement.ProfileVersion, replacement.PolicyDigest, replacement.ImageReference, replacement.ImageDigest, replacement.Generation, replacement.State, replacement.Capacity, formatAuthorityTime(now), formatAuthorityTime(now), replacement.WorkerStorageLineageID, replacement.WorkerFenceEpoch)
 	if err != nil {
 		return AuthorityWorker{}, false, err
 	}
@@ -974,7 +1043,7 @@ type authorityRowScanner interface{ Scan(...any) error }
 func scanAuthorityWorker(row authorityRowScanner) (AuthorityWorker, error) {
 	var worker AuthorityWorker
 	var heartbeat, created, updated string
-	err := row.Scan(&worker.WorkerID, &worker.Profile, &worker.ProfileVersion, &worker.PolicyDigest, &worker.ImageReference, &worker.ImageDigest, &worker.Generation, &worker.ContainerID, &worker.State, &worker.Capacity, &worker.AssignedSessions, &worker.Health, &worker.DrainReason, &worker.ReplacementWorker, &heartbeat, &created, &updated)
+	err := row.Scan(&worker.WorkerID, &worker.Profile, &worker.ProfileVersion, &worker.PolicyDigest, &worker.ImageReference, &worker.ImageDigest, &worker.Generation, &worker.ContainerID, &worker.State, &worker.Capacity, &worker.AssignedSessions, &worker.Health, &worker.DrainReason, &worker.ReplacementWorker, &heartbeat, &created, &updated, &worker.WorkerStorageLineageID, &worker.WorkerFenceEpoch)
 	if err != nil {
 		return AuthorityWorker{}, err
 	}

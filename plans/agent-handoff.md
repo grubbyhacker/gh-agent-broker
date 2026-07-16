@@ -162,6 +162,24 @@ fence configuration, and Docker returns unavailable until that protocol lands.
 Checkpoint files remain lease-observation evidence only, not an agentd
 recovery manifest or a recovery guarantee.
 
+The current broker/agentd integration matches the agentd PR 9 source contract:
+authenticated `/readyz` uses `agentd/control/v1` and the camelCase
+`workerId`, `storageLineageId`, and `fenceEpoch` identity fields plus the
+`components` object. Create-session projects the exact agentd/v1 camelCase
+fields and the workspace object contains only `workspaceRef`, `uid`, and `gid`.
+Profiles without the authenticated agentd readiness contract retain their
+existing liveness behavior; the stricter readiness gate applies only to the
+profile that opts into it.
+
+Worker journal/session, checkpoint, and evidence named volumes are mounted
+with Docker `VolumeOptions.Subpath` set to the opaque worker storage lineage.
+A root-run initializer creates and secures those lineage directories before
+the worker container is created; authority workers never receive the full
+backing volume. Replacements inherit the storage lineage and advance its worker
+fence epoch by exactly one, while logical session lineage remains unchanged and
+separate. Journal continuation therefore comes from inherited fenced storage,
+not from broker checkpoint artifacts.
+
 A committed zero-lease draining predecessor is retired after cutover;
 reconciliation retries that retirement after an interruption. REST errors remain structured as
 `reassignment_not_ready`, `reassignment_stale_predecessor`,

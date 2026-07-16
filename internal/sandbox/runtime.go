@@ -48,6 +48,10 @@ type Mount struct {
 	Source   string
 	Target   string
 	ReadOnly bool
+	Volume   bool
+	// VolumeSubpath selects an existing relative directory inside a named
+	// Docker volume. It is never represented as a bind string.
+	VolumeSubpath string
 }
 
 type ContainerInfo struct {
@@ -119,6 +123,7 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 			CapDrop:         []string{"ALL"},
 			NetworkMode:     networkMode(spec.Network),
 			Binds:           binds(spec.Mounts),
+			Mounts:          dockerMounts(spec.Mounts),
 			PidsLimit:       spec.Resources.PidsLimit,
 			Memory:          spec.Resources.MemoryMB * 1024 * 1024,
 			CPUWeight:       spec.Resources.CPUShares,
@@ -215,6 +220,60 @@ func (d *DockerBackend) Inspect(ctx context.Context, containerID string) (Contai
 		return ContainerStatus{}, err
 	}
 	return dockerContainerStatus(out), nil
+}
+
+func (d *DockerBackend) InternalAddress(ctx context.Context, containerID string) (string, error) {
+	var out dockerInspectResponse
+	if err := d.doJSON(ctx, http.MethodGet, "/containers/"+url.PathEscape(containerID)+"/json", nil, &out); err != nil {
+		return "", err
+	}
+	for _, network := range out.NetworkSettings.Networks {
+		if network.IPAddress != "" {
+			return network.IPAddress, nil
+		}
+	}
+	return "", nil
+}
+
+// EnsureVolumeSubpaths creates the opaque lineage directory through a short
+// lived helper that alone sees each full backing volume. Docker requires a
+// volume subpath to exist before the authority container is created.
+func (d *DockerBackend) EnsureVolumeSubpaths(ctx context.Context, image, lineageID string, mounts []Mount) error {
+	if !validOpaqueLineageID(lineageID) {
+		return fmt.Errorf("invalid volume storage lineage")
+	}
+	initMounts := make([]Mount, 0, len(mounts))
+	args := []string{"-d", "-o", "bun", "-g", "bun", "-m", "0700"}
+	for index, mount := range mounts {
+		if !mount.Volume || mount.Source == "" || mount.VolumeSubpath != lineageID {
+			return fmt.Errorf("invalid authority volume subpath request")
+		}
+		target := fmt.Sprintf("/lineage-volumes/%d", index)
+		initMounts = append(initMounts, Mount{Source: mount.Source, Target: target, Volume: true})
+		args = append(args, target+"/"+lineageID)
+	}
+	runID := "authority-volume-init-" + lineageID
+	spec := RuntimeSpec{RunID: runID, Image: image, Entrypoint: []string{"install"}, Command: args, User: "0:0", Labels: map[string]string{"gh-agent-broker.run_id": runID, "gh-agent-broker.volume_initializer": "true"}, Mounts: initMounts, Resources: Resources{CPUShares: 2, MemoryMB: 32, PidsLimit: 16}}
+	info, err := d.Create(ctx, spec)
+	if err != nil {
+		return err
+	}
+	if info.Lifecycle == ContainerNeverStarted {
+		if err := d.Start(ctx, info.ID); err != nil {
+			return err
+		}
+	}
+	status := info.Status
+	if info.Lifecycle != ContainerExited {
+		status, err = d.Wait(ctx, info.ID)
+		if err != nil {
+			return err
+		}
+	}
+	if status.ExitCode == nil || *status.ExitCode != 0 {
+		return fmt.Errorf("volume subpath initializer failed")
+	}
+	return d.Remove(ctx, info.ID)
 }
 
 func dockerContainerStatus(out dockerInspectResponse) ContainerStatus {
@@ -492,17 +551,30 @@ type dockerCreateRequest struct {
 }
 
 type dockerHostConfig struct {
-	ReadonlyRootfs  bool     `json:"ReadonlyRootfs"`
-	SecurityOpt     []string `json:"SecurityOpt"`
-	CapDrop         []string `json:"CapDrop"`
-	NetworkMode     string   `json:"NetworkMode"`
-	Binds           []string `json:"Binds"`
-	PidsLimit       int64    `json:"PidsLimit,omitempty"`
-	Memory          int64    `json:"Memory,omitempty"`
-	CPUWeight       int      `json:"CpuShares,omitempty"`
-	AutoRemove      bool     `json:"AutoRemove"`
-	Privileged      bool     `json:"Privileged"`
-	PublishAllPorts bool     `json:"PublishAllPorts"`
+	ReadonlyRootfs  bool          `json:"ReadonlyRootfs"`
+	SecurityOpt     []string      `json:"SecurityOpt"`
+	CapDrop         []string      `json:"CapDrop"`
+	NetworkMode     string        `json:"NetworkMode"`
+	Binds           []string      `json:"Binds"`
+	Mounts          []dockerMount `json:"Mounts,omitempty"`
+	PidsLimit       int64         `json:"PidsLimit,omitempty"`
+	Memory          int64         `json:"Memory,omitempty"`
+	CPUWeight       int           `json:"CpuShares,omitempty"`
+	AutoRemove      bool          `json:"AutoRemove"`
+	Privileged      bool          `json:"Privileged"`
+	PublishAllPorts bool          `json:"PublishAllPorts"`
+}
+
+type dockerMount struct {
+	Type          string               `json:"Type"`
+	Source        string               `json:"Source"`
+	Target        string               `json:"Target"`
+	ReadOnly      bool                 `json:"ReadOnly,omitempty"`
+	VolumeOptions *dockerVolumeOptions `json:"VolumeOptions,omitempty"`
+}
+
+type dockerVolumeOptions struct {
+	Subpath string `json:"Subpath,omitempty"`
 }
 
 type dockerInspectResponse struct {
@@ -520,6 +592,11 @@ type dockerInspectResponse struct {
 		StartedAt  string `json:"StartedAt"`
 		FinishedAt string `json:"FinishedAt"`
 	} `json:"State"`
+	NetworkSettings struct {
+		Networks map[string]struct {
+			IPAddress string `json:"IPAddress"`
+		} `json:"Networks"`
+	} `json:"NetworkSettings"`
 }
 
 func runtimeSpecDigest(spec RuntimeSpec) (string, error) {
@@ -560,11 +637,25 @@ func envList(env map[string]string) []string {
 func binds(mounts []Mount) []string {
 	out := make([]string, 0, len(mounts))
 	for _, mount := range mounts {
+		if mount.Volume {
+			continue
+		}
 		mode := "rw"
 		if mount.ReadOnly {
 			mode = "ro"
 		}
 		out = append(out, filepath.Clean(mount.Source)+":"+mount.Target+":"+mode)
+	}
+	return out
+}
+
+func dockerMounts(mounts []Mount) []dockerMount {
+	var out []dockerMount
+	for _, mount := range mounts {
+		if !mount.Volume {
+			continue
+		}
+		out = append(out, dockerMount{Type: "volume", Source: mount.Source, Target: mount.Target, ReadOnly: mount.ReadOnly, VolumeOptions: &dockerVolumeOptions{Subpath: mount.VolumeSubpath}})
 	}
 	return out
 }
