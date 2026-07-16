@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -118,7 +119,27 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 	if err != nil {
 		imageDigest = spec.Image
 	}
-	reqBody := dockerCreateRequest{
+	reqBody := dockerCreateRequestFor(spec)
+	var out struct {
+		ID       string   `json:"Id"`
+		Warnings []string `json:"Warnings"`
+	}
+	path := "/containers/create?name=" + url.QueryEscape("sandbox-"+spec.RunID)
+	if err := d.doJSON(ctx, http.MethodPost, path, reqBody, &out); err != nil {
+		if code, ok := DockerStatusCode(err); ok && code == http.StatusConflict {
+			return d.adopt(ctx, spec)
+		}
+		return ContainerInfo{}, err
+	}
+	return ContainerInfo{ID: out.ID, ImageDigest: imageDigest, Lifecycle: ContainerNeverStarted}, nil
+}
+
+// dockerCreateRequestFor is the single source of Docker launch settings for
+// RuntimeSpec. The launch fingerprint below derives from this effective
+// request so it cannot omit an internal security-class switch that Docker
+// applies at create time.
+func dockerCreateRequestFor(spec RuntimeSpec) dockerCreateRequest {
+	return dockerCreateRequest{
 		Image:      spec.Image,
 		Platform:   spec.Platform,
 		Entrypoint: spec.Entrypoint,
@@ -143,18 +164,6 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 			PublishAllPorts: false,
 		},
 	}
-	var out struct {
-		ID       string   `json:"Id"`
-		Warnings []string `json:"Warnings"`
-	}
-	path := "/containers/create?name=" + url.QueryEscape("sandbox-"+spec.RunID)
-	if err := d.doJSON(ctx, http.MethodPost, path, reqBody, &out); err != nil {
-		if code, ok := DockerStatusCode(err); ok && code == http.StatusConflict {
-			return d.adopt(ctx, spec)
-		}
-		return ContainerInfo{}, err
-	}
-	return ContainerInfo{ID: out.ID, ImageDigest: imageDigest, Lifecycle: ContainerNeverStarted}, nil
 }
 
 func runtimeSecurityOptions(spec RuntimeSpec) []string {
@@ -710,13 +719,13 @@ func runtimeSpecDigest(spec RuntimeSpec) (string, error) {
 	copySpec := spec
 	copySpec.Labels = cloneStringMap(spec.Labels)
 	delete(copySpec.Labels, "gh-agent-broker.launch_spec")
-	var value any = copySpec
-	if legacyOrdinaryRuntimeSpec(copySpec) {
-		value = legacyRuntimeSpec{
-			RunID: copySpec.RunID, Image: copySpec.Image, Command: copySpec.Command, User: copySpec.User,
-			Env: copySpec.Env, Labels: copySpec.Labels, Mounts: legacyMounts(copySpec.Mounts), Network: copySpec.Network,
-			Resources: copySpec.Resources, WorkingDir: copySpec.WorkingDir, Timeout: copySpec.Timeout,
-		}
+	if !legacyOrdinaryRuntimeSpec(copySpec) {
+		return effectiveRuntimeLaunchFingerprintDigest(effectiveRuntimeLaunchFingerprint{CreateRequest: dockerCreateRequestFor(copySpec)})
+	}
+	value := legacyRuntimeSpec{
+		RunID: copySpec.RunID, Image: copySpec.Image, Command: copySpec.Command, User: copySpec.User,
+		Env: copySpec.Env, Labels: copySpec.Labels, Mounts: legacyMounts(copySpec.Mounts), Network: copySpec.Network,
+		Resources: copySpec.Resources, WorkingDir: copySpec.WorkingDir, Timeout: copySpec.Timeout,
 	}
 	b, err := json.Marshal(value)
 	if err != nil {
@@ -724,6 +733,24 @@ func runtimeSpecDigest(spec RuntimeSpec) (string, error) {
 	}
 	sum := sha256.Sum256(b)
 	return fmt.Sprintf("v1:%x", sum[:]), nil
+}
+
+// effectiveRuntimeLaunchFingerprint intentionally contains the complete
+// Docker create request derived from a reviewed RuntimeSpec. It is used only
+// for non-legacy launches, including authority workers and their helpers.
+// RuntimeSpec exposes no caller-controlled capability fields; CapAdd and
+// SecurityOpt remain derived by the fixed runtime functions above.
+type effectiveRuntimeLaunchFingerprint struct {
+	CreateRequest dockerCreateRequest
+}
+
+func effectiveRuntimeLaunchFingerprintDigest(value effectiveRuntimeLaunchFingerprint) (string, error) {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("v2:%x", sum[:]), nil
 }
 
 // legacyRuntimeSpec is the launch-spec representation emitted before authority
@@ -794,6 +821,7 @@ func envList(env map[string]string) []string {
 	for k, v := range env {
 		out = append(out, k+"="+v)
 	}
+	sort.Strings(out)
 	return out
 }
 

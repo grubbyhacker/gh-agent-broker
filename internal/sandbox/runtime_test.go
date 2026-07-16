@@ -328,6 +328,136 @@ func TestDockerCreateAdoptsLegacyOrdinaryCreatePendingIntentAfterConflict(t *tes
 	}
 }
 
+func TestRuntimeSpecDigestUsesEffectiveInitializerSecurityClass(t *testing.T) {
+	initializer := RuntimeSpec{
+		RunID:                      "authority-volume-init-lineage",
+		Image:                      "worker:latest",
+		Entrypoint:                 []string{"install"},
+		Command:                    []string{"-d", "-o", "bun", "-g", "bun", "-m", "0711", "/lineage/lineage"},
+		User:                       "0:0",
+		Labels:                     map[string]string{"gh-agent-broker.run_id": "authority-volume-init-lineage"},
+		Mounts:                     []Mount{{Source: "workspace", Target: "/lineage", Volume: true}},
+		Network:                    NetworkPolicy{None: true},
+		authorityVolumeInitializer: true,
+	}
+	initializerDigest, err := runtimeSpecDigest(initializer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(initializerDigest, "v2:") {
+		t.Fatalf("initializer digest=%q, want effective v2 fingerprint", initializerDigest)
+	}
+
+	withoutInitializerPrivilege := initializer
+	withoutInitializerPrivilege.authorityVolumeInitializer = false
+	zeroCapabilityDigest, err := runtimeSpecDigest(withoutInitializerPrivilege)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initializerDigest == zeroCapabilityDigest {
+		t.Fatal("initializer privilege class did not change launch fingerprint")
+	}
+
+	chownOnly := effectiveRuntimeLaunchFingerprint{CreateRequest: dockerCreateRequestFor(initializer)}
+	chownOnly.CreateRequest.HostConfig.CapAdd = []string{"CHOWN"}
+	chownOnlyDigest, err := effectiveRuntimeLaunchFingerprintDigest(chownOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initializerDigest == chownOnlyDigest || zeroCapabilityDigest == chownOnlyDigest {
+		t.Fatalf("capability fingerprints overlap: initializer=%q zero=%q chown-only=%q", initializerDigest, zeroCapabilityDigest, chownOnlyDigest)
+	}
+}
+
+func TestRuntimeSpecDigestDistinguishesAuthoritySetuidSecurityClass(t *testing.T) {
+	base := RuntimeSpec{
+		RunID:      "authority-worker",
+		Image:      "worker:latest",
+		Entrypoint: []string{"agentd"},
+		User:       "bun",
+		Labels:     map[string]string{"gh-agent-broker.run_id": "authority-worker"},
+		Mounts:     []Mount{{Source: "workspace", Target: "/work", Volume: true, VolumeSubpath: "lineage"}},
+	}
+	setuid := base
+	setuid.AllowAgentdSetuidLauncherPrivilegeTransition = true
+	setuidDigest, err := runtimeSpecDigest(setuid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryDigest, err := runtimeSpecDigest(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setuidDigest == ordinaryDigest {
+		t.Fatal("authority SETUID/SETGID class did not change launch fingerprint")
+	}
+	if got, want := dockerCreateRequestFor(setuid).HostConfig.CapAdd, []string{"SETUID", "SETGID"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("authority capabilities=%q, want %q", got, want)
+	}
+	if got := dockerCreateRequestFor(setuid).HostConfig.SecurityOpt; len(got) != 0 {
+		t.Fatalf("authority security options=%q, want no no-new-privileges", got)
+	}
+}
+
+func TestDockerAdoptRejectsCapabilityMismatchedEffectiveFingerprint(t *testing.T) {
+	spec := RuntimeSpec{
+		RunID:                      "authority-volume-init-lineage",
+		Image:                      "worker:latest",
+		Entrypoint:                 []string{"install"},
+		User:                       "0:0",
+		Labels:                     map[string]string{"gh-agent-broker.run_id": "authority-volume-init-lineage"},
+		Mounts:                     []Mount{{Source: "workspace", Target: "/lineage", Volume: true}},
+		Network:                    NetworkPolicy{None: true},
+		authorityVolumeInitializer: true,
+	}
+	exactDigest, err := runtimeSpecDigest(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroCapabilitySpec := spec
+	zeroCapabilitySpec.authorityVolumeInitializer = false
+	zeroCapabilityDigest, err := runtimeSpecDigest(zeroCapabilitySpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chownOnly := effectiveRuntimeLaunchFingerprint{CreateRequest: dockerCreateRequestFor(spec)}
+	chownOnly.CreateRequest.HostConfig.CapAdd = []string{"CHOWN"}
+	chownOnlyDigest, err := effectiveRuntimeLaunchFingerprintDigest(chownOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		name        string
+		labelDigest string
+		wantError   bool
+	}{
+		{name: "zero capabilities", labelDigest: zeroCapabilityDigest, wantError: true},
+		{name: "CHOWN without FOWNER", labelDigest: chownOnlyDigest, wantError: true},
+		{name: "exact effective security class", labelDigest: exactDigest},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := `{"Id":"container-id","Name":"/sandbox-authority-volume-init-lineage","Image":"sha256:image","Config":{"Labels":{"gh-agent-broker.run_id":"authority-volume-init-lineage","gh-agent-broker.launch_spec":"` + tt.labelDigest + `"}},"State":{}}`
+			backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodGet || req.URL.Path != "/containers/sandbox-authority-volume-init-lineage/json" {
+					t.Fatalf("request=%s %s", req.Method, req.URL.Path)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			})}}
+			info, err := backend.adopt(context.Background(), spec)
+			if tt.wantError {
+				if err == nil {
+					t.Fatalf("adopted capability-mismatched container: %+v", info)
+				}
+				return
+			}
+			if err != nil || !info.Existing || info.ID != "container-id" {
+				t.Fatalf("exact effective fingerprint adoption info=%+v err=%v", info, err)
+			}
+		})
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
