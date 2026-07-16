@@ -223,13 +223,33 @@ domain-separated HMAC validation token derived from the reviewed broker-agent
 secret and bound to the exact worker ID, storage lineage ID, and fence epoch.
 The raw broker secret is never reused as the validation token. Validation uses
 a constant-time comparison and returns the same `unauthorized` result for an
-unknown worker and an invalid token before checking lease/session fences. As of
-agentd PR 10 head `6ddc461c611da9b35c707cc2e174b126abbf5060`, `/readyz`
-still exposes only `components.journal`, `components.runtime`,
-`components.launcher`, and `components.isolation`. The exact broker-fence
-readiness component field remains undefined upstream, so decoding that pending
-field is intentionally isolated from this change. The rebind payload also
-remains pending agentd ownership and is not invented here.
+unknown worker and an invalid token before checking lease/session fences.
+Agentd PR 10 head `cf2d5f475daf3a7defb2595486338610a310c82d`
+finalizes `/readyz` with the additional required
+`components.brokerFenceValidatorConfigured` field. Broker decoding requires
+that exact field while retaining the journal, runtime, launcher, and isolation
+claims; the retired `brokerFenceValidator` spelling and missing components fail
+closed.
+
+Reassignment now completes the durable broker-to-agentd half of the fencing
+contract. Agentd's generated `sessionId` is recorded against the broker-owned
+workspace during authenticated session creation. After the exact predecessor
+to recorded-successor lease CAS, the broker calls only that successor's
+Docker-inspected endpoint at `POST /v1/sessions/<sessionId>/rebind` with the
+existing coordinator bearer token. The body contains only a broker-derived
+stable idempotency key and the exact predecessor/successor worker, storage
+lineage, and epoch bindings. A strict full `agentd/v1` status matching the
+durable coordinator binding, session identity, lineage, worker, and epoch is
+required before predecessor retirement or reassignment success.
+
+Timeouts, malformed or mismatched success bodies, and agentd 5xx/validator/
+storage failures return `reassignment_rebind_retryable` with HTTP 503 after
+the CAS and never roll it back. Exact-transition retries resume the same agentd
+command without another lease effect, even when the coordinator supplies a
+fresh transport request key. Agentd `rebind_conflict` and `session_fenced` 409
+responses return terminal `reassignment_rebind_conflict`; other 4xx responses
+are never accepted as success. Audit errors remain bounded and do not include
+the coordinator token, successor endpoint, or agentd response body.
 
 Config versioning retains the exact pre-`source_volume` canonical digest shape
 when that field is empty, so ordinary-worker nonterminal launch intents remain
@@ -249,12 +269,13 @@ the GHCR pull credential interface expected after vps-ops #244. No PAT,
 repository secret, Doppler credential, or container environment projection is
 introduced by this repository.
 
-A committed zero-lease draining predecessor is retired after cutover;
-reconciliation retries that retirement after an interruption. REST errors remain structured as
+A committed zero-lease draining predecessor is retired only after verified
+agentd rebind; reconciliation retries retirement after an interruption. REST errors remain structured as
 `reassignment_not_ready`, `reassignment_stale_predecessor`,
 `reassignment_conflicting_replacement`, `reassignment_capacity`, and
-`reassignment_replay`. This is an inert broker contract: it does not activate
-any production route or alter an authority profile.
+`reassignment_replay`, plus retryable `reassignment_rebind_retryable` and
+terminal `reassignment_rebind_conflict`. This does not activate any generic
+production route or alter an authority profile.
 
 ## Validation
 

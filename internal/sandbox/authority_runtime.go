@@ -1,11 +1,13 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -142,10 +144,11 @@ type agentdReadinessResponse struct {
 	StorageLineageID string   `json:"storageLineageId"`
 	FenceEpoch       int64    `json:"fenceEpoch"`
 	Components       struct {
-		Journal   bool `json:"journal"`
-		Runtime   bool `json:"runtime"`
-		Launcher  bool `json:"launcher"`
-		Isolation bool `json:"isolation"`
+		Journal                        *bool `json:"journal"`
+		Runtime                        *bool `json:"runtime"`
+		Launcher                       *bool `json:"launcher"`
+		Isolation                      *bool `json:"isolation"`
+		BrokerFenceValidatorConfigured *bool `json:"brokerFenceValidatorConfigured"`
 	} `json:"components"`
 }
 
@@ -195,11 +198,73 @@ func probeAgentdReadiness(client *http.Client, req *http.Request, protocolVersio
 	if claim.Version != protocolVersion || claim.WorkerID != worker.WorkerID || claim.StorageLineageID != worker.WorkerStorageLineageID || claim.FenceEpoch != worker.WorkerFenceEpoch {
 		return false, "agentd_readiness_identity_mismatch", nil
 	}
-	componentsReady := claim.Components.Journal && claim.Components.Runtime && claim.Components.Launcher && claim.Components.Isolation
+	if claim.Components.Journal == nil || claim.Components.Runtime == nil || claim.Components.Launcher == nil || claim.Components.Isolation == nil || claim.Components.BrokerFenceValidatorConfigured == nil {
+		return false, "agentd_readiness_malformed", nil
+	}
+	componentsReady := *claim.Components.Journal && *claim.Components.Runtime && *claim.Components.Launcher && *claim.Components.Isolation && *claim.Components.BrokerFenceValidatorConfigured
 	if resp.StatusCode != http.StatusOK || claim.Status != "ready" || len(claim.Reasons) != 0 || !componentsReady {
 		return false, "agentd_readiness_subsystem_unavailable", nil
 	}
 	return true, "agentd_authenticated_readiness_ok", nil
+}
+
+func (r *DockerAuthorityRuntime) RebindAgentdSession(ctx context.Context, worker AuthorityWorker, sessionID string, rebind agentdRebindRequest) (agentdSessionStatus, error) {
+	profile, ok := r.profiles[worker.Profile]
+	readiness := configuredAgentdReadiness(profile)
+	if !ok || readiness.ContractVersion != "agentd/control/v1" || !validAgentdID(sessionID) {
+		return agentdSessionStatus{}, &agentdRebindError{}
+	}
+	token := strings.TrimSpace(os.Getenv(profile.CoordinatorTokenEnv))
+	if token == "" {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	address, err := r.docker.InternalAddress(ctx, worker.ContainerID)
+	if err != nil || address == "" {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	endpoint := "http://" + address + ":" + strconv.Itoa(readiness.Port) + "/v1/sessions/" + url.PathEscape(sessionID) + "/rebind"
+	return postAgentdRebind(ctx, r.httpClient, endpoint, token, rebind)
+}
+
+func postAgentdRebind(ctx context.Context, client *http.Client, endpoint, token string, rebind agentdRebindRequest) (agentdSessionStatus, error) {
+	payload, err := json.Marshal(rebind)
+	if err != nil {
+		return agentdSessionStatus{}, &agentdRebindError{}
+	}
+	//nolint:gosec // The production caller derives this endpoint only from Docker's recorded successor address, the reviewed profile port, and the durable session ID.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return agentdSessionStatus{}, &agentdRebindError{}
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	//nolint:gosec // The production caller derives this endpoint only from Docker's recorded successor address, the reviewed profile port, and the durable session ID.
+	resp, err := client.Do(req)
+	if err != nil {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	defer closeBody(resp.Body)
+	if resp.StatusCode == http.StatusOK {
+		status, err := decodeAgentdSessionStatus(resp.Body)
+		if err != nil {
+			return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+		}
+		return status, nil
+	}
+	if resp.StatusCode >= 500 {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	code := ""
+	if resp.StatusCode == http.StatusConflict {
+		var response struct {
+			Error string `json:"error"`
+		}
+		decoder := json.NewDecoder(io.LimitReader(resp.Body, 4096))
+		if decoder.Decode(&response) == nil && (response.Error == "rebind_conflict" || response.Error == "session_fenced") {
+			code = response.Error
+		}
+	}
+	return agentdSessionStatus{}, &agentdRebindError{code: code}
 }
 
 func imageDigestOnly(value string) string {

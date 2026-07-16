@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 5
+const authorityStoreSchemaVersion = 6
 
 type AuthorityWorkerState string
 
@@ -87,6 +87,8 @@ const (
 	ReassignmentConflictingReplacement ReassignmentErrorCode = "reassignment_conflicting_replacement"
 	ReassignmentCapacity               ReassignmentErrorCode = "reassignment_capacity"
 	ReassignmentReplay                 ReassignmentErrorCode = "reassignment_replay"
+	ReassignmentRebindRetryable        ReassignmentErrorCode = "reassignment_rebind_retryable"
+	ReassignmentRebindConflict         ReassignmentErrorCode = "reassignment_rebind_conflict"
 )
 
 type ReassignmentError struct {
@@ -177,6 +179,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	}
 	if version == 4 {
 		if err := s.migrateV5(ctx); err != nil {
+			return err
+		}
+		version = 5
+	}
+	if version == 5 {
+		if err := s.migrateV6(ctx); err != nil {
 			return err
 		}
 	}
@@ -301,6 +309,15 @@ func (s *AuthorityWorkerStore) migrateV5(ctx context.Context) error {
 	return err
 }
 
+// V6 records agentd's generated session identifier beside the broker-owned
+// session lineage. Reassignment can therefore address only the durable agentd
+// session associated during creation, never a caller-selected identity.
+func (s *AuthorityWorkerStore) migrateV6(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE authority_session_workspaces ADD COLUMN agentd_session_id TEXT NOT NULL DEFAULT '';
+	PRAGMA user_version=6`)
+	return err
+}
+
 func (s *AuthorityWorkerStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
@@ -312,6 +329,10 @@ func (s *AuthorityWorkerStore) requestDigest(raw string) string {
 	mac := hmac.New(sha256.New, s.salt)
 	_, _ = mac.Write([]byte(raw))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *AuthorityWorkerStore) rebindIdempotencyKey(sessionID string, predecessor, successor agentdWorkerBinding) string {
+	return s.requestDigest(fmt.Sprintf("agentd-rebind:v1\x00%s\x00%s\x00%s\x00%d\x00%s\x00%s\x00%d", sessionID, predecessor.WorkerID, predecessor.StorageLineageID, predecessor.FenceEpoch, successor.WorkerID, successor.StorageLineageID, successor.FenceEpoch))
 }
 
 func newOpaqueLineageID(kind string) (string, error) {
@@ -692,6 +713,33 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	if err == nil {
 		if storedFingerprint != fingerprint {
 			return AuthoritySessionReassignment{}, reassignmentError(ReassignmentReplay, "reassignment idempotency key conflicts with a prior request")
+		}
+		lease, err := getLeaseByDigest(ctx, conn, principal, binding)
+		if err != nil {
+			return AuthoritySessionReassignment{}, err
+		}
+		if lease.WorkerID != reassignment.ReplacementWorkerID || !lease.ReleasedAt.IsZero() {
+			return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "reassignment record no longer matches the active session lease")
+		}
+		reassignment.Lease, reassignment.Replay = lease, true
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return AuthoritySessionReassignment{}, err
+		}
+		committed = true
+		return reassignment, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return AuthoritySessionReassignment{}, err
+	}
+	// A retry may use a fresh coordinator request key after the broker response
+	// was lost. The durable binding transition, not that transport-level key,
+	// is the unique effect. Resume only the exact recorded transition.
+	err = conn.QueryRowContext(ctx, `SELECT predecessor_worker_id,replacement_worker_id,request_fingerprint
+		FROM authority_session_reassignments WHERE principal=? AND binding_digest=?`, principal, binding).
+		Scan(&reassignment.PredecessorWorkerID, &reassignment.ReplacementWorkerID, &storedFingerprint)
+	if err == nil {
+		if storedFingerprint != fingerprint {
+			return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "session has a different durable reassignment transition")
 		}
 		lease, err := getLeaseByDigest(ctx, conn, principal, binding)
 		if err != nil {

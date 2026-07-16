@@ -90,7 +90,11 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			if err != nil {
 				var reassignmentErr *ReassignmentError
 				if errors.As(err, &reassignmentErr) {
-					writeRESTCodeError(w, http.StatusConflict, string(reassignmentErr.Code), reassignmentErr.Error())
+					status := http.StatusConflict
+					if reassignmentErr.Code == ReassignmentRebindRetryable {
+						status = http.StatusServiceUnavailable
+					}
+					writeRESTCodeError(w, status, string(reassignmentErr.Code), reassignmentErr.Error())
 					return
 				}
 				writeRESTCodeError(w, http.StatusConflict, "reassignment_denied", err.Error())

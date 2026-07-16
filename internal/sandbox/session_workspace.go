@@ -13,6 +13,7 @@ type SessionWorkspace struct {
 	GID              int    `json:"gid"`
 	Path             string `json:"workspace_path"`
 	SessionLineageID string `json:"session_lineage_id"`
+	AgentdSessionID  string `json:"-"`
 }
 
 func (s *AuthorityWorkerStore) AllocateSessionWorkspace(ctx context.Context, lease AuthorityLease, policy SessionIsolation) (SessionWorkspace, error) {
@@ -22,7 +23,7 @@ func (s *AuthorityWorkerStore) AllocateSessionWorkspace(ctx context.Context, lea
 		return SessionWorkspace{}, fmt.Errorf("active authority lease is required")
 	}
 	var existing SessionWorkspace
-	err := s.db.QueryRowContext(ctx, `SELECT uid,gid,workspace_path,session_lineage_id FROM authority_session_workspaces WHERE session_lineage_id=?`, lease.SessionLineageID).Scan(&existing.UID, &existing.GID, &existing.Path, &existing.SessionLineageID)
+	err := s.db.QueryRowContext(ctx, `SELECT uid,gid,workspace_path,session_lineage_id,agentd_session_id FROM authority_session_workspaces WHERE session_lineage_id=?`, lease.SessionLineageID).Scan(&existing.UID, &existing.GID, &existing.Path, &existing.SessionLineageID, &existing.AgentdSessionID)
 	if err == nil {
 		return existing, nil
 	}
@@ -57,6 +58,24 @@ func (s *AuthorityWorkerStore) AllocateSessionWorkspace(ctx context.Context, lea
 
 func (s *AuthorityWorkerStore) SessionWorkspace(ctx context.Context, binding string) (SessionWorkspace, error) {
 	var workspace SessionWorkspace
-	err := s.db.QueryRowContext(ctx, `SELECT uid,gid,workspace_path,session_lineage_id FROM authority_session_workspaces WHERE binding_digest=?`, s.requestDigest(binding)).Scan(&workspace.UID, &workspace.GID, &workspace.Path, &workspace.SessionLineageID)
+	err := s.db.QueryRowContext(ctx, `SELECT uid,gid,workspace_path,session_lineage_id,agentd_session_id FROM authority_session_workspaces WHERE binding_digest=?`, s.requestDigest(binding)).Scan(&workspace.UID, &workspace.GID, &workspace.Path, &workspace.SessionLineageID, &workspace.AgentdSessionID)
 	return workspace, err
+}
+
+func (s *AuthorityWorkerStore) BindAgentdSession(ctx context.Context, binding, sessionID string) error {
+	if !validAgentdID(sessionID) {
+		return fmt.Errorf("agentd session identity is malformed")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE authority_session_workspaces SET agentd_session_id=? WHERE binding_digest=? AND (agentd_session_id='' OR agentd_session_id=?)`, sessionID, s.requestDigest(binding), sessionID)
+	if err != nil {
+		return fmt.Errorf("record agentd session identity: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("agentd session identity conflicts with durable workspace")
+	}
+	return nil
 }

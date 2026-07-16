@@ -23,6 +23,7 @@ type fakeAuthorityRuntime struct {
 	err         error
 	unhealthy   bool
 	afterCreate func()
+	rebind      func(context.Context, AuthorityWorker, string, agentdRebindRequest) (agentdSessionStatus, error)
 }
 
 type fakeAuthenticatedReadinessRuntime struct {
@@ -75,6 +76,13 @@ func (f *fakeAuthorityRuntime) Healthy(_ context.Context, _ string) (bool, strin
 		return false, "synthetic_unhealthy", f.err
 	}
 	return true, "synthetic_liveness_ok", nil
+}
+
+func (f *fakeAuthorityRuntime) RebindAgentdSession(ctx context.Context, worker AuthorityWorker, sessionID string, request agentdRebindRequest) (agentdSessionStatus, error) {
+	if f.rebind == nil {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	return f.rebind(ctx, worker, sessionID, request)
 }
 
 func TestAuthorityReconcileAppliesAuthenticatedReadinessOnlyToConfiguredProfiles(t *testing.T) {
@@ -1016,6 +1024,10 @@ func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testin
 	if _, err := store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 20000, 20000, "/durable/session", formatAuthorityTime(time.Now().UTC()), lease.SessionLineageID); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.BindAgentdSession(ctx, "logical-session", "agentd-reassign-session"); err != nil {
+		t.Fatal(err)
+	}
+	runtime.rebind = successfulAgentdRebind("logical-session", lease, SessionWorkspace{UID: 20000, GID: 20000, Path: "/durable/session", SessionLineageID: lease.SessionLineageID, AgentdSessionID: "agentd-reassign-session"})
 	if _, err := service.SetHealth(ctx, "coordinator", old.WorkerID, "abrupt_container_loss", false); err != nil {
 		t.Fatal(err)
 	}
@@ -1026,6 +1038,37 @@ func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testin
 	if _, err := service.SetHealth(ctx, "coordinator", replacement.WorkerID, "ready", true); err != nil {
 		t.Fatal(err)
 	}
+	request := AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", SessionLineageID: lease.SessionLineageID, PredecessorWorkerID: old.WorkerID, PredecessorWorkerFenceEpoch: lease.WorkerFenceEpoch, IdempotencyKey: "reassign-idem"}
+	if _, err := store.db.ExecContext(ctx, `UPDATE authority_workers SET replacement_worker_id='' WHERE worker_id=?`, old.WorkerID); err != nil {
+		t.Fatal(err)
+	}
+	missingReplacement := request
+	missingReplacement.IdempotencyKey = "missing-recorded-successor"
+	if _, err := service.ReassignSession(ctx, "coordinator", missingReplacement); !isReassignmentCode(err, ReassignmentNotReady) {
+		t.Fatalf("missing recorded successor error=%v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE authority_workers SET replacement_worker_id=? WHERE worker_id=?`, replacement.WorkerID, old.WorkerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE authority_workers SET worker_storage_lineage_id=? WHERE worker_id=?`, "22222222222222222222222222222222", replacement.WorkerID); err != nil {
+		t.Fatal(err)
+	}
+	wrongLineage := request
+	wrongLineage.IdempotencyKey = "wrong-successor-lineage"
+	if _, err := service.ReassignSession(ctx, "coordinator", wrongLineage); !isReassignmentCode(err, ReassignmentConflictingReplacement) {
+		t.Fatalf("wrong successor lineage error=%v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE authority_workers SET worker_storage_lineage_id=?,worker_fence_epoch=? WHERE worker_id=?`, old.WorkerStorageLineageID, old.WorkerFenceEpoch+2, replacement.WorkerID); err != nil {
+		t.Fatal(err)
+	}
+	wrongEpoch := request
+	wrongEpoch.IdempotencyKey = "wrong-successor-epoch"
+	if _, err := service.ReassignSession(ctx, "coordinator", wrongEpoch); !isReassignmentCode(err, ReassignmentConflictingReplacement) {
+		t.Fatalf("wrong successor epoch error=%v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE authority_workers SET worker_fence_epoch=? WHERE worker_id=?`, old.WorkerFenceEpoch+1, replacement.WorkerID); err != nil {
+		t.Fatal(err)
+	}
 	fillerLease, err := service.Acquire(ctx, "session-only", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "filler-lease-idem", SessionBinding: "filler-logical-session"})
 	if err != nil {
 		t.Fatal(err)
@@ -1033,7 +1076,6 @@ func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testin
 	if _, err := service.ReassignSession(ctx, "session-only", AuthoritySessionReassignmentRequest{SessionBinding: "filler-logical-session", SessionLineageID: fillerLease.SessionLineageID, PredecessorWorkerID: old.WorkerID, PredecessorWorkerFenceEpoch: old.WorkerFenceEpoch, IdempotencyKey: "other-reassign-idem"}); err == nil || !strings.Contains(err.Error(), "policy denial") {
 		t.Fatalf("cross-profile/principal escalation error=%v", err)
 	}
-	request := AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", SessionLineageID: lease.SessionLineageID, PredecessorWorkerID: old.WorkerID, PredecessorWorkerFenceEpoch: lease.WorkerFenceEpoch, IdempotencyKey: "reassign-idem"}
 	if _, err := service.ReassignSession(ctx, "coordinator", request); err == nil || !isReassignmentCode(err, ReassignmentCapacity) {
 		t.Fatalf("capacity reassignment error=%v", err)
 	}
@@ -1073,7 +1115,8 @@ func TestAuthoritySessionFenceDeniesPredecessorAndReplaysCutover(t *testing.T) {
 	cfg := authorityTestConfig(t)
 	t.Setenv("WRITER_BROKER_CREDENTIAL", "agentd-broker-test-token")
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
-	service := NewAuthorityWorkerService(cfg, store, &fakeAuthorityRuntime{}, nil)
+	runtime := &fakeAuthorityRuntime{}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
 	ids := []string{"fence-old", "fence-new"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
@@ -1090,6 +1133,10 @@ func TestAuthoritySessionFenceDeniesPredecessorAndReplaysCutover(t *testing.T) {
 	if _, err = store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 20000, 20000, "/durable/fence-session", formatAuthorityTime(time.Now().UTC()), lease.SessionLineageID); err != nil {
 		t.Fatal(err)
 	}
+	if err = store.BindAgentdSession(ctx, "fence-session", "agentd-fence-session"); err != nil {
+		t.Fatal(err)
+	}
+	runtime.rebind = successfulAgentdRebind("fence-session", lease, SessionWorkspace{UID: 20000, GID: 20000, Path: "/durable/fence-session", SessionLineageID: lease.SessionLineageID, AgentdSessionID: "agentd-fence-session"})
 	if lease.SessionLineageID == "" || lease.WorkerFenceEpoch != 1 || lease.WorkerStorageLineageID != old.WorkerStorageLineageID {
 		t.Fatalf("lineage lease=%+v", lease)
 	}
@@ -1157,14 +1204,168 @@ func TestAuthoritySessionFenceDeniesPredecessorAndReplaysCutover(t *testing.T) {
 	}
 	stale := request
 	stale.IdempotencyKey = "stale-different-key"
-	if _, err = service.ReassignSession(ctx, "coordinator", stale); !isReassignmentCode(err, ReassignmentStalePredecessor) {
-		t.Fatalf("stale different key error=%v", err)
+	if retried, retryErr := service.ReassignSession(ctx, "coordinator", stale); retryErr != nil || !retried.Replay {
+		t.Fatalf("exact transition with fresh request key=%+v err=%v", retried, retryErr)
+	}
+}
+
+func TestAuthoritySessionRebindRetriesAfterCASWithStableAgentdCommand(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &fakeAuthorityRuntime{}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	ids := []string{"ordered-old", "ordered-successor"}
+	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
+	old, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "ordered-lease", SessionBinding: "ordered-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := SessionWorkspace{UID: 20000, GID: 20000, Path: "/durable/ordered-session", SessionLineageID: lease.SessionLineageID, AgentdSessionID: "agentd-ordered-session"}
+	if _, err = store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, workspace.UID, workspace.GID, workspace.Path, formatAuthorityTime(time.Now().UTC()), lease.SessionLineageID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.BindAgentdSession(ctx, "ordered-session", workspace.AgentdSessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "lost", false); err != nil {
+		t.Fatal(err)
+	}
+	successor, err := service.Replace(ctx, "coordinator", old.WorkerID, "lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", successor.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []agentdRebindRequest
+	success := successfulAgentdRebind("ordered-session", lease, workspace)
+	runtime.rebind = func(callCtx context.Context, worker AuthorityWorker, sessionID string, request agentdRebindRequest) (agentdSessionStatus, error) {
+		calls = append(calls, request)
+		current, leaseErr := store.GetLease(callCtx, "coordinator", "ordered-session")
+		if leaseErr != nil || current.WorkerID != successor.WorkerID {
+			t.Fatalf("agentd called before successor CAS: lease=%+v err=%v", current, leaseErr)
+		}
+		predecessor, workerErr := store.GetWorker(callCtx, old.WorkerID)
+		if workerErr != nil || predecessor.State != AuthorityWorkerDraining || len(runtime.stopped) != 0 {
+			t.Fatalf("predecessor retired before agentd verification: worker=%+v stopped=%v err=%v", predecessor, runtime.stopped, workerErr)
+		}
+		if worker.WorkerID != successor.WorkerID || sessionID != workspace.AgentdSessionID {
+			t.Fatalf("rebind destination worker=%q session=%q", worker.WorkerID, sessionID)
+		}
+		if len(calls) == 1 {
+			return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+		}
+		return success(callCtx, worker, sessionID, request)
+	}
+	request := AuthoritySessionReassignmentRequest{SessionBinding: "ordered-session", SessionLineageID: lease.SessionLineageID, PredecessorWorkerID: old.WorkerID, PredecessorWorkerFenceEpoch: old.WorkerFenceEpoch, IdempotencyKey: "ordered-request-one"}
+	first, err := service.ReassignSession(ctx, "coordinator", request)
+	if !isReassignmentCode(err, ReassignmentRebindRetryable) || first.Lease.WorkerID != successor.WorkerID {
+		t.Fatalf("post-CAS timeout result=%+v err=%v", first, err)
+	}
+	request.IdempotencyKey = "ordered-request-two"
+	second, err := service.ReassignSession(ctx, "coordinator", request)
+	if err != nil || !second.Replay || second.Lease.WorkerID != successor.WorkerID {
+		t.Fatalf("rebind retry result=%+v err=%v", second, err)
+	}
+	if len(calls) != 2 || calls[0] != calls[1] {
+		t.Fatalf("agentd rebind command changed across retry: %#v", calls)
+	}
+	if calls[0].IdempotencyKey == request.IdempotencyKey || len(calls[0].IdempotencyKey) != 64 {
+		t.Fatalf("agentd idempotency key was not broker-derived: %q", calls[0].IdempotencyKey)
+	}
+	var records int
+	if err = store.db.QueryRowContext(ctx, `SELECT count(*) FROM authority_session_reassignments WHERE binding_digest=?`, lease.BindingDigest).Scan(&records); err != nil || records != 1 {
+		t.Fatalf("durable reassignment records=%d err=%v", records, err)
+	}
+	oldAfter, err := store.GetWorker(ctx, old.WorkerID)
+	if err != nil || oldAfter.State != AuthorityWorkerStopped || len(runtime.stopped) != 1 {
+		t.Fatalf("predecessor retirement after verified rebind worker=%+v stopped=%v err=%v", oldAfter, runtime.stopped, err)
+	}
+}
+
+func TestAuthoritySessionRebindRejectsMismatchedSuccessBeforeRetirement(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &fakeAuthorityRuntime{}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	ids := []string{"mismatch-old", "mismatch-successor"}
+	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
+	old, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "mismatch-lease", SessionBinding: "mismatch-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := SessionWorkspace{UID: 20000, GID: 20000, Path: "/durable/mismatch", SessionLineageID: lease.SessionLineageID, AgentdSessionID: "agentd-mismatch-session"}
+	if _, err = store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, workspace.UID, workspace.GID, workspace.Path, formatAuthorityTime(time.Now().UTC()), lease.SessionLineageID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.BindAgentdSession(ctx, "mismatch-session", workspace.AgentdSessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "lost", false); err != nil {
+		t.Fatal(err)
+	}
+	successor, err := service.Replace(ctx, "coordinator", old.WorkerID, "lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", successor.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	valid := successfulAgentdRebind("mismatch-session", lease, workspace)
+	runtime.rebind = func(callCtx context.Context, worker AuthorityWorker, sessionID string, request agentdRebindRequest) (agentdSessionStatus, error) {
+		status, statusErr := valid(callCtx, worker, sessionID, request)
+		status.WorkerID = "wrong-successor"
+		return status, statusErr
+	}
+	request := AuthoritySessionReassignmentRequest{SessionBinding: "mismatch-session", SessionLineageID: lease.SessionLineageID, PredecessorWorkerID: old.WorkerID, PredecessorWorkerFenceEpoch: old.WorkerFenceEpoch, IdempotencyKey: "mismatch-reassign"}
+	if _, err = service.ReassignSession(ctx, "coordinator", request); !isReassignmentCode(err, ReassignmentRebindRetryable) {
+		t.Fatalf("mismatched agentd success error=%v", err)
+	}
+	oldAfter, workerErr := store.GetWorker(ctx, old.WorkerID)
+	if workerErr != nil || oldAfter.State != AuthorityWorkerDraining || len(runtime.stopped) != 0 {
+		t.Fatalf("mismatched success retired predecessor worker=%+v stopped=%v err=%v", oldAfter, runtime.stopped, workerErr)
 	}
 }
 
 func isReassignmentCode(err error, want ReassignmentErrorCode) bool {
 	var reassignmentErr *ReassignmentError
 	return errors.As(err, &reassignmentErr) && reassignmentErr.Code == want
+}
+
+func successfulAgentdRebind(binding string, lease AuthorityLease, workspace SessionWorkspace) func(context.Context, AuthorityWorker, string, agentdRebindRequest) (agentdSessionStatus, error) {
+	return func(_ context.Context, worker AuthorityWorker, sessionID string, request agentdRebindRequest) (agentdSessionStatus, error) {
+		return agentdSessionStatus{
+			Version:            agentdSessionProtocolVersion,
+			SessionID:          sessionID,
+			CoordinatorBinding: binding,
+			AuthorityBinding:   lease.Profile,
+			WorkerID:           request.Successor.WorkerID,
+			StorageLineageID:   request.Successor.StorageLineageID,
+			FenceEpoch:         request.Successor.FenceEpoch,
+			SessionLineageID:   lease.SessionLineageID,
+			Workspace:          agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID},
+			Phase:              "active",
+			TurnIDs:            []string{},
+			NextCursor:         2,
+		}, nil
+	}
 }
 
 func authorityTestConfig(t *testing.T) Config {
