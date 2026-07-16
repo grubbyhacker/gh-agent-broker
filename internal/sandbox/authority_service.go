@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -308,19 +309,28 @@ func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string
 // ValidateAgentdSession is the authenticated, fail-closed fencing contract
 // agentd calls before accessing any lineage-scoped journal or workspace state.
 func (s *AuthorityWorkerService) ValidateAgentdSession(ctx context.Context, credential string, request AgentdSessionValidationRequest) (AgentdSessionValidation, error) {
-	if !safeAuthorityName(request.WorkerID) || !validOpaqueLineageID(request.WorkerStorageLineageID) || !validOpaqueLineageID(request.SessionLineageID) || request.WorkerFenceEpoch < 1 {
-		return AgentdSessionValidation{Code: "invalid_request"}, nil
-	}
 	worker, err := s.store.GetWorker(ctx, request.WorkerID)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return AgentdSessionValidation{Code: "unknown_worker"}, nil
+		if !errors.Is(err, sql.ErrNoRows) {
+			return AgentdSessionValidation{}, err
 		}
-		return AgentdSessionValidation{}, err
 	}
-	profile, ok := s.cfg.AuthorityProfiles[worker.Profile]
-	if !ok || !secureTokenEqual(credential, strings.TrimSpace(os.Getenv(profile.BrokerSecretEnv))) {
+	validationKey := string(make([]byte, sha256.Size))
+	knownWorker := err == nil
+	profile, knownProfile := s.cfg.AuthorityProfiles[worker.Profile]
+	if knownWorker && knownProfile {
+		if configuredSecret := strings.TrimSpace(os.Getenv(profile.BrokerSecretEnv)); configuredSecret != "" {
+			validationKey = configuredSecret
+		} else {
+			knownProfile = false
+		}
+	}
+	expected := deriveAgentdValidationToken(validationKey, request.WorkerID, request.WorkerStorageLineageID, request.WorkerFenceEpoch)
+	if !knownWorker || !knownProfile || !secureTokenEqual(credential, expected) {
 		return AgentdSessionValidation{Code: "unauthorized"}, nil
+	}
+	if !safeAuthorityName(request.WorkerID) || !validOpaqueLineageID(request.WorkerStorageLineageID) || !validOpaqueLineageID(request.SessionLineageID) || request.WorkerFenceEpoch < 1 {
+		return AgentdSessionValidation{Code: "invalid_request"}, nil
 	}
 	if worker.WorkerStorageLineageID != request.WorkerStorageLineageID || worker.WorkerFenceEpoch != request.WorkerFenceEpoch {
 		return AgentdSessionValidation{Code: "fenced"}, nil

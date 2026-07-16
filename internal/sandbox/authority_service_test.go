@@ -296,6 +296,21 @@ func TestAuthorityProfileValidationAndDigest(t *testing.T) {
 			bundle.AllowedAuthorityProfiles = []string{"caller-selected"}
 			cfg.Bundles["agentd-staging-auth"] = bundle
 		}, "allows unknown authority profile"},
+		"session volume collision": {func(cfg *Config) {
+			bundle := cfg.Bundles["agentd-staging-auth"]
+			bundle.SourceVolume = cfg.AuthorityProfiles["writer"].Storage.SessionVolume
+			cfg.Bundles["agentd-staging-auth"] = bundle
+		}, "managed storage volumes"},
+		"checkpoint volume collision": {func(cfg *Config) {
+			bundle := cfg.Bundles["agentd-staging-auth"]
+			bundle.SourceVolume = cfg.AuthorityProfiles["writer"].Storage.CheckpointVolume
+			cfg.Bundles["agentd-staging-auth"] = bundle
+		}, "managed storage volumes"},
+		"evidence volume collision": {func(cfg *Config) {
+			bundle := cfg.Bundles["agentd-staging-auth"]
+			bundle.SourceVolume = cfg.AuthorityProfiles["writer"].Storage.EvidenceVolume
+			cfg.Bundles["agentd-staging-auth"] = bundle
+		}, "managed storage volumes"},
 		"production credential": {func(cfg *Config) { cfg.Production = true }, "must not configure credentials in production mode"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -348,8 +363,19 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	if got := runtime.Env["AGENTD_BROKER_VALIDATION_URL"]; got != agentdBrokerValidationURL {
 		t.Fatalf("AGENTD_BROKER_VALIDATION_URL=%q, want %q", got, agentdBrokerValidationURL)
 	}
-	if got := runtime.Env["AGENTD_BROKER_VALIDATION_TOKEN"]; got != "secret" || got != runtime.Env[profile.BrokerSecretEnv] {
-		t.Fatal("agentd broker validation token does not reuse the reviewed broker-agent credential")
+	validationToken := runtime.Env["AGENTD_BROKER_VALIDATION_TOKEN"]
+	wantValidationToken := deriveAgentdValidationToken("secret", worker.WorkerID, worker.WorkerStorageLineageID, worker.WorkerFenceEpoch)
+	if validationToken != wantValidationToken || validationToken == "secret" || validationToken == runtime.Env[profile.BrokerSecretEnv] {
+		t.Fatal("agentd broker validation token is not an opaque generation-bound derivation")
+	}
+	for _, other := range []string{
+		deriveAgentdValidationToken("secret", "other-worker", worker.WorkerStorageLineageID, worker.WorkerFenceEpoch),
+		deriveAgentdValidationToken("secret", worker.WorkerID, "22222222222222222222222222222222", worker.WorkerFenceEpoch),
+		deriveAgentdValidationToken("secret", worker.WorkerID, worker.WorkerStorageLineageID, worker.WorkerFenceEpoch+1),
+	} {
+		if validationToken == other {
+			t.Fatal("agentd broker validation token was not bound to the exact worker generation")
+		}
 	}
 	if runtime.User != "bun" || !runtime.AllowAgentdSetuidLauncherPrivilegeTransition {
 		t.Fatalf("agentd runtime user=%q privilege transition=%t", runtime.User, runtime.AllowAgentdSetuidLauncherPrivilegeTransition)
@@ -485,7 +511,8 @@ func TestAuthorityWorkerLifecycleCapacityDrainReleaseAndReplacement(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{firstRequest.IdempotencyKey, firstRequest.SessionBinding, "WRITER_BROKER_CREDENTIAL", validationSecret} {
+	derivedValidationToken := deriveAgentdValidationToken(validationSecret, worker.WorkerID, worker.WorkerStorageLineageID, worker.WorkerFenceEpoch)
+	for _, secret := range []string{firstRequest.IdempotencyKey, firstRequest.SessionBinding, "WRITER_BROKER_CREDENTIAL", validationSecret, derivedValidationToken} {
 		if strings.Contains(string(auditBytes), secret) {
 			t.Fatalf("audit leaked %q: %s", secret, auditBytes)
 		}
@@ -1036,8 +1063,28 @@ func TestAuthoritySessionFenceDeniesPredecessorAndReplaysCutover(t *testing.T) {
 	if lease.SessionLineageID == "" || lease.WorkerFenceEpoch != 1 || lease.WorkerStorageLineageID != old.WorkerStorageLineageID {
 		t.Fatalf("lineage lease=%+v", lease)
 	}
-	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: old.WorkerID, WorkerStorageLineageID: old.WorkerStorageLineageID, WorkerFenceEpoch: old.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID}); err != nil || !got.Authorized {
+	oldToken := deriveAgentdValidationToken("agentd-broker-test-token", old.WorkerID, old.WorkerStorageLineageID, old.WorkerFenceEpoch)
+	oldRequest := AgentdSessionValidationRequest{WorkerID: old.WorkerID, WorkerStorageLineageID: old.WorkerStorageLineageID, WorkerFenceEpoch: old.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID}
+	if got, err := service.ValidateAgentdSession(ctx, oldToken, oldRequest); err != nil || !got.Authorized {
 		t.Fatalf("pre-cutover validation=%+v err=%v", got, err)
+	}
+	for name, mutated := range map[string]AgentdSessionValidationRequest{
+		"cross-lineage": {WorkerID: old.WorkerID, WorkerStorageLineageID: "22222222222222222222222222222222", WorkerFenceEpoch: old.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID},
+		"cross-epoch":   {WorkerID: old.WorkerID, WorkerStorageLineageID: old.WorkerStorageLineageID, WorkerFenceEpoch: old.WorkerFenceEpoch + 1, SessionLineageID: lease.SessionLineageID},
+	} {
+		if got, err := service.ValidateAgentdSession(ctx, oldToken, mutated); err != nil || got.Authorized || got.Code != "unauthorized" {
+			t.Fatalf("%s validation=%+v err=%v", name, got, err)
+		}
+	}
+	invalidAuth, err := service.ValidateAgentdSession(ctx, "invalid-generation-token", oldRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownRequest := oldRequest
+	unknownRequest.WorkerID = "unknown-worker"
+	unknownAuth, err := service.ValidateAgentdSession(ctx, "invalid-generation-token", unknownRequest)
+	if err != nil || unknownAuth != invalidAuth || unknownAuth.Code != "unauthorized" {
+		t.Fatalf("unknown=%+v invalid=%+v err=%v, want uniform unauthorized", unknownAuth, invalidAuth, err)
 	}
 	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "lost", false); err != nil {
 		t.Fatal(err)
@@ -1067,10 +1114,15 @@ func TestAuthoritySessionFenceDeniesPredecessorAndReplaysCutover(t *testing.T) {
 	if err != nil || !replay.Replay || replay.Lease.WorkerFenceEpoch != 2 {
 		t.Fatalf("post-CAS replay=%+v err=%v", replay, err)
 	}
-	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: old.WorkerID, WorkerStorageLineageID: old.WorkerStorageLineageID, WorkerFenceEpoch: old.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID}); err != nil || got.Authorized || got.Code != "fenced" {
+	if got, err := service.ValidateAgentdSession(ctx, oldToken, oldRequest); err != nil || got.Authorized || got.Code != "fenced" {
 		t.Fatalf("stale predecessor validation=%+v err=%v", got, err)
 	}
-	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: replacement.WorkerID, WorkerStorageLineageID: replacement.WorkerStorageLineageID, WorkerFenceEpoch: replacement.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID}); err != nil || !got.Authorized {
+	replacementRequest := AgentdSessionValidationRequest{WorkerID: replacement.WorkerID, WorkerStorageLineageID: replacement.WorkerStorageLineageID, WorkerFenceEpoch: replacement.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID}
+	if got, err := service.ValidateAgentdSession(ctx, oldToken, replacementRequest); err != nil || got.Authorized || got.Code != "unauthorized" {
+		t.Fatalf("cross-worker validation=%+v err=%v", got, err)
+	}
+	replacementToken := deriveAgentdValidationToken("agentd-broker-test-token", replacement.WorkerID, replacement.WorkerStorageLineageID, replacement.WorkerFenceEpoch)
+	if got, err := service.ValidateAgentdSession(ctx, replacementToken, replacementRequest); err != nil || !got.Authorized {
 		t.Fatalf("successor validation=%+v err=%v", got, err)
 	}
 	stale := request

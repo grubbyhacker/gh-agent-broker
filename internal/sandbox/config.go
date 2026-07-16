@@ -358,8 +358,15 @@ func (c Config) validateBundle(name string, bundle CredentialBundle) []string {
 		}
 	}
 	for _, profile := range bundle.AllowedAuthorityProfiles {
-		if _, ok := c.AuthorityProfiles[profile]; !ok {
+		authorityProfile, ok := c.AuthorityProfiles[profile]
+		if !ok {
 			errs = append(errs, fmt.Sprintf("credential bundle %q allows unknown authority profile %q", name, profile))
+			continue
+		}
+		if hasVolume && (bundle.SourceVolume == authorityProfile.Storage.SessionVolume ||
+			bundle.SourceVolume == authorityProfile.Storage.CheckpointVolume ||
+			bundle.SourceVolume == authorityProfile.Storage.EvidenceVolume) {
+			errs = append(errs, fmt.Sprintf("credential bundle %q source_volume conflicts with authority profile %q managed storage volumes", name, profile))
 		}
 	}
 	for _, p := range append(bundle.SecretFiles, bundle.RedactFiles...) {
@@ -761,8 +768,13 @@ func (c Config) versionDigest() string {
 	bundles := make(map[string]any, len(c.Bundles))
 	for name, bundle := range c.Bundles {
 		entry := map[string]any{
-			"SourcePath": bundle.SourcePath, "SourceVolume": bundle.SourceVolume, "MountPath": bundle.MountPath, "ReadOnly": bundle.ReadOnly,
+			"SourcePath": bundle.SourcePath, "MountPath": bundle.MountPath, "ReadOnly": bundle.ReadOnly,
 			"AllowedTemplates": bundle.AllowedTemplates, "SecretFiles": bundle.SecretFiles, "RedactFiles": bundle.RedactFiles,
+		}
+		// Preserve the pre-source_volume canonical shape for legacy configs so
+		// startup reconciliation accepts their nonterminal launch intents.
+		if bundle.SourceVolume != "" {
+			entry["SourceVolume"] = bundle.SourceVolume
 		}
 		if len(bundle.AllowedAuthorityProfiles) > 0 {
 			entry["AllowedAuthorityProfiles"] = bundle.AllowedAuthorityProfiles

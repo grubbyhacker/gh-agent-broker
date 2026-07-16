@@ -219,13 +219,24 @@ and production authority profiles reject credentials.
 
 Authority workers now receive the fixed broker validation URL
 `http://broker:8080/v1/authority-workers/agentd/session-validation` and a
-validation token copied from the same reviewed broker-agent secret. As of
+domain-separated HMAC validation token derived from the reviewed broker-agent
+secret and bound to the exact worker ID, storage lineage ID, and fence epoch.
+The raw broker secret is never reused as the validation token. Validation uses
+a constant-time comparison and returns the same `unauthorized` result for an
+unknown worker and an invalid token before checking lease/session fences. As of
 agentd PR 10 head `6ddc461c611da9b35c707cc2e174b126abbf5060`, `/readyz`
 still exposes only `components.journal`, `components.runtime`,
 `components.launcher`, and `components.isolation`. The exact broker-fence
 readiness component field remains undefined upstream, so decoding that pending
 field is intentionally isolated from this change. The rebind payload also
 remains pending agentd ownership and is not invented here.
+
+Config versioning retains the exact pre-`source_volume` canonical digest shape
+when that field is empty, so ordinary-worker nonterminal launch intents remain
+reconcilable across upgrade. A nonempty named source volume is included in the
+digest. Staging credential source volumes must also be distinct from every
+allowed authority profile's broker-managed session, checkpoint, and evidence
+volumes.
 
 The production deploy workflow grants `packages: read` and passes the
 ephemeral `github.token` plus `github.actor` to only the vps-ops deploy step as

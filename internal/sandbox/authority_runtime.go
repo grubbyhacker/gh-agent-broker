@@ -75,7 +75,7 @@ func authorityWorkerRuntimeSpec(spec AuthorityWorkerSpec, secret, coordinatorTok
 	env := map[string]string{
 		spec.BrokerSecretEnv:             secret,
 		"AGENTD_BROKER_VALIDATION_URL":   agentdBrokerValidationURL,
-		"AGENTD_BROKER_VALIDATION_TOKEN": secret,
+		"AGENTD_BROKER_VALIDATION_TOKEN": deriveAgentdValidationToken(secret, spec.WorkerID, spec.WorkerStorageLineageID, spec.WorkerFenceEpoch),
 		"AGENTD_COORDINATOR_TOKEN":       coordinatorToken,
 		"AGENTD_STATE_PATH":              filepath.Join(spec.SessionIsolation.WorkspaceRoot, agentdControlV1StateDirectory, agentdControlV1StateFile),
 		"AGENTD_WORKER_ID":               spec.WorkerID,
