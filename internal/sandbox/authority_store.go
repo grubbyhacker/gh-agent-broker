@@ -556,6 +556,38 @@ func (s *AuthorityWorkerStore) Drain(ctx context.Context, workerID, reason strin
 	return s.GetWorker(ctx, workerID)
 }
 
+// DrainedPredecessor returns the zero-lease worker which was replaced by the
+// supplied worker.  A predecessor with active sessions must remain available
+// until its leases are released, so it is deliberately not returned here.
+func (s *AuthorityWorkerStore) DrainedPredecessor(ctx context.Context, replacementWorkerID string) (AuthorityWorker, bool, error) {
+	worker, err := scanAuthorityWorker(s.db.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at FROM authority_workers WHERE replacement_worker_id=? AND state=? AND assigned_sessions=0`, replacementWorkerID, AuthorityWorkerDraining))
+	if errors.Is(err, sql.ErrNoRows) {
+		return AuthorityWorker{}, false, nil
+	}
+	if err != nil {
+		return AuthorityWorker{}, false, err
+	}
+	return worker, true, nil
+}
+
+// MarkDrainedStopped records retirement only after the runtime has stopped the
+// zero-lease predecessor.  The conditional update keeps a concurrent lease or
+// state transition from being silently discarded.
+func (s *AuthorityWorkerStore) MarkDrainedStopped(ctx context.Context, workerID string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE authority_workers SET state=?,updated_at=? WHERE worker_id=? AND state=? AND assigned_sessions=0`, AuthorityWorkerStopped, formatAuthorityTime(time.Now().UTC()), workerID, AuthorityWorkerDraining)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("drained worker %q was not retired", workerID)
+	}
+	return nil
+}
+
 func (s *AuthorityWorkerStore) LinkReplacement(ctx context.Context, oldWorkerID string, replacement AuthorityWorker, maxWorkers int) (AuthorityWorker, bool, error) {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {

@@ -415,8 +415,11 @@ func TestAuthorityWorkerReplacementFailureKeepsOldWorkerAvailableAndRetries(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if old.State != AuthorityWorkerDraining {
-		t.Fatalf("old worker after replacement readiness = %+v", old)
+	if old.State != AuthorityWorkerStopped {
+		t.Fatalf("zero-lease predecessor after replacement readiness = %+v", old)
+	}
+	if len(runtime.stopped) != 1 || runtime.stopped[0] != old.ContainerID {
+		t.Fatalf("retired predecessor runtime stops = %v, want %q", runtime.stopped, old.ContainerID)
 	}
 }
 
