@@ -1,8 +1,8 @@
 package sandbox
 
-// Broker-owned checkpoint evidence is deliberately small in PR 8. It records
-// that a lease was durably fenced before a worker drain/replacement; agentd's
-// session journal and resume protocol remain PR 9 work.
+// Broker-owned checkpoint evidence is deliberately small. It records a lease
+// observation before worker drain/replacement; it is not an agentd recovery
+// manifest and does not establish that a session can be resumed.
 
 import (
 	"context"
@@ -30,13 +30,16 @@ type checkpointEnvelope struct {
 }
 
 type checkpointPayload struct {
-	SchemaVersion  string `json:"schema_version"`
-	WorkerID       string `json:"worker_id"`
-	Profile        string `json:"profile"`
-	ProfileVersion string `json:"profile_version"`
-	PolicyDigest   string `json:"policy_digest"`
-	LeaseBinding   string `json:"lease_binding_digest"`
-	CreatedAt      string `json:"created_at"`
+	SchemaVersion          string `json:"schema_version"`
+	WorkerID               string `json:"worker_id"`
+	Profile                string `json:"profile"`
+	ProfileVersion         string `json:"profile_version"`
+	PolicyDigest           string `json:"policy_digest"`
+	LeaseBinding           string `json:"lease_binding_digest"`
+	SessionLineageID       string `json:"session_lineage_id"`
+	WorkerStorageLineageID string `json:"worker_storage_lineage_id"`
+	WorkerFenceEpoch       int64  `json:"worker_fence_epoch"`
+	CreatedAt              string `json:"created_at"`
 }
 
 type CheckpointStore struct {
@@ -61,11 +64,15 @@ func (s *CheckpointStore) CheckpointWorker(ctx context.Context, worker Authority
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(profile.Checkpoint.Directory, 0o700); err != nil {
+	if !validOpaqueLineageID(worker.WorkerStorageLineageID) {
+		return fmt.Errorf("checkpoint worker storage lineage is invalid")
+	}
+	lineageDirectory := filepath.Join(profile.Checkpoint.Directory, worker.WorkerStorageLineageID)
+	if err := os.MkdirAll(lineageDirectory, 0o700); err != nil {
 		return err
 	}
 	for _, lease := range leases {
-		payload := checkpointPayload{SchemaVersion: "authority-checkpoint/v1", WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, LeaseBinding: lease.BindingDigest, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+		payload := checkpointPayload{SchemaVersion: "authority-checkpoint/v1", WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, LeaseBinding: lease.BindingDigest, SessionLineageID: lease.SessionLineageID, WorkerStorageLineageID: worker.WorkerStorageLineageID, WorkerFenceEpoch: worker.WorkerFenceEpoch, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 		b, err := json.Marshal(payload)
 		if err != nil {
 			return err
@@ -74,8 +81,8 @@ func (s *CheckpointStore) CheckpointWorker(ctx context.Context, worker Authority
 		if err != nil {
 			return err
 		}
-		name := worker.WorkerID + "-" + lease.BindingDigest + ".checkpoint"
-		if err := writeCheckpoint(filepath.Join(profile.Checkpoint.Directory, name), sealed); err != nil {
+		name := lease.SessionLineageID + ".checkpoint"
+		if err := writeCheckpoint(filepath.Join(lineageDirectory, name), sealed); err != nil {
 			return err
 		}
 	}
@@ -161,7 +168,7 @@ func VerifyCheckpoint(path string, profile AuthorityProfile, worker AuthorityWor
 	if err := json.Unmarshal(plain, &payload); err != nil || payload.SchemaVersion != "authority-checkpoint/v1" {
 		return fmt.Errorf("checkpoint payload schema is unsupported")
 	}
-	if payload.WorkerID != worker.WorkerID || payload.Profile != worker.Profile || payload.ProfileVersion != worker.ProfileVersion || payload.PolicyDigest != worker.PolicyDigest {
+	if payload.WorkerID != worker.WorkerID || payload.Profile != worker.Profile || payload.ProfileVersion != worker.ProfileVersion || payload.PolicyDigest != worker.PolicyDigest || payload.WorkerStorageLineageID != worker.WorkerStorageLineageID || payload.WorkerFenceEpoch != worker.WorkerFenceEpoch {
 		return fmt.Errorf("checkpoint authority binding does not match")
 	}
 	return nil

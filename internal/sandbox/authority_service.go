@@ -3,6 +3,8 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +23,36 @@ type AuthorityWorkerRequest struct {
 	Profile        string `json:"profile"`
 	IdempotencyKey string `json:"idempotency_key"`
 	SessionBinding string `json:"session_binding"`
+}
+
+// AuthoritySessionReassignmentRequest intentionally identifies only the
+// session and its observed predecessor. The broker derives the replacement
+// from its durable lifecycle record.
+type AuthoritySessionReassignmentRequest struct {
+	SessionBinding              string `json:"session_binding"`
+	SessionLineageID            string `json:"session_lineage_id"`
+	PredecessorWorkerID         string `json:"predecessor_worker_id"`
+	PredecessorWorkerFenceEpoch int64  `json:"predecessor_worker_fence_epoch"`
+	IdempotencyKey              string `json:"idempotency_key"`
+}
+
+type agentdCreateSessionRequest struct {
+	Version            string                 `json:"version"`
+	CoordinatorBinding string                 `json:"coordinatorBinding"`
+	AuthorityBinding   string                 `json:"authorityBinding"`
+	WorkerID           string                 `json:"workerId"`
+	StorageLineageID   string                 `json:"storageLineageId"`
+	FenceEpoch         int64                  `json:"fenceEpoch"`
+	SessionLineageID   string                 `json:"sessionLineageId"`
+	Workspace          agentdSessionWorkspace `json:"workspace"`
+}
+
+type agentdSessionWorkspace struct {
+	WorkspaceRef  string `json:"workspaceRef"`
+	UID           int    `json:"uid"`
+	GID           int    `json:"gid"`
+	BranchRef     string `json:"branchRef,omitempty"`
+	CheckpointRef string `json:"checkpointRef,omitempty"`
 }
 
 func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, binding string) (json.RawMessage, error) {
@@ -39,7 +72,16 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if token == "" {
 		return nil, fmt.Errorf("authority worker coordinator credential is unavailable")
 	}
-	payload, err := json.Marshal(map[string]any{"version": "agentd/v1", "coordinatorBinding": binding, "authorityBinding": lease.BindingDigest, "workspace": map[string]string{"workspaceRef": workspace.Path}})
+	payload, err := json.Marshal(agentdCreateSessionRequest{
+		Version:            "agentd/v1",
+		CoordinatorBinding: binding,
+		AuthorityBinding:   lease.Profile,
+		WorkerID:           lease.WorkerID,
+		StorageLineageID:   lease.WorkerStorageLineageID,
+		FenceEpoch:         lease.WorkerFenceEpoch,
+		SessionLineageID:   lease.SessionLineageID,
+		Workspace:          agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -56,14 +98,22 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	}
 	//nolint:errcheck // The response is decoded before return; a close error cannot alter admission state.
 	defer resp.Body.Close()
-	var result json.RawMessage
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
 	if resp.StatusCode != http.StatusCreated {
 		return nil, fmt.Errorf("agentd session create rejected")
 	}
-	return result, nil
+	status, err := decodeAgentdSessionStatus(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("agentd session create returned an invalid status")
+	}
+	expectedBinding := agentdWorkerBinding{WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch}
+	expectedWorkspace := agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}
+	if !exactAgentdSessionStatus(status, status.SessionID, binding, lease.Profile, lease.SessionLineageID, expectedWorkspace, expectedBinding) {
+		return nil, fmt.Errorf("agentd session create returned a mismatched status")
+	}
+	if err := s.store.BindAgentdSession(ctx, binding, status.SessionID); err != nil {
+		return nil, err
+	}
+	return marshalAgentdSessionStatus(status)
 }
 
 func (r *AuthorityWorkerRequest) UnmarshalJSON(data []byte) error {
@@ -81,29 +131,47 @@ func (r *AuthorityWorkerRequest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (r *AuthoritySessionReassignmentRequest) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	type request AuthoritySessionReassignmentRequest
+	var decoded request
+	if err := decoder.Decode(&decoded); err != nil {
+		return fmt.Errorf("invalid authority session reassignment request: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("invalid authority session reassignment request: trailing JSON value")
+	}
+	*r = AuthoritySessionReassignmentRequest(decoded)
+	return nil
+}
+
 type AuthorityWorkerSpec struct {
-	WorkerID            string
-	Profile             string
-	ProfileVersion      string
-	PolicyDigest        string
-	Image               string
-	Platform            string
-	Command             []string
-	Resources           Resources
-	Network             NetworkPolicy
-	BrokerAgentID       string
-	BrokerSecretEnv     string
-	CoordinatorTokenEnv string
-	CredentialBundle    string
-	CredentialMount     Mount
-	Repositories        []string
-	BranchPolicy        BranchPolicy
-	Operations          []string
-	ExtraMounts         []ExtraMount
-	SessionIsolation    SessionIsolation
-	Checkpoint          CheckpointPolicy
-	Storage             AuthorityStorage
-	SessionCapacity     int
+	WorkerID               string
+	Profile                string
+	ProfileVersion         string
+	PolicyDigest           string
+	Image                  string
+	Platform               string
+	Command                []string
+	Resources              Resources
+	Network                NetworkPolicy
+	BrokerAgentID          string
+	BrokerSecretEnv        string
+	CoordinatorTokenEnv    string
+	CredentialBundle       string
+	CredentialMount        Mount
+	Repositories           []string
+	BranchPolicy           BranchPolicy
+	Operations             []string
+	ExtraMounts            []ExtraMount
+	SessionIsolation       SessionIsolation
+	Checkpoint             CheckpointPolicy
+	Storage                AuthorityStorage
+	SessionCapacity        int
+	WorkerStorageLineageID string
+	WorkerFenceEpoch       int64
+	AgentdReadiness        AgentdReadiness
 }
 
 type AuthorityRuntimeResult struct {
@@ -122,14 +190,40 @@ type AuthorityWorkerRuntime interface {
 	Healthy(context.Context, string) (bool, string, error)
 }
 
+// AuthorityAgentdReadiness is intentionally separate from container liveness.
+// Reconciliation only promotes workers after agentd attests its journal,
+// runtime, launcher and fencing-validator configuration.
+type AuthorityAgentdReadiness interface {
+	AgentdReady(context.Context, AuthorityWorker) (bool, string, error)
+}
+
+// AuthorityAgentdRebinder addresses agentd only through the runtime-owned
+// endpoint for the broker-recorded successor worker.
+type AuthorityAgentdRebinder interface {
+	RebindAgentdSession(context.Context, AuthorityWorker, string, agentdRebindRequest) (agentdSessionStatus, error)
+}
+
+type AgentdSessionValidationRequest struct {
+	WorkerID               string `json:"worker_id"`
+	WorkerStorageLineageID string `json:"worker_storage_lineage_id"`
+	WorkerFenceEpoch       int64  `json:"worker_fence_epoch"`
+	SessionLineageID       string `json:"session_lineage_id"`
+}
+
+type AgentdSessionValidation struct {
+	Authorized bool   `json:"authorized"`
+	Code       string `json:"code"`
+}
+
 type AuthorityWorkerService struct {
-	cfg         Config
-	store       *AuthorityWorkerStore
-	runtime     AuthorityWorkerRuntime
-	audit       *AuditLogger
-	now         func() time.Time
-	newID       func() (string, error)
-	checkpoints *CheckpointStore
+	cfg          Config
+	store        *AuthorityWorkerStore
+	runtime      AuthorityWorkerRuntime
+	audit        *AuditLogger
+	now          func() time.Time
+	newID        func() (string, error)
+	checkpoints  *CheckpointStore
+	retirementMu sync.Mutex
 }
 
 type AuthoritySessionAdmission struct {
@@ -174,9 +268,11 @@ func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string
 	if err != nil {
 		return err
 	}
+	var reconcileErr error
 	for _, worker := range workers {
 		if _, err := s.authorize(principal, worker.Profile, "health"); err != nil {
-			return err
+			reconcileErr = errors.Join(reconcileErr, err)
+			continue
 		}
 		if worker.ContainerID == "" {
 			continue
@@ -186,24 +282,104 @@ func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string
 			healthy, evidence = false, "runtime_inspect_failed"
 		}
 		if healthy {
-			if _, err := s.SetHealth(ctx, principal, worker.WorkerID, evidence, true); err != nil {
-				return err
+			profile := s.cfg.AuthorityProfiles[worker.Profile]
+			if configuredAgentdReadiness(profile).ContractVersion == "" {
+				if _, err := s.SetHealth(ctx, principal, worker.WorkerID, evidence, true); err != nil {
+					reconcileErr = errors.Join(reconcileErr, err)
+				}
+				continue
+			}
+			probe, ok := s.runtime.(AuthorityAgentdReadiness)
+			ready, readinessEvidence, readinessErr := false, "agentd_authenticated_readiness_contract_unavailable", error(nil)
+			if ok {
+				ready, readinessEvidence, readinessErr = probe.AgentdReady(ctx, worker)
+			}
+			if readinessErr != nil || !ready {
+				continue
+			}
+			if _, err := s.SetHealth(ctx, principal, worker.WorkerID, readinessEvidence, true); err != nil {
+				reconcileErr = errors.Join(reconcileErr, err)
 			}
 			continue
 		}
 		if s.checkpoints != nil {
 			if err := s.checkpoints.CheckpointWorker(ctx, worker); err != nil {
-				return err
+				reconcileErr = errors.Join(reconcileErr, err)
+				continue
 			}
 		}
 		if _, err := s.SetHealth(ctx, principal, worker.WorkerID, evidence, false); err != nil {
-			return err
+			reconcileErr = errors.Join(reconcileErr, err)
+			continue
 		}
 		if _, err := s.Replace(ctx, principal, worker.WorkerID, "runtime_unhealthy"); err != nil {
-			return err
+			reconcileErr = errors.Join(reconcileErr, err)
 		}
 	}
-	return nil
+	adoptions, err := s.store.UnconfirmedAgentdAdoptions(ctx)
+	if err != nil {
+		reconcileErr = errors.Join(reconcileErr, err)
+	} else {
+		for _, adoption := range adoptions {
+			if _, authErr := s.authorize(principal, adoption.AuthorityBinding, "reassign"); authErr != nil {
+				reconcileErr = errors.Join(reconcileErr, authErr)
+				continue
+			}
+			if adoptionErr := s.confirmAgentdAdoption(ctx, adoption); adoptionErr != nil {
+				reconcileErr = errors.Join(reconcileErr, adoptionErr)
+			}
+		}
+	}
+	replacements, err := s.store.ReadyReplacementWorkersWithDrainedPredecessors(ctx)
+	if err != nil {
+		reconcileErr = errors.Join(reconcileErr, err)
+	} else {
+		for _, replacementWorkerID := range replacements {
+			if retireErr := s.retireDrainedPredecessor(ctx, replacementWorkerID); retireErr != nil {
+				reconcileErr = errors.Join(reconcileErr, retireErr)
+			}
+		}
+	}
+	return reconcileErr
+}
+
+// ValidateAgentdSession is the authenticated, fail-closed fencing contract
+// agentd calls before accessing any lineage-scoped journal or workspace state.
+func (s *AuthorityWorkerService) ValidateAgentdSession(ctx context.Context, credential string, request AgentdSessionValidationRequest) (AgentdSessionValidation, error) {
+	worker, err := s.store.GetWorker(ctx, request.WorkerID)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return AgentdSessionValidation{}, err
+		}
+	}
+	validationKey := string(make([]byte, sha256.Size))
+	knownWorker := err == nil
+	profile, knownProfile := s.cfg.AuthorityProfiles[worker.Profile]
+	if knownWorker && knownProfile {
+		if configuredSecret := strings.TrimSpace(os.Getenv(profile.BrokerSecretEnv)); configuredSecret != "" {
+			validationKey = configuredSecret
+		} else {
+			knownProfile = false
+		}
+	}
+	expected := deriveAgentdValidationToken(validationKey, request.WorkerID, request.WorkerStorageLineageID, request.WorkerFenceEpoch)
+	if !knownWorker || !knownProfile || !secureTokenEqual(credential, expected) {
+		return AgentdSessionValidation{Code: "unauthorized"}, nil
+	}
+	if !safeAuthorityName(request.WorkerID) || !validOpaqueLineageID(request.WorkerStorageLineageID) || !validOpaqueLineageID(request.SessionLineageID) || request.WorkerFenceEpoch < 1 {
+		return AgentdSessionValidation{Code: "invalid_request"}, nil
+	}
+	if worker.WorkerStorageLineageID != request.WorkerStorageLineageID || worker.WorkerFenceEpoch != request.WorkerFenceEpoch {
+		return AgentdSessionValidation{Code: "fenced"}, nil
+	}
+	valid, err := s.store.ValidateSessionFence(ctx, request.WorkerID, request.SessionLineageID, request.WorkerFenceEpoch)
+	if err != nil {
+		return AgentdSessionValidation{}, err
+	}
+	if !valid {
+		return AgentdSessionValidation{Code: "fenced"}, nil
+	}
+	return AgentdSessionValidation{Authorized: true, Code: "authorized"}, nil
 }
 
 func (s *AuthorityWorkerService) GetWorker(ctx context.Context, principal, workerID string) (AuthorityWorker, error) {
@@ -279,6 +455,8 @@ func (s *AuthorityWorkerService) SetHealth(ctx context.Context, principal, worke
 }
 
 func (s *AuthorityWorkerService) retireDrainedPredecessor(ctx context.Context, replacementWorkerID string) error {
+	s.retirementMu.Lock()
+	defer s.retirementMu.Unlock()
 	predecessor, found, err := s.store.DrainedPredecessor(ctx, replacementWorkerID)
 	if err != nil || !found {
 		return err
@@ -304,6 +482,120 @@ func (s *AuthorityWorkerService) Acquire(ctx context.Context, principal string, 
 	worker := AuthorityWorker{WorkerID: lease.WorkerID, Profile: request.Profile}
 	s.log("authority_worker.acquire", principal, request.Profile, worker, decision(err), err)
 	return lease, err
+}
+
+func (s *AuthorityWorkerService) ReassignSession(ctx context.Context, principal string, request AuthoritySessionReassignmentRequest) (AuthoritySessionReassignment, error) {
+	if err := validateReassignmentRequest(request); err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
+	lease, err := s.store.GetLease(ctx, principal, request.SessionBinding)
+	if err != nil {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "session binding is not visible to this principal")
+	}
+	if _, err := s.authorize(principal, lease.Profile, "reassign"); err != nil {
+		s.log("authority_worker.reassign", principal, lease.Profile, AuthorityWorker{WorkerID: request.PredecessorWorkerID, Profile: lease.Profile}, "deny", err)
+		return AuthoritySessionReassignment{}, err
+	}
+	predecessor, err := s.store.GetWorker(ctx, request.PredecessorWorkerID)
+	if err != nil {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "supplied predecessor is unavailable")
+	}
+	profile := s.cfg.AuthorityProfiles[lease.Profile]
+	profileVersion, policyDigest, digestErr := authorityProfileDigest(lease.Profile, profile)
+	if digestErr != nil || predecessor.Profile != lease.Profile || predecessor.ProfileVersion != profileVersion || predecessor.PolicyDigest != policyDigest || predecessor.ImageReference != profile.Image || predecessor.Capacity != profile.SessionCapacity {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "immutable profile/policy/storage identity no longer matches predecessor")
+	}
+	workspace, err := s.store.SessionWorkspace(ctx, request.SessionBinding)
+	if err != nil || !validAgentdID(workspace.AgentdSessionID) {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "session has no durable agentd identity")
+	}
+	if _, ok := s.runtime.(AuthorityAgentdRebinder); !ok {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
+	}
+	reassignment, err := s.store.Reassign(ctx, principal, request.SessionBinding, request.SessionLineageID, request.PredecessorWorkerID, request.PredecessorWorkerFenceEpoch, request.IdempotencyKey, workspace)
+	if err != nil {
+		worker := AuthorityWorker{WorkerID: reassignment.ReplacementWorkerID, Profile: lease.Profile}
+		s.log("authority_worker.reassign", principal, lease.Profile, worker, decision(err), err)
+		return reassignment, err
+	}
+	replacement, err := s.store.GetWorker(ctx, reassignment.ReplacementWorkerID)
+	if err != nil {
+		err = reassignmentError(ReassignmentRebindRetryable, "broker-recorded replacement is temporarily unavailable after lease cutover")
+		s.log("authority_worker.reassign", principal, lease.Profile, AuthorityWorker{WorkerID: reassignment.ReplacementWorkerID, Profile: lease.Profile}, "deny", err)
+		return reassignment, err
+	}
+	adoption, err := s.store.AgentdAdoption(ctx, reassignment.Lease.BindingDigest)
+	if err != nil {
+		err = reassignmentError(ReassignmentRebindRetryable, "durable agentd adoption transition is temporarily unavailable")
+		s.log("authority_worker.reassign", principal, lease.Profile, replacement, "deny", err)
+		return reassignment, err
+	}
+	if err = s.confirmAgentdAdoption(ctx, adoption); err != nil {
+		s.log("authority_worker.reassign", principal, lease.Profile, replacement, "deny", err)
+		return reassignment, err
+	}
+	// Retirement is intentionally after the exact agentd status is durably
+	// confirmed. Every retirement query repeats that durable gate.
+	if retireErr := s.retireDrainedPredecessor(ctx, reassignment.ReplacementWorkerID); retireErr != nil {
+		err = reassignmentError(ReassignmentRebindRetryable, "predecessor retirement is temporarily unavailable")
+		s.log("authority_worker.reassign", principal, lease.Profile, replacement, "deny", err)
+		return reassignment, err
+	}
+	worker := replacement
+	s.log("authority_worker.reassign", principal, lease.Profile, worker, decision(err), err)
+	return reassignment, err
+}
+
+func (s *AuthorityWorkerService) confirmAgentdAdoption(ctx context.Context, adoption authorityAgentdAdoption) error {
+	switch adoption.State {
+	case authorityAdoptionConfirmed:
+		return nil
+	case authorityAdoptionConflict:
+		return reassignmentError(ReassignmentRebindConflict, "agentd adoption has terminal conflict %s", adoption.ErrorCode)
+	case authorityAdoptionLegacyUnresolved:
+		return reassignmentError(ReassignmentRebindConflict, "agentd adoption transition predates replayable recovery state and requires operator resolution")
+	case authorityAdoptionPending:
+	default:
+		return reassignmentError(ReassignmentRebindConflict, "agentd adoption transition has invalid durable state")
+	}
+	if !validAgentdID(adoption.AgentdSessionID) || !validAgentdID(adoption.SessionLineageID) ||
+		adoption.RebindIdempotencyKey != s.store.rebindIdempotencyKey(adoption.AgentdSessionID, adoption.Predecessor, adoption.Successor) {
+		return reassignmentError(ReassignmentRebindConflict, "agentd adoption transition identity is invalid")
+	}
+	replacement, err := s.store.GetWorker(ctx, adoption.Successor.WorkerID)
+	if err != nil || replacement.Profile != adoption.AuthorityBinding || replacement.WorkerStorageLineageID != adoption.Successor.StorageLineageID || replacement.WorkerFenceEpoch != adoption.Successor.FenceEpoch {
+		return reassignmentError(ReassignmentRebindRetryable, "broker-recorded adoption successor is temporarily unavailable")
+	}
+	rebinder, ok := s.runtime.(AuthorityAgentdRebinder)
+	if !ok {
+		return reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
+	}
+	request := agentdRebindRequest{IdempotencyKey: adoption.RebindIdempotencyKey, Predecessor: adoption.Predecessor, Successor: adoption.Successor}
+	status, rebindErr := rebinder.RebindAgentdSession(ctx, replacement, adoption.AgentdSessionID, request)
+	if rebindErr != nil {
+		var typed *agentdRebindError
+		if errors.As(rebindErr, &typed) && !typed.retryable {
+			code := typed.code
+			if code == "" {
+				code = "agentd_rebind_rejected"
+			}
+			if recordErr := s.store.RecordAgentdAdoptionConflict(context.WithoutCancel(ctx), adoption, code); recordErr != nil {
+				return reassignmentError(ReassignmentRebindRetryable, "agentd adoption conflict could not be recorded")
+			}
+			return reassignmentError(ReassignmentRebindConflict, "%s", typed.Error())
+		}
+		return reassignmentError(ReassignmentRebindRetryable, "agentd rebind is temporarily unavailable")
+	}
+	expectedWorkspace := adoption.Workspace
+	expectedWorkspace.BranchRef = status.Workspace.BranchRef
+	expectedWorkspace.CheckpointRef = status.Workspace.CheckpointRef
+	if !exactAgentdSessionStatus(status, adoption.AgentdSessionID, adoption.CoordinatorBinding, adoption.AuthorityBinding, adoption.SessionLineageID, expectedWorkspace, adoption.Successor) {
+		return reassignmentError(ReassignmentRebindRetryable, "agentd rebind returned an invalid successor status")
+	}
+	if err := s.store.ConfirmAgentdAdoption(context.WithoutCancel(ctx), adoption); err != nil {
+		return reassignmentError(ReassignmentRebindRetryable, "agentd adoption confirmation is temporarily unavailable")
+	}
+	return nil
 }
 
 func (s *AuthorityWorkerService) Release(ctx context.Context, principal, sessionBinding string) (AuthorityLease, error) {
@@ -359,15 +651,21 @@ func (s *AuthorityWorkerService) Replace(ctx context.Context, principal, workerI
 	if strings.TrimSpace(reason) == "" || len(reason) > 256 {
 		return AuthorityWorker{}, fmt.Errorf("bounded replacement reason is required")
 	}
-	newID, err := s.newID()
-	if err != nil {
-		return AuthorityWorker{}, err
-	}
 	profileVersion, policyDigest, err := authorityProfileDigest(old.Profile, profile)
 	if err != nil {
 		return AuthorityWorker{}, err
 	}
-	replacement := AuthorityWorker{WorkerID: newID, Profile: old.Profile, ProfileVersion: profileVersion, PolicyDigest: policyDigest, ImageReference: profile.Image, Generation: old.Generation + 1, State: AuthorityWorkerProvisioning, Capacity: profile.SessionCapacity, DrainReason: reason}
+	// A generation change may not silently change its profile, policy, image or
+	// storage identity. ProfileVersion hashes the complete reviewed profile,
+	// including AuthorityStorage; PolicyDigest is asserted separately.
+	if profileVersion != old.ProfileVersion || policyDigest != old.PolicyDigest || profile.Image != old.ImageReference || profile.SessionCapacity != old.Capacity {
+		return AuthorityWorker{}, fmt.Errorf("replacement immutable profile/policy/storage identity differs from predecessor")
+	}
+	newID, err := s.newID()
+	if err != nil {
+		return AuthorityWorker{}, err
+	}
+	replacement := AuthorityWorker{WorkerID: newID, Profile: old.Profile, ProfileVersion: old.ProfileVersion, PolicyDigest: old.PolicyDigest, ImageReference: old.ImageReference, Generation: old.Generation + 1, State: AuthorityWorkerProvisioning, Capacity: old.Capacity, DrainReason: reason}
 	replacement, created, err := s.store.LinkReplacement(ctx, old.WorkerID, replacement, profile.MaxWorkers)
 	if err != nil {
 		s.log("authority_worker.replace", principal, old.Profile, old, "deny", err)
@@ -425,12 +723,38 @@ func validateAuthorityRequest(request AuthorityWorkerRequest) error {
 	return nil
 }
 
+func validateReassignmentRequest(request AuthoritySessionReassignmentRequest) error {
+	if strings.TrimSpace(request.SessionBinding) == "" || len(request.SessionBinding) > 256 {
+		return fmt.Errorf("session_binding is required and must be at most 256 bytes")
+	}
+	if !safeAuthorityName(request.PredecessorWorkerID) {
+		return fmt.Errorf("predecessor_worker_id is required")
+	}
+	if !validOpaqueLineageID(request.SessionLineageID) {
+		return fmt.Errorf("session_lineage_id must be an opaque broker-generated lineage")
+	}
+	if request.PredecessorWorkerFenceEpoch < 1 {
+		return fmt.Errorf("predecessor_worker_fence_epoch must be positive")
+	}
+	if strings.TrimSpace(request.IdempotencyKey) == "" || len(request.IdempotencyKey) > 256 {
+		return fmt.Errorf("idempotency_key is required and must be at most 256 bytes")
+	}
+	return nil
+}
+
 func authoritySpec(worker AuthorityWorker, profile AuthorityProfile, cfg Config) AuthorityWorkerSpec {
-	spec := AuthorityWorkerSpec{WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, Image: profile.Image, Platform: profile.Platform, Command: append([]string(nil), profile.Command...), Resources: profile.Resources, Network: cfg.Networks[profile.NetworkPolicy], BrokerAgentID: profile.BrokerAgentID, BrokerSecretEnv: profile.BrokerSecretEnv, CoordinatorTokenEnv: profile.CoordinatorTokenEnv, CredentialBundle: profile.CredentialBundle, Repositories: append([]string(nil), profile.Repositories...), BranchPolicy: profile.BranchPolicy, Operations: append([]string(nil), profile.Operations...), ExtraMounts: append([]ExtraMount(nil), profile.ExtraMounts...), SessionIsolation: profile.SessionIsolation, Checkpoint: profile.Checkpoint, Storage: profile.Storage, SessionCapacity: profile.SessionCapacity}
+	spec := AuthorityWorkerSpec{WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, Image: profile.Image, Platform: profile.Platform, Command: append([]string(nil), profile.Command...), Resources: profile.Resources, Network: cfg.Networks[profile.NetworkPolicy], BrokerAgentID: profile.BrokerAgentID, BrokerSecretEnv: profile.BrokerSecretEnv, CoordinatorTokenEnv: profile.CoordinatorTokenEnv, CredentialBundle: profile.CredentialBundle, Repositories: append([]string(nil), profile.Repositories...), BranchPolicy: profile.BranchPolicy, Operations: append([]string(nil), profile.Operations...), ExtraMounts: append([]ExtraMount(nil), profile.ExtraMounts...), SessionIsolation: profile.SessionIsolation, Checkpoint: profile.Checkpoint, Storage: profile.Storage, SessionCapacity: profile.SessionCapacity, WorkerStorageLineageID: worker.WorkerStorageLineageID, WorkerFenceEpoch: worker.WorkerFenceEpoch, AgentdReadiness: configuredAgentdReadiness(profile)}
 	if bundle, ok := cfg.Bundles[profile.CredentialBundle]; ok {
-		spec.CredentialMount = Mount{Source: bundle.SourcePath, Target: bundle.MountPath, ReadOnly: bundle.ReadOnly}
+		spec.CredentialMount = credentialBundleMount(bundle)
 	}
 	return spec
+}
+
+func credentialBundleMount(bundle CredentialBundle) Mount {
+	if bundle.SourceVolume != "" {
+		return Mount{Source: bundle.SourceVolume, Target: bundle.MountPath, ReadOnly: bundle.ReadOnly, Volume: true}
+	}
+	return Mount{Source: bundle.SourcePath, Target: bundle.MountPath, ReadOnly: bundle.ReadOnly}
 }
 
 func decision(err error) string {

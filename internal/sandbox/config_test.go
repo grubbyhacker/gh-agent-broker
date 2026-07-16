@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadExampleConfig(t *testing.T) {
@@ -17,6 +18,29 @@ func TestLoadExampleConfig(t *testing.T) {
 	}
 	if cfg.MCPPath != "/mcp" || cfg.Templates["hermes-task-worker"].BrokerAgentSecret != "broker-secret" {
 		t.Fatalf("loaded config = %+v", cfg)
+	}
+}
+
+func TestConfigVersionIncludesOnlyNonemptySourceVolume(t *testing.T) {
+	cfg := baseTestConfig(t)
+	bundle := cfg.Bundles["codex"]
+	bundle.SourcePath = ""
+	cfg.Bundles["codex"] = bundle
+	cfg.StampLoaded(time.Unix(1, 0).UTC())
+	withoutVolume := cfg.ConfigVersion
+
+	bundle.SourceVolume = "agentd-staging-auth"
+	cfg.Bundles["codex"] = bundle
+	cfg.StampLoaded(time.Unix(2, 0).UTC())
+	if cfg.ConfigVersion == withoutVolume {
+		t.Fatal("nonempty source_volume was omitted from config version")
+	}
+
+	bundle.SourceVolume = ""
+	cfg.Bundles["codex"] = bundle
+	cfg.StampLoaded(time.Unix(3, 0).UTC())
+	if cfg.ConfigVersion != withoutVolume {
+		t.Fatal("empty source_volume changed the legacy canonical config shape")
 	}
 }
 

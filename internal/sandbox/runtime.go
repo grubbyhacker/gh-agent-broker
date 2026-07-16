@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -42,12 +43,26 @@ type RuntimeSpec struct {
 	Resources  Resources
 	WorkingDir string
 	Timeout    time.Duration
+	// AllowAgentdSetuidLauncherPrivilegeTransition is the sole exception to
+	// Docker's default no-new-privileges policy. It is set only by the reviewed
+	// authority-worker spec: agentd stays the non-root bun user while its fixed,
+	// root-owned setuid launcher obtains the euid required to isolate a turn.
+	AllowAgentdSetuidLauncherPrivilegeTransition bool
+	// authorityVolumeInitializer is intentionally package-private: only the
+	// broker's fixed authority-volume initialization path may add its two
+	// ownership-transition capabilities.
+	// It is not an authority or ordinary-worker capability.
+	authorityVolumeInitializer bool
 }
 
 type Mount struct {
 	Source   string
 	Target   string
 	ReadOnly bool
+	Volume   bool
+	// VolumeSubpath selects an existing relative directory inside a named
+	// Docker volume. It is never represented as a bind string.
+	VolumeSubpath string
 }
 
 type ContainerInfo struct {
@@ -104,29 +119,7 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 	if err != nil {
 		imageDigest = spec.Image
 	}
-	reqBody := dockerCreateRequest{
-		Image:      spec.Image,
-		Platform:   spec.Platform,
-		Entrypoint: spec.Entrypoint,
-		Cmd:        spec.Command,
-		User:       spec.User,
-		Env:        envList(spec.Env),
-		Labels:     spec.Labels,
-		WorkingDir: spec.WorkingDir,
-		HostConfig: dockerHostConfig{
-			ReadonlyRootfs:  false,
-			SecurityOpt:     []string{"no-new-privileges"},
-			CapDrop:         []string{"ALL"},
-			NetworkMode:     networkMode(spec.Network),
-			Binds:           binds(spec.Mounts),
-			PidsLimit:       spec.Resources.PidsLimit,
-			Memory:          spec.Resources.MemoryMB * 1024 * 1024,
-			CPUWeight:       spec.Resources.CPUShares,
-			AutoRemove:      false,
-			Privileged:      false,
-			PublishAllPorts: false,
-		},
-	}
+	reqBody := dockerCreateRequestFor(spec)
 	var out struct {
 		ID       string   `json:"Id"`
 		Warnings []string `json:"Warnings"`
@@ -139,6 +132,59 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 		return ContainerInfo{}, err
 	}
 	return ContainerInfo{ID: out.ID, ImageDigest: imageDigest, Lifecycle: ContainerNeverStarted}, nil
+}
+
+// dockerCreateRequestFor is the single source of Docker launch settings for
+// RuntimeSpec. The launch fingerprint below derives from this effective
+// request so it cannot omit an internal security-class switch that Docker
+// applies at create time.
+func dockerCreateRequestFor(spec RuntimeSpec) dockerCreateRequest {
+	return dockerCreateRequest{
+		Image:      spec.Image,
+		Platform:   spec.Platform,
+		Entrypoint: spec.Entrypoint,
+		Cmd:        spec.Command,
+		User:       spec.User,
+		Env:        envList(spec.Env),
+		Labels:     spec.Labels,
+		WorkingDir: spec.WorkingDir,
+		HostConfig: dockerHostConfig{
+			ReadonlyRootfs:  false,
+			SecurityOpt:     runtimeSecurityOptions(spec),
+			CapDrop:         []string{"ALL"},
+			CapAdd:          runtimeCapabilityAdds(spec),
+			NetworkMode:     networkMode(spec.Network),
+			Binds:           binds(spec.Mounts),
+			Mounts:          dockerMounts(spec.Mounts),
+			PidsLimit:       spec.Resources.PidsLimit,
+			Memory:          spec.Resources.MemoryMB * 1024 * 1024,
+			CPUWeight:       spec.Resources.CPUShares,
+			AutoRemove:      false,
+			Privileged:      false,
+			PublishAllPorts: false,
+		},
+	}
+}
+
+func runtimeSecurityOptions(spec RuntimeSpec) []string {
+	if spec.AllowAgentdSetuidLauncherPrivilegeTransition {
+		return nil
+	}
+	return []string{"no-new-privileges"}
+}
+
+func runtimeCapabilityAdds(spec RuntimeSpec) []string {
+	if spec.authorityVolumeInitializer {
+		// install -o/-g performs chown(2), then chmod(2), on each fixed
+		// directory. CAP_CHOWN permits the ownership transition; after that
+		// transition CAP_FOWNER is required to set the requested mode on the
+		// now bun-owned directory. Creation itself needs no extra capability.
+		return []string{"CHOWN", "FOWNER"}
+	}
+	if !spec.AllowAgentdSetuidLauncherPrivilegeTransition {
+		return nil
+	}
+	return []string{"SETUID", "SETGID"}
 }
 
 func (d *DockerBackend) adopt(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
@@ -215,6 +261,134 @@ func (d *DockerBackend) Inspect(ctx context.Context, containerID string) (Contai
 		return ContainerStatus{}, err
 	}
 	return dockerContainerStatus(out), nil
+}
+
+func (d *DockerBackend) InternalAddress(ctx context.Context, containerID string) (string, error) {
+	var out dockerInspectResponse
+	if err := d.doJSON(ctx, http.MethodGet, "/containers/"+url.PathEscape(containerID)+"/json", nil, &out); err != nil {
+		return "", err
+	}
+	for _, network := range out.NetworkSettings.Networks {
+		if network.IPAddress != "" {
+			return network.IPAddress, nil
+		}
+	}
+	return "", nil
+}
+
+// ensureAuthorityVolumeSubpaths creates the opaque lineage directory and its private
+// agentd state child through short-lived helpers that alone see the full backing
+// volume. The 0711 root is owner-only writable but traversable by each distinct
+// per-session UID/GID; the 0700 child satisfies agentd's state-store contract.
+// Docker requires the lineage subpath to exist before the authority container
+// is created.
+func (d *DockerBackend) ensureAuthorityVolumeSubpaths(ctx context.Context, image, lineageID string, mounts []Mount, sessionMountTarget string) error {
+	if !validOpaqueLineageID(lineageID) {
+		return fmt.Errorf("invalid volume storage lineage")
+	}
+	initMounts := make([]Mount, 0, len(mounts))
+	args := []string{"-d", "-o", "bun", "-g", "bun", "-m", "0711"}
+	var privateMount Mount
+	for index, mount := range mounts {
+		if !mount.Volume || mount.Source == "" || mount.VolumeSubpath != lineageID {
+			return fmt.Errorf("invalid authority volume subpath request")
+		}
+		if mount.Target == sessionMountTarget {
+			if privateMount.Source != "" {
+				return fmt.Errorf("private authority volume target is ambiguous")
+			}
+			privateMount = mount
+		}
+		target := fmt.Sprintf("/lineage-volumes/%d", index)
+		initMounts = append(initMounts, Mount{Source: mount.Source, Target: target, Volume: true})
+		args = append(args, target+"/"+lineageID)
+	}
+	if privateMount.Source == "" {
+		return fmt.Errorf("private authority session volume is unavailable")
+	}
+	if err := d.runAuthorityVolumeInitializer(ctx, image, "authority-volume-init-"+lineageID, initMounts, args); err != nil {
+		return err
+	}
+	privateTarget := "/lineage-volume"
+	privateMounts := []Mount{{Source: privateMount.Source, Target: privateTarget, Volume: true}}
+	privateArgs := []string{"-d", "-o", "bun", "-g", "bun", "-m", "0700", path.Join(privateTarget, lineageID, agentdControlV1StateDirectory)}
+	return d.runAuthorityStateInitializer(ctx, image, "authority-state-init-"+lineageID, privateMounts, privateArgs)
+}
+
+// runAuthorityVolumeInitializer runs the only root helper allowed to change
+// ownership in an authority storage volume. Its image, install command and
+// paths are generated by ensureAuthorityVolumeSubpaths from reviewed profile
+// storage; no REST caller or worker can supply a command, path, or capability.
+func (d *DockerBackend) runAuthorityVolumeInitializer(ctx context.Context, image, runID string, mounts []Mount, args []string) error {
+	spec := RuntimeSpec{
+		RunID:                      runID,
+		Image:                      image,
+		Entrypoint:                 []string{"install"},
+		Command:                    args,
+		User:                       "0:0",
+		Labels:                     map[string]string{"gh-agent-broker.run_id": runID, "gh-agent-broker.volume_initializer": "true"},
+		Mounts:                     mounts,
+		Network:                    NetworkPolicy{None: true},
+		Resources:                  Resources{CPUShares: 2, MemoryMB: 32, PidsLimit: 16},
+		authorityVolumeInitializer: true,
+	}
+	info, err := d.Create(ctx, spec)
+	if err != nil {
+		return err
+	}
+	if info.Lifecycle == ContainerNeverStarted {
+		if err := d.Start(ctx, info.ID); err != nil {
+			return err
+		}
+	}
+	status := info.Status
+	if info.Lifecycle != ContainerExited {
+		status, err = d.Wait(ctx, info.ID)
+		if err != nil {
+			return err
+		}
+	}
+	if status.ExitCode == nil || *status.ExitCode != 0 {
+		return fmt.Errorf("volume subpath initializer failed")
+	}
+	return d.Remove(ctx, info.ID)
+}
+
+// runAuthorityStateInitializer creates agentd's private state directory as
+// bun after the root helper has transferred ownership of the lineage root. It
+// intentionally has no added capabilities.
+func (d *DockerBackend) runAuthorityStateInitializer(ctx context.Context, image, runID string, mounts []Mount, args []string) error {
+	spec := RuntimeSpec{
+		RunID:      runID,
+		Image:      image,
+		Entrypoint: []string{"install"},
+		Command:    args,
+		User:       "bun",
+		Labels:     map[string]string{"gh-agent-broker.run_id": runID, "gh-agent-broker.volume_initializer": "true"},
+		Mounts:     mounts,
+		Network:    NetworkPolicy{None: true},
+		Resources:  Resources{CPUShares: 2, MemoryMB: 32, PidsLimit: 16},
+	}
+	info, err := d.Create(ctx, spec)
+	if err != nil {
+		return err
+	}
+	if info.Lifecycle == ContainerNeverStarted {
+		if err := d.Start(ctx, info.ID); err != nil {
+			return err
+		}
+	}
+	status := info.Status
+	if info.Lifecycle != ContainerExited {
+		status, err = d.Wait(ctx, info.ID)
+		if err != nil {
+			return err
+		}
+	}
+	if status.ExitCode == nil || *status.ExitCode != 0 {
+		return fmt.Errorf("volume subpath initializer failed")
+	}
+	return d.Remove(ctx, info.ID)
 }
 
 func dockerContainerStatus(out dockerInspectResponse) ContainerStatus {
@@ -492,17 +666,31 @@ type dockerCreateRequest struct {
 }
 
 type dockerHostConfig struct {
-	ReadonlyRootfs  bool     `json:"ReadonlyRootfs"`
-	SecurityOpt     []string `json:"SecurityOpt"`
-	CapDrop         []string `json:"CapDrop"`
-	NetworkMode     string   `json:"NetworkMode"`
-	Binds           []string `json:"Binds"`
-	PidsLimit       int64    `json:"PidsLimit,omitempty"`
-	Memory          int64    `json:"Memory,omitempty"`
-	CPUWeight       int      `json:"CpuShares,omitempty"`
-	AutoRemove      bool     `json:"AutoRemove"`
-	Privileged      bool     `json:"Privileged"`
-	PublishAllPorts bool     `json:"PublishAllPorts"`
+	ReadonlyRootfs  bool          `json:"ReadonlyRootfs"`
+	SecurityOpt     []string      `json:"SecurityOpt"`
+	CapDrop         []string      `json:"CapDrop"`
+	CapAdd          []string      `json:"CapAdd,omitempty"`
+	NetworkMode     string        `json:"NetworkMode"`
+	Binds           []string      `json:"Binds"`
+	Mounts          []dockerMount `json:"Mounts,omitempty"`
+	PidsLimit       int64         `json:"PidsLimit,omitempty"`
+	Memory          int64         `json:"Memory,omitempty"`
+	CPUWeight       int           `json:"CpuShares,omitempty"`
+	AutoRemove      bool          `json:"AutoRemove"`
+	Privileged      bool          `json:"Privileged"`
+	PublishAllPorts bool          `json:"PublishAllPorts"`
+}
+
+type dockerMount struct {
+	Type          string               `json:"Type"`
+	Source        string               `json:"Source"`
+	Target        string               `json:"Target"`
+	ReadOnly      bool                 `json:"ReadOnly,omitempty"`
+	VolumeOptions *dockerVolumeOptions `json:"VolumeOptions,omitempty"`
+}
+
+type dockerVolumeOptions struct {
+	Subpath string `json:"Subpath,omitempty"`
 }
 
 type dockerInspectResponse struct {
@@ -520,18 +708,97 @@ type dockerInspectResponse struct {
 		StartedAt  string `json:"StartedAt"`
 		FinishedAt string `json:"FinishedAt"`
 	} `json:"State"`
+	NetworkSettings struct {
+		Networks map[string]struct {
+			IPAddress string `json:"IPAddress"`
+		} `json:"Networks"`
+	} `json:"NetworkSettings"`
 }
 
 func runtimeSpecDigest(spec RuntimeSpec) (string, error) {
 	copySpec := spec
 	copySpec.Labels = cloneStringMap(spec.Labels)
 	delete(copySpec.Labels, "gh-agent-broker.launch_spec")
-	b, err := json.Marshal(copySpec)
+	if !legacyOrdinaryRuntimeSpec(copySpec) {
+		return effectiveRuntimeLaunchFingerprintDigest(effectiveRuntimeLaunchFingerprint{CreateRequest: dockerCreateRequestFor(copySpec)})
+	}
+	value := legacyRuntimeSpec{
+		RunID: copySpec.RunID, Image: copySpec.Image, Command: copySpec.Command, User: copySpec.User,
+		Env: copySpec.Env, Labels: copySpec.Labels, Mounts: legacyMounts(copySpec.Mounts), Network: copySpec.Network,
+		Resources: copySpec.Resources, WorkingDir: copySpec.WorkingDir, Timeout: copySpec.Timeout,
+	}
+	b, err := json.Marshal(value)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(b)
 	return fmt.Sprintf("v1:%x", sum[:]), nil
+}
+
+// effectiveRuntimeLaunchFingerprint intentionally contains the complete
+// Docker create request derived from a reviewed RuntimeSpec. It is used only
+// for non-legacy launches, including authority workers and their helpers.
+// RuntimeSpec exposes no caller-controlled capability fields; CapAdd and
+// SecurityOpt remain derived by the fixed runtime functions above.
+type effectiveRuntimeLaunchFingerprint struct {
+	CreateRequest dockerCreateRequest
+}
+
+func effectiveRuntimeLaunchFingerprintDigest(value effectiveRuntimeLaunchFingerprint) (string, error) {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("v2:%x", sum[:]), nil
+}
+
+// legacyRuntimeSpec is the launch-spec representation emitted before authority
+// workers added platform, entrypoint, named-volume, and privilege-transition
+// fields. Keep that representation for ordinary workers whose new fields are
+// all absent so a crash between Docker create and intent persistence can still
+// adopt its already-created container after an upgrade.
+type legacyRuntimeSpec struct {
+	RunID      string
+	Image      string
+	Command    []string
+	User       string
+	Env        map[string]string
+	Labels     map[string]string
+	Mounts     []legacyMount
+	Network    NetworkPolicy
+	Resources  Resources
+	WorkingDir string
+	Timeout    time.Duration
+}
+
+type legacyMount struct {
+	Source   string
+	Target   string
+	ReadOnly bool
+}
+
+func legacyOrdinaryRuntimeSpec(spec RuntimeSpec) bool {
+	if spec.Platform != "" || len(spec.Entrypoint) != 0 || spec.AllowAgentdSetuidLauncherPrivilegeTransition {
+		return false
+	}
+	for _, mount := range spec.Mounts {
+		if mount.Volume || mount.VolumeSubpath != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func legacyMounts(mounts []Mount) []legacyMount {
+	if mounts == nil {
+		return nil
+	}
+	out := make([]legacyMount, len(mounts))
+	for i, mount := range mounts {
+		out[i] = legacyMount{Source: mount.Source, Target: mount.Target, ReadOnly: mount.ReadOnly}
+	}
+	return out
 }
 
 func cloneStringMap(in map[string]string) map[string]string {
@@ -554,17 +821,32 @@ func envList(env map[string]string) []string {
 	for k, v := range env {
 		out = append(out, k+"="+v)
 	}
+	sort.Strings(out)
 	return out
 }
 
 func binds(mounts []Mount) []string {
 	out := make([]string, 0, len(mounts))
 	for _, mount := range mounts {
+		if mount.Volume {
+			continue
+		}
 		mode := "rw"
 		if mount.ReadOnly {
 			mode = "ro"
 		}
 		out = append(out, filepath.Clean(mount.Source)+":"+mount.Target+":"+mode)
+	}
+	return out
+}
+
+func dockerMounts(mounts []Mount) []dockerMount {
+	var out []dockerMount
+	for _, mount := range mounts {
+		if !mount.Volume {
+			continue
+		}
+		out = append(out, dockerMount{Type: "volume", Source: mount.Source, Target: mount.Target, ReadOnly: mount.ReadOnly, VolumeOptions: &dockerVolumeOptions{Subpath: mount.VolumeSubpath}})
 	}
 	return out
 }

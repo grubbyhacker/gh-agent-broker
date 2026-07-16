@@ -64,6 +64,7 @@ type NetworkPolicy struct {
 
 type CredentialBundle struct {
 	SourcePath               string   `yaml:"source_path"`
+	SourceVolume             string   `yaml:"source_volume"`
 	MountPath                string   `yaml:"mount_path"`
 	ReadOnly                 bool     `yaml:"readonly"`
 	AllowedTemplates         []string `yaml:"allowed_templates"`
@@ -290,7 +291,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	for name, bundle := range c.Bundles {
-		errs = append(errs, validateBundle(name, bundle)...)
+		errs = append(errs, c.validateBundle(name, bundle)...)
 	}
 	if len(c.Templates) == 0 {
 		errs = append(errs, "templates must not be empty")
@@ -316,13 +317,21 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func validateBundle(name string, bundle CredentialBundle) []string {
+func (c Config) validateBundle(name string, bundle CredentialBundle) []string {
 	var errs []string
 	if name == "" {
 		errs = append(errs, "credential bundle name is required")
 	}
-	if !filepath.IsAbs(bundle.SourcePath) {
+	hasPath := strings.TrimSpace(bundle.SourcePath) != ""
+	hasVolume := strings.TrimSpace(bundle.SourceVolume) != ""
+	if hasPath == hasVolume {
+		errs = append(errs, fmt.Sprintf("credential bundle %q must set exactly one of source_path or source_volume", name))
+	}
+	if hasPath && !filepath.IsAbs(bundle.SourcePath) {
 		errs = append(errs, fmt.Sprintf("credential bundle %q source_path must be absolute", name))
+	}
+	if hasVolume && !safeDockerVolumeName(bundle.SourceVolume) {
+		errs = append(errs, fmt.Sprintf("credential bundle %q source_volume is unsafe", name))
 	}
 	if !filepath.IsAbs(bundle.MountPath) {
 		errs = append(errs, fmt.Sprintf("credential bundle %q mount_path must be absolute", name))
@@ -330,12 +339,37 @@ func validateBundle(name string, bundle CredentialBundle) []string {
 	if !bundle.ReadOnly {
 		errs = append(errs, fmt.Sprintf("credential bundle %q readonly must be true", name))
 	}
-	if filepath.Clean(bundle.SourcePath) == "/var/run/docker.sock" || strings.HasPrefix(filepath.Clean(bundle.SourcePath), "/var/run/docker.sock/") {
+	if hasPath && (filepath.Clean(bundle.SourcePath) == "/var/run/docker.sock" || strings.HasPrefix(filepath.Clean(bundle.SourcePath), "/var/run/docker.sock/")) {
 		errs = append(errs, fmt.Sprintf("credential bundle %q cannot mount Docker socket", name))
 	}
 	if bundle.MountPath == "/" || strings.HasPrefix(bundle.MountPath, "/input") || strings.HasPrefix(bundle.MountPath, "/work") ||
 		strings.HasPrefix(bundle.MountPath, "/output") || strings.HasPrefix(bundle.MountPath, "/lessons") {
 		errs = append(errs, fmt.Sprintf("credential bundle %q mount_path conflicts with sandbox paths", name))
+	}
+	if hasVolume {
+		if filepath.Clean(bundle.MountPath) != authorityCodexHomeMountPath {
+			errs = append(errs, fmt.Sprintf("credential bundle %q source_volume must mount at %q", name, authorityCodexHomeMountPath))
+		}
+		if len(bundle.AllowedTemplates) != 0 {
+			errs = append(errs, fmt.Sprintf("credential bundle %q source_volume cannot allow sandbox templates", name))
+		}
+		if len(bundle.AllowedAuthorityProfiles) == 0 {
+			errs = append(errs, fmt.Sprintf("credential bundle %q source_volume must allow an authority profile", name))
+		}
+	}
+	for _, profile := range bundle.AllowedAuthorityProfiles {
+		if _, ok := c.AuthorityProfiles[profile]; !ok {
+			errs = append(errs, fmt.Sprintf("credential bundle %q allows unknown authority profile %q", name, profile))
+		}
+	}
+	if hasVolume {
+		for profileName, profile := range c.AuthorityProfiles {
+			if bundle.SourceVolume == profile.Storage.SessionVolume ||
+				bundle.SourceVolume == profile.Storage.CheckpointVolume ||
+				bundle.SourceVolume == profile.Storage.EvidenceVolume {
+				errs = append(errs, fmt.Sprintf("credential bundle %q source_volume conflicts with authority profile %q managed storage volumes", name, profileName))
+			}
+		}
 	}
 	for _, p := range append(bundle.SecretFiles, bundle.RedactFiles...) {
 		if !safeRelativePath(p) {
@@ -343,6 +377,10 @@ func validateBundle(name string, bundle CredentialBundle) []string {
 		}
 	}
 	return errs
+}
+
+func safeDockerVolumeName(value string) bool {
+	return len(value) <= 80 && regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]+$`).MatchString(value)
 }
 
 func (c Config) validateTemplate(name string, tmpl Template) []string {
@@ -734,6 +772,11 @@ func (c Config) versionDigest() string {
 		entry := map[string]any{
 			"SourcePath": bundle.SourcePath, "MountPath": bundle.MountPath, "ReadOnly": bundle.ReadOnly,
 			"AllowedTemplates": bundle.AllowedTemplates, "SecretFiles": bundle.SecretFiles, "RedactFiles": bundle.RedactFiles,
+		}
+		// Preserve the pre-source_volume canonical shape for legacy configs so
+		// startup reconciliation accepts their nonterminal launch intents.
+		if bundle.SourceVolume != "" {
+			entry["SourceVolume"] = bundle.SourceVolume
 		}
 		if len(bundle.AllowedAuthorityProfiles) > 0 {
 			entry["AllowedAuthorityProfiles"] = bundle.AllowedAuthorityProfiles

@@ -42,6 +42,7 @@ on:
 permissions:
   contents: read
   issues: write
+  packages: read
 
 jobs:
   deploy:
@@ -131,6 +132,8 @@ jobs:
           VPS_OPS_SECRET_BACKEND: doppler
           VPS_OPS_DOPPLER_SOURCE: env
           VPS_OPS_DOPPLER_ROLES: gh-agent-broker
+          VPS_OPS_GH_BROKER_GHCR_PACKAGES_READ_TOKEN: ${{ github.token }}
+          VPS_OPS_GH_BROKER_GHCR_PULL_USERNAME: ${{ github.actor }}
           VPS_OPS_GH_BROKER_ADMIN_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_ADMIN_SECRET }}
           VPS_OPS_GH_BROKER_REPORTER_01_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_REPORTER_01_SECRET }}
           VPS_OPS_GH_BROKER_SANDBOX_MCP_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_SANDBOX_MCP_TOKEN }}

@@ -132,6 +132,183 @@ logical session, turn, runtime adapter, or Fleet package dependency. PR 9 can
 consume the fixed profile, lifecycle, storage, checkpoint, and isolation
 contract after the versioned agentd session protocol is released.
 
+## PR 9 Coordinator Reassignment and Fencing Contract
+
+The authenticated authority-worker REST surface exposes
+`POST /v1/authority-workers/leases/reassign`. Its bounded request contains a
+logical `session_binding`, the coordinator-observed `predecessor_worker_id`,
+the predecessor's `prior_fence_epoch`, and an idempotency key. It cannot select a replacement, image, authority,
+credential, mount, network, or policy. The broker derives the destination from
+the predecessor's durable replacement link and requires that replacement to be
+ready, profile-compatible, and within capacity.
+
+Schema v4 gives every logical lease an opaque durable `lineage_id` and a
+monotonic `fence_epoch`. It atomically CASes predecessor worker plus prior
+epoch to successor worker plus incremented epoch, transfers capacity, and
+keeps the workspace keyed by lineage rather than worker generation. The typed
+admission and reassignment responses include both values, and agentd session
+creation receives broker-selected uid, gid, workspace path, lineage, and
+epoch; callers cannot choose them. Replacement and reassignment assert the
+full immutable profile digest (including storage), policy digest, image, and
+capacity identity.
+
+`POST /v1/authority-workers/agentd/session-validation` is the minimal
+broker-secret-authenticated, fail-closed fencing contract for agentd. Before
+journal/workspace/launcher state access, agentd must validate its worker,
+lineage, and epoch. A predecessor or old epoch is denied after CAS. Current
+Docker liveness is explicitly not agentd readiness: reconciliation requires a
+future authenticated agentd readiness probe covering journal/runtime/launcher/
+fence configuration, and Docker returns unavailable until that protocol lands.
+Checkpoint files remain lease-observation evidence only, not an agentd
+recovery manifest or a recovery guarantee.
+
+The current broker/agentd integration matches the agentd PR 10 source contract:
+authenticated `/readyz` uses `agentd/control/v1` and the camelCase
+`workerId`, `storageLineageId`, and `fenceEpoch` identity fields plus the
+`components` object. Create-session projects the exact agentd/v1 camelCase
+fields and the workspace object contains only `workspaceRef`, `uid`, and `gid`.
+Profiles without the authenticated agentd readiness contract retain their
+existing liveness behavior; the stricter readiness gate applies only to the
+profile that opts into it.
+
+Worker journal/session, checkpoint, and evidence named volumes are mounted
+with Docker `VolumeOptions.Subpath` set to the opaque worker storage lineage.
+A root-run initializer creates and secures those lineage directories before
+the worker container is created. The lineage root remains `bun:bun 0711` so
+distinct session UIDs/GIDs can traverse to their own `0700` workspaces. A
+second broker-managed initializer creates `.agentd-state` inside the session
+lineage root as `bun:bun 0700`; agentd keeps its SQLite journal file `0600` at
+`.agentd-state/agentd.sqlite3`. Authority workers never receive the full backing
+volume. Replacements inherit the storage lineage and therefore reuse that same
+private state directory while advancing its worker
+fence epoch by exactly one, while logical session lineage remains unchanged and
+separate. Journal continuation therefore comes from inherited fenced storage,
+not from broker checkpoint artifacts.
+
+The root-owned authority volume initializer is a distinct, fixed `install`
+helper. It retains `no-new-privileges`, non-privileged mode, no network, and
+`CapDrop: ALL`, adding only `CAP_CHOWN` and `CAP_FOWNER`: `install -o bun -g
+bun` first needs `CAP_CHOWN` for its `chown(2)` ownership transition, then
+needs `CAP_FOWNER` because it applies the requested mode after the directory is
+owned by `bun`. A real Docker proof showed that `CAP_CHOWN` alone fails at that
+post-chown mode change. The separate state initializer then runs as `bun` with
+zero added capabilities, creating `.agentd-state` under the now bun-owned
+lineage root. These root-helper capabilities are package-private; ordinary
+workers retain zero added capabilities and the authority runtime retains only
+`SETUID` and `SETGID`.
+
+The reviewed agentd authority runtime keeps the server process explicitly on
+Docker user `bun`, remains non-privileged, drops all capabilities, and restores
+only `SETUID` and `SETGID` to the bounding set. Its
+immutable root-owned setuid launcher is the sole RuntimeSpec exception to the
+default `no-new-privileges` option because the launcher must obtain euid 0
+during exec before dropping into the turn's allocated UID/GID. Ordinary
+sandboxes, helpers, volume initializers, and legacy paths retain
+`no-new-privileges`; authenticated readiness is not treated as proof that the
+actual launch spec permits this transition.
+
+Profiles selecting `agentd/control/v1` now fail closed unless
+`workspace_root` is exactly `/var/lib/agentd/workspaces`, matching agentd's
+fixed immediate-child launcher boundary. `AGENTD_SESSION_ROOT` remains that
+exact path, while `AGENTD_STATE_PATH` is
+`/var/lib/agentd/workspaces/.agentd-state/agentd.sqlite3`. The hidden state
+directory cannot be allocated as a session workspace: broker lineages are
+exactly 32 hexadecimal characters, and agentd accepts only the exact
+broker-projected lineage child rather than discovering directory entries. The
+follow-on vps-ops integration PR must change the managed profile from
+`/var/lib/agentd/sessions` and update its reviewed digest.
+
+The authority Docker create contract keeps `USER bun`, non-privileged and the
+existing read-only constraints, drops `ALL`, then adds only `SETUID` and
+`SETGID` to the capability bounding set. Only this immutable authority spec
+omits `no-new-privileges`; ordinary Bun processes retain no general root path,
+while the root-owned fixed setuid launcher owns the reviewed transition. Agentd
+PR 10 independently exercises that image-side launcher transition and its
+negative Bun control. A
+staging-only credential bundle may select a fixed named Docker volume, mounted
+read-only at `/var/empty/.codex`; host-path credential bundles are unchanged,
+and production authority profiles reject credentials.
+
+Authority workers now receive the fixed broker validation URL
+`http://broker:8080/v1/authority-workers/agentd/session-validation` and a
+domain-separated HMAC validation token derived from the reviewed broker-agent
+secret and bound to the exact worker ID, storage lineage ID, and fence epoch.
+The raw broker secret is never reused as the validation token. Validation uses
+a constant-time comparison and returns the same `unauthorized` result for an
+unknown worker and an invalid token before checking lease/session fences.
+Agentd PR 10 head `cf2d5f475daf3a7defb2595486338610a310c82d`
+finalizes `/readyz` with the additional required
+`components.brokerFenceValidatorConfigured` field. Broker decoding requires
+that exact field while retaining the journal, runtime, launcher, and isolation
+claims; the retired `brokerFenceValidator` spelling and missing components fail
+closed.
+
+Reassignment now completes the durable broker-to-agentd half of the fencing
+contract. Agentd's generated `sessionId` is recorded against the broker-owned
+workspace during authenticated session creation. After the exact predecessor
+to recorded-successor lease CAS, the broker calls only that successor's
+Docker-inspected endpoint at `POST /v1/sessions/<sessionId>/rebind` with the
+existing coordinator bearer token. The body contains only a broker-derived
+stable idempotency key and the exact predecessor/successor worker, storage
+lineage, and epoch bindings. A strict full `agentd/v1` status matching the
+durable coordinator binding, session identity, lineage, worker, and epoch is
+required before predecessor retirement or reassignment success.
+
+Timeouts, malformed or mismatched success bodies, and agentd 5xx/validator/
+storage failures return `reassignment_rebind_retryable` with HTTP 503 after
+the CAS and never roll it back. Exact-transition retries resume the same agentd
+command without another lease effect, even when the coordinator supplies a
+fresh transport request key. Agentd `rebind_conflict` and `session_fenced` 409
+responses return terminal `reassignment_rebind_conflict`; other 4xx responses
+are never accepted as success. Audit errors remain bounded and do not include
+the coordinator token, successor endpoint, or agentd response body.
+
+Config versioning retains the exact pre-`source_volume` canonical digest shape
+when that field is empty, so ordinary-worker nonterminal launch intents remain
+reconcilable across upgrade. A nonempty named source volume is included in the
+digest. Runtime launch-spec labels likewise retain their pre-authority-field
+canonical representation only for ordinary specs whose platform, entrypoint,
+volume/subpath mounts, and privilege-transition flag are all absent. This lets
+a persisted `create_pending` intent adopt its exact pre-upgrade Docker
+container; authority specs always use the full current representation.
+Staging credential source volumes must be distinct from every configured
+authority profile's broker-managed session, checkpoint, and evidence volumes,
+regardless of which profiles the credential bundle is allowed to reference.
+
+The production deploy workflow grants `packages: read` and passes the
+ephemeral `github.token` plus `github.actor` to only the vps-ops deploy step as
+the GHCR pull credential interface expected after vps-ops #244. No PAT,
+repository secret, Doppler credential, or container environment projection is
+introduced by this repository.
+
+A schema-v7 reassignment row now captures the raw coordinator binding,
+authority profile, agentd/session lineage IDs, exact predecessor and successor
+worker/storage/epoch bindings, broker-derived rebind idempotency key, and
+workspace identity in the same transaction as the lease/workspace CAS. Its
+agentd adoption state starts `pending`; only a strictly matching HTTP 200
+status atomically changes it to `confirmed`. Semantic agentd conflicts are
+persisted as `conflict`, and migrated pre-v7 rows are `legacy_unresolved`
+because their hashed coordinator bindings cannot reconstruct an exact status
+check. Both states remain actionable and block automatic retirement.
+
+Reconciliation enumerates every non-confirmed transition and replays pending
+rows to the recorded successor with the exact stored body, independent of the
+original coordinator request key. A crash before the call or after agentd
+success is therefore recovered by the same idempotent command. Retryable,
+malformed, and mismatched responses remain pending. All predecessor retirement
+lookups and the final conditional stopped-state update require every transition
+from that predecessor to be confirmed; readiness and zero lease count alone
+are insufficient. Concurrent health/reconcile retirement is serialized within
+the service, and multiple sessions block retirement until all adoptions are
+confirmed.
+
+REST errors remain structured as
+`reassignment_not_ready`, `reassignment_stale_predecessor`,
+`reassignment_conflicting_replacement`, `reassignment_capacity`, and
+`reassignment_replay`, plus retryable `reassignment_rebind_retryable` and
+terminal `reassignment_rebind_conflict`. This does not activate any generic
+production route or alter an authority profile.
+
 ## Validation
 
 Run `make fmt` after changing Go code and `make check` before handoff. Also run

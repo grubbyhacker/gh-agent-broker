@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -10,12 +11,29 @@ import (
 // It never accepts caller-selected runtime, repository, or policy fields.
 func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/authority-workers"), "/")
+		if r.Method == http.MethodPost && path == "agentd/session-validation" {
+			var in AgentdSessionValidationRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.ValidateAgentdSession(r.Context(), bearerToken(r), in)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusInternalServerError, "validation_failed", err.Error())
+				return
+			}
+			if !out.Authorized {
+				writeJSON(w, http.StatusForbidden, out)
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
 		principal, ok := authorityRESTPrincipal(service.cfg, bearerToken(r))
 		if !ok {
 			writeRESTError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/authority-workers"), "/")
 		if r.Method == http.MethodPost && path == "provision" {
 			var in struct {
 				Profile string `json:"profile"`
@@ -58,6 +76,28 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			out, err := service.Release(r.Context(), principal, in.SessionBinding)
 			if err != nil {
 				writeRESTCodeError(w, http.StatusConflict, "lease_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		if r.Method == http.MethodPost && path == "leases/reassign" {
+			var in AuthoritySessionReassignmentRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.ReassignSession(r.Context(), principal, in)
+			if err != nil {
+				var reassignmentErr *ReassignmentError
+				if errors.As(err, &reassignmentErr) {
+					status := http.StatusConflict
+					if reassignmentErr.Code == ReassignmentRebindRetryable {
+						status = http.StatusServiceUnavailable
+					}
+					writeRESTCodeError(w, status, string(reassignmentErr.Code), reassignmentErr.Error())
+					return
+				}
+				writeRESTCodeError(w, http.StatusConflict, "reassignment_denied", err.Error())
 				return
 			}
 			writeJSON(w, http.StatusOK, out)

@@ -1164,7 +1164,7 @@ func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Red
 		if !contains(bundle.AllowedTemplates, meta.Template) {
 			return RuntimeSpec{}, redactor, fmt.Errorf("credential bundle %q does not allow template %q", tmpl.CredentialBundle, meta.Template)
 		}
-		mounts = append(mounts, Mount{Source: bundle.SourcePath, Target: bundle.MountPath, ReadOnly: true})
+		mounts = append(mounts, credentialBundleMount(bundle))
 		bundleRedactor := RedactorForBundle(bundle)
 		redactor.known = append(redactor.known, bundleRedactor.known...)
 	}

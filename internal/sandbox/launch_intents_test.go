@@ -256,6 +256,41 @@ func TestRESTLaunchReplayAfterRestartAndIndexReconstruction(t *testing.T) {
 	}
 }
 
+func TestLegacyConfigVersionAcceptsNonterminalOrdinaryWorkerIntentOnUpgrade(t *testing.T) {
+	cfg := restTestConfig(t)
+	cfg.RunsDir = "/tmp/gh-agent-broker-config-upgrade-regression/runs"
+	t.Cleanup(func() {
+		if err := os.RemoveAll("/tmp/gh-agent-broker-config-upgrade-regression"); err != nil {
+			t.Errorf("remove upgrade regression fixture: %v", err)
+		}
+	})
+	bundle := cfg.Bundles["codex"]
+	bundle.SourcePath = "/srv/sandbox-test/bundle"
+	cfg.Bundles["codex"] = bundle
+	tmpl := cfg.Templates["worker"]
+	tmpl.KnowledgeSnapshots = []string{"/srv/sandbox-test/knowledge.md"}
+	tmpl.ExtraMounts = []ExtraMount{{SourcePath: "/srv/sandbox-test/evidence", MountPath: "/data/intake", ReadOnly: true}}
+	cfg.Templates["worker"] = tmpl
+	cfg.Audit.Path = "/srv/sandbox-test/audit.jsonl"
+	cfg.StampLoaded(time.Unix(1, 0).UTC())
+
+	// This digest was emitted by the release before source_volume was added.
+	// Keeping the fixture literal ensures an empty new field cannot silently
+	// alter the canonical shape and strand an ordinary-worker launch intent.
+	const legacyConfigVersion = "5d3541645374a2e21fb78c756202e8fbc4cf86c2f71e58cc12801d58c22bab84"
+	if cfg.ConfigVersion != legacyConfigVersion {
+		t.Fatalf("legacy config version=%q, want %q", cfg.ConfigVersion, legacyConfigVersion)
+	}
+	service := newRESTTestService(t, cfg, newFakeRuntime(), testAudit(t))
+	intent := persistRecoveryIntent(t, service, service.launchIntents, intentStateRunning)
+	if intent.Plan.ConfigVersion != legacyConfigVersion {
+		t.Fatalf("persisted config version=%q, want legacy %q", intent.Plan.ConfigVersion, legacyConfigVersion)
+	}
+	if err := service.Reconcile(context.Background()); err != nil {
+		t.Fatalf("upgrade reconciliation rejected legacy nonterminal intent: %v", err)
+	}
+}
+
 func TestLaunchIntentNeverPersistsOrAuditsRawKey(t *testing.T) {
 	cfg := restTestConfig(t)
 	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
