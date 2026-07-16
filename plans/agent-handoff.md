@@ -132,21 +132,38 @@ logical session, turn, runtime adapter, or Fleet package dependency. PR 9 can
 consume the fixed profile, lifecycle, storage, checkpoint, and isolation
 contract after the versioned agentd session protocol is released.
 
-## PR 9 Coordinator Reassignment Contract
+## PR 9 Coordinator Reassignment and Fencing Contract
 
-The authenticated authority-worker REST surface now exposes only
+The authenticated authority-worker REST surface exposes
 `POST /v1/authority-workers/leases/reassign`. Its bounded request contains a
 logical `session_binding`, the coordinator-observed `predecessor_worker_id`,
-and an idempotency key. It cannot select a replacement, image, authority,
+the predecessor's `prior_fence_epoch`, and an idempotency key. It cannot select a replacement, image, authority,
 credential, mount, network, or policy. The broker derives the destination from
 the predecessor's durable replacement link and requires that replacement to be
 ready, profile-compatible, and within capacity.
 
-Schema v3 atomically transfers the active lease and its existing workspace
-allocation, moves capacity accounting from predecessor to replacement, and
-records the reassignment replay result. A committed zero-lease draining
-predecessor is retired after cutover; reconciliation retries that retirement
-after an interruption. REST errors remain structured as
+Schema v4 gives every logical lease an opaque durable `lineage_id` and a
+monotonic `fence_epoch`. It atomically CASes predecessor worker plus prior
+epoch to successor worker plus incremented epoch, transfers capacity, and
+keeps the workspace keyed by lineage rather than worker generation. The typed
+admission and reassignment responses include both values, and agentd session
+creation receives broker-selected uid, gid, workspace path, lineage, and
+epoch; callers cannot choose them. Replacement and reassignment assert the
+full immutable profile digest (including storage), policy digest, image, and
+capacity identity.
+
+`POST /v1/authority-workers/agentd/session-validation` is the minimal
+broker-secret-authenticated, fail-closed fencing contract for agentd. Before
+journal/workspace/launcher state access, agentd must validate its worker,
+lineage, and epoch. A predecessor or old epoch is denied after CAS. Current
+Docker liveness is explicitly not agentd readiness: reconciliation requires a
+future authenticated agentd readiness probe covering journal/runtime/launcher/
+fence configuration, and Docker returns unavailable until that protocol lands.
+Checkpoint files remain lease-observation evidence only, not an agentd
+recovery manifest or a recovery guarantee.
+
+A committed zero-lease draining predecessor is retired after cutover;
+reconciliation retries that retirement after an interruption. REST errors remain structured as
 `reassignment_not_ready`, `reassignment_stale_predecessor`,
 `reassignment_conflicting_replacement`, `reassignment_capacity`, and
 `reassignment_replay`. This is an inert broker contract: it does not activate

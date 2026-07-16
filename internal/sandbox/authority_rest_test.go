@@ -27,7 +27,7 @@ func TestAuthorityRESTSessionReassignmentContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at) VALUES(?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 21000, 21000, "/durable/rest-session", formatAuthorityTime(service.now())); err != nil {
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 21000, 21000, "/durable/rest-session", formatAuthorityTime(service.now()), lease.LineageID); err != nil {
 		t.Fatal(err)
 	}
 	replacement, err := service.Replace(ctx, "coordinator", old.WorkerID, "lost")
@@ -35,7 +35,7 @@ func TestAuthorityRESTSessionReassignmentContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := NewAuthorityRESTHandler(service)
-	body := []byte(`{"session_binding":"rest-session","predecessor_worker_id":"rest-old","idempotency_key":"rest-reassign"}`)
+	body := []byte(`{"session_binding":"rest-session","predecessor_worker_id":"rest-old","prior_fence_epoch":1,"idempotency_key":"rest-reassign"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/authority-workers/leases/reassign", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer coordinator-test-token")
 	resp := httptest.NewRecorder()
@@ -59,7 +59,7 @@ func TestAuthorityRESTSessionReassignmentContract(t *testing.T) {
 	}
 	// Unknown authority-bearing fields are rejected rather than being silently
 	// interpreted as a caller override.
-	bad := []byte(`{"session_binding":"rest-session","predecessor_worker_id":"rest-old","idempotency_key":"rest-reassign-2","image":"forbidden"}`)
+	bad := []byte(`{"session_binding":"rest-session","predecessor_worker_id":"rest-old","prior_fence_epoch":1,"idempotency_key":"rest-reassign-2","image":"forbidden"}`)
 	req = httptest.NewRequest(http.MethodPost, "/v1/authority-workers/leases/reassign", bytes.NewReader(bad))
 	req.Header.Set("Authorization", "Bearer coordinator-test-token")
 	resp = httptest.NewRecorder()

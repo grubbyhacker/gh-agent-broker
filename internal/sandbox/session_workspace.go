@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 type SessionWorkspace struct {
-	UID, GID int
-	Path     string
+	UID, GID  int
+	Path      string
+	LineageID string `json:"lineage_id"`
 }
 
 func (s *AuthorityWorkerStore) AllocateSessionWorkspace(ctx context.Context, lease AuthorityLease, policy SessionIsolation) (SessionWorkspace, error) {
@@ -19,7 +21,7 @@ func (s *AuthorityWorkerStore) AllocateSessionWorkspace(ctx context.Context, lea
 		return SessionWorkspace{}, fmt.Errorf("active authority lease is required")
 	}
 	var existing SessionWorkspace
-	err := s.db.QueryRowContext(ctx, `SELECT uid,gid,workspace_path FROM authority_session_workspaces WHERE binding_digest=?`, lease.BindingDigest).Scan(&existing.UID, &existing.GID, &existing.Path)
+	err := s.db.QueryRowContext(ctx, `SELECT uid,gid,workspace_path,lineage_id FROM authority_session_workspaces WHERE lineage_id=?`, lease.LineageID).Scan(&existing.UID, &existing.GID, &existing.Path, &existing.LineageID)
 	if err == nil {
 		return existing, nil
 	}
@@ -30,7 +32,7 @@ func (s *AuthorityWorkerStore) AllocateSessionWorkspace(ctx context.Context, lea
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM authority_session_workspaces WHERE worker_id=?`, lease.WorkerID).Scan(&used); err != nil {
 		return SessionWorkspace{}, err
 	}
-	workspace := SessionWorkspace{UID: policy.UIDStart + used, GID: policy.GIDStart + used, Path: filepath.Join(policy.WorkspaceRoot, lease.BindingDigest)}
+	workspace := SessionWorkspace{UID: policy.UIDStart + used, GID: policy.GIDStart + used, Path: filepath.Join(policy.WorkspaceRoot, lease.LineageID), LineageID: lease.LineageID}
 	if err := os.MkdirAll(workspace.Path, 0o700); err != nil {
 		return SessionWorkspace{}, err
 	}
@@ -41,7 +43,7 @@ func (s *AuthorityWorkerStore) AllocateSessionWorkspace(ctx context.Context, lea
 	if err := os.Chown(workspace.Path, workspace.UID, workspace.GID); err != nil {
 		return SessionWorkspace{}, err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at) VALUES(?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))`, lease.BindingDigest, lease.WorkerID, workspace.UID, workspace.GID, workspace.Path)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, lease.WorkerID, workspace.UID, workspace.GID, workspace.Path, formatAuthorityTime(time.Now().UTC()), workspace.LineageID)
 	if err != nil {
 		return SessionWorkspace{}, err
 	}
@@ -50,6 +52,6 @@ func (s *AuthorityWorkerStore) AllocateSessionWorkspace(ctx context.Context, lea
 
 func (s *AuthorityWorkerStore) SessionWorkspace(ctx context.Context, binding string) (SessionWorkspace, error) {
 	var workspace SessionWorkspace
-	err := s.db.QueryRowContext(ctx, `SELECT uid,gid,workspace_path FROM authority_session_workspaces WHERE binding_digest=?`, s.requestDigest(binding)).Scan(&workspace.UID, &workspace.GID, &workspace.Path)
+	err := s.db.QueryRowContext(ctx, `SELECT uid,gid,workspace_path,lineage_id FROM authority_session_workspaces WHERE binding_digest=?`, s.requestDigest(binding)).Scan(&workspace.UID, &workspace.GID, &workspace.Path, &workspace.LineageID)
 	return workspace, err
 }

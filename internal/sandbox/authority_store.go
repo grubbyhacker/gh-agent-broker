@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 3
+const authorityStoreSchemaVersion = 4
 
 type AuthorityWorkerState string
 
@@ -55,6 +55,8 @@ type AuthorityLease struct {
 	Principal         string    `json:"principal"`
 	Profile           string    `json:"profile"`
 	WorkerID          string    `json:"worker_id"`
+	LineageID         string    `json:"lineage_id"`
+	FenceEpoch        int64     `json:"fence_epoch"`
 	BindingDigest     string    `json:"session_binding_digest"`
 	IdempotencyDigest string    `json:"idempotency_key_digest"`
 	CreatedAt         time.Time `json:"created_at"`
@@ -162,6 +164,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		if err := s.migrateV3(ctx); err != nil {
 			return err
 		}
+		version = 3
+	}
+	if version == 3 {
+		if err := s.migrateV4(ctx); err != nil {
+			return err
+		}
 	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
@@ -242,6 +250,20 @@ func (s *AuthorityWorkerStore) migrateV3(ctx context.Context) error {
 	return err
 }
 
+// V4 makes the logical session identity independent of a worker generation.
+// Existing sessions receive a one-time opaque lineage during migration.
+func (s *AuthorityWorkerStore) migrateV4(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE authority_session_leases ADD COLUMN lineage_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_leases ADD COLUMN fence_epoch INTEGER NOT NULL DEFAULT 1;
+	ALTER TABLE authority_session_workspaces ADD COLUMN lineage_id TEXT NOT NULL DEFAULT '';
+	UPDATE authority_session_leases SET lineage_id=lower(hex(randomblob(16))) WHERE lineage_id='';
+	UPDATE authority_session_workspaces SET lineage_id=(SELECT lineage_id FROM authority_session_leases l WHERE l.binding_digest=authority_session_workspaces.binding_digest) WHERE lineage_id='';
+	CREATE UNIQUE INDEX authority_session_leases_lineage ON authority_session_leases(lineage_id);
+	CREATE UNIQUE INDEX authority_session_workspaces_lineage ON authority_session_workspaces(lineage_id);
+	PRAGMA user_version=4`)
+	return err
+}
+
 func (s *AuthorityWorkerStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
@@ -253,6 +275,14 @@ func (s *AuthorityWorkerStore) requestDigest(raw string) string {
 	mac := hmac.New(sha256.New, s.salt)
 	_, _ = mac.Write([]byte(raw))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func newAuthorityLineageID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate session lineage: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (s *AuthorityWorkerStore) CreateWorker(ctx context.Context, worker AuthorityWorker, maxWorkers int) (AuthorityWorker, error) {
@@ -427,8 +457,8 @@ func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, re
 	}()
 	var lease AuthorityLease
 	var storedFingerprint, created, released string
-	err = conn.QueryRowContext(ctx, `SELECT profile,worker_id,binding_digest,idempotency_digest,request_fingerprint,created_at,released_at FROM authority_session_leases WHERE principal=? AND profile=? AND idempotency_digest=?`, principal, request.Profile, idem).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.BindingDigest, &lease.IdempotencyDigest, &storedFingerprint, &created, &released)
+	err = conn.QueryRowContext(ctx, `SELECT profile,worker_id,lineage_id,fence_epoch,binding_digest,idempotency_digest,request_fingerprint,created_at,released_at FROM authority_session_leases WHERE principal=? AND profile=? AND idempotency_digest=?`, principal, request.Profile, idem).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.LineageID, &lease.FenceEpoch, &lease.BindingDigest, &lease.IdempotencyDigest, &storedFingerprint, &created, &released)
 	if err == nil {
 		if storedFingerprint != fingerprint {
 			return AuthorityLease{}, fmt.Errorf("idempotency conflict")
@@ -471,7 +501,11 @@ func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, re
 		return AuthorityLease{}, fmt.Errorf("authority worker capacity changed")
 	}
 	now := time.Now().UTC()
-	_, err = conn.ExecContext(ctx, `INSERT INTO authority_session_leases(principal,profile,idempotency_digest,request_fingerprint,binding_digest,worker_id,created_at) VALUES(?,?,?,?,?,?,?)`, principal, request.Profile, idem, fingerprint, binding, workerID, formatAuthorityTime(now))
+	lineageID, err := newAuthorityLineageID()
+	if err != nil {
+		return AuthorityLease{}, err
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO authority_session_leases(principal,profile,idempotency_digest,request_fingerprint,binding_digest,worker_id,lineage_id,fence_epoch,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, principal, request.Profile, idem, fingerprint, binding, workerID, lineageID, 1, formatAuthorityTime(now))
 	if err != nil {
 		return AuthorityLease{}, err
 	}
@@ -479,7 +513,7 @@ func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, re
 		return AuthorityLease{}, err
 	}
 	committed = true
-	return AuthorityLease{Principal: principal, Profile: request.Profile, WorkerID: workerID, BindingDigest: binding, IdempotencyDigest: idem, CreatedAt: now}, nil
+	return AuthorityLease{Principal: principal, Profile: request.Profile, WorkerID: workerID, LineageID: lineageID, FenceEpoch: 1, BindingDigest: binding, IdempotencyDigest: idem, CreatedAt: now}, nil
 }
 
 func (s *AuthorityWorkerStore) Release(ctx context.Context, principal, sessionBinding string) (AuthorityLease, error) {
@@ -500,8 +534,8 @@ func (s *AuthorityWorkerStore) Release(ctx context.Context, principal, sessionBi
 	}()
 	var lease AuthorityLease
 	var created, released string
-	err = conn.QueryRowContext(ctx, `SELECT profile,worker_id,idempotency_digest,created_at,released_at FROM authority_session_leases WHERE principal=? AND binding_digest=?`, principal, binding).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.IdempotencyDigest, &created, &released)
+	err = conn.QueryRowContext(ctx, `SELECT profile,worker_id,lineage_id,fence_epoch,idempotency_digest,created_at,released_at FROM authority_session_leases WHERE principal=? AND binding_digest=?`, principal, binding).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.LineageID, &lease.FenceEpoch, &lease.IdempotencyDigest, &created, &released)
 	if err != nil {
 		return AuthorityLease{}, err
 	}
@@ -545,8 +579,8 @@ func (s *AuthorityWorkerStore) GetLease(ctx context.Context, principal, sessionB
 	binding := s.requestDigest(sessionBinding)
 	var lease AuthorityLease
 	var created, released string
-	err := s.db.QueryRowContext(ctx, `SELECT profile,worker_id,idempotency_digest,created_at,released_at FROM authority_session_leases WHERE principal=? AND binding_digest=?`, principal, binding).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.IdempotencyDigest, &created, &released)
+	err := s.db.QueryRowContext(ctx, `SELECT profile,worker_id,lineage_id,fence_epoch,idempotency_digest,created_at,released_at FROM authority_session_leases WHERE principal=? AND binding_digest=?`, principal, binding).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.LineageID, &lease.FenceEpoch, &lease.IdempotencyDigest, &created, &released)
 	if err != nil {
 		return AuthorityLease{}, err
 	}
@@ -562,13 +596,21 @@ func (s *AuthorityWorkerStore) GetLease(ctx context.Context, principal, sessionB
 	return lease, nil
 }
 
+func (s *AuthorityWorkerStore) ValidateSessionFence(ctx context.Context, workerID, lineageID string, fenceEpoch int64) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM authority_session_leases l
+		JOIN authority_session_workspaces w ON w.lineage_id=l.lineage_id
+		WHERE l.worker_id=? AND l.lineage_id=? AND l.fence_epoch=? AND l.released_at='' AND w.worker_id=?`, workerID, lineageID, fenceEpoch, workerID).Scan(&count)
+	return count == 1, err
+}
+
 // Reassign moves an active lease only to the replacement durably linked to the
 // supplied predecessor.  Lease ownership, workspace ownership, and capacity
 // accounting commit together, so a process crash leaves either side intact.
-func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionBinding, predecessorWorkerID, idempotencyKey string) (AuthoritySessionReassignment, error) {
+func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionBinding, predecessorWorkerID string, priorFenceEpoch int64, idempotencyKey string) (AuthoritySessionReassignment, error) {
 	binding := s.requestDigest(sessionBinding)
 	idem := s.requestDigest(idempotencyKey)
-	fingerprint := s.requestDigest("reassign:" + sessionBinding + "\x00" + predecessorWorkerID)
+	fingerprint := s.requestDigest(fmt.Sprintf("reassign:%s\x00%s\x00%d", sessionBinding, predecessorWorkerID, priorFenceEpoch))
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return AuthoritySessionReassignment{}, err
@@ -618,7 +660,7 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 		}
 		return AuthoritySessionReassignment{}, err
 	}
-	if !lease.ReleasedAt.IsZero() || lease.WorkerID != predecessorWorkerID {
+	if !lease.ReleasedAt.IsZero() || lease.WorkerID != predecessorWorkerID || lease.FenceEpoch != priorFenceEpoch {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "session binding is not assigned to the supplied predecessor")
 	}
 	var replacementID string
@@ -632,13 +674,18 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	if replacementID == "" {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentNotReady, "predecessor has no broker-recorded replacement")
 	}
-	var replacementProfile string
+	var replacementProfile, replacementProfileVersion, replacementPolicyDigest, replacementImage string
 	var replacementState AuthorityWorkerState
 	var replacementCapacity, replacementAssigned int
-	if err := conn.QueryRowContext(ctx, `SELECT profile,state,capacity,assigned_sessions FROM authority_workers WHERE worker_id=?`, replacementID).Scan(&replacementProfile, &replacementState, &replacementCapacity, &replacementAssigned); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT profile,profile_version,policy_digest,image_reference,state,capacity,assigned_sessions FROM authority_workers WHERE worker_id=?`, replacementID).Scan(&replacementProfile, &replacementProfileVersion, &replacementPolicyDigest, &replacementImage, &replacementState, &replacementCapacity, &replacementAssigned); err != nil {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "broker-recorded replacement is unavailable")
 	}
-	if replacementProfile != predecessorProfile {
+	var predecessorProfileVersion, predecessorPolicyDigest, predecessorImage string
+	var predecessorCapacity int
+	if err := conn.QueryRowContext(ctx, `SELECT profile_version,policy_digest,image_reference,capacity FROM authority_workers WHERE worker_id=?`, predecessorWorkerID).Scan(&predecessorProfileVersion, &predecessorPolicyDigest, &predecessorImage, &predecessorCapacity); err != nil {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "predecessor immutable identity is unavailable")
+	}
+	if replacementProfile != predecessorProfile || replacementProfileVersion != predecessorProfileVersion || replacementPolicyDigest != predecessorPolicyDigest || replacementImage != predecessorImage || replacementCapacity != predecessorCapacity {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "broker-recorded replacement has a different authority profile")
 	}
 	if replacementState != AuthorityWorkerReady {
@@ -664,7 +711,7 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	if err != nil || rows != 1 {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentCapacity, "broker-recorded replacement capacity changed")
 	}
-	result, err = conn.ExecContext(ctx, `UPDATE authority_session_leases SET worker_id=? WHERE principal=? AND binding_digest=? AND worker_id=? AND released_at=''`, replacementID, principal, binding, predecessorWorkerID)
+	result, err = conn.ExecContext(ctx, `UPDATE authority_session_leases SET worker_id=?,fence_epoch=fence_epoch+1 WHERE principal=? AND binding_digest=? AND worker_id=? AND fence_epoch=? AND released_at=''`, replacementID, principal, binding, predecessorWorkerID, priorFenceEpoch)
 	if err != nil {
 		return AuthoritySessionReassignment{}, err
 	}
@@ -672,7 +719,7 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	if err != nil || rows != 1 {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "session lease changed during reassignment")
 	}
-	result, err = conn.ExecContext(ctx, `UPDATE authority_session_workspaces SET worker_id=? WHERE binding_digest=? AND worker_id=?`, replacementID, binding, predecessorWorkerID)
+	result, err = conn.ExecContext(ctx, `UPDATE authority_session_workspaces SET worker_id=? WHERE lineage_id=? AND binding_digest=? AND worker_id=?`, replacementID, lease.LineageID, binding, predecessorWorkerID)
 	if err != nil {
 		return AuthoritySessionReassignment{}, err
 	}
@@ -684,6 +731,7 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 		return AuthoritySessionReassignment{}, err
 	}
 	lease.WorkerID = replacementID
+	lease.FenceEpoch++
 	reassignment = AuthoritySessionReassignment{Lease: lease, PredecessorWorkerID: predecessorWorkerID, ReplacementWorkerID: replacementID}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return AuthoritySessionReassignment{}, err
@@ -698,8 +746,8 @@ func getLeaseByDigest(ctx context.Context, queryer interface {
 ) (AuthorityLease, error) {
 	var lease AuthorityLease
 	var created, released string
-	err := queryer.QueryRowContext(ctx, `SELECT profile,worker_id,idempotency_digest,created_at,released_at FROM authority_session_leases WHERE principal=? AND binding_digest=?`, principal, binding).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.IdempotencyDigest, &created, &released)
+	err := queryer.QueryRowContext(ctx, `SELECT profile,worker_id,lineage_id,fence_epoch,idempotency_digest,created_at,released_at FROM authority_session_leases WHERE principal=? AND binding_digest=?`, principal, binding).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.LineageID, &lease.FenceEpoch, &lease.IdempotencyDigest, &created, &released)
 	if err != nil {
 		return AuthorityLease{}, err
 	}

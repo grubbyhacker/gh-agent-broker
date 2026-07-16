@@ -272,19 +272,18 @@ func TestAuthorityWorkerLifecycleCapacityDrainReleaseAndReplacement(t *testing.T
 		t.Fatalf("replayed Release()=%+v err=%v", released, err)
 	}
 
-	updatedProfile := service.cfg.AuthorityProfiles["writer"]
+	originalProfile := service.cfg.AuthorityProfiles["writer"]
+	updatedProfile := originalProfile
 	updatedProfile.Image = "example.com/agentd@sha256:3333333333333333333333333333333333333333333333333333333333333333"
 	updatedProfile.Operations = append(updatedProfile.Operations, "pull.read")
 	service.cfg.AuthorityProfiles["writer"] = updatedProfile
+	if _, err := service.Replace(ctx, "coordinator", worker.WorkerID, "profile_upgrade"); err == nil || !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("replacement accepted changed immutable profile: %v", err)
+	}
+	service.cfg.AuthorityProfiles["writer"] = originalProfile
 	replacement, err := service.Replace(ctx, "coordinator", worker.WorkerID, "profile_upgrade")
-	if err != nil || replacement.WorkerID != "worker-two" || replacement.Generation != 2 || replacement.State != AuthorityWorkerStarting {
+	if err != nil || replacement.WorkerID != "worker-two" || replacement.Generation != 2 || replacement.State != AuthorityWorkerStarting || replacement.ProfileVersion != worker.ProfileVersion || replacement.PolicyDigest != worker.PolicyDigest {
 		t.Fatalf("Replace()=%+v err=%v", replacement, err)
-	}
-	if replacement.ProfileVersion == worker.ProfileVersion || replacement.PolicyDigest == worker.PolicyDigest || replacement.ImageReference != updatedProfile.Image {
-		t.Fatalf("replacement did not attest current profile: old=%+v replacement=%+v", worker, replacement)
-	}
-	if runtime.created[1].ProfileVersion != replacement.ProfileVersion || runtime.created[1].Operations[len(runtime.created[1].Operations)-1] != "pull.read" {
-		t.Fatalf("replacement runtime spec = %+v", runtime.created[1])
 	}
 	replayedReplacement, err := service.Replace(ctx, "coordinator", worker.WorkerID, "profile_upgrade")
 	if err != nil || replayedReplacement.WorkerID != replacement.WorkerID || len(runtime.created) != 2 {
@@ -766,7 +765,7 @@ func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testin
 	}
 	// The workspace is durable session state; reassignment must preserve its
 	// allocation while transferring its worker association.
-	if _, err := store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at) VALUES(?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 20000, 20000, "/durable/session", formatAuthorityTime(time.Now().UTC())); err != nil {
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 20000, 20000, "/durable/session", formatAuthorityTime(time.Now().UTC()), lease.LineageID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.SetHealth(ctx, "coordinator", old.WorkerID, "abrupt_container_loss", false); err != nil {
@@ -782,10 +781,10 @@ func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testin
 	if _, err := service.Acquire(ctx, "session-only", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "filler-lease-idem", SessionBinding: "filler-logical-session"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.ReassignSession(ctx, "session-only", AuthoritySessionReassignmentRequest{SessionBinding: "filler-logical-session", PredecessorWorkerID: old.WorkerID, IdempotencyKey: "other-reassign-idem"}); err == nil || !strings.Contains(err.Error(), "policy denial") {
+	if _, err := service.ReassignSession(ctx, "session-only", AuthoritySessionReassignmentRequest{SessionBinding: "filler-logical-session", PredecessorWorkerID: old.WorkerID, PriorFenceEpoch: 1, IdempotencyKey: "other-reassign-idem"}); err == nil || !strings.Contains(err.Error(), "policy denial") {
 		t.Fatalf("cross-profile/principal escalation error=%v", err)
 	}
-	request := AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", PredecessorWorkerID: old.WorkerID, IdempotencyKey: "reassign-idem"}
+	request := AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", PredecessorWorkerID: old.WorkerID, PriorFenceEpoch: lease.FenceEpoch, IdempotencyKey: "reassign-idem"}
 	if _, err := service.ReassignSession(ctx, "coordinator", request); err == nil || !isReassignmentCode(err, ReassignmentCapacity) {
 		t.Fatalf("capacity reassignment error=%v", err)
 	}
@@ -815,8 +814,77 @@ func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testin
 	if err != nil || oldAfter.AssignedSessions != 0 || newAfter.AssignedSessions != 1 || oldAfter.State != AuthorityWorkerStopped {
 		t.Fatalf("old=%+v new=%+v err=%v", oldAfter, newAfter, err)
 	}
-	if _, err := service.ReassignSession(ctx, "coordinator", AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", PredecessorWorkerID: "not-the-predecessor", IdempotencyKey: "stale-idem"}); err == nil || !isReassignmentCode(err, ReassignmentStalePredecessor) {
+	if _, err := service.ReassignSession(ctx, "coordinator", AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", PredecessorWorkerID: "not-the-predecessor", PriorFenceEpoch: lease.FenceEpoch, IdempotencyKey: "stale-idem"}); err == nil || !isReassignmentCode(err, ReassignmentStalePredecessor) {
 		t.Fatalf("stale reassignment error=%v", err)
+	}
+}
+
+func TestAuthoritySessionFenceDeniesPredecessorAndReplaysCutover(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	t.Setenv("WRITER_BROKER_CREDENTIAL", "agentd-broker-test-token")
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	service := NewAuthorityWorkerService(cfg, store, &fakeAuthorityRuntime{}, nil)
+	ids := []string{"fence-old", "fence-new"}
+	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
+	old, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "fence-lease", SessionBinding: "fence-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 20000, 20000, "/durable/fence-session", formatAuthorityTime(time.Now().UTC()), lease.LineageID); err != nil {
+		t.Fatal(err)
+	}
+	if lease.LineageID == "" || lease.FenceEpoch != 1 {
+		t.Fatalf("lineage lease=%+v", lease)
+	}
+	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: old.WorkerID, LineageID: lease.LineageID, FenceEpoch: 1}); err != nil || !got.Authorized {
+		t.Fatalf("pre-cutover validation=%+v err=%v", got, err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "lost", false); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := service.Replace(ctx, "coordinator", old.WorkerID, "lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", replacement.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+
+	request := AuthoritySessionReassignmentRequest{SessionBinding: "fence-session", PredecessorWorkerID: old.WorkerID, PriorFenceEpoch: 1, IdempotencyKey: "fence-reassign"}
+	// Before the CAS, a wrong predecessor epoch must not mutate lease/accounting.
+	wrong := request
+	wrong.PriorFenceEpoch = 2
+	wrong.IdempotencyKey = "before-cas"
+	if _, err = service.ReassignSession(ctx, "coordinator", wrong); !isReassignmentCode(err, ReassignmentStalePredecessor) {
+		t.Fatalf("before CAS error=%v", err)
+	}
+	assigned, err := service.ReassignSession(ctx, "coordinator", request)
+	if err != nil || assigned.Lease.FenceEpoch != 2 || assigned.Lease.LineageID != lease.LineageID {
+		t.Fatalf("CAS result=%+v err=%v", assigned, err)
+	}
+	// This retry models a crash after durable CAS and before the HTTP response.
+	replay, err := service.ReassignSession(ctx, "coordinator", request)
+	if err != nil || !replay.Replay || replay.Lease.FenceEpoch != 2 {
+		t.Fatalf("post-CAS replay=%+v err=%v", replay, err)
+	}
+	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: old.WorkerID, LineageID: lease.LineageID, FenceEpoch: 1}); err != nil || got.Authorized || got.Code != "fenced" {
+		t.Fatalf("stale predecessor validation=%+v err=%v", got, err)
+	}
+	if got, err := service.ValidateAgentdSession(ctx, "agentd-broker-test-token", AgentdSessionValidationRequest{WorkerID: replacement.WorkerID, LineageID: lease.LineageID, FenceEpoch: 2}); err != nil || !got.Authorized {
+		t.Fatalf("successor validation=%+v err=%v", got, err)
+	}
+	stale := request
+	stale.IdempotencyKey = "stale-different-key"
+	if _, err = service.ReassignSession(ctx, "coordinator", stale); !isReassignmentCode(err, ReassignmentStalePredecessor) {
+		t.Fatalf("stale different key error=%v", err)
 	}
 }
 

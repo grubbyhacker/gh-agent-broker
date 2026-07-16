@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ type AuthorityWorkerRequest struct {
 type AuthoritySessionReassignmentRequest struct {
 	SessionBinding      string `json:"session_binding"`
 	PredecessorWorkerID string `json:"predecessor_worker_id"`
+	PriorFenceEpoch     int64  `json:"prior_fence_epoch"`
 	IdempotencyKey      string `json:"idempotency_key"`
 }
 
@@ -48,7 +50,7 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if token == "" {
 		return nil, fmt.Errorf("authority worker coordinator credential is unavailable")
 	}
-	payload, err := json.Marshal(map[string]any{"version": "agentd/v1", "coordinatorBinding": binding, "authorityBinding": lease.BindingDigest, "workspace": map[string]string{"workspaceRef": workspace.Path}})
+	payload, err := json.Marshal(map[string]any{"version": "agentd/v1", "coordinatorBinding": binding, "authorityBinding": lease.BindingDigest, "lineageId": lease.LineageID, "fenceEpoch": lease.FenceEpoch, "workerId": lease.WorkerID, "workspace": map[string]any{"workspaceRef": workspace.Path, "uid": workspace.UID, "gid": workspace.GID, "lineageId": workspace.LineageID}})
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +148,24 @@ type AuthorityWorkerRuntime interface {
 	Healthy(context.Context, string) (bool, string, error)
 }
 
+// AuthorityAgentdReadiness is intentionally separate from container liveness.
+// Reconciliation only promotes workers after agentd attests its journal,
+// runtime, launcher and fencing-validator configuration.
+type AuthorityAgentdReadiness interface {
+	AgentdReady(context.Context, AuthorityWorker) (bool, string, error)
+}
+
+type AgentdSessionValidationRequest struct {
+	WorkerID   string `json:"worker_id"`
+	LineageID  string `json:"lineage_id"`
+	FenceEpoch int64  `json:"fence_epoch"`
+}
+
+type AgentdSessionValidation struct {
+	Authorized bool   `json:"authorized"`
+	Code       string `json:"code"`
+}
+
 type AuthorityWorkerService struct {
 	cfg         Config
 	store       *AuthorityWorkerStore
@@ -210,7 +230,15 @@ func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string
 			healthy, evidence = false, "runtime_inspect_failed"
 		}
 		if healthy {
-			if _, err := s.SetHealth(ctx, principal, worker.WorkerID, evidence, true); err != nil {
+			probe, ok := s.runtime.(AuthorityAgentdReadiness)
+			ready, readinessEvidence, readinessErr := false, "agentd_authenticated_readiness_contract_unavailable", error(nil)
+			if ok {
+				ready, readinessEvidence, readinessErr = probe.AgentdReady(ctx, worker)
+			}
+			if readinessErr != nil || !ready {
+				continue
+			}
+			if _, err := s.SetHealth(ctx, principal, worker.WorkerID, readinessEvidence, true); err != nil {
 				return err
 			}
 			continue
@@ -237,6 +265,33 @@ func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string
 		}
 	}
 	return nil
+}
+
+// ValidateAgentdSession is the authenticated, fail-closed fencing contract
+// agentd calls before accessing any lineage-scoped journal or workspace state.
+func (s *AuthorityWorkerService) ValidateAgentdSession(ctx context.Context, credential string, request AgentdSessionValidationRequest) (AgentdSessionValidation, error) {
+	if !safeAuthorityName(request.WorkerID) || strings.TrimSpace(request.LineageID) == "" || request.FenceEpoch < 1 {
+		return AgentdSessionValidation{Code: "invalid_request"}, nil
+	}
+	worker, err := s.store.GetWorker(ctx, request.WorkerID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AgentdSessionValidation{Code: "unknown_worker"}, nil
+		}
+		return AgentdSessionValidation{}, err
+	}
+	profile, ok := s.cfg.AuthorityProfiles[worker.Profile]
+	if !ok || !secureTokenEqual(credential, strings.TrimSpace(os.Getenv(profile.BrokerSecretEnv))) {
+		return AgentdSessionValidation{Code: "unauthorized"}, nil
+	}
+	valid, err := s.store.ValidateSessionFence(ctx, request.WorkerID, request.LineageID, request.FenceEpoch)
+	if err != nil {
+		return AgentdSessionValidation{}, err
+	}
+	if !valid {
+		return AgentdSessionValidation{Code: "fenced"}, nil
+	}
+	return AgentdSessionValidation{Authorized: true, Code: "authorized"}, nil
 }
 
 func (s *AuthorityWorkerService) GetWorker(ctx context.Context, principal, workerID string) (AuthorityWorker, error) {
@@ -351,7 +406,16 @@ func (s *AuthorityWorkerService) ReassignSession(ctx context.Context, principal 
 		s.log("authority_worker.reassign", principal, lease.Profile, AuthorityWorker{WorkerID: request.PredecessorWorkerID, Profile: lease.Profile}, "deny", err)
 		return AuthoritySessionReassignment{}, err
 	}
-	reassignment, err := s.store.Reassign(ctx, principal, request.SessionBinding, request.PredecessorWorkerID, request.IdempotencyKey)
+	predecessor, err := s.store.GetWorker(ctx, request.PredecessorWorkerID)
+	if err != nil {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "supplied predecessor is unavailable")
+	}
+	profile := s.cfg.AuthorityProfiles[lease.Profile]
+	profileVersion, policyDigest, digestErr := authorityProfileDigest(lease.Profile, profile)
+	if digestErr != nil || predecessor.Profile != lease.Profile || predecessor.ProfileVersion != profileVersion || predecessor.PolicyDigest != policyDigest || predecessor.ImageReference != profile.Image || predecessor.Capacity != profile.SessionCapacity {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "immutable profile/policy/storage identity no longer matches predecessor")
+	}
+	reassignment, err := s.store.Reassign(ctx, principal, request.SessionBinding, request.PredecessorWorkerID, request.PriorFenceEpoch, request.IdempotencyKey)
 	if err == nil {
 		// Runtime retirement is intentionally after the durable cutover. A crash
 		// here leaves a draining zero-lease predecessor that Reconcile can retire.
@@ -417,15 +481,21 @@ func (s *AuthorityWorkerService) Replace(ctx context.Context, principal, workerI
 	if strings.TrimSpace(reason) == "" || len(reason) > 256 {
 		return AuthorityWorker{}, fmt.Errorf("bounded replacement reason is required")
 	}
-	newID, err := s.newID()
-	if err != nil {
-		return AuthorityWorker{}, err
-	}
 	profileVersion, policyDigest, err := authorityProfileDigest(old.Profile, profile)
 	if err != nil {
 		return AuthorityWorker{}, err
 	}
-	replacement := AuthorityWorker{WorkerID: newID, Profile: old.Profile, ProfileVersion: profileVersion, PolicyDigest: policyDigest, ImageReference: profile.Image, Generation: old.Generation + 1, State: AuthorityWorkerProvisioning, Capacity: profile.SessionCapacity, DrainReason: reason}
+	// A generation change may not silently change its profile, policy, image or
+	// storage identity. ProfileVersion hashes the complete reviewed profile,
+	// including AuthorityStorage; PolicyDigest is asserted separately.
+	if profileVersion != old.ProfileVersion || policyDigest != old.PolicyDigest || profile.Image != old.ImageReference || profile.SessionCapacity != old.Capacity {
+		return AuthorityWorker{}, fmt.Errorf("replacement immutable profile/policy/storage identity differs from predecessor")
+	}
+	newID, err := s.newID()
+	if err != nil {
+		return AuthorityWorker{}, err
+	}
+	replacement := AuthorityWorker{WorkerID: newID, Profile: old.Profile, ProfileVersion: old.ProfileVersion, PolicyDigest: old.PolicyDigest, ImageReference: old.ImageReference, Generation: old.Generation + 1, State: AuthorityWorkerProvisioning, Capacity: old.Capacity, DrainReason: reason}
 	replacement, created, err := s.store.LinkReplacement(ctx, old.WorkerID, replacement, profile.MaxWorkers)
 	if err != nil {
 		s.log("authority_worker.replace", principal, old.Profile, old, "deny", err)
@@ -489,6 +559,9 @@ func validateReassignmentRequest(request AuthoritySessionReassignmentRequest) er
 	}
 	if !safeAuthorityName(request.PredecessorWorkerID) {
 		return fmt.Errorf("predecessor_worker_id is required")
+	}
+	if request.PriorFenceEpoch < 1 {
+		return fmt.Errorf("prior_fence_epoch must be positive")
 	}
 	if strings.TrimSpace(request.IdempotencyKey) == "" || len(request.IdempotencyKey) > 256 {
 		return fmt.Errorf("idempotency_key is required and must be at most 256 bytes")

@@ -71,7 +71,13 @@ func (r *DockerAuthorityRuntime) Healthy(ctx context.Context, id string) (bool, 
 	if !status.Running {
 		return false, "container_not_running", nil
 	}
-	return true, "container_liveness_ok_agentd_session_admission_deferred", nil
+	return true, "container_liveness_ok", nil
+}
+
+// AgentdReady is fail-closed until agentd exposes an authenticated readiness
+// endpoint. Container liveness is deliberately insufficient.
+func (r *DockerAuthorityRuntime) AgentdReady(context.Context, AuthorityWorker) (bool, string, error) {
+	return false, "agentd_authenticated_readiness_contract_unavailable", nil
 }
 
 func imageDigestOnly(value string) string {

@@ -1,8 +1,8 @@
 package sandbox
 
-// Broker-owned checkpoint evidence is deliberately small in PR 8. It records
-// that a lease was durably fenced before a worker drain/replacement; agentd's
-// session journal and resume protocol remain PR 9 work.
+// Broker-owned checkpoint evidence is deliberately small. It records a lease
+// observation before worker drain/replacement; it is not an agentd recovery
+// manifest and does not establish that a session can be resumed.
 
 import (
 	"context"

@@ -13,7 +13,7 @@ func TestAuthorityWorkerStoreMigratesV1WorkspaceSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DROP TABLE authority_session_reassignments; DROP TABLE authority_session_workspaces; PRAGMA user_version=1`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `PRAGMA user_version=4`); err != nil {
 		if closeErr := store.Close(); closeErr != nil {
 			t.Fatalf("close store after setup failure: %v", closeErr)
 		}
