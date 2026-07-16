@@ -269,8 +269,26 @@ func (s *AuthorityWorkerService) SetHealth(ctx context.Context, principal, worke
 		return AuthorityWorker{}, fmt.Errorf("bounded health evidence is required")
 	}
 	worker, err = s.store.SetWorkerHealth(ctx, workerID, health, ready)
+	if err == nil && ready {
+		if retireErr := s.retireDrainedPredecessor(ctx, worker.WorkerID); retireErr != nil {
+			err = retireErr
+		}
+	}
 	s.log("authority_worker.health", principal, worker.Profile, worker, decision(err), err)
 	return worker, err
+}
+
+func (s *AuthorityWorkerService) retireDrainedPredecessor(ctx context.Context, replacementWorkerID string) error {
+	predecessor, found, err := s.store.DrainedPredecessor(ctx, replacementWorkerID)
+	if err != nil || !found {
+		return err
+	}
+	if predecessor.ContainerID != "" {
+		if err := s.runtime.Stop(ctx, predecessor.ContainerID); err != nil {
+			return fmt.Errorf("stop drained predecessor %q: %w", predecessor.WorkerID, err)
+		}
+	}
+	return s.store.MarkDrainedStopped(ctx, predecessor.WorkerID)
 }
 
 func (s *AuthorityWorkerService) Acquire(ctx context.Context, principal string, request AuthorityWorkerRequest) (AuthorityLease, error) {
