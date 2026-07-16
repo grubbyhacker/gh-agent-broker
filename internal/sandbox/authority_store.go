@@ -11,12 +11,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 1
+const authorityStoreSchemaVersion = 2
 
 type AuthorityWorkerState string
 
@@ -62,8 +63,9 @@ type AuthorityLease struct {
 }
 
 type AuthorityWorkerStore struct {
-	db   *sql.DB
-	salt []byte
+	db        *sql.DB
+	salt      []byte
+	sessionMu sync.Mutex
 }
 
 func OpenAuthorityWorkerStore(ctx context.Context, path string) (*AuthorityWorkerStore, error) {
@@ -112,6 +114,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	}
 	if version == 0 {
 		if err := s.migrateV1(ctx); err != nil {
+			return err
+		}
+		version = 1
+	}
+	if version == 1 {
+		if err := s.migrateV2(ctx); err != nil {
 			return err
 		}
 	}
@@ -168,6 +176,16 @@ func (s *AuthorityWorkerStore) migrateV1(ctx context.Context) error {
 		}
 	}
 	return tx.Commit()
+}
+
+func (s *AuthorityWorkerStore) migrateV2(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE authority_session_workspaces (
+		binding_digest TEXT PRIMARY KEY REFERENCES authority_session_leases(binding_digest),
+		worker_id TEXT NOT NULL REFERENCES authority_workers(worker_id),
+		uid INTEGER NOT NULL, gid INTEGER NOT NULL, workspace_path TEXT NOT NULL,
+		created_at TEXT NOT NULL, UNIQUE(worker_id,uid), UNIQUE(worker_id,gid), UNIQUE(workspace_path)
+	) STRICT; PRAGMA user_version=2`)
+	return err
 }
 
 func (s *AuthorityWorkerStore) Close() error {

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -18,6 +20,50 @@ type AuthorityWorkerRequest struct {
 	Profile        string `json:"profile"`
 	IdempotencyKey string `json:"idempotency_key"`
 	SessionBinding string `json:"session_binding"`
+}
+
+func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, binding string) (json.RawMessage, error) {
+	lease, err := s.store.GetLease(ctx, principal, binding)
+	if err != nil {
+		return nil, err
+	}
+	profile, err := s.authorize(principal, lease.Profile, "acquire")
+	if err != nil {
+		return nil, err
+	}
+	workspace, err := s.store.SessionWorkspace(ctx, binding)
+	if err != nil {
+		return nil, err
+	}
+	token := strings.TrimSpace(os.Getenv(profile.CoordinatorTokenEnv))
+	if token == "" {
+		return nil, fmt.Errorf("authority worker coordinator credential is unavailable")
+	}
+	payload, err := json.Marshal(map[string]any{"version": "agentd/v1", "coordinatorBinding": binding, "authorityBinding": lease.BindingDigest, "workspace": map[string]string{"workspaceRef": workspace.Path}})
+	if err != nil {
+		return nil, err
+	}
+	url := "http://sandbox-authority-" + lease.WorkerID + ":8080/v1/sessions"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("agentd session create: %w", err)
+	}
+	//nolint:errcheck // The response is decoded before return; a close error cannot alter admission state.
+	defer resp.Body.Close()
+	var result json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("agentd session create rejected")
+	}
+	return result, nil
 }
 
 func (r *AuthorityWorkerRequest) UnmarshalJSON(data []byte) error {
@@ -36,27 +82,28 @@ func (r *AuthorityWorkerRequest) UnmarshalJSON(data []byte) error {
 }
 
 type AuthorityWorkerSpec struct {
-	WorkerID         string
-	Profile          string
-	ProfileVersion   string
-	PolicyDigest     string
-	Image            string
-	Platform         string
-	Command          []string
-	Resources        Resources
-	Network          NetworkPolicy
-	BrokerAgentID    string
-	BrokerSecretEnv  string
-	CredentialBundle string
-	CredentialMount  Mount
-	Repositories     []string
-	BranchPolicy     BranchPolicy
-	Operations       []string
-	ExtraMounts      []ExtraMount
-	SessionIsolation SessionIsolation
-	Checkpoint       CheckpointPolicy
-	Storage          AuthorityStorage
-	SessionCapacity  int
+	WorkerID            string
+	Profile             string
+	ProfileVersion      string
+	PolicyDigest        string
+	Image               string
+	Platform            string
+	Command             []string
+	Resources           Resources
+	Network             NetworkPolicy
+	BrokerAgentID       string
+	BrokerSecretEnv     string
+	CoordinatorTokenEnv string
+	CredentialBundle    string
+	CredentialMount     Mount
+	Repositories        []string
+	BranchPolicy        BranchPolicy
+	Operations          []string
+	ExtraMounts         []ExtraMount
+	SessionIsolation    SessionIsolation
+	Checkpoint          CheckpointPolicy
+	Storage             AuthorityStorage
+	SessionCapacity     int
 }
 
 type AuthorityRuntimeResult struct {
@@ -83,6 +130,30 @@ type AuthorityWorkerService struct {
 	now         func() time.Time
 	newID       func() (string, error)
 	checkpoints *CheckpointStore
+}
+
+type AuthoritySessionAdmission struct {
+	Lease     AuthorityLease   `json:"lease"`
+	Workspace SessionWorkspace `json:"workspace"`
+}
+
+func (s *AuthorityWorkerService) AcquireSession(ctx context.Context, principal string, request AuthorityWorkerRequest) (AuthoritySessionAdmission, error) {
+	profile, err := s.authorize(principal, request.Profile, "acquire")
+	if err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
+	if err := validateAuthorityRequest(request); err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
+	lease, err := s.store.Acquire(ctx, principal, request)
+	if err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
+	workspace, err := s.store.AllocateSessionWorkspace(ctx, lease, profile.SessionIsolation)
+	if err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
+	return AuthoritySessionAdmission{Lease: lease, Workspace: workspace}, nil
 }
 
 func NewAuthorityWorkerService(cfg Config, store *AuthorityWorkerStore, runtime AuthorityWorkerRuntime, audit *AuditLogger) *AuthorityWorkerService {
@@ -337,7 +408,7 @@ func validateAuthorityRequest(request AuthorityWorkerRequest) error {
 }
 
 func authoritySpec(worker AuthorityWorker, profile AuthorityProfile, cfg Config) AuthorityWorkerSpec {
-	spec := AuthorityWorkerSpec{WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, Image: profile.Image, Platform: profile.Platform, Command: append([]string(nil), profile.Command...), Resources: profile.Resources, Network: cfg.Networks[profile.NetworkPolicy], BrokerAgentID: profile.BrokerAgentID, BrokerSecretEnv: profile.BrokerSecretEnv, CredentialBundle: profile.CredentialBundle, Repositories: append([]string(nil), profile.Repositories...), BranchPolicy: profile.BranchPolicy, Operations: append([]string(nil), profile.Operations...), ExtraMounts: append([]ExtraMount(nil), profile.ExtraMounts...), SessionIsolation: profile.SessionIsolation, Checkpoint: profile.Checkpoint, Storage: profile.Storage, SessionCapacity: profile.SessionCapacity}
+	spec := AuthorityWorkerSpec{WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, Image: profile.Image, Platform: profile.Platform, Command: append([]string(nil), profile.Command...), Resources: profile.Resources, Network: cfg.Networks[profile.NetworkPolicy], BrokerAgentID: profile.BrokerAgentID, BrokerSecretEnv: profile.BrokerSecretEnv, CoordinatorTokenEnv: profile.CoordinatorTokenEnv, CredentialBundle: profile.CredentialBundle, Repositories: append([]string(nil), profile.Repositories...), BranchPolicy: profile.BranchPolicy, Operations: append([]string(nil), profile.Operations...), ExtraMounts: append([]ExtraMount(nil), profile.ExtraMounts...), SessionIsolation: profile.SessionIsolation, Checkpoint: profile.Checkpoint, Storage: profile.Storage, SessionCapacity: profile.SessionCapacity}
 	if bundle, ok := cfg.Bundles[profile.CredentialBundle]; ok {
 		spec.CredentialMount = Mount{Source: bundle.SourcePath, Target: bundle.MountPath, ReadOnly: bundle.ReadOnly}
 	}
