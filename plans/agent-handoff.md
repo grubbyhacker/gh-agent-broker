@@ -185,6 +185,18 @@ fence epoch by exactly one, while logical session lineage remains unchanged and
 separate. Journal continuation therefore comes from inherited fenced storage,
 not from broker checkpoint artifacts.
 
+The root-owned authority volume initializer is a distinct, fixed `install`
+helper. It retains `no-new-privileges`, non-privileged mode, no network, and
+`CapDrop: ALL`, adding only `CAP_CHOWN` and `CAP_FOWNER`: `install -o bun -g
+bun` first needs `CAP_CHOWN` for its `chown(2)` ownership transition, then
+needs `CAP_FOWNER` because it applies the requested mode after the directory is
+owned by `bun`. A real Docker proof showed that `CAP_CHOWN` alone fails at that
+post-chown mode change. The separate state initializer then runs as `bun` with
+zero added capabilities, creating `.agentd-state` under the now bun-owned
+lineage root. These root-helper capabilities are package-private; ordinary
+workers retain zero added capabilities and the authority runtime retains only
+`SETUID` and `SETGID`.
+
 The reviewed agentd authority runtime keeps the server process explicitly on
 Docker user `bun`, remains non-privileged, drops all capabilities, and restores
 only `SETUID` and `SETGID` to the bounding set. Its

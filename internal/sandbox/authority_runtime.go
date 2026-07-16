@@ -47,7 +47,7 @@ func (r *DockerAuthorityRuntime) Create(ctx context.Context, spec AuthorityWorke
 		{Source: spec.Storage.CheckpointVolume, Target: spec.Checkpoint.Directory, Volume: true, VolumeSubpath: spec.WorkerStorageLineageID},
 		{Source: spec.Storage.EvidenceVolume, Target: "/var/lib/agentd/evidence", Volume: true, VolumeSubpath: spec.WorkerStorageLineageID},
 	}
-	if err := r.docker.EnsureAuthorityVolumeSubpaths(ctx, spec.Image, spec.WorkerStorageLineageID, volumes, spec.SessionIsolation.WorkspaceRoot); err != nil {
+	if err := r.docker.ensureAuthorityVolumeSubpaths(ctx, spec.Image, spec.WorkerStorageLineageID, volumes, spec.SessionIsolation.WorkspaceRoot); err != nil {
 		return AuthorityRuntimeResult{}, fmt.Errorf("prepare authority worker volume subpaths: %w", err)
 	}
 	mounts := append([]Mount(nil), volumes...)

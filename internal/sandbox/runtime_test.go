@@ -156,18 +156,36 @@ func TestDockerEnsureVolumeSubpathsUsesTraversableRootAndReusesPrivateStateForRe
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body.User != "0:0" {
-				t.Fatalf("initializer user=%q, want 0:0", body.User)
+			if got, want := body.HostConfig.SecurityOpt, []string{"no-new-privileges"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("initializer SecurityOpt=%q, want %q", got, want)
+			}
+			if got, want := body.HostConfig.CapDrop, []string{"ALL"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("initializer CapDrop=%q, want %q", got, want)
+			}
+			if body.HostConfig.Privileged || body.HostConfig.NetworkMode != "none" || len(body.HostConfig.Binds) != 0 {
+				t.Fatalf("initializer confinement privileged=%t network=%q binds=%q", body.HostConfig.Privileged, body.HostConfig.NetworkMode, body.HostConfig.Binds)
+			}
+			if got, want := body.Entrypoint, []string{"install"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("initializer entrypoint=%q, want %q", got, want)
 			}
 			switch body.Labels["gh-agent-broker.run_id"] {
 			case "authority-volume-init-" + lineage:
 				rootInitializers++
+				if body.User != "0:0" {
+					t.Fatalf("root initializer user=%q, want 0:0", body.User)
+				}
+				if got, want := body.HostConfig.CapAdd, []string{"CHOWN", "FOWNER"}; !reflect.DeepEqual(got, want) {
+					t.Fatalf("root initializer CapAdd=%q, want %q", got, want)
+				}
 				if got, want := body.Cmd, []string{"-d", "-o", "bun", "-g", "bun", "-m", "0711", "/lineage-volumes/0/" + lineage}; !reflect.DeepEqual(got, want) {
 					t.Fatalf("lineage initializer args=%q, want %q", got, want)
 				}
 				return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"lineage-initializer"}`)), Header: make(http.Header)}, nil
 			case "authority-state-init-" + lineage:
 				stateInitializers++
+				if body.User != "bun" || len(body.HostConfig.CapAdd) != 0 {
+					t.Fatalf("state initializer user=%q CapAdd=%q, want bun with no capabilities", body.User, body.HostConfig.CapAdd)
+				}
 				if got, want := body.Cmd, []string{"-d", "-o", "bun", "-g", "bun", "-m", "0700", "/lineage-volume/" + lineage + "/.agentd-state"}; !reflect.DeepEqual(got, want) {
 					t.Fatalf("state initializer args=%q, want %q", got, want)
 				}
@@ -193,7 +211,7 @@ func TestDockerEnsureVolumeSubpathsUsesTraversableRootAndReusesPrivateStateForRe
 
 	mounts := []Mount{{Source: "workspace", Target: agentdControlV1WorkspaceRoot, Volume: true, VolumeSubpath: lineage}}
 	for generation := 1; generation <= 2; generation++ {
-		if err := backend.EnsureAuthorityVolumeSubpaths(context.Background(), "worker:latest", lineage, mounts, agentdControlV1WorkspaceRoot); err != nil {
+		if err := backend.ensureAuthorityVolumeSubpaths(context.Background(), "worker:latest", lineage, mounts, agentdControlV1WorkspaceRoot); err != nil {
 			t.Fatalf("generation %d initializer: %v", generation, err)
 		}
 	}
