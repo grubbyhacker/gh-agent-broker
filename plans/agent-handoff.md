@@ -132,6 +132,26 @@ logical session, turn, runtime adapter, or Fleet package dependency. PR 9 can
 consume the fixed profile, lifecycle, storage, checkpoint, and isolation
 contract after the versioned agentd session protocol is released.
 
+## PR 9 Coordinator Reassignment Contract
+
+The authenticated authority-worker REST surface now exposes only
+`POST /v1/authority-workers/leases/reassign`. Its bounded request contains a
+logical `session_binding`, the coordinator-observed `predecessor_worker_id`,
+and an idempotency key. It cannot select a replacement, image, authority,
+credential, mount, network, or policy. The broker derives the destination from
+the predecessor's durable replacement link and requires that replacement to be
+ready, profile-compatible, and within capacity.
+
+Schema v3 atomically transfers the active lease and its existing workspace
+allocation, moves capacity accounting from predecessor to replacement, and
+records the reassignment replay result. A committed zero-lease draining
+predecessor is retired after cutover; reconciliation retries that retirement
+after an interruption. REST errors remain structured as
+`reassignment_not_ready`, `reassignment_stale_predecessor`,
+`reassignment_conflicting_replacement`, `reassignment_capacity`, and
+`reassignment_replay`. This is an inert broker contract: it does not activate
+any production route or alter an authority profile.
+
 ## Validation
 
 Run `make fmt` after changing Go code and `make check` before handoff. Also run

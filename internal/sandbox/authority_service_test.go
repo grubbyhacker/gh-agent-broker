@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeAuthorityRuntime struct {
@@ -741,6 +742,89 @@ func TestDrainWritesEncryptedCheckpointEvidenceAndRestoreFailsClosed(t *testing.
 	}
 }
 
+func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	profile := cfg.AuthorityProfiles["writer"]
+	profile.SessionCapacity = 1
+	cfg.AuthorityProfiles["writer"] = profile
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &fakeAuthorityRuntime{}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	ids := []string{"reassign-old", "reassign-new"}
+	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
+	old, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetHealth(ctx, "coordinator", old.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "lease-idem", SessionBinding: "logical-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The workspace is durable session state; reassignment must preserve its
+	// allocation while transferring its worker association.
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at) VALUES(?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, 20000, 20000, "/durable/session", formatAuthorityTime(time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetHealth(ctx, "coordinator", old.WorkerID, "abrupt_container_loss", false); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := service.Replace(ctx, "coordinator", old.WorkerID, "abrupt_predecessor_loss")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetHealth(ctx, "coordinator", replacement.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Acquire(ctx, "session-only", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "filler-lease-idem", SessionBinding: "filler-logical-session"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ReassignSession(ctx, "session-only", AuthoritySessionReassignmentRequest{SessionBinding: "filler-logical-session", PredecessorWorkerID: old.WorkerID, IdempotencyKey: "other-reassign-idem"}); err == nil || !strings.Contains(err.Error(), "policy denial") {
+		t.Fatalf("cross-profile/principal escalation error=%v", err)
+	}
+	request := AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", PredecessorWorkerID: old.WorkerID, IdempotencyKey: "reassign-idem"}
+	if _, err := service.ReassignSession(ctx, "coordinator", request); err == nil || !isReassignmentCode(err, ReassignmentCapacity) {
+		t.Fatalf("capacity reassignment error=%v", err)
+	}
+	if _, err := service.Release(ctx, "session-only", "filler-logical-session"); err != nil {
+		t.Fatal(err)
+	}
+	assigned, err := service.ReassignSession(ctx, "coordinator", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assigned.Lease.WorkerID != replacement.WorkerID || assigned.Replay {
+		t.Fatalf("reassignment=%+v", assigned)
+	}
+	replayed, err := service.ReassignSession(ctx, "coordinator", request)
+	if err != nil || !replayed.Replay || replayed.Lease.WorkerID != replacement.WorkerID {
+		t.Fatalf("replayed=%+v err=%v", replayed, err)
+	}
+	workspace, err := store.SessionWorkspace(ctx, "logical-session")
+	if err != nil || workspace.Path != "/durable/session" || workspace.UID != 20000 {
+		t.Fatalf("workspace=%+v err=%v", workspace, err)
+	}
+	oldAfter, err := store.GetWorker(ctx, old.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newAfter, err := store.GetWorker(ctx, replacement.WorkerID)
+	if err != nil || oldAfter.AssignedSessions != 0 || newAfter.AssignedSessions != 1 || oldAfter.State != AuthorityWorkerStopped {
+		t.Fatalf("old=%+v new=%+v err=%v", oldAfter, newAfter, err)
+	}
+	if _, err := service.ReassignSession(ctx, "coordinator", AuthoritySessionReassignmentRequest{SessionBinding: "logical-session", PredecessorWorkerID: "not-the-predecessor", IdempotencyKey: "stale-idem"}); err == nil || !isReassignmentCode(err, ReassignmentStalePredecessor) {
+		t.Fatalf("stale reassignment error=%v", err)
+	}
+}
+
+func isReassignmentCode(err error, want ReassignmentErrorCode) bool {
+	var reassignmentErr *ReassignmentError
+	return errors.As(err, &reassignmentErr) && reassignmentErr.Code == want
+}
+
 func authorityTestConfig(t *testing.T) Config {
 	t.Helper()
 	t.Setenv("AGENTD_COORDINATOR_TOKEN", "synthetic-agentd-coordinator-token")
@@ -765,7 +849,7 @@ func authorityTestConfig(t *testing.T) Config {
 		},
 	}
 	cfg.AuthorityPrincipals = map[string]AuthorityPrincipal{
-		"coordinator":  {Token: "coordinator-test-token", AllowedProfiles: []string{"writer"}, AllowedActions: []string{"provision", "health", "acquire", "release", "drain", "replace"}},
+		"coordinator":  {Token: "coordinator-test-token", AllowedProfiles: []string{"writer"}, AllowedActions: []string{"provision", "health", "acquire", "release", "drain", "replace", "reassign"}},
 		"session-only": {Token: "session-test-token", AllowedProfiles: []string{"writer"}, AllowedActions: []string{"acquire", "release"}},
 	}
 	return cfg

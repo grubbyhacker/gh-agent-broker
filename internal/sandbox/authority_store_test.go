@@ -13,7 +13,7 @@ func TestAuthorityWorkerStoreMigratesV1WorkspaceSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.ExecContext(ctx, `DROP TABLE authority_session_workspaces; PRAGMA user_version=1`); err != nil {
+	if _, err := store.db.ExecContext(ctx, `DROP TABLE authority_session_reassignments; DROP TABLE authority_session_workspaces; PRAGMA user_version=1`); err != nil {
 		if closeErr := store.Close(); closeErr != nil {
 			t.Fatalf("close store after setup failure: %v", closeErr)
 		}
@@ -31,14 +31,17 @@ func TestAuthorityWorkerStoreMigratesV1WorkspaceSchema(t *testing.T) {
 			t.Errorf("close migrated store: %v", closeErr)
 		}
 	})
-	var version, table int
+	var version, table, reassignmentTable int
 	if err := migrated.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
 	if err := migrated.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='authority_session_workspaces'`).Scan(&table); err != nil {
 		t.Fatal(err)
 	}
-	if version != authorityStoreSchemaVersion || table != 1 {
-		t.Fatalf("migration version=%d workspace_table=%d", version, table)
+	if err := migrated.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='authority_session_reassignments'`).Scan(&reassignmentTable); err != nil {
+		t.Fatal(err)
+	}
+	if version != authorityStoreSchemaVersion || table != 1 || reassignmentTable != 1 {
+		t.Fatalf("migration version=%d workspace_table=%d reassignment_table=%d", version, table, reassignmentTable)
 	}
 }

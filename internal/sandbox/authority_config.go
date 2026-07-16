@@ -210,7 +210,7 @@ func (c Config) validateAuthorityPrincipal(name string, principal AuthorityPrinc
 
 func validAuthorityAction(action string) bool {
 	switch action {
-	case "provision", "health", "acquire", "release", "drain", "replace":
+	case "provision", "health", "acquire", "release", "drain", "replace", "reassign":
 		return true
 	default:
 		return false

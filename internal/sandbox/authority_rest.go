@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -58,6 +59,24 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			out, err := service.Release(r.Context(), principal, in.SessionBinding)
 			if err != nil {
 				writeRESTCodeError(w, http.StatusConflict, "lease_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		if r.Method == http.MethodPost && path == "leases/reassign" {
+			var in AuthoritySessionReassignmentRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.ReassignSession(r.Context(), principal, in)
+			if err != nil {
+				var reassignmentErr *ReassignmentError
+				if errors.As(err, &reassignmentErr) {
+					writeRESTCodeError(w, http.StatusConflict, string(reassignmentErr.Code), reassignmentErr.Error())
+					return
+				}
+				writeRESTCodeError(w, http.StatusConflict, "reassignment_denied", err.Error())
 				return
 			}
 			writeJSON(w, http.StatusOK, out)

@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 2
+const authorityStoreSchemaVersion = 3
 
 type AuthorityWorkerState string
 
@@ -60,6 +60,40 @@ type AuthorityLease struct {
 	CreatedAt         time.Time `json:"created_at"`
 	ReleasedAt        time.Time `json:"released_at,omitempty"`
 	Replay            bool      `json:"replay"`
+}
+
+// AuthoritySessionReassignment is the durable result of moving one logical
+// session between a linked predecessor and replacement.  The replacement is
+// always selected by the broker, never by a caller.
+type AuthoritySessionReassignment struct {
+	Lease               AuthorityLease `json:"lease"`
+	PredecessorWorkerID string         `json:"predecessor_worker_id"`
+	ReplacementWorkerID string         `json:"replacement_worker_id"`
+	Replay              bool           `json:"replay"`
+}
+
+// ReassignmentErrorCode is deliberately narrow so coordinators can decide
+// whether to retry, refresh their binding, or surface a deterministic denial.
+type ReassignmentErrorCode string
+
+const (
+	ReassignmentNotReady               ReassignmentErrorCode = "reassignment_not_ready"
+	ReassignmentStalePredecessor       ReassignmentErrorCode = "reassignment_stale_predecessor"
+	ReassignmentConflictingReplacement ReassignmentErrorCode = "reassignment_conflicting_replacement"
+	ReassignmentCapacity               ReassignmentErrorCode = "reassignment_capacity"
+	ReassignmentReplay                 ReassignmentErrorCode = "reassignment_replay"
+)
+
+type ReassignmentError struct {
+	Code ReassignmentErrorCode
+	Err  error
+}
+
+func (e *ReassignmentError) Error() string { return e.Err.Error() }
+func (e *ReassignmentError) Unwrap() error { return e.Err }
+
+func reassignmentError(code ReassignmentErrorCode, format string, args ...any) error {
+	return &ReassignmentError{Code: code, Err: fmt.Errorf(format, args...)}
 }
 
 type AuthorityWorkerStore struct {
@@ -120,6 +154,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	}
 	if version == 1 {
 		if err := s.migrateV2(ctx); err != nil {
+			return err
+		}
+		version = 2
+	}
+	if version == 2 {
+		if err := s.migrateV3(ctx); err != nil {
 			return err
 		}
 	}
@@ -185,6 +225,20 @@ func (s *AuthorityWorkerStore) migrateV2(ctx context.Context) error {
 		uid INTEGER NOT NULL, gid INTEGER NOT NULL, workspace_path TEXT NOT NULL,
 		created_at TEXT NOT NULL, UNIQUE(worker_id,uid), UNIQUE(worker_id,gid), UNIQUE(workspace_path)
 	) STRICT; PRAGMA user_version=2`)
+	return err
+}
+
+func (s *AuthorityWorkerStore) migrateV3(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE authority_session_reassignments (
+		principal TEXT NOT NULL, idempotency_digest TEXT NOT NULL,
+		request_fingerprint TEXT NOT NULL, binding_digest TEXT NOT NULL,
+		predecessor_worker_id TEXT NOT NULL REFERENCES authority_workers(worker_id),
+		replacement_worker_id TEXT NOT NULL REFERENCES authority_workers(worker_id),
+		created_at TEXT NOT NULL,
+		PRIMARY KEY(principal,idempotency_digest), UNIQUE(principal,binding_digest)
+	) STRICT;
+	CREATE INDEX authority_session_reassignments_replacement ON authority_session_reassignments(replacement_worker_id);
+	PRAGMA user_version=3`)
 	return err
 }
 
@@ -508,6 +562,155 @@ func (s *AuthorityWorkerStore) GetLease(ctx context.Context, principal, sessionB
 	return lease, nil
 }
 
+// Reassign moves an active lease only to the replacement durably linked to the
+// supplied predecessor.  Lease ownership, workspace ownership, and capacity
+// accounting commit together, so a process crash leaves either side intact.
+func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionBinding, predecessorWorkerID, idempotencyKey string) (AuthoritySessionReassignment, error) {
+	binding := s.requestDigest(sessionBinding)
+	idem := s.requestDigest(idempotencyKey)
+	fingerprint := s.requestDigest("reassign:" + sessionBinding + "\x00" + predecessorWorkerID)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
+	defer closeAuthorityConn(conn)
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			rollbackAuthorityConn(context.WithoutCancel(ctx), conn)
+		}
+	}()
+
+	var reassignment AuthoritySessionReassignment
+	var storedFingerprint string
+	err = conn.QueryRowContext(ctx, `SELECT predecessor_worker_id,replacement_worker_id,request_fingerprint
+		FROM authority_session_reassignments WHERE principal=? AND idempotency_digest=?`, principal, idem).
+		Scan(&reassignment.PredecessorWorkerID, &reassignment.ReplacementWorkerID, &storedFingerprint)
+	if err == nil {
+		if storedFingerprint != fingerprint {
+			return AuthoritySessionReassignment{}, reassignmentError(ReassignmentReplay, "reassignment idempotency key conflicts with a prior request")
+		}
+		lease, err := getLeaseByDigest(ctx, conn, principal, binding)
+		if err != nil {
+			return AuthoritySessionReassignment{}, err
+		}
+		if lease.WorkerID != reassignment.ReplacementWorkerID || !lease.ReleasedAt.IsZero() {
+			return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "reassignment record no longer matches the active session lease")
+		}
+		reassignment.Lease, reassignment.Replay = lease, true
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return AuthoritySessionReassignment{}, err
+		}
+		committed = true
+		return reassignment, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return AuthoritySessionReassignment{}, err
+	}
+
+	lease, err := getLeaseByDigest(ctx, conn, principal, binding)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "session binding is not an active lease for this principal")
+		}
+		return AuthoritySessionReassignment{}, err
+	}
+	if !lease.ReleasedAt.IsZero() || lease.WorkerID != predecessorWorkerID {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "session binding is not assigned to the supplied predecessor")
+	}
+	var replacementID string
+	var predecessorProfile string
+	if err := conn.QueryRowContext(ctx, `SELECT profile,replacement_worker_id FROM authority_workers WHERE worker_id=?`, predecessorWorkerID).Scan(&predecessorProfile, &replacementID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "supplied predecessor does not exist")
+		}
+		return AuthoritySessionReassignment{}, err
+	}
+	if replacementID == "" {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentNotReady, "predecessor has no broker-recorded replacement")
+	}
+	var replacementProfile string
+	var replacementState AuthorityWorkerState
+	var replacementCapacity, replacementAssigned int
+	if err := conn.QueryRowContext(ctx, `SELECT profile,state,capacity,assigned_sessions FROM authority_workers WHERE worker_id=?`, replacementID).Scan(&replacementProfile, &replacementState, &replacementCapacity, &replacementAssigned); err != nil {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "broker-recorded replacement is unavailable")
+	}
+	if replacementProfile != predecessorProfile {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "broker-recorded replacement has a different authority profile")
+	}
+	if replacementState != AuthorityWorkerReady {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentNotReady, "broker-recorded replacement is not ready")
+	}
+	if replacementAssigned >= replacementCapacity {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentCapacity, "broker-recorded replacement has no session capacity")
+	}
+	now := time.Now().UTC()
+	result, err := conn.ExecContext(ctx, `UPDATE authority_workers SET assigned_sessions=assigned_sessions-1,updated_at=? WHERE worker_id=? AND assigned_sessions>0`, formatAuthorityTime(now), predecessorWorkerID)
+	if err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "predecessor capacity no longer contains the session")
+	}
+	result, err = conn.ExecContext(ctx, `UPDATE authority_workers SET assigned_sessions=assigned_sessions+1,updated_at=? WHERE worker_id=? AND state=? AND assigned_sessions<capacity`, formatAuthorityTime(now), replacementID, AuthorityWorkerReady)
+	if err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
+	rows, err = result.RowsAffected()
+	if err != nil || rows != 1 {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentCapacity, "broker-recorded replacement capacity changed")
+	}
+	result, err = conn.ExecContext(ctx, `UPDATE authority_session_leases SET worker_id=? WHERE principal=? AND binding_digest=? AND worker_id=? AND released_at=''`, replacementID, principal, binding, predecessorWorkerID)
+	if err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
+	rows, err = result.RowsAffected()
+	if err != nil || rows != 1 {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "session lease changed during reassignment")
+	}
+	result, err = conn.ExecContext(ctx, `UPDATE authority_session_workspaces SET worker_id=? WHERE binding_digest=? AND worker_id=?`, replacementID, binding, predecessorWorkerID)
+	if err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
+	rows, err = result.RowsAffected()
+	if err != nil || rows != 1 {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "session workspace is missing or belongs to another worker")
+	}
+	if _, err := conn.ExecContext(ctx, `INSERT INTO authority_session_reassignments(principal,idempotency_digest,request_fingerprint,binding_digest,predecessor_worker_id,replacement_worker_id,created_at) VALUES(?,?,?,?,?,?,?)`, principal, idem, fingerprint, binding, predecessorWorkerID, replacementID, formatAuthorityTime(now)); err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
+	lease.WorkerID = replacementID
+	reassignment = AuthoritySessionReassignment{Lease: lease, PredecessorWorkerID: predecessorWorkerID, ReplacementWorkerID: replacementID}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
+	committed = true
+	return reassignment, nil
+}
+
+func getLeaseByDigest(ctx context.Context, queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, principal, binding string,
+) (AuthorityLease, error) {
+	var lease AuthorityLease
+	var created, released string
+	err := queryer.QueryRowContext(ctx, `SELECT profile,worker_id,idempotency_digest,created_at,released_at FROM authority_session_leases WHERE principal=? AND binding_digest=?`, principal, binding).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.IdempotencyDigest, &created, &released)
+	if err != nil {
+		return AuthorityLease{}, err
+	}
+	lease.Principal, lease.BindingDigest = principal, binding
+	if lease.CreatedAt, err = parseAuthorityTime(created); err != nil {
+		return AuthorityLease{}, err
+	}
+	lease.ReleasedAt, err = parseAuthorityTime(released)
+	return lease, err
+}
+
 func (s *AuthorityWorkerStore) ListActiveLeases(ctx context.Context, workerID string) ([]AuthorityLease, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT principal,profile,worker_id,binding_digest,idempotency_digest,created_at FROM authority_session_leases WHERE worker_id=? AND released_at='' ORDER BY created_at,binding_digest`, workerID)
 	if err != nil {
@@ -568,6 +771,30 @@ func (s *AuthorityWorkerStore) DrainedPredecessor(ctx context.Context, replaceme
 		return AuthorityWorker{}, false, err
 	}
 	return worker, true, nil
+}
+
+// ReadyReplacementWorkersWithDrainedPredecessors supplies reconciliation with
+// committed cutovers whose runtime retirement was interrupted after commit.
+func (s *AuthorityWorkerStore) ReadyReplacementWorkersWithDrainedPredecessors(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT replacement_worker_id FROM authority_workers predecessor
+		WHERE predecessor.state=? AND predecessor.assigned_sessions=0 AND predecessor.replacement_worker_id<>''
+		AND EXISTS (SELECT 1 FROM authority_workers replacement WHERE replacement.worker_id=predecessor.replacement_worker_id AND replacement.state=?)`, AuthorityWorkerDraining, AuthorityWorkerReady)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		//nolint:errcheck // Read-only rows are exhausted before close; no recovery action exists on close.
+		_ = rows.Close()
+	}()
+	var workerIDs []string
+	for rows.Next() {
+		var workerID string
+		if err := rows.Scan(&workerID); err != nil {
+			return nil, err
+		}
+		workerIDs = append(workerIDs, workerID)
+	}
+	return workerIDs, rows.Err()
 }
 
 // MarkDrainedStopped records retirement only after the runtime has stopped the

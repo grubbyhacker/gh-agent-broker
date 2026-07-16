@@ -22,6 +22,15 @@ type AuthorityWorkerRequest struct {
 	SessionBinding string `json:"session_binding"`
 }
 
+// AuthoritySessionReassignmentRequest intentionally identifies only the
+// session and its observed predecessor. The broker derives the replacement
+// from its durable lifecycle record.
+type AuthoritySessionReassignmentRequest struct {
+	SessionBinding      string `json:"session_binding"`
+	PredecessorWorkerID string `json:"predecessor_worker_id"`
+	IdempotencyKey      string `json:"idempotency_key"`
+}
+
 func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, binding string) (json.RawMessage, error) {
 	lease, err := s.store.GetLease(ctx, principal, binding)
 	if err != nil {
@@ -78,6 +87,21 @@ func (r *AuthorityWorkerRequest) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("invalid authority worker request: trailing JSON value")
 	}
 	*r = AuthorityWorkerRequest(decoded)
+	return nil
+}
+
+func (r *AuthoritySessionReassignmentRequest) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	type request AuthoritySessionReassignmentRequest
+	var decoded request
+	if err := decoder.Decode(&decoded); err != nil {
+		return fmt.Errorf("invalid authority session reassignment request: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("invalid authority session reassignment request: trailing JSON value")
+	}
+	*r = AuthoritySessionReassignmentRequest(decoded)
 	return nil
 }
 
@@ -203,6 +227,15 @@ func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string
 			return err
 		}
 	}
+	replacements, err := s.store.ReadyReplacementWorkersWithDrainedPredecessors(ctx)
+	if err != nil {
+		return err
+	}
+	for _, replacementWorkerID := range replacements {
+		if err := s.retireDrainedPredecessor(ctx, replacementWorkerID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -304,6 +337,31 @@ func (s *AuthorityWorkerService) Acquire(ctx context.Context, principal string, 
 	worker := AuthorityWorker{WorkerID: lease.WorkerID, Profile: request.Profile}
 	s.log("authority_worker.acquire", principal, request.Profile, worker, decision(err), err)
 	return lease, err
+}
+
+func (s *AuthorityWorkerService) ReassignSession(ctx context.Context, principal string, request AuthoritySessionReassignmentRequest) (AuthoritySessionReassignment, error) {
+	if err := validateReassignmentRequest(request); err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
+	lease, err := s.store.GetLease(ctx, principal, request.SessionBinding)
+	if err != nil {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "session binding is not visible to this principal")
+	}
+	if _, err := s.authorize(principal, lease.Profile, "reassign"); err != nil {
+		s.log("authority_worker.reassign", principal, lease.Profile, AuthorityWorker{WorkerID: request.PredecessorWorkerID, Profile: lease.Profile}, "deny", err)
+		return AuthoritySessionReassignment{}, err
+	}
+	reassignment, err := s.store.Reassign(ctx, principal, request.SessionBinding, request.PredecessorWorkerID, request.IdempotencyKey)
+	if err == nil {
+		// Runtime retirement is intentionally after the durable cutover. A crash
+		// here leaves a draining zero-lease predecessor that Reconcile can retire.
+		if retireErr := s.retireDrainedPredecessor(ctx, reassignment.ReplacementWorkerID); retireErr != nil {
+			err = retireErr
+		}
+	}
+	worker := AuthorityWorker{WorkerID: reassignment.ReplacementWorkerID, Profile: lease.Profile}
+	s.log("authority_worker.reassign", principal, lease.Profile, worker, decision(err), err)
+	return reassignment, err
 }
 
 func (s *AuthorityWorkerService) Release(ctx context.Context, principal, sessionBinding string) (AuthorityLease, error) {
@@ -421,6 +479,19 @@ func validateAuthorityRequest(request AuthorityWorkerRequest) error {
 	}
 	if strings.TrimSpace(request.SessionBinding) == "" || len(request.SessionBinding) > 256 {
 		return fmt.Errorf("session_binding is required and must be at most 256 bytes")
+	}
+	return nil
+}
+
+func validateReassignmentRequest(request AuthoritySessionReassignmentRequest) error {
+	if strings.TrimSpace(request.SessionBinding) == "" || len(request.SessionBinding) > 256 {
+		return fmt.Errorf("session_binding is required and must be at most 256 bytes")
+	}
+	if !safeAuthorityName(request.PredecessorWorkerID) {
+		return fmt.Errorf("predecessor_worker_id is required")
+	}
+	if strings.TrimSpace(request.IdempotencyKey) == "" || len(request.IdempotencyKey) > 256 {
+		return fmt.Errorf("idempotency_key is required and must be at most 256 bytes")
 	}
 	return nil
 }
