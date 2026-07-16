@@ -82,6 +82,25 @@ jobs:
           token: ${{ secrets.VPS_OPS_READ_TOKEN }}
           path: vps-ops
 
+      - name: Verify deployment secret prerequisites
+        working-directory: vps-ops
+        env:
+          VPS_OPS_GH_BROKER_ADMIN_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_ADMIN_SECRET }}
+          VPS_OPS_GH_BROKER_REPORTER_01_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_REPORTER_01_SECRET }}
+          VPS_OPS_GH_BROKER_REPORTER_APP_PEM: ${{ secrets.VPS_OPS_GH_BROKER_REPORTER_APP_PEM }}
+          VPS_OPS_GH_BROKER_SANDBOX_MCP_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_SANDBOX_MCP_TOKEN }}
+          VPS_OPS_GH_BROKER_YKM_CURATOR_BROKER_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_YKM_CURATOR_BROKER_SECRET }}
+          VPS_OPS_HERMES_BROKER_AGENT_SECRET: ${{ secrets.VPS_OPS_HERMES_BROKER_AGENT_SECRET }}
+          VPS_OPS_GH_BROKER_HERMES_AGENT_INFRA_APP_PEM: ${{ secrets.VPS_OPS_GH_BROKER_HERMES_AGENT_INFRA_APP_PEM }}
+          VPS_OPS_GH_BROKER_FLEIGLABS_REPO_AGENT_BROKER_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_FLEIGLABS_REPO_AGENT_BROKER_SECRET }}
+          VPS_OPS_GH_BROKER_AGENTD_COORDINATOR_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_AGENTD_COORDINATOR_TOKEN }}
+          VPS_OPS_GH_BROKER_FLEIGLABS_REPO_AGENT_APP_PEM: ${{ secrets.VPS_OPS_GH_BROKER_FLEIGLABS_REPO_AGENT_APP_PEM }}
+          VPS_OPS_GH_BROKER_YKM_CURATOR_APP_PEM: ${{ secrets.VPS_OPS_GH_BROKER_YKM_CURATOR_APP_PEM }}
+          VPS_OPS_GH_BROKER_AGENT_PROXY_TOKEN: ${{ secrets.VPS_OPS_GH_BROKER_AGENT_PROXY_TOKEN }}
+          VPS_OPS_GH_BROKER_LITELLM_MASTER_KEY: ${{ secrets.VPS_OPS_GH_BROKER_LITELLM_MASTER_KEY }}
+          VPS_OPS_GH_BROKER_OPENROUTER_API_KEY: ${{ secrets.VPS_OPS_GH_BROKER_OPENROUTER_API_KEY }}
+        run: python3 scripts/verify-deploy-secret-prerequisites.py --role gh-agent-broker
+
       - name: Connect to Tailnet
         uses: tailscale/github-action@v4
         with:
