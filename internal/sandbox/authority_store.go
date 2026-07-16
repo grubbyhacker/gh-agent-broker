@@ -109,7 +109,7 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version != 0 && version != authorityStoreSchemaVersion {
+	if version > authorityStoreSchemaVersion {
 		return fmt.Errorf("unsupported authority worker schema version %d", version)
 	}
 	if version == 0 {
