@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const agentdBrokerValidationURL = "http://sandbox-broker:8080/v1/authority-workers/agentd/session-validation"
+const agentdBrokerValidationURL = "http://sandbox-broker:8091/v1/authority-workers/agentd/session-validation"
 
 // DockerAuthorityRuntime is purpose-built for immutable authority workers. It
 // does not accept caller runtime inputs; AuthorityWorkerSpec is constructed

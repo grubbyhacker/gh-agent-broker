@@ -398,7 +398,7 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	if got := runtime.Env["AGENTD_SESSION_ROOT"]; got != agentdControlV1WorkspaceRoot {
 		t.Fatalf("AGENTD_SESSION_ROOT=%q, want %q", got, agentdControlV1WorkspaceRoot)
 	}
-	if got, want := runtime.Env["AGENTD_BROKER_VALIDATION_URL"], "http://sandbox-broker:8080/v1/authority-workers/agentd/session-validation"; got != want {
+	if got, want := runtime.Env["AGENTD_BROKER_VALIDATION_URL"], "http://sandbox-broker:8091/v1/authority-workers/agentd/session-validation"; got != want {
 		t.Fatalf("AGENTD_BROKER_VALIDATION_URL=%q, want %q", got, want)
 	}
 	validationToken := runtime.Env["AGENTD_BROKER_VALIDATION_TOKEN"]
