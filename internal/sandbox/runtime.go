@@ -249,7 +249,7 @@ func (d *DockerBackend) InternalAddress(ctx context.Context, containerID string)
 
 // EnsureVolumeSubpaths creates the opaque lineage directory through a short-
 // lived helper that alone sees each full backing volume. The 0711 root is
-// owner-only writable but traversable by the distinct per-session bun UID/GID;
+// owner-only writable but traversable by each distinct per-session UID/GID;
 // Docker requires a volume subpath to exist before the authority container is
 // created.
 func (d *DockerBackend) EnsureVolumeSubpaths(ctx context.Context, image, lineageID string, mounts []Mount) error {
