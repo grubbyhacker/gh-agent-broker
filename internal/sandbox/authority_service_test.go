@@ -272,8 +272,11 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	if !equalStrings(runtime.Entrypoint, fixedAgentdCommand) || len(runtime.Command) != 0 || runtime.WorkingDir != "" {
 		t.Fatalf("runtime entrypoint=%q command=%q", runtime.Entrypoint, runtime.Command)
 	}
-	if got, want := runtime.Env["AGENTD_STATE_PATH"], agentdControlV1WorkspaceRoot+"/agentd.sqlite3"; got != want {
+	if got, want := runtime.Env["AGENTD_STATE_PATH"], agentdControlV1WorkspaceRoot+"/.agentd-state/agentd.sqlite3"; got != want {
 		t.Fatalf("AGENTD_STATE_PATH=%q, want %q", got, want)
+	}
+	if got := runtime.Env["AGENTD_SESSION_ROOT"]; got != agentdControlV1WorkspaceRoot {
+		t.Fatalf("AGENTD_SESSION_ROOT=%q, want %q", got, agentdControlV1WorkspaceRoot)
 	}
 	if runtime.User != "bun" || !runtime.AllowAgentdSetuidLauncherPrivilegeTransition {
 		t.Fatalf("agentd runtime user=%q privilege transition=%t", runtime.User, runtime.AllowAgentdSetuidLauncherPrivilegeTransition)
@@ -282,6 +285,23 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 		if got := runtime.Env[key]; got != want {
 			t.Fatalf("%s=%q, want %q", key, got, want)
 		}
+	}
+}
+
+func TestPrivateAgentdStateDirectoryCannotBeAllocatedAsSessionWorkspace(t *testing.T) {
+	if validOpaqueLineageID(agentdControlV1StateDirectory) {
+		t.Fatalf("private state directory %q must not be a valid session lineage", agentdControlV1StateDirectory)
+	}
+	cfg := authorityTestConfig(t)
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	lease := AuthorityLease{
+		BindingDigest:          "binding",
+		WorkerID:               "worker",
+		SessionLineageID:       agentdControlV1StateDirectory,
+		WorkerStorageLineageID: "11111111111111111111111111111111",
+	}
+	if _, err := store.AllocateSessionWorkspace(context.Background(), lease, cfg.AuthorityProfiles["writer"].SessionIsolation); err == nil || !strings.Contains(err.Error(), "lineage is malformed") {
+		t.Fatalf("private state directory allocation error=%v, want malformed lineage denial", err)
 	}
 }
 

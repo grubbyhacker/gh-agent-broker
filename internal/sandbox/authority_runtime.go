@@ -43,7 +43,7 @@ func (r *DockerAuthorityRuntime) Create(ctx context.Context, spec AuthorityWorke
 		{Source: spec.Storage.CheckpointVolume, Target: spec.Checkpoint.Directory, Volume: true, VolumeSubpath: spec.WorkerStorageLineageID},
 		{Source: spec.Storage.EvidenceVolume, Target: "/var/lib/agentd/evidence", Volume: true, VolumeSubpath: spec.WorkerStorageLineageID},
 	}
-	if err := r.docker.EnsureVolumeSubpaths(ctx, spec.Image, spec.WorkerStorageLineageID, volumes); err != nil {
+	if err := r.docker.EnsureAuthorityVolumeSubpaths(ctx, spec.Image, spec.WorkerStorageLineageID, volumes, spec.SessionIsolation.WorkspaceRoot); err != nil {
 		return AuthorityRuntimeResult{}, fmt.Errorf("prepare authority worker volume subpaths: %w", err)
 	}
 	mounts := append([]Mount(nil), volumes...)
@@ -73,7 +73,7 @@ func authorityWorkerRuntimeSpec(spec AuthorityWorkerSpec, secret, coordinatorTok
 	env := map[string]string{
 		spec.BrokerSecretEnv:        secret,
 		"AGENTD_COORDINATOR_TOKEN":  coordinatorToken,
-		"AGENTD_STATE_PATH":         filepath.Join(spec.SessionIsolation.WorkspaceRoot, "agentd.sqlite3"),
+		"AGENTD_STATE_PATH":         filepath.Join(spec.SessionIsolation.WorkspaceRoot, agentdControlV1StateDirectory, agentdControlV1StateFile),
 		"AGENTD_WORKER_ID":          spec.WorkerID,
 		"AGENTD_STORAGE_LINEAGE_ID": spec.WorkerStorageLineageID,
 		"AGENTD_FENCE_EPOCH":        strconv.FormatInt(spec.WorkerFenceEpoch, 10),

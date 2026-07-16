@@ -174,8 +174,13 @@ profile that opts into it.
 Worker journal/session, checkpoint, and evidence named volumes are mounted
 with Docker `VolumeOptions.Subpath` set to the opaque worker storage lineage.
 A root-run initializer creates and secures those lineage directories before
-the worker container is created; authority workers never receive the full
-backing volume. Replacements inherit the storage lineage and advance its worker
+the worker container is created. The lineage root remains `bun:bun 0711` so
+distinct session UIDs/GIDs can traverse to their own `0700` workspaces. A
+second broker-managed initializer creates `.agentd-state` inside the session
+lineage root as `bun:bun 0700`; agentd keeps its SQLite journal file `0600` at
+`.agentd-state/agentd.sqlite3`. Authority workers never receive the full backing
+volume. Replacements inherit the storage lineage and therefore reuse that same
+private state directory while advancing its worker
 fence epoch by exactly one, while logical session lineage remains unchanged and
 separate. Journal continuation therefore comes from inherited fenced storage,
 not from broker checkpoint artifacts.
@@ -191,10 +196,14 @@ actual launch spec permits this transition.
 
 Profiles selecting `agentd/control/v1` now fail closed unless
 `workspace_root` is exactly `/var/lib/agentd/workspaces`, matching agentd's
-fixed immediate-child launcher boundary. Worker state remains
-`workspaceRoot/agentd.sqlite3` inside the worker storage-lineage volume
-subpath. The follow-on vps-ops integration PR must change the managed profile
-from `/var/lib/agentd/sessions` and update its reviewed digest.
+fixed immediate-child launcher boundary. `AGENTD_SESSION_ROOT` remains that
+exact path, while `AGENTD_STATE_PATH` is
+`/var/lib/agentd/workspaces/.agentd-state/agentd.sqlite3`. The hidden state
+directory cannot be allocated as a session workspace: broker lineages are
+exactly 32 hexadecimal characters, and agentd accepts only the exact
+broker-projected lineage child rather than discovering directory entries. The
+follow-on vps-ops integration PR must change the managed profile from
+`/var/lib/agentd/sessions` and update its reviewed digest.
 
 The production deploy workflow grants `packages: read` and passes the
 ephemeral `github.token` plus `github.actor` to only the vps-ops deploy step as

@@ -124,8 +124,9 @@ func TestDockerCreateSerializesVolumeSubpathsWithoutFullVolumeBinds(t *testing.T
 	}
 }
 
-func TestDockerEnsureVolumeSubpathsUsesTraversableOpaqueRoot(t *testing.T) {
+func TestDockerEnsureVolumeSubpathsUsesTraversableRootAndReusesPrivateStateForReplacement(t *testing.T) {
 	const lineage = "11111111111111111111111111111111"
+	var rootInitializers, stateInitializers int
 	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch {
 		case req.Method == http.MethodGet && req.URL.Path == "/images/worker:latest/json":
@@ -135,28 +136,49 @@ func TestDockerEnsureVolumeSubpathsUsesTraversableOpaqueRoot(t *testing.T) {
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if got, want := body.Cmd, []string{"-d", "-o", "bun", "-g", "bun", "-m", "0711", "/lineage-volumes/0/" + lineage}; !reflect.DeepEqual(got, want) {
-				t.Fatalf("initializer args=%q, want %q", got, want)
-			}
 			if body.User != "0:0" {
 				t.Fatalf("initializer user=%q, want 0:0", body.User)
 			}
-			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"initializer"}`)), Header: make(http.Header)}, nil
-		case req.Method == http.MethodPost && req.URL.Path == "/containers/initializer/start":
+			switch body.Labels["gh-agent-broker.run_id"] {
+			case "authority-volume-init-" + lineage:
+				rootInitializers++
+				if got, want := body.Cmd, []string{"-d", "-o", "bun", "-g", "bun", "-m", "0711", "/lineage-volumes/0/" + lineage}; !reflect.DeepEqual(got, want) {
+					t.Fatalf("lineage initializer args=%q, want %q", got, want)
+				}
+				return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"lineage-initializer"}`)), Header: make(http.Header)}, nil
+			case "authority-state-init-" + lineage:
+				stateInitializers++
+				if got, want := body.Cmd, []string{"-d", "-o", "bun", "-g", "bun", "-m", "0700", "/lineage-volume/" + lineage + "/.agentd-state"}; !reflect.DeepEqual(got, want) {
+					t.Fatalf("state initializer args=%q, want %q", got, want)
+				}
+				if len(body.HostConfig.Mounts) != 1 || body.HostConfig.Mounts[0].Source != "workspace" || body.HostConfig.Mounts[0].Target != "/lineage-volume" || body.HostConfig.Mounts[0].VolumeOptions == nil || body.HostConfig.Mounts[0].VolumeOptions.Subpath != "" {
+					t.Fatalf("private state initializer mount=%+v", body.HostConfig.Mounts)
+				}
+				return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"state-initializer"}`)), Header: make(http.Header)}, nil
+			default:
+				return nil, fmt.Errorf("unexpected initializer labels %+v", body.Labels)
+			}
+		case req.Method == http.MethodPost && (req.URL.Path == "/containers/lineage-initializer/start" || req.URL.Path == "/containers/state-initializer/start"):
 			return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
-		case req.Method == http.MethodPost && req.URL.Path == "/containers/initializer/wait":
+		case req.Method == http.MethodPost && (req.URL.Path == "/containers/lineage-initializer/wait" || req.URL.Path == "/containers/state-initializer/wait"):
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"StatusCode":0}`)), Header: make(http.Header)}, nil
-		case req.Method == http.MethodGet && req.URL.Path == "/containers/initializer/json":
-			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"Id":"initializer","State":{"ExitCode":0}}`)), Header: make(http.Header)}, nil
-		case req.Method == http.MethodDelete && req.URL.Path == "/containers/initializer":
+		case req.Method == http.MethodGet && (req.URL.Path == "/containers/lineage-initializer/json" || req.URL.Path == "/containers/state-initializer/json"):
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"State":{"ExitCode":0}}`)), Header: make(http.Header)}, nil
+		case req.Method == http.MethodDelete && (req.URL.Path == "/containers/lineage-initializer" || req.URL.Path == "/containers/state-initializer"):
 			return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
 		default:
 			return nil, fmt.Errorf("unexpected request %s %s", req.Method, req.URL.Path)
 		}
 	})}}
 
-	if err := backend.EnsureVolumeSubpaths(context.Background(), "worker:latest", lineage, []Mount{{Source: "workspace", Volume: true, VolumeSubpath: lineage}}); err != nil {
-		t.Fatal(err)
+	mounts := []Mount{{Source: "workspace", Target: agentdControlV1WorkspaceRoot, Volume: true, VolumeSubpath: lineage}}
+	for generation := 1; generation <= 2; generation++ {
+		if err := backend.EnsureAuthorityVolumeSubpaths(context.Background(), "worker:latest", lineage, mounts, agentdControlV1WorkspaceRoot); err != nil {
+			t.Fatalf("generation %d initializer: %v", generation, err)
+		}
+	}
+	if rootInitializers != 2 || stateInitializers != 2 {
+		t.Fatalf("initializer calls roots=%d states=%d, want two of each for lineage reuse", rootInitializers, stateInitializers)
 	}
 }
 

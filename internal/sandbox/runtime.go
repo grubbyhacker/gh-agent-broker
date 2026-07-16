@@ -247,27 +247,47 @@ func (d *DockerBackend) InternalAddress(ctx context.Context, containerID string)
 	return "", nil
 }
 
-// EnsureVolumeSubpaths creates the opaque lineage directory through a short-
-// lived helper that alone sees each full backing volume. The 0711 root is
-// owner-only writable but traversable by each distinct per-session UID/GID;
-// Docker requires a volume subpath to exist before the authority container is
-// created.
-func (d *DockerBackend) EnsureVolumeSubpaths(ctx context.Context, image, lineageID string, mounts []Mount) error {
+// EnsureAuthorityVolumeSubpaths creates the opaque lineage directory and its private
+// agentd state child through short-lived helpers that alone see the full backing
+// volume. The 0711 root is owner-only writable but traversable by each distinct
+// per-session UID/GID; the 0700 child satisfies agentd's state-store contract.
+// Docker requires the lineage subpath to exist before the authority container
+// is created.
+func (d *DockerBackend) EnsureAuthorityVolumeSubpaths(ctx context.Context, image, lineageID string, mounts []Mount, sessionMountTarget string) error {
 	if !validOpaqueLineageID(lineageID) {
 		return fmt.Errorf("invalid volume storage lineage")
 	}
 	initMounts := make([]Mount, 0, len(mounts))
 	args := []string{"-d", "-o", "bun", "-g", "bun", "-m", "0711"}
+	var privateMount Mount
 	for index, mount := range mounts {
 		if !mount.Volume || mount.Source == "" || mount.VolumeSubpath != lineageID {
 			return fmt.Errorf("invalid authority volume subpath request")
+		}
+		if mount.Target == sessionMountTarget {
+			if privateMount.Source != "" {
+				return fmt.Errorf("private authority volume target is ambiguous")
+			}
+			privateMount = mount
 		}
 		target := fmt.Sprintf("/lineage-volumes/%d", index)
 		initMounts = append(initMounts, Mount{Source: mount.Source, Target: target, Volume: true})
 		args = append(args, target+"/"+lineageID)
 	}
-	runID := "authority-volume-init-" + lineageID
-	spec := RuntimeSpec{RunID: runID, Image: image, Entrypoint: []string{"install"}, Command: args, User: "0:0", Labels: map[string]string{"gh-agent-broker.run_id": runID, "gh-agent-broker.volume_initializer": "true"}, Mounts: initMounts, Resources: Resources{CPUShares: 2, MemoryMB: 32, PidsLimit: 16}}
+	if privateMount.Source == "" {
+		return fmt.Errorf("private authority session volume is unavailable")
+	}
+	if err := d.runVolumeInitializer(ctx, image, "authority-volume-init-"+lineageID, initMounts, args); err != nil {
+		return err
+	}
+	privateTarget := "/lineage-volume"
+	privateMounts := []Mount{{Source: privateMount.Source, Target: privateTarget, Volume: true}}
+	privateArgs := []string{"-d", "-o", "bun", "-g", "bun", "-m", "0700", path.Join(privateTarget, lineageID, agentdControlV1StateDirectory)}
+	return d.runVolumeInitializer(ctx, image, "authority-state-init-"+lineageID, privateMounts, privateArgs)
+}
+
+func (d *DockerBackend) runVolumeInitializer(ctx context.Context, image, runID string, mounts []Mount, args []string) error {
+	spec := RuntimeSpec{RunID: runID, Image: image, Entrypoint: []string{"install"}, Command: args, User: "0:0", Labels: map[string]string{"gh-agent-broker.run_id": runID, "gh-agent-broker.volume_initializer": "true"}, Mounts: mounts, Resources: Resources{CPUShares: 2, MemoryMB: 32, PidsLimit: 16}}
 	info, err := d.Create(ctx, spec)
 	if err != nil {
 		return err

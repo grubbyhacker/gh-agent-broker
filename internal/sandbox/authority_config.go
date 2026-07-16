@@ -73,9 +73,13 @@ type AuthorityStorage struct {
 var fixedAgentdCommand = []string{"bun", "run", "src/cli.ts", "serve"}
 
 // agentdControlV1WorkspaceRoot matches the launcher's immutable immediate-child
-// workspace boundary. The state database remains at workspaceRoot/agentd.sqlite3
-// inside the worker storage-lineage volume subpath.
-const agentdControlV1WorkspaceRoot = "/var/lib/agentd/workspaces"
+// workspace boundary. The lineage root remains traversable for distinct session
+// identities, while agentd's journal lives under a broker-created private child.
+const (
+	agentdControlV1WorkspaceRoot  = "/var/lib/agentd/workspaces"
+	agentdControlV1StateDirectory = ".agentd-state"
+	agentdControlV1StateFile      = "agentd.sqlite3"
+)
 
 type AuthorityPrincipal struct {
 	Token           string   `json:"-" yaml:"token"`
