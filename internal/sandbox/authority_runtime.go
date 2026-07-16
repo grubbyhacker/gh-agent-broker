@@ -52,7 +52,14 @@ func authorityWorkerRuntimeSpec(spec AuthorityWorkerSpec, secret, coordinatorTok
 }
 
 func (r *DockerAuthorityRuntime) Stop(ctx context.Context, id string) error {
-	return r.docker.Stop(ctx, id, 10)
+	err := r.docker.Stop(ctx, id, 10)
+	if status, ok := DockerStatusCode(err); ok && status == 304 {
+		// Docker uses 304 for an already-stopped container.  A drained
+		// zero-lease predecessor is already unavailable, so retirement is
+		// complete and can safely advance its durable lifecycle record.
+		return nil
+	}
+	return err
 }
 
 func (r *DockerAuthorityRuntime) Healthy(ctx context.Context, id string) (bool, string, error) {
