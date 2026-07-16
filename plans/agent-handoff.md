@@ -21,6 +21,11 @@ Runtime broker and sandbox configuration is owned by `vps-ops`. This repository
 owns the broker implementation, public examples, worker images, deploy workflow
 interface, and deterministic deploy-contract tests.
 
+The production deploy workflow projects the dedicated
+`VPS_OPS_GH_BROKER_GHCR_PACKAGES_READ_TOKEN` only into its preflight and
+managed broker-deploy steps. The token remains a Doppler-managed host registry
+credential; `vps-ops` owns its Docker login, permission, and runtime mount.
+
 ## Signal Plane Proof Retirement
 
 The narrow Phase 5 webhook-derived Codex worker proof is retired:
