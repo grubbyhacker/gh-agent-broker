@@ -188,6 +188,11 @@ func TestAuthorityProfileValidationAndDigest(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
+	productionWithoutAuthorityCredentials := cfg
+	productionWithoutAuthorityCredentials.Production = true
+	if err := productionWithoutAuthorityCredentials.Validate(); err != nil {
+		t.Fatalf("Validate() production profile with credential_bundle unset error = %v", err)
+	}
 	first, policy, err := authorityProfileDigest("writer", cfg.AuthorityProfiles["writer"])
 	if err != nil {
 		t.Fatal(err)
@@ -248,10 +253,72 @@ func TestAuthorityProfileValidationAndDigest(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() with reviewed credential bundle error = %v", err)
 	}
+
+	cfg = authorityTestConfig(t)
+	profile = cfg.AuthorityProfiles["writer"]
+	profile.CredentialBundle = "agentd-staging-auth"
+	cfg.AuthorityProfiles["writer"] = profile
+	cfg.Bundles["agentd-staging-auth"] = CredentialBundle{SourceVolume: "agentd-staging-auth", MountPath: authorityCodexHomeMountPath, ReadOnly: true, AllowedAuthorityProfiles: []string{"writer"}, SecretFiles: []string{"auth.json"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() with reviewed authority volume credential error = %v", err)
+	}
+	spec := authoritySpec(AuthorityWorker{WorkerID: "volume-credential", Profile: "writer"}, profile, cfg)
+	if mount := spec.CredentialMount; !mount.Volume || mount.Source != "agentd-staging-auth" || mount.Target != authorityCodexHomeMountPath || !mount.ReadOnly {
+		t.Fatalf("authority credential mount=%+v, want named read-only volume", mount)
+	}
+
+	for name, tc := range map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"conflicting sources": {func(cfg *Config) {
+			bundle := cfg.Bundles["agentd-staging-auth"]
+			bundle.SourcePath = "/srv/agentd-auth"
+			cfg.Bundles["agentd-staging-auth"] = bundle
+		}, "exactly one of source_path or source_volume"},
+		"unsafe volume": {func(cfg *Config) {
+			bundle := cfg.Bundles["agentd-staging-auth"]
+			bundle.SourceVolume = "../../host"
+			cfg.Bundles["agentd-staging-auth"] = bundle
+		}, "source_volume is unsafe"},
+		"writable mount": {func(cfg *Config) {
+			bundle := cfg.Bundles["agentd-staging-auth"]
+			bundle.ReadOnly = false
+			cfg.Bundles["agentd-staging-auth"] = bundle
+		}, "readonly must be true"},
+		"wrong mount target": {func(cfg *Config) {
+			bundle := cfg.Bundles["agentd-staging-auth"]
+			bundle.MountPath = "/credentials/agentd"
+			cfg.Bundles["agentd-staging-auth"] = bundle
+		}, `source_volume must mount at "/var/empty/.codex"`},
+		"unknown authority profile": {func(cfg *Config) {
+			bundle := cfg.Bundles["agentd-staging-auth"]
+			bundle.AllowedAuthorityProfiles = []string{"caller-selected"}
+			cfg.Bundles["agentd-staging-auth"] = bundle
+		}, "allows unknown authority profile"},
+		"production credential": {func(cfg *Config) { cfg.Production = true }, "must not configure credentials in production mode"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := cfg
+			invalid.Bundles = cloneCredentialBundles(cfg.Bundles)
+			tc.mutate(&invalid)
+			if err := invalid.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error=%v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func cloneCredentialBundles(in map[string]CredentialBundle) map[string]CredentialBundle {
+	out := make(map[string]CredentialBundle, len(in))
+	for name, bundle := range in {
+		out[name] = bundle
+	}
+	return out
 }
 
 func TestAuthorityWorkerRequestRejectsAuthorityOverrides(t *testing.T) {
-	for _, field := range []string{"image", "platform", "command", "credentials", "mounts", "network", "repo", "operations", "user", "isolation"} {
+	for _, field := range []string{"image", "platform", "command", "credentials", "credential_bundle", "source_volume", "mount_path", "mounts", "network", "repo", "operations", "user", "isolation", "cap_add"} {
 		body := `{"profile":"writer","idempotency_key":"one","session_binding":"session-1","` + field + `":"forbidden"}`
 		var request AuthorityWorkerRequest
 		if err := json.Unmarshal([]byte(body), &request); err == nil || !strings.Contains(err.Error(), "unknown field") {
@@ -277,6 +344,12 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	}
 	if got := runtime.Env["AGENTD_SESSION_ROOT"]; got != agentdControlV1WorkspaceRoot {
 		t.Fatalf("AGENTD_SESSION_ROOT=%q, want %q", got, agentdControlV1WorkspaceRoot)
+	}
+	if got := runtime.Env["AGENTD_BROKER_VALIDATION_URL"]; got != agentdBrokerValidationURL {
+		t.Fatalf("AGENTD_BROKER_VALIDATION_URL=%q, want %q", got, agentdBrokerValidationURL)
+	}
+	if got := runtime.Env["AGENTD_BROKER_VALIDATION_TOKEN"]; got != "secret" || got != runtime.Env[profile.BrokerSecretEnv] {
+		t.Fatal("agentd broker validation token does not reuse the reviewed broker-agent credential")
 	}
 	if runtime.User != "bun" || !runtime.AllowAgentdSetuidLauncherPrivilegeTransition {
 		t.Fatalf("agentd runtime user=%q privilege transition=%t", runtime.User, runtime.AllowAgentdSetuidLauncherPrivilegeTransition)
@@ -308,6 +381,8 @@ func TestPrivateAgentdStateDirectoryCannotBeAllocatedAsSessionWorkspace(t *testi
 func TestAuthorityWorkerLifecycleCapacityDrainReleaseAndReplacement(t *testing.T) {
 	ctx := context.Background()
 	cfg := authorityTestConfig(t)
+	validationSecret := t.Name()
+	t.Setenv(cfg.AuthorityProfiles["writer"].BrokerSecretEnv, validationSecret)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
 	auditPath := filepath.Join(t.TempDir(), "authority-audit.jsonl")
@@ -410,7 +485,7 @@ func TestAuthorityWorkerLifecycleCapacityDrainReleaseAndReplacement(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{firstRequest.IdempotencyKey, firstRequest.SessionBinding, "WRITER_BROKER_CREDENTIAL"} {
+	for _, secret := range []string{firstRequest.IdempotencyKey, firstRequest.SessionBinding, "WRITER_BROKER_CREDENTIAL", validationSecret} {
 		if strings.Contains(string(auditBytes), secret) {
 			t.Fatalf("audit leaked %q: %s", secret, auditBytes)
 		}

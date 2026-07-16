@@ -79,6 +79,7 @@ const (
 	agentdControlV1WorkspaceRoot  = "/var/lib/agentd/workspaces"
 	agentdControlV1StateDirectory = ".agentd-state"
 	agentdControlV1StateFile      = "agentd.sqlite3"
+	authorityCodexHomeMountPath   = "/var/empty/.codex"
 )
 
 type AuthorityPrincipal struct {
@@ -178,6 +179,9 @@ func (c Config) validateAuthorityProfile(name string, profile AuthorityProfile) 
 		errs = append(errs, fmt.Sprintf("authority profile %q checkpoint must set absolute directory and key_env", name))
 	}
 	if profile.CredentialBundle != "" {
+		if c.Production {
+			errs = append(errs, fmt.Sprintf("authority profile %q must not configure credentials in production mode", name))
+		}
 		bundle, ok := c.Bundles[profile.CredentialBundle]
 		if !ok {
 			errs = append(errs, fmt.Sprintf("authority profile %q references unknown credential_bundle %q", name, profile.CredentialBundle))

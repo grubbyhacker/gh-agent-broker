@@ -162,7 +162,7 @@ fence configuration, and Docker returns unavailable until that protocol lands.
 Checkpoint files remain lease-observation evidence only, not an agentd
 recovery manifest or a recovery guarantee.
 
-The current broker/agentd integration matches the agentd PR 9 source contract:
+The current broker/agentd integration matches the agentd PR 10 source contract:
 authenticated `/readyz` uses `agentd/control/v1` and the camelCase
 `workerId`, `storageLineageId`, and `fenceEpoch` identity fields plus the
 `components` object. Create-session projects the exact agentd/v1 camelCase
@@ -186,7 +186,8 @@ separate. Journal continuation therefore comes from inherited fenced storage,
 not from broker checkpoint artifacts.
 
 The reviewed agentd authority runtime keeps the server process explicitly on
-Docker user `bun`, remains non-privileged, and drops all capabilities. Its
+Docker user `bun`, remains non-privileged, drops all capabilities, and restores
+only `SETUID` and `SETGID` to the bounding set. Its
 immutable root-owned setuid launcher is the sole RuntimeSpec exception to the
 default `no-new-privileges` option because the launcher must obtain euid 0
 during exec before dropping into the turn's allocated UID/GID. Ordinary
@@ -204,6 +205,27 @@ exactly 32 hexadecimal characters, and agentd accepts only the exact
 broker-projected lineage child rather than discovering directory entries. The
 follow-on vps-ops integration PR must change the managed profile from
 `/var/lib/agentd/sessions` and update its reviewed digest.
+
+The authority Docker create contract keeps `USER bun`, non-privileged and the
+existing read-only constraints, drops `ALL`, then adds only `SETUID` and
+`SETGID` to the capability bounding set. Only this immutable authority spec
+omits `no-new-privileges`; ordinary Bun processes retain no general root path,
+while the root-owned fixed setuid launcher owns the reviewed transition. Agentd
+PR 10 independently exercises that image-side launcher transition and its
+negative Bun control. A
+staging-only credential bundle may select a fixed named Docker volume, mounted
+read-only at `/var/empty/.codex`; host-path credential bundles are unchanged,
+and production authority profiles reject credentials.
+
+Authority workers now receive the fixed broker validation URL
+`http://broker:8080/v1/authority-workers/agentd/session-validation` and a
+validation token copied from the same reviewed broker-agent secret. As of
+agentd PR 10 head `6ddc461c611da9b35c707cc2e174b126abbf5060`, `/readyz`
+still exposes only `components.journal`, `components.runtime`,
+`components.launcher`, and `components.isolation`. The exact broker-fence
+readiness component field remains undefined upstream, so decoding that pending
+field is intentionally isolated from this change. The rebind payload also
+remains pending agentd ownership and is not invented here.
 
 The production deploy workflow grants `packages: read` and passes the
 ephemeral `github.token` plus `github.actor` to only the vps-ops deploy step as

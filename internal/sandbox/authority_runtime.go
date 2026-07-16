@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const agentdBrokerValidationURL = "http://broker:8080/v1/authority-workers/agentd/session-validation"
+
 // DockerAuthorityRuntime is purpose-built for immutable authority workers. It
 // does not accept caller runtime inputs; AuthorityWorkerSpec is constructed
 // exclusively from a reviewed profile.
@@ -71,16 +73,18 @@ func authorityWorkerRuntimeSpec(spec AuthorityWorkerSpec, secret, coordinatorTok
 	// source relative to that directory. State is durable within the worker's
 	// engine-enforced storage-lineage subpath.
 	env := map[string]string{
-		spec.BrokerSecretEnv:        secret,
-		"AGENTD_COORDINATOR_TOKEN":  coordinatorToken,
-		"AGENTD_STATE_PATH":         filepath.Join(spec.SessionIsolation.WorkspaceRoot, agentdControlV1StateDirectory, agentdControlV1StateFile),
-		"AGENTD_WORKER_ID":          spec.WorkerID,
-		"AGENTD_STORAGE_LINEAGE_ID": spec.WorkerStorageLineageID,
-		"AGENTD_FENCE_EPOCH":        strconv.FormatInt(spec.WorkerFenceEpoch, 10),
-		"AGENTD_AUTHORITY_BINDING":  spec.Profile,
-		"AGENTD_SESSION_ROOT":       spec.SessionIsolation.WorkspaceRoot,
-		"AGENTD_SESSION_UID_MIN":    strconv.Itoa(spec.SessionIsolation.UIDStart),
-		"AGENTD_SESSION_CAPACITY":   strconv.Itoa(spec.SessionCapacity),
+		spec.BrokerSecretEnv:             secret,
+		"AGENTD_BROKER_VALIDATION_URL":   agentdBrokerValidationURL,
+		"AGENTD_BROKER_VALIDATION_TOKEN": secret,
+		"AGENTD_COORDINATOR_TOKEN":       coordinatorToken,
+		"AGENTD_STATE_PATH":              filepath.Join(spec.SessionIsolation.WorkspaceRoot, agentdControlV1StateDirectory, agentdControlV1StateFile),
+		"AGENTD_WORKER_ID":               spec.WorkerID,
+		"AGENTD_STORAGE_LINEAGE_ID":      spec.WorkerStorageLineageID,
+		"AGENTD_FENCE_EPOCH":             strconv.FormatInt(spec.WorkerFenceEpoch, 10),
+		"AGENTD_AUTHORITY_BINDING":       spec.Profile,
+		"AGENTD_SESSION_ROOT":            spec.SessionIsolation.WorkspaceRoot,
+		"AGENTD_SESSION_UID_MIN":         strconv.Itoa(spec.SessionIsolation.UIDStart),
+		"AGENTD_SESSION_CAPACITY":        strconv.Itoa(spec.SessionCapacity),
 	}
 	labels := map[string]string{
 		"gh-agent-broker.run_id":                 "authority-" + spec.WorkerID,

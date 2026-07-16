@@ -22,6 +22,12 @@ func TestDockerCreatePassesPlatform(t *testing.T) {
 			if got, want := body.HostConfig.SecurityOpt, []string{"no-new-privileges"}; !reflect.DeepEqual(got, want) {
 				t.Fatalf("ordinary runtime SecurityOpt=%q, want %q", got, want)
 			}
+			if len(body.HostConfig.CapAdd) != 0 {
+				t.Fatalf("ordinary runtime must not gain capabilities: %q", body.HostConfig.CapAdd)
+			}
+			if got, want := body.HostConfig.CapDrop, []string{"ALL"}; !reflect.DeepEqual(got, want) || body.User != "bun" || body.HostConfig.Privileged {
+				t.Fatalf("ordinary bun confinement user=%q privileged=%t CapDrop=%q", body.User, body.HostConfig.Privileged, got)
+			}
 			if body.Platform != "linux/amd64" {
 				t.Fatalf("platform=%q", body.Platform)
 			}
@@ -36,7 +42,7 @@ func TestDockerCreatePassesPlatform(t *testing.T) {
 			return nil, fmt.Errorf("unexpected request path")
 		}
 	})}}
-	info, err := backend.Create(context.Background(), RuntimeSpec{RunID: "platform", Image: "worker:latest", Platform: "linux/amd64", Entrypoint: []string{"bun", "run", "src/cli.ts", "serve"}, Labels: map[string]string{}})
+	info, err := backend.Create(context.Background(), RuntimeSpec{RunID: "platform", Image: "worker:latest", Platform: "linux/amd64", Entrypoint: []string{"bun", "run", "src/cli.ts", "serve"}, User: "bun", Labels: map[string]string{}})
 	if err != nil || info.ID != "created" {
 		t.Fatalf("Create()=%+v err=%v", info, err)
 	}
@@ -54,7 +60,8 @@ func TestDockerCreateAgentdSetuidLaunchOmitsOnlyNoNewPrivileges(t *testing.T) {
 		WorkerStorageLineageID: "11111111111111111111111111111111",
 		WorkerFenceEpoch:       1,
 	}
-	spec := authorityWorkerRuntimeSpec(authoritySpec(worker, profile, cfg), "secret", "coordinator-secret", nil)
+	credential := Mount{Source: "agentd-staging-auth", Target: authorityCodexHomeMountPath, ReadOnly: true, Volume: true}
+	spec := authorityWorkerRuntimeSpec(authoritySpec(worker, profile, cfg), "secret", "coordinator-secret", []Mount{credential})
 	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Path {
 		case "/containers/create":
@@ -73,6 +80,19 @@ func TestDockerCreateAgentdSetuidLaunchOmitsOnlyNoNewPrivileges(t *testing.T) {
 			}
 			if got, want := body.HostConfig.CapDrop, []string{"ALL"}; !reflect.DeepEqual(got, want) {
 				t.Fatalf("agentd authority CapDrop=%q, want %q", got, want)
+			}
+			if got, want := body.HostConfig.CapAdd, []string{"SETUID", "SETGID"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("agentd authority CapAdd=%q, want %q", got, want)
+			}
+			if body.HostConfig.ReadonlyRootfs {
+				t.Fatal("agentd authority readonly-rootfs constraint changed")
+			}
+			if len(body.HostConfig.Binds) != 0 || len(body.HostConfig.Mounts) != 1 {
+				t.Fatalf("agentd credential must serialize only as a volume mount: binds=%q mounts=%+v", body.HostConfig.Binds, body.HostConfig.Mounts)
+			}
+			mount := body.HostConfig.Mounts[0]
+			if mount.Type != "volume" || mount.Source != "agentd-staging-auth" || mount.Target != authorityCodexHomeMountPath || !mount.ReadOnly || mount.VolumeOptions == nil || mount.VolumeOptions.Subpath != "" {
+				t.Fatalf("agentd credential volume mount=%+v", mount)
 			}
 			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"created"}`)), Header: make(http.Header)}, nil
 		case "/images/worker:latest/json":

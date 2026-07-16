@@ -126,6 +126,7 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 			ReadonlyRootfs:  false,
 			SecurityOpt:     runtimeSecurityOptions(spec),
 			CapDrop:         []string{"ALL"},
+			CapAdd:          runtimeCapabilityAdds(spec),
 			NetworkMode:     networkMode(spec.Network),
 			Binds:           binds(spec.Mounts),
 			Mounts:          dockerMounts(spec.Mounts),
@@ -156,6 +157,13 @@ func runtimeSecurityOptions(spec RuntimeSpec) []string {
 		return nil
 	}
 	return []string{"no-new-privileges"}
+}
+
+func runtimeCapabilityAdds(spec RuntimeSpec) []string {
+	if !spec.AllowAgentdSetuidLauncherPrivilegeTransition {
+		return nil
+	}
+	return []string{"SETUID", "SETGID"}
 }
 
 func (d *DockerBackend) adopt(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
@@ -588,6 +596,7 @@ type dockerHostConfig struct {
 	ReadonlyRootfs  bool          `json:"ReadonlyRootfs"`
 	SecurityOpt     []string      `json:"SecurityOpt"`
 	CapDrop         []string      `json:"CapDrop"`
+	CapAdd          []string      `json:"CapAdd,omitempty"`
 	NetworkMode     string        `json:"NetworkMode"`
 	Binds           []string      `json:"Binds"`
 	Mounts          []dockerMount `json:"Mounts,omitempty"`

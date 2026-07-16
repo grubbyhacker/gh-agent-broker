@@ -616,9 +616,16 @@ func validateReassignmentRequest(request AuthoritySessionReassignmentRequest) er
 func authoritySpec(worker AuthorityWorker, profile AuthorityProfile, cfg Config) AuthorityWorkerSpec {
 	spec := AuthorityWorkerSpec{WorkerID: worker.WorkerID, Profile: worker.Profile, ProfileVersion: worker.ProfileVersion, PolicyDigest: worker.PolicyDigest, Image: profile.Image, Platform: profile.Platform, Command: append([]string(nil), profile.Command...), Resources: profile.Resources, Network: cfg.Networks[profile.NetworkPolicy], BrokerAgentID: profile.BrokerAgentID, BrokerSecretEnv: profile.BrokerSecretEnv, CoordinatorTokenEnv: profile.CoordinatorTokenEnv, CredentialBundle: profile.CredentialBundle, Repositories: append([]string(nil), profile.Repositories...), BranchPolicy: profile.BranchPolicy, Operations: append([]string(nil), profile.Operations...), ExtraMounts: append([]ExtraMount(nil), profile.ExtraMounts...), SessionIsolation: profile.SessionIsolation, Checkpoint: profile.Checkpoint, Storage: profile.Storage, SessionCapacity: profile.SessionCapacity, WorkerStorageLineageID: worker.WorkerStorageLineageID, WorkerFenceEpoch: worker.WorkerFenceEpoch, AgentdReadiness: configuredAgentdReadiness(profile)}
 	if bundle, ok := cfg.Bundles[profile.CredentialBundle]; ok {
-		spec.CredentialMount = Mount{Source: bundle.SourcePath, Target: bundle.MountPath, ReadOnly: bundle.ReadOnly}
+		spec.CredentialMount = credentialBundleMount(bundle)
 	}
 	return spec
+}
+
+func credentialBundleMount(bundle CredentialBundle) Mount {
+	if bundle.SourceVolume != "" {
+		return Mount{Source: bundle.SourceVolume, Target: bundle.MountPath, ReadOnly: bundle.ReadOnly, Volume: true}
+	}
+	return Mount{Source: bundle.SourcePath, Target: bundle.MountPath, ReadOnly: bundle.ReadOnly}
 }
 
 func decision(err error) string {
