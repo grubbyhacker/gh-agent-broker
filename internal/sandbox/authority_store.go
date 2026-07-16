@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -62,8 +63,9 @@ type AuthorityLease struct {
 }
 
 type AuthorityWorkerStore struct {
-	db   *sql.DB
-	salt []byte
+	db        *sql.DB
+	salt      []byte
+	sessionMu sync.Mutex
 }
 
 func OpenAuthorityWorkerStore(ctx context.Context, path string) (*AuthorityWorkerStore, error) {

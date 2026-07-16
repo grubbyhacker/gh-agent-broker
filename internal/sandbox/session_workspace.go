@@ -13,6 +13,8 @@ type SessionWorkspace struct {
 }
 
 func (s *AuthorityWorkerStore) AllocateSessionWorkspace(ctx context.Context, lease AuthorityLease, policy SessionIsolation) (SessionWorkspace, error) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
 	if lease.BindingDigest == "" || lease.WorkerID == "" {
 		return SessionWorkspace{}, fmt.Errorf("active authority lease is required")
 	}
