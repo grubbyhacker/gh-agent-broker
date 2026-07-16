@@ -42,6 +42,11 @@ type RuntimeSpec struct {
 	Resources  Resources
 	WorkingDir string
 	Timeout    time.Duration
+	// AllowAgentdSetuidLauncherPrivilegeTransition is the sole exception to
+	// Docker's default no-new-privileges policy. It is set only by the reviewed
+	// authority-worker spec: agentd stays the non-root bun user while its fixed,
+	// root-owned setuid launcher obtains the euid required to isolate a turn.
+	AllowAgentdSetuidLauncherPrivilegeTransition bool
 }
 
 type Mount struct {
@@ -119,7 +124,7 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 		WorkingDir: spec.WorkingDir,
 		HostConfig: dockerHostConfig{
 			ReadonlyRootfs:  false,
-			SecurityOpt:     []string{"no-new-privileges"},
+			SecurityOpt:     runtimeSecurityOptions(spec),
 			CapDrop:         []string{"ALL"},
 			NetworkMode:     networkMode(spec.Network),
 			Binds:           binds(spec.Mounts),
@@ -144,6 +149,13 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 		return ContainerInfo{}, err
 	}
 	return ContainerInfo{ID: out.ID, ImageDigest: imageDigest, Lifecycle: ContainerNeverStarted}, nil
+}
+
+func runtimeSecurityOptions(spec RuntimeSpec) []string {
+	if spec.AllowAgentdSetuidLauncherPrivilegeTransition {
+		return nil
+	}
+	return []string{"no-new-privileges"}
 }
 
 func (d *DockerBackend) adopt(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {

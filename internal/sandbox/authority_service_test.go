@@ -220,6 +220,15 @@ func TestAuthorityProfileValidationAndDigest(t *testing.T) {
 
 	cfg = authorityTestConfig(t)
 	profile = cfg.AuthorityProfiles["writer"]
+	profile.AgentdReadiness = &AgentdReadiness{ContractVersion: "agentd/control/v1", Port: 8080, Path: "/readyz"}
+	profile.SessionIsolation.WorkspaceRoot = "/var/lib/agentd/sessions"
+	cfg.AuthorityProfiles["writer"] = profile
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), `agentd/control/v1 requires workspace_root "/var/lib/agentd/workspaces"`) {
+		t.Fatalf("Validate() error = %v, want fixed agentd workspace root denial", err)
+	}
+
+	cfg = authorityTestConfig(t)
+	profile = cfg.AuthorityProfiles["writer"]
 	profile.ExtraMounts = []ExtraMount{{SourcePath: "/var/run/docker.sock", MountPath: "/runtime/docker.sock"}}
 	cfg.AuthorityProfiles["writer"] = profile
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "Docker socket") {
@@ -263,8 +272,11 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	if !equalStrings(runtime.Entrypoint, fixedAgentdCommand) || len(runtime.Command) != 0 || runtime.WorkingDir != "" {
 		t.Fatalf("runtime entrypoint=%q command=%q", runtime.Entrypoint, runtime.Command)
 	}
-	if got, want := runtime.Env["AGENTD_STATE_PATH"], "/var/lib/agentd/sessions/agentd.sqlite3"; got != want {
+	if got, want := runtime.Env["AGENTD_STATE_PATH"], agentdControlV1WorkspaceRoot+"/agentd.sqlite3"; got != want {
 		t.Fatalf("AGENTD_STATE_PATH=%q, want %q", got, want)
+	}
+	if runtime.User != "bun" || !runtime.AllowAgentdSetuidLauncherPrivilegeTransition {
+		t.Fatalf("agentd runtime user=%q privilege transition=%t", runtime.User, runtime.AllowAgentdSetuidLauncherPrivilegeTransition)
 	}
 	for key, want := range map[string]string{"AGENTD_WORKER_ID": worker.WorkerID, "AGENTD_STORAGE_LINEAGE_ID": worker.WorkerStorageLineageID, "AGENTD_FENCE_EPOCH": "7"} {
 		if got := runtime.Env[key]; got != want {
@@ -996,7 +1008,7 @@ func authorityTestConfig(t *testing.T) Config {
 			Repositories: []string{"owner/repo", "owner/other"},
 			BranchPolicy: BranchPolicy{AllowedPatterns: []string{`^agent/writer/[A-Za-z0-9_.:-]+$`}, BaseBranches: []string{"main"}, GeneratePrefix: "agent/writer"},
 			Operations:   []string{"git.receive-pack", "pull.create"}, MaxWorkers: 2, SessionCapacity: 2,
-			SessionIsolation: SessionIsolation{Primitive: "uid_gid_0700", WorkspaceRoot: "/var/lib/agentd/sessions", UIDStart: 20000, GIDStart: 20000},
+			SessionIsolation: SessionIsolation{Primitive: "uid_gid_0700", WorkspaceRoot: agentdControlV1WorkspaceRoot, UIDStart: 20000, GIDStart: 20000},
 			Checkpoint:       CheckpointPolicy{Directory: "/var/lib/agentd/checkpoints", KeyEnv: "AUTHORITY_CHECKPOINT_KEY"},
 			Storage:          AuthorityStorage{SessionVolume: "authority-sessions", CheckpointVolume: "authority-checkpoints", EvidenceVolume: "authority-evidence"},
 		},

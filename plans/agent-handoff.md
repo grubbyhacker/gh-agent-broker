@@ -180,6 +180,28 @@ fence epoch by exactly one, while logical session lineage remains unchanged and
 separate. Journal continuation therefore comes from inherited fenced storage,
 not from broker checkpoint artifacts.
 
+The reviewed agentd authority runtime keeps the server process explicitly on
+Docker user `bun`, remains non-privileged, and drops all capabilities. Its
+immutable root-owned setuid launcher is the sole RuntimeSpec exception to the
+default `no-new-privileges` option because the launcher must obtain euid 0
+during exec before dropping into the turn's allocated UID/GID. Ordinary
+sandboxes, helpers, volume initializers, and legacy paths retain
+`no-new-privileges`; authenticated readiness is not treated as proof that the
+actual launch spec permits this transition.
+
+Profiles selecting `agentd/control/v1` now fail closed unless
+`workspace_root` is exactly `/var/lib/agentd/workspaces`, matching agentd's
+fixed immediate-child launcher boundary. Worker state remains
+`workspaceRoot/agentd.sqlite3` inside the worker storage-lineage volume
+subpath. The follow-on vps-ops integration PR must change the managed profile
+from `/var/lib/agentd/sessions` and update its reviewed digest.
+
+The production deploy workflow grants `packages: read` and passes the
+ephemeral `github.token` plus `github.actor` to only the vps-ops deploy step as
+the GHCR pull credential interface expected after vps-ops #244. No PAT,
+repository secret, Doppler credential, or container environment projection is
+introduced by this repository.
+
 A committed zero-lease draining predecessor is retired after cutover;
 reconciliation retries that retirement after an interruption. REST errors remain structured as
 `reassignment_not_ready`, `reassignment_stale_predecessor`,

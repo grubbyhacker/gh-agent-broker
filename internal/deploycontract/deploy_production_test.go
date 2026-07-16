@@ -42,6 +42,46 @@ func TestProductionDeploySecretExports(t *testing.T) {
 	}
 }
 
+func TestProductionDeployUsesJobTokenForGHCROnlyInDeployStep(t *testing.T) {
+	t.Parallel()
+
+	workflow, err := os.ReadFile("../../.github/workflows/deploy-production.yml")
+	if err != nil {
+		t.Fatalf("read production deploy workflow: %v", err)
+	}
+	text := string(workflow)
+	if !regexp.MustCompile(`(?m)^  packages: read$`).MatchString(text) {
+		t.Fatal("production deploy workflow must grant packages: read")
+	}
+
+	//nolint:gosec // These are workflow variable names and GitHub context expressions, not credential values.
+	for name, source := range map[string]string{
+		"VPS_OPS_GH_BROKER_GHCR_PACKAGES_READ_TOKEN": `\$\{\{ github\.token \}\}`,
+		"VPS_OPS_GH_BROKER_GHCR_PULL_USERNAME":       `\$\{\{ github\.actor \}\}`,
+	} {
+		pattern := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(name) + `:\s*` + source + `\s*$`)
+		matches := pattern.FindAllStringIndex(text, -1)
+		if len(matches) != 1 {
+			t.Errorf("%s must be exported exactly once from its GitHub context, got %d", name, len(matches))
+		}
+	}
+
+	const deployStep = "      - name: Deploy gh-agent-broker\n"
+	start := strings.Index(text, deployStep)
+	if start < 0 {
+		t.Fatal("production deploy workflow must contain the gh-agent-broker deploy step")
+	}
+	deploy := text[start:]
+	if end := strings.Index(deploy[len(deployStep):], "\n      - name:"); end >= 0 {
+		deploy = deploy[:len(deployStep)+end]
+	}
+	for _, name := range []string{"VPS_OPS_GH_BROKER_GHCR_PACKAGES_READ_TOKEN", "VPS_OPS_GH_BROKER_GHCR_PULL_USERNAME"} {
+		if !strings.Contains(deploy, name) {
+			t.Errorf("deploy step must export %s", name)
+		}
+	}
+}
+
 func TestProductionDeployOmitsRetiredProofSecrets(t *testing.T) {
 	t.Parallel()
 

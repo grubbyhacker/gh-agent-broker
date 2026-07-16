@@ -72,6 +72,11 @@ type AuthorityStorage struct {
 
 var fixedAgentdCommand = []string{"bun", "run", "src/cli.ts", "serve"}
 
+// agentdControlV1WorkspaceRoot matches the launcher's immutable immediate-child
+// workspace boundary. The state database remains at workspaceRoot/agentd.sqlite3
+// inside the worker storage-lineage volume subpath.
+const agentdControlV1WorkspaceRoot = "/var/lib/agentd/workspaces"
+
 type AuthorityPrincipal struct {
 	Token           string   `json:"-" yaml:"token"`
 	TokenEnv        string   `json:"-" yaml:"token_env"`
@@ -116,6 +121,9 @@ func (c Config) validateAuthorityProfile(name string, profile AuthorityProfile) 
 	case "agentd/control/v1":
 		if readiness.Port < 1 || readiness.Port > 65535 || readiness.Path != "/readyz" {
 			errs = append(errs, fmt.Sprintf("authority profile %q agentd/control/v1 readiness requires a valid port and /readyz path", name))
+		}
+		if profile.SessionIsolation.WorkspaceRoot != agentdControlV1WorkspaceRoot {
+			errs = append(errs, fmt.Sprintf("authority profile %q agentd/control/v1 requires workspace_root %q", name, agentdControlV1WorkspaceRoot))
 		}
 	default:
 		errs = append(errs, fmt.Sprintf("authority profile %q has unsupported agentd readiness contract %q", name, readiness.ContractVersion))

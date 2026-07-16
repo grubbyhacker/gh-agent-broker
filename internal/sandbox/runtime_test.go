@@ -19,6 +19,9 @@ func TestDockerCreatePassesPlatform(t *testing.T) {
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
+			if got, want := body.HostConfig.SecurityOpt, []string{"no-new-privileges"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("ordinary runtime SecurityOpt=%q, want %q", got, want)
+			}
 			if body.Platform != "linux/amd64" {
 				t.Fatalf("platform=%q", body.Platform)
 			}
@@ -36,6 +39,50 @@ func TestDockerCreatePassesPlatform(t *testing.T) {
 	info, err := backend.Create(context.Background(), RuntimeSpec{RunID: "platform", Image: "worker:latest", Platform: "linux/amd64", Entrypoint: []string{"bun", "run", "src/cli.ts", "serve"}, Labels: map[string]string{}})
 	if err != nil || info.ID != "created" {
 		t.Fatalf("Create()=%+v err=%v", info, err)
+	}
+}
+
+func TestDockerCreateAgentdSetuidLaunchOmitsOnlyNoNewPrivileges(t *testing.T) {
+	cfg := authorityTestConfig(t)
+	profile := cfg.AuthorityProfiles["writer"]
+	profile.Image = "worker:latest"
+	worker := AuthorityWorker{
+		WorkerID:               "setuid-launch",
+		Profile:                "writer",
+		ProfileVersion:         "version",
+		PolicyDigest:           "policy",
+		WorkerStorageLineageID: "11111111111111111111111111111111",
+		WorkerFenceEpoch:       1,
+	}
+	spec := authorityWorkerRuntimeSpec(authoritySpec(worker, profile, cfg), "secret", "coordinator-secret", nil)
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/containers/create":
+			var body dockerCreateRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body.HostConfig.SecurityOpt) != 0 {
+				t.Fatalf("agentd setuid launch SecurityOpt=%q, want no no-new-privileges option", body.HostConfig.SecurityOpt)
+			}
+			if body.User != "bun" {
+				t.Fatalf("agentd server user=%q, want bun", body.User)
+			}
+			if body.HostConfig.Privileged {
+				t.Fatal("agentd authority container must remain non-privileged")
+			}
+			if got, want := body.HostConfig.CapDrop, []string{"ALL"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("agentd authority CapDrop=%q, want %q", got, want)
+			}
+			return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"Id":"created"}`)), Header: make(http.Header)}, nil
+		case "/images/worker:latest/json":
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"Id":"sha256:image"}`)), Header: make(http.Header)}, nil
+		default:
+			return nil, fmt.Errorf("unexpected request path %q", req.URL.Path)
+		}
+	})}}
+	if _, err := backend.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
 	}
 }
 

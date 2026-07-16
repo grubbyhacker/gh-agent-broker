@@ -44,7 +44,7 @@ func TestAgentdCreateSessionPayloadMatchesCurrentSchema(t *testing.T) {
 		StorageLineageID:   "11111111111111111111111111111111",
 		FenceEpoch:         2,
 		SessionLineageID:   "22222222222222222222222222222222",
-		Workspace:          agentdSessionWorkspace{WorkspaceRef: "/var/lib/agentd/sessions/22222222222222222222222222222222", UID: 20000, GID: 20000},
+		Workspace:          agentdSessionWorkspace{WorkspaceRef: agentdControlV1WorkspaceRoot + "/22222222222222222222222222222222", UID: 20000, GID: 20000},
 	})
 	if err != nil {
 		t.Fatal(err)
