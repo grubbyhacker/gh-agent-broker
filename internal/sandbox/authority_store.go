@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 7
+const authorityStoreSchemaVersion = 8
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -67,6 +67,8 @@ type AuthorityLease struct {
 	SessionLineageID       string    `json:"session_lineage_id"`
 	WorkerStorageLineageID string    `json:"worker_storage_lineage_id"`
 	WorkerFenceEpoch       int64     `json:"worker_fence_epoch"`
+	ProfileVersion         string    `json:"profile_version"`
+	PolicyDigest           string    `json:"policy_digest"`
 	BindingDigest          string    `json:"session_binding_digest"`
 	IdempotencyDigest      string    `json:"idempotency_key_digest"`
 	CreatedAt              time.Time `json:"created_at"`
@@ -215,6 +217,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	}
 	if version == 6 {
 		if err := s.migrateV7(ctx); err != nil {
+			return err
+		}
+		version = 7
+	}
+	if version == 7 {
+		if err := s.migrateV8(ctx); err != nil {
 			return err
 		}
 	}
@@ -371,6 +379,45 @@ func (s *AuthorityWorkerStore) migrateV7(ctx context.Context) error {
 	UPDATE authority_session_reassignments SET authority_binding=coalesce((SELECT profile FROM authority_session_leases lease WHERE lease.binding_digest=authority_session_reassignments.binding_digest),'');
 	CREATE INDEX authority_session_reassignments_adoption ON authority_session_reassignments(adoption_state,created_at,binding_digest);
 	PRAGMA user_version=7`)
+	return err
+}
+
+// V8 records one transition per predecessor generation. The earlier unique
+// binding constraint prevented a durable logical session from surviving a
+// second worker replacement.
+func (s *AuthorityWorkerStore) migrateV8(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS authority_session_reassignments_replacement;
+	CREATE TABLE authority_session_reassignments_v8 (
+		principal TEXT NOT NULL, idempotency_digest TEXT NOT NULL,
+		request_fingerprint TEXT NOT NULL, binding_digest TEXT NOT NULL,
+		predecessor_worker_id TEXT NOT NULL REFERENCES authority_workers(worker_id),
+		replacement_worker_id TEXT NOT NULL REFERENCES authority_workers(worker_id),
+		created_at TEXT NOT NULL, coordinator_binding TEXT NOT NULL DEFAULT '',
+		authority_binding TEXT NOT NULL DEFAULT '', session_lineage_id TEXT NOT NULL DEFAULT '',
+		agentd_session_id TEXT NOT NULL DEFAULT '', predecessor_storage_lineage_id TEXT NOT NULL DEFAULT '',
+		predecessor_fence_epoch INTEGER NOT NULL DEFAULT 0, replacement_storage_lineage_id TEXT NOT NULL DEFAULT '',
+		replacement_fence_epoch INTEGER NOT NULL DEFAULT 0, rebind_idempotency_key TEXT NOT NULL DEFAULT '',
+		workspace_ref TEXT NOT NULL DEFAULT '', workspace_uid INTEGER NOT NULL DEFAULT 0,
+		workspace_gid INTEGER NOT NULL DEFAULT 0, adoption_state TEXT NOT NULL DEFAULT 'legacy_unresolved',
+		adoption_error_code TEXT NOT NULL DEFAULT '', adoption_confirmed_at TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY(principal,idempotency_digest),
+		UNIQUE(principal,binding_digest,predecessor_fence_epoch)
+	) STRICT;
+	INSERT INTO authority_session_reassignments_v8(
+		principal,idempotency_digest,request_fingerprint,binding_digest,predecessor_worker_id,replacement_worker_id,created_at,
+		coordinator_binding,authority_binding,session_lineage_id,agentd_session_id,predecessor_storage_lineage_id,
+		predecessor_fence_epoch,replacement_storage_lineage_id,replacement_fence_epoch,rebind_idempotency_key,
+		workspace_ref,workspace_uid,workspace_gid,adoption_state,adoption_error_code,adoption_confirmed_at)
+	SELECT principal,idempotency_digest,request_fingerprint,binding_digest,predecessor_worker_id,replacement_worker_id,created_at,
+		coordinator_binding,authority_binding,session_lineage_id,agentd_session_id,predecessor_storage_lineage_id,
+		predecessor_fence_epoch,replacement_storage_lineage_id,replacement_fence_epoch,rebind_idempotency_key,
+		workspace_ref,workspace_uid,workspace_gid,adoption_state,adoption_error_code,adoption_confirmed_at
+	FROM authority_session_reassignments;
+	DROP TABLE authority_session_reassignments;
+	ALTER TABLE authority_session_reassignments_v8 RENAME TO authority_session_reassignments;
+	CREATE INDEX authority_session_reassignments_replacement ON authority_session_reassignments(replacement_worker_id);
+	CREATE INDEX authority_session_reassignments_adoption ON authority_session_reassignments(adoption_state,created_at,binding_digest);
+	PRAGMA user_version=8`)
 	return err
 }
 
@@ -586,8 +633,8 @@ func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, re
 	}()
 	var lease AuthorityLease
 	var storedFingerprint, created, released string
-	err = conn.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.binding_digest,l.idempotency_digest,l.request_fingerprint,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.profile=? AND l.idempotency_digest=?`, principal, request.Profile, idem).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.BindingDigest, &lease.IdempotencyDigest, &storedFingerprint, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch)
+	err = conn.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.binding_digest,l.idempotency_digest,l.request_fingerprint,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch,w.profile_version,w.policy_digest FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.profile=? AND l.idempotency_digest=?`, principal, request.Profile, idem).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.BindingDigest, &lease.IdempotencyDigest, &storedFingerprint, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch, &lease.ProfileVersion, &lease.PolicyDigest)
 	if err == nil {
 		if storedFingerprint != fingerprint {
 			return AuthorityLease{}, fmt.Errorf("idempotency conflict")
@@ -642,12 +689,12 @@ func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, re
 		return AuthorityLease{}, err
 	}
 	committed = true
-	var workerStorageLineageID string
+	var workerStorageLineageID, profileVersion, policyDigest string
 	var workerFenceEpoch int64
-	if err := conn.QueryRowContext(ctx, `SELECT worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE worker_id=?`, workerID).Scan(&workerStorageLineageID, &workerFenceEpoch); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT worker_storage_lineage_id,worker_fence_epoch,profile_version,policy_digest FROM authority_workers WHERE worker_id=?`, workerID).Scan(&workerStorageLineageID, &workerFenceEpoch, &profileVersion, &policyDigest); err != nil {
 		return AuthorityLease{}, err
 	}
-	return AuthorityLease{Principal: principal, Profile: request.Profile, WorkerID: workerID, SessionLineageID: lineageID, WorkerStorageLineageID: workerStorageLineageID, WorkerFenceEpoch: workerFenceEpoch, BindingDigest: binding, IdempotencyDigest: idem, CreatedAt: now}, nil
+	return AuthorityLease{Principal: principal, Profile: request.Profile, WorkerID: workerID, SessionLineageID: lineageID, WorkerStorageLineageID: workerStorageLineageID, WorkerFenceEpoch: workerFenceEpoch, ProfileVersion: profileVersion, PolicyDigest: policyDigest, BindingDigest: binding, IdempotencyDigest: idem, CreatedAt: now}, nil
 }
 
 func (s *AuthorityWorkerStore) Release(ctx context.Context, principal, sessionBinding string) (AuthorityLease, error) {
@@ -668,8 +715,8 @@ func (s *AuthorityWorkerStore) Release(ctx context.Context, principal, sessionBi
 	}()
 	var lease AuthorityLease
 	var created, released string
-	err = conn.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.idempotency_digest,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.binding_digest=?`, principal, binding).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.IdempotencyDigest, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch)
+	err = conn.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.idempotency_digest,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch,w.profile_version,w.policy_digest FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.binding_digest=?`, principal, binding).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.IdempotencyDigest, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch, &lease.ProfileVersion, &lease.PolicyDigest)
 	if err != nil {
 		return AuthorityLease{}, err
 	}
@@ -713,8 +760,8 @@ func (s *AuthorityWorkerStore) GetLease(ctx context.Context, principal, sessionB
 	binding := s.requestDigest(sessionBinding)
 	var lease AuthorityLease
 	var created, released string
-	err := s.db.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.idempotency_digest,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.binding_digest=?`, principal, binding).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.IdempotencyDigest, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch)
+	err := s.db.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.idempotency_digest,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch,w.profile_version,w.policy_digest FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.binding_digest=?`, principal, binding).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.IdempotencyDigest, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch, &lease.ProfileVersion, &lease.PolicyDigest)
 	if err != nil {
 		return AuthorityLease{}, err
 	}
@@ -791,7 +838,7 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	// was lost. The durable binding transition, not that transport-level key,
 	// is the unique effect. Resume only the exact recorded transition.
 	err = conn.QueryRowContext(ctx, `SELECT predecessor_worker_id,replacement_worker_id,request_fingerprint
-		FROM authority_session_reassignments WHERE principal=? AND binding_digest=?`, principal, binding).
+		FROM authority_session_reassignments WHERE principal=? AND binding_digest=? AND predecessor_fence_epoch=?`, principal, binding, predecessorWorkerFenceEpoch).
 		Scan(&reassignment.PredecessorWorkerID, &reassignment.ReplacementWorkerID, &storedFingerprint)
 	if err == nil {
 		if storedFingerprint != fingerprint {
@@ -933,8 +980,8 @@ func getLeaseByDigest(ctx context.Context, queryer interface {
 ) (AuthorityLease, error) {
 	var lease AuthorityLease
 	var created, released string
-	err := queryer.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.idempotency_digest,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.binding_digest=?`, principal, binding).
-		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.IdempotencyDigest, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch)
+	err := queryer.QueryRowContext(ctx, `SELECT l.profile,l.worker_id,l.session_lineage_id,l.idempotency_digest,l.created_at,l.released_at,w.worker_storage_lineage_id,w.worker_fence_epoch,w.profile_version,w.policy_digest FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.binding_digest=?`, principal, binding).
+		Scan(&lease.Profile, &lease.WorkerID, &lease.SessionLineageID, &lease.IdempotencyDigest, &created, &released, &lease.WorkerStorageLineageID, &lease.WorkerFenceEpoch, &lease.ProfileVersion, &lease.PolicyDigest)
 	if err != nil {
 		return AuthorityLease{}, err
 	}
@@ -965,7 +1012,15 @@ func scanAuthorityAgentdAdoption(scanner interface{ Scan(...any) error }) (autho
 }
 
 func (s *AuthorityWorkerStore) AgentdAdoption(ctx context.Context, bindingDigest string) (authorityAgentdAdoption, error) {
-	return scanAuthorityAgentdAdoption(s.db.QueryRowContext(ctx, authorityAdoptionSelect+` WHERE binding_digest=?`, bindingDigest))
+	return scanAuthorityAgentdAdoption(s.db.QueryRowContext(ctx, authorityAdoptionSelect+` WHERE binding_digest=? ORDER BY predecessor_fence_epoch DESC LIMIT 1`, bindingDigest))
+}
+
+func (s *AuthorityWorkerStore) AgentdAdoptionAtEpoch(ctx context.Context, bindingDigest string, predecessorEpoch int64) (authorityAgentdAdoption, error) {
+	return scanAuthorityAgentdAdoption(s.db.QueryRowContext(ctx, authorityAdoptionSelect+` WHERE binding_digest=? AND predecessor_fence_epoch=?`, bindingDigest, predecessorEpoch))
+}
+
+func (s *AuthorityWorkerStore) AgentdAdoptionForPrincipalAtEpoch(ctx context.Context, principal, bindingDigest string, predecessorEpoch int64) (authorityAgentdAdoption, error) {
+	return scanAuthorityAgentdAdoption(s.db.QueryRowContext(ctx, authorityAdoptionSelect+` WHERE principal=? AND binding_digest=? AND predecessor_fence_epoch=?`, principal, bindingDigest, predecessorEpoch))
 }
 
 func (s *AuthorityWorkerStore) UnconfirmedAgentdAdoptions(ctx context.Context) ([]authorityAgentdAdoption, error) {
@@ -1009,7 +1064,7 @@ func (s *AuthorityWorkerStore) ConfirmAgentdAdoption(ctx context.Context, adopti
 	if rows == 1 {
 		return nil
 	}
-	current, err := s.AgentdAdoption(ctx, adoption.BindingDigest)
+	current, err := s.AgentdAdoptionAtEpoch(ctx, adoption.BindingDigest, adoption.Predecessor.FenceEpoch)
 	if err == nil && current.State == authorityAdoptionConfirmed && current == adoptionWithState(adoption, authorityAdoptionConfirmed, "") {
 		return nil
 	}
@@ -1025,7 +1080,7 @@ func (s *AuthorityWorkerStore) RecordAgentdAdoptionConflict(ctx context.Context,
 	if code != "rebind_conflict" && code != "session_fenced" && code != "agentd_rebind_rejected" {
 		return fmt.Errorf("invalid agentd adoption conflict code")
 	}
-	current, err := s.AgentdAdoption(ctx, adoption.BindingDigest)
+	current, err := s.AgentdAdoptionAtEpoch(ctx, adoption.BindingDigest, adoption.Predecessor.FenceEpoch)
 	if err != nil {
 		return err
 	}
@@ -1047,7 +1102,7 @@ func (s *AuthorityWorkerStore) RecordAgentdAdoptionConflict(ctx context.Context,
 	if rows == 1 {
 		return nil
 	}
-	current, err = s.AgentdAdoption(ctx, adoption.BindingDigest)
+	current, err = s.AgentdAdoptionAtEpoch(ctx, adoption.BindingDigest, adoption.Predecessor.FenceEpoch)
 	if err == nil && current.State == authorityAdoptionConflict && current.ErrorCode == code {
 		return nil
 	}

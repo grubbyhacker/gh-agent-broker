@@ -34,6 +34,88 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			writeRESTError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
+		if r.Method == http.MethodPost && path == "coordinator/v1/leases" {
+			var in AuthorityWorkerRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.AcquireSession(r.Context(), principal, in)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusConflict, "lease_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, CoordinatorLeaseAdmission{Version: coordinatorProtocolVersion, Admission: out})
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasPrefix(path, "coordinator/v1/sessions/") {
+			operation := strings.TrimPrefix(path, "coordinator/v1/sessions/")
+			var in CoordinatorSessionRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			if operation == "create" {
+				if err := validateCoordinatorSessionRequest("status", in); err != nil {
+					writeRESTCodeError(w, http.StatusBadRequest, "invalid_session_command", err.Error())
+					return
+				}
+				result, err := service.CreateSession(r.Context(), principal, in.SessionBinding)
+				if err != nil {
+					writeRESTCodeError(w, http.StatusConflict, "session_create_denied", err.Error())
+					return
+				}
+				lease, err := service.store.GetLease(r.Context(), principal, in.SessionBinding)
+				if err != nil {
+					writeRESTCodeError(w, http.StatusConflict, "session_create_denied", "session lease unavailable")
+					return
+				}
+				writeJSON(w, http.StatusCreated, CoordinatorSessionResponse{Version: coordinatorProtocolVersion, Lease: lease, Result: result})
+				return
+			}
+			out, err := service.CoordinatorSessionCommand(r.Context(), principal, operation, in)
+			if err != nil {
+				var agentdErr *CoordinatorAgentdError
+				if errors.As(err, &agentdErr) {
+					writeRESTCodeError(w, agentdErr.Status, agentdErr.Code, agentdErr.Error())
+					return
+				}
+				writeRESTCodeError(w, http.StatusConflict, "session_command_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		if r.Method == http.MethodPost && path == "coordinator/v1/reassign" {
+			var in AuthoritySessionReassignmentRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.ReassignSession(r.Context(), principal, in)
+			if err != nil {
+				authorityReassignmentError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, struct {
+				Version      string                       `json:"version"`
+				Reassignment AuthoritySessionReassignment `json:"reassignment"`
+			}{coordinatorProtocolVersion, out})
+			return
+		}
+		if r.Method == http.MethodPost && path == "coordinator/v1/reassignments/status" {
+			var in struct {
+				SessionBinding        string `json:"session_binding"`
+				PredecessorFenceEpoch int64  `json:"predecessor_fence_epoch"`
+			}
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.CoordinatorReassignmentStatus(r.Context(), principal, in.SessionBinding, in.PredecessorFenceEpoch)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusNotFound, "reassignment_status_unavailable", "reassignment status unavailable")
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
 		if r.Method == http.MethodPost && path == "provision" {
 			var in struct {
 				Profile string `json:"profile"`
@@ -88,16 +170,7 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			}
 			out, err := service.ReassignSession(r.Context(), principal, in)
 			if err != nil {
-				var reassignmentErr *ReassignmentError
-				if errors.As(err, &reassignmentErr) {
-					status := http.StatusConflict
-					if reassignmentErr.Code == ReassignmentRebindRetryable {
-						status = http.StatusServiceUnavailable
-					}
-					writeRESTCodeError(w, status, string(reassignmentErr.Code), reassignmentErr.Error())
-					return
-				}
-				writeRESTCodeError(w, http.StatusConflict, "reassignment_denied", err.Error())
+				authorityReassignmentError(w, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, out)
@@ -157,6 +230,19 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 		}
 		writeRESTError(w, http.StatusNotFound, "not_found")
 	})
+}
+
+func authorityReassignmentError(w http.ResponseWriter, err error) {
+	var reassignmentErr *ReassignmentError
+	if errors.As(err, &reassignmentErr) {
+		status := http.StatusConflict
+		if reassignmentErr.Code == ReassignmentRebindRetryable {
+			status = http.StatusServiceUnavailable
+		}
+		writeRESTCodeError(w, status, string(reassignmentErr.Code), reassignmentErr.Error())
+		return
+	}
+	writeRESTCodeError(w, http.StatusConflict, "reassignment_denied", err.Error())
 }
 
 func authorityRESTPrincipal(cfg Config, token string) (string, bool) {

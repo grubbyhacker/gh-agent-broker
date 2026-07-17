@@ -7,6 +7,24 @@ lifecycle management, fixed operator launch profiles, durable idempotent launch
 intents, recovery/reconciliation, scoped run visibility, and brokered GitHub
 operations without returning installation credentials to workers.
 
+### Roadmap PR10 broker coordinator surface
+
+The private `broker/coordinator/v1` REST surface now mediates the complete
+authority session command set: acquire, create, submit, events, checkpoint,
+resume, cancel, status, reassign, and reassignment status. Signal Plane supplies
+only a logical binding and operation-specific typed data. The broker resolves
+the immutable profile version, policy digest, worker/session/storage lineages,
+fence epoch, agentd identity, and fixed Docker endpoint; callers cannot address
+agentd or select runtime authority.
+
+Authority store schema v8 keys reassignment history by binding plus predecessor
+fence epoch, allowing the same logical session to survive repeated worker
+generations. Durable adoption status is principal-scoped and retains pending,
+confirmed, conflict, and legacy-unresolved reconciliation states. Stable wire
+fixtures live under `testdata/coordinator-wire/`. This slice does not implement
+the credential holder or app-server boundary, change deployment configuration,
+or activate production authority.
+
 ### Curator lifecycle incident remediation
 
 Sandbox lifecycle audit records carry the Docker container ID and stable

@@ -1,0 +1,18 @@
+{
+  "version": "broker/coordinator/v1",
+  "session_binding": "logical-session",
+  "session_lineage_id": "11111111111111111111111111111111",
+  "authority_profile": "writer",
+  "predecessor": {
+    "workerId": "worker-1",
+    "storageLineageId": "22222222222222222222222222222222",
+    "fenceEpoch": 1
+  },
+  "successor": {
+    "workerId": "worker-2",
+    "storageLineageId": "22222222222222222222222222222222",
+    "fenceEpoch": 2
+  },
+  "rebind_idempotency_key": "opaque-rebind-key",
+  "state": "confirmed"
+}
