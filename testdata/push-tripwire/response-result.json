@@ -1,0 +1,17 @@
+{
+  "version": "broker/push-tripwire/v1",
+  "finding_id": "finding-01",
+  "idempotent_replay": false,
+  "actions": [
+    {
+      "action": "halt_issuance",
+      "state": "halted",
+      "completed_at": "2026-07-17T07:00:00.123456789Z"
+    },
+    {
+      "action": "fence_worker_session",
+      "state": "fence_requested",
+      "completed_at": "2026-07-17T07:00:00.234567891Z"
+    }
+  ]
+}
