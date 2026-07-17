@@ -1,0 +1,26 @@
+{
+  "version": "broker/coordinator/v1",
+  "admission": {
+    "lease": {
+      "principal": "coordinator",
+      "profile": "writer",
+      "worker_id": "worker-1",
+      "session_lineage_id": "11111111111111111111111111111111",
+      "worker_storage_lineage_id": "22222222222222222222222222222222",
+      "worker_fence_epoch": 1,
+      "profile_version": "profile-v1",
+      "policy_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "session_binding_digest": "binding-digest",
+      "idempotency_key_digest": "idempotency-digest",
+      "created_at": "2026-07-16T12:00:00Z",
+      "released_at": "0001-01-01T00:00:00Z",
+      "replay": false
+    },
+    "workspace": {
+      "uid": 20000,
+      "gid": 20000,
+      "workspace_path": "/var/lib/agentd/workspaces/11111111111111111111111111111111",
+      "session_lineage_id": "11111111111111111111111111111111"
+    }
+  }
+}

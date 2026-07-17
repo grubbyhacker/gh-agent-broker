@@ -64,6 +64,9 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if err != nil {
 		return nil, err
 	}
+	if err := s.store.RequireConfirmedCoordinatorRouting(ctx, binding, lease); err != nil {
+		return nil, err
+	}
 	workspace, err := s.store.SessionWorkspace(ctx, binding)
 	if err != nil {
 		return nil, err

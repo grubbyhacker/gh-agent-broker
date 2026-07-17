@@ -1547,6 +1547,48 @@ func TestAuthorityTerminalAdoptionConflictRemainsActionable(t *testing.T) {
 	assertAuthorityNotRetired(t, fixture)
 }
 
+func TestAuthoritySessionCanReassignAcrossMultipleGenerations(t *testing.T) {
+	fixture := newAuthorityAdoptionFixture(t, 1)
+	ctx := context.Background()
+	fixture.runtime.rebind = successfulAgentdRebind(fixture.bindings[0], fixture.leases[0], fixture.workspaces[0])
+	first, err := fixture.service.ReassignSession(ctx, "coordinator", fixture.requests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.service.newID = func() (string, error) { return "adoption-third", nil }
+	if _, err = fixture.service.SetHealth(ctx, "coordinator", first.ReplacementWorkerID, "lost-again", false); err != nil {
+		t.Fatal(err)
+	}
+	third, err := fixture.service.Replace(ctx, "coordinator", first.ReplacementWorkerID, "second-generation-loss")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = fixture.service.SetHealth(ctx, "coordinator", third.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	current, err := fixture.store.GetLease(ctx, "coordinator", fixture.bindings[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.runtime.rebind = successfulAgentdRebind(fixture.bindings[0], current, fixture.workspaces[0])
+	request := AuthoritySessionReassignmentRequest{SessionBinding: fixture.bindings[0], SessionLineageID: current.SessionLineageID, PredecessorWorkerID: current.WorkerID, PredecessorWorkerFenceEpoch: current.WorkerFenceEpoch, IdempotencyKey: "adoption-second-generation"}
+	second, err := fixture.service.ReassignSession(ctx, "coordinator", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ReplacementWorkerID != third.WorkerID || second.Lease.WorkerFenceEpoch != 3 {
+		t.Fatalf("second reassignment=%+v", second)
+	}
+	var records int
+	if err := fixture.store.db.QueryRowContext(ctx, `SELECT count(*) FROM authority_session_reassignments WHERE binding_digest=?`, current.BindingDigest).Scan(&records); err != nil || records != 2 {
+		t.Fatalf("records=%d err=%v", records, err)
+	}
+	replay, err := fixture.service.ReassignSession(ctx, "coordinator", request)
+	if err != nil || !replay.Replay || replay.ReplacementWorkerID != third.WorkerID {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+}
+
 type authorityAdoptionFixture struct {
 	cfg         Config
 	store       *AuthorityWorkerStore

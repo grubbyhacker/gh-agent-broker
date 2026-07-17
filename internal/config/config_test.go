@@ -228,6 +228,33 @@ agents:
 	}
 }
 
+func TestGitReceivePackPolicyDefaultsAndRejectsUnknownMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, `
+github:
+  app_id: 1
+  private_key_path: key.pem
+  installations:
+    owner/repo: 2
+agents:
+  - id: agent-1
+    enabled: false
+    secret: test-secret
+    repositories: [owner/repo]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Agents[0].GitReceivePack != GitReceivePackAllowOpaque {
+		t.Fatalf("default git receive-pack policy = %q", cfg.Agents[0].GitReceivePack)
+	}
+	cfg.Agents[0].GitReceivePack = "caller_selected"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "git_receive_pack_policy") {
+		t.Fatalf("invalid git receive-pack policy error = %v", err)
+	}
+}
+
 func TestValidateRejectsInvalidBranchLifecycleGuardMode(t *testing.T) {
 	cfg := Config{
 		GitHub: GitHubConfig{

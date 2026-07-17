@@ -3,11 +3,200 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
+
+type coordinatorTestRuntime struct {
+	*fakeAuthorityRuntime
+	worker AuthorityWorker
+	method string
+	path   string
+	body   json.RawMessage
+	result json.RawMessage
+	status int
+}
+
+func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker AuthorityWorker, method, path string, body json.RawMessage) (int, json.RawMessage, error) {
+	r.worker, r.method, r.path, r.body = worker, method, path, bytes.Clone(body)
+	parts := strings.Split(path, "/")
+	sessionID := "agentd-session"
+	if len(parts) > 3 && parts[1] == "v1" && parts[2] == "sessions" {
+		sessionID = parts[3]
+	}
+	if len(r.result) != 0 {
+		status := r.status
+		if status == 0 {
+			status = http.StatusAccepted
+		}
+		return status, bytes.Clone(r.result), nil
+	}
+	return http.StatusAccepted, json.RawMessage(`{"sessionId":"` + sessionID + `","turnId":"turn-1","phase":"queued"}`), nil
+}
+
+func TestCoordinatorV1SubmitIsBrokerMediated(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	profile := cfg.AuthorityProfiles["writer"]
+	profile.SessionIsolation.WorkspaceRoot = t.TempDir()
+	cfg.AuthorityProfiles["writer"] = profile
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &coordinatorTestRuntime{fakeAuthorityRuntime: &fakeAuthorityRuntime{}}
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := NewAuditLogger(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestAudit(t, auditLog)
+	service := NewAuthorityWorkerService(cfg, store, runtime, auditLog)
+	service.newID = func() (string, error) { return "coordinator-worker", nil }
+	worker, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", worker.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.Acquire(ctx, "coordinator", AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "lease-key", SessionBinding: "logical-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, worker.WorkerID, 20000, 20000, filepath.Join(profile.SessionIsolation.WorkspaceRoot, lease.SessionLineageID), formatAuthorityTime(service.now()), lease.SessionLineageID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.BindAgentdSession(ctx, "logical-session", "agentd-session"); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAuthorityRESTHandler(service)
+	body := []byte(`{"session_binding":"logical-session","idempotency_key":"turn-key","prompt":"make the registered change"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v1/sessions/submit", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer coordinator-test-token")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if runtime.worker.WorkerID != lease.WorkerID || runtime.path != "/v1/sessions/agentd-session/turns" || runtime.method != http.MethodPost || !bytes.Contains(runtime.body, []byte(`"idempotencyKey":"turn-key"`)) {
+		t.Fatalf("broker projection worker=%+v method=%s path=%s body=%s", runtime.worker, runtime.method, runtime.path, runtime.body)
+	}
+	var out CoordinatorSessionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.Version != coordinatorProtocolVersion || out.Lease.ProfileVersion == "" || out.Lease.PolicyDigest == "" {
+		t.Fatalf("response=%+v err=%v", out, err)
+	}
+	for _, forbidden := range []string{"worker_id", "profile", "model", "runtime", "agentd_session_id", "endpoint"} {
+		bad := []byte(strings.TrimSuffix(string(body), "}") + `,"` + forbidden + `":"caller-selected"}`)
+		req = httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v1/sessions/submit", bytes.NewReader(bad))
+		req.Header.Set("Authorization", "Bearer coordinator-test-token")
+		resp = httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusBadRequest {
+			t.Fatalf("forbidden %s status=%d body=%s", forbidden, resp.Code, resp.Body.String())
+		}
+	}
+	canary := "PR10-CREDENTIAL-CANARY:coordinator-only-test"
+	runtime.result = json.RawMessage(`{"sessionId":"agentd-session","turnId":"turn-2","phase":"queued","evidence":"` + canary + `"}`)
+	_, err = service.CoordinatorSessionCommand(ctx, "coordinator", "submit", CoordinatorSessionRequest{SessionBinding: "logical-session", IdempotencyKey: "blocked-turn", Prompt: "return evidence"})
+	if err == nil || strings.Contains(err.Error(), canary) || !strings.Contains(err.Error(), "credential_canary") {
+		t.Fatalf("unsafe coordinator result error = %v", err)
+	}
+	auditBytes, err := os.ReadFile(auditPath) //nolint:gosec // G304: path is a test-owned temporary audit file.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(auditBytes, []byte(canary)) || !bytes.Contains(auditBytes, []byte(`"operation":"security.egress_blocked"`)) {
+		t.Fatalf("unsafe coordinator audit = %s", auditBytes)
+	}
+
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(canary))
+	runtime.status = http.StatusUnauthorized
+	runtime.result = json.RawMessage(`{"error":"` + encoded + `"}`)
+	_, err = service.CoordinatorSessionCommand(ctx, "coordinator", "submit", CoordinatorSessionRequest{SessionBinding: "logical-session", IdempotencyKey: "blocked-error-turn", Prompt: "return error"})
+	if err == nil || strings.Contains(err.Error(), encoded) || !strings.Contains(err.Error(), "credential_canary") {
+		t.Fatalf("encoded unsafe agentd error = %v", err)
+	}
+
+	runtime.result = json.RawMessage(`{"error":"caller_selected_error"}`)
+	_, err = service.CoordinatorSessionCommand(ctx, "coordinator", "submit", CoordinatorSessionRequest{SessionBinding: "logical-session", IdempotencyKey: "safe-error-turn", Prompt: "return safe error"})
+	var agentdErr *CoordinatorAgentdError
+	if !errors.As(err, &agentdErr) || agentdErr.Code != "agentd_session_rejected" {
+		t.Fatalf("unsafe exported agentd error = %#v", err)
+	}
+}
+
+func TestCoordinatorV1BlocksCommandsUntilReassignmentAdoptionIsConfirmed(t *testing.T) {
+	fixture := newAuthorityAdoptionFixture(t, 1)
+	adoption := fixture.commit(t, 0)
+	runtime := &coordinatorTestRuntime{fakeAuthorityRuntime: fixture.runtime}
+	service := NewAuthorityWorkerService(fixture.cfg, fixture.store, runtime, nil)
+	request := CoordinatorSessionRequest{
+		SessionBinding: fixture.bindings[0],
+		IdempotencyKey: "blocked-turn",
+		Prompt:         "make the registered change",
+	}
+
+	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err == nil || !strings.Contains(err.Error(), "not confirmed") {
+		t.Fatalf("pending adoption routed command: %v", err)
+	}
+	if runtime.path != "" {
+		t.Fatalf("pending adoption reached agentd path %q", runtime.path)
+	}
+	if err := fixture.store.ConfirmAgentdAdoption(context.Background(), adoption); err != nil {
+		t.Fatal(err)
+	}
+	activeLease, err := fixture.store.GetLease(context.Background(), "coordinator", fixture.bindings[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*AuthorityLease){
+		"profile version": func(lease *AuthorityLease) { lease.ProfileVersion = "wrong-profile-version" },
+		"policy digest":   func(lease *AuthorityLease) { lease.PolicyDigest = strings.Repeat("f", 64) },
+	} {
+		mismatched := activeLease
+		mutate(&mismatched)
+		if err := fixture.store.RequireConfirmedCoordinatorRouting(context.Background(), fixture.bindings[0], mismatched); err == nil || !strings.Contains(err.Error(), "does not match") {
+			t.Fatalf("mismatched %s routed: %v", name, err)
+		}
+	}
+	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err != nil {
+		t.Fatalf("confirmed adoption did not route: %v", err)
+	}
+	if runtime.path == "" {
+		t.Fatal("confirmed adoption did not reach agentd")
+	}
+}
+
+func TestCoordinatorWireFixturesAreStable(t *testing.T) {
+	created := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	lease := AuthorityLease{Principal: "coordinator", Profile: "writer", WorkerID: "worker-1", SessionLineageID: "11111111111111111111111111111111", WorkerStorageLineageID: "22222222222222222222222222222222", WorkerFenceEpoch: 1, ProfileVersion: "profile-v1", PolicyDigest: strings.Repeat("a", 64), BindingDigest: "binding-digest", IdempotencyDigest: "idempotency-digest", CreatedAt: created}
+	admission := CoordinatorLeaseAdmission{Version: coordinatorProtocolVersion, Admission: AuthoritySessionAdmission{Lease: lease, Workspace: SessionWorkspace{UID: 20000, GID: 20000, Path: "/var/lib/agentd/workspaces/11111111111111111111111111111111", SessionLineageID: lease.SessionLineageID}}}
+	status := CoordinatorReassignmentStatus{Version: coordinatorProtocolVersion, SessionBinding: "logical-session", SessionLineageID: lease.SessionLineageID, AuthorityProfile: "writer", ProfileVersion: lease.ProfileVersion, PolicyDigest: lease.PolicyDigest, Predecessor: agentdWorkerBinding{WorkerID: "worker-1", StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: 1}, Successor: agentdWorkerBinding{WorkerID: "worker-2", StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: 2}, IdempotencyKey: "opaque-rebind-key", State: "confirmed"}
+	for _, fixture := range []struct {
+		name, path string
+		value      any
+	}{{"lease-v1.json", "../../testdata/coordinator-wire/lease-v1.json", admission}, {"reassignment-status-v1.json", "../../testdata/coordinator-wire/reassignment-status-v1.json", status}} {
+		want, err := os.ReadFile(fixture.path) //nolint:gosec // Paths are fixed checked-in wire fixtures, not runtime input.
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := json.Marshal(fixture.value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wantValue, gotValue any
+		if json.Unmarshal(want, &wantValue) != nil || json.Unmarshal(got, &gotValue) != nil || !reflect.DeepEqual(wantValue, gotValue) {
+			t.Fatalf("fixture %s drifted\nwant=%s\ngot=%s", fixture.name, want, got)
+		}
+	}
+}
 
 func TestAuthorityRESTSessionReassignmentContract(t *testing.T) {
 	ctx := context.Background()
@@ -61,6 +250,16 @@ func TestAuthorityRESTSessionReassignmentContract(t *testing.T) {
 	var out AuthoritySessionReassignment
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.ReplacementWorkerID != replacement.WorkerID || out.Replay {
 		t.Fatalf("response=%+v err=%v", out, err)
+	}
+	statusBody := []byte(`{"session_binding":"rest-session","predecessor_fence_epoch":1}`)
+	for token, want := range map[string]int{"coordinator-test-token": http.StatusOK, "session-test-token": http.StatusNotFound} {
+		req = httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v1/reassignments/status", bytes.NewReader(statusBody))
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp = httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != want {
+			t.Fatalf("status token=%s code=%d body=%s", token, resp.Code, resp.Body.String())
+		}
 	}
 	// Unknown authority-bearing fields are rejected rather than being silently
 	// interpreted as a caller override.

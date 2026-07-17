@@ -7,6 +7,44 @@ lifecycle management, fixed operator launch profiles, durable idempotent launch
 intents, recovery/reconciliation, scoped run visibility, and brokered GitHub
 operations without returning installation credentials to workers.
 
+### Roadmap PR10 broker coordinator surface
+
+The private `broker/coordinator/v1` REST surface now mediates the complete
+authority session command set: acquire, create, submit, events, checkpoint,
+resume, cancel, status, reassign, and reassignment status. Signal Plane supplies
+only a logical binding and operation-specific typed data. The broker resolves
+the immutable profile version, policy digest, worker/session/storage lineages,
+fence epoch, agentd identity, and fixed Docker endpoint; callers cannot address
+agentd or select runtime authority.
+
+Authority store schema v8 keys reassignment history by binding plus predecessor
+fence epoch, allowing the same logical session to survive repeated worker
+generations. Durable adoption status is principal-scoped and retains pending,
+confirmed, conflict, and legacy-unresolved reconciliation states. Stable wire
+fixtures live under `testdata/coordinator-wire/`. This slice does not implement
+the credential holder or app-server boundary, change deployment configuration,
+or activate production authority.
+
+### Roadmap PR10 egress security subset
+
+Broker-owned textual GitHub mutations, sandbox logs and inline text
+artifact/lesson responses, raw coordinator agentd results, and both audit
+serializers now fail closed on the synthetic PR10 canary or common
+credential-shaped material. Findings expose only a stable code and field,
+produce sanitized `security.egress_blocked` audit events, and stop GitHub
+installation-token issuance for the attempted mutation. The implementation
+does not load or compare real secret values and does not activate production.
+
+Canonical decoding covers bounded URL, hex, base64, and base64url forms plus
+broker-controlled split sequences. All artifact bytes are scanned within a
+16 MiB per-file bound; larger files fail closed. Git smart-HTTP commit packfiles
+remain opaque, so credential-bearing authority identities must set
+`git_receive_pack_policy: deny_opaque`, which denies before token issuance while
+leaving legacy identities compatible. Durable worker quarantine, maximum-age
+policy, global credential halt/revocation, semantic pack inspection, and
+production wiring remain explicit later seams. See
+`docs/pr10-egress-security.md` for the exact boundary.
+
 ### Curator lifecycle incident remediation
 
 Sandbox lifecycle audit records carry the Docker container ID and stable

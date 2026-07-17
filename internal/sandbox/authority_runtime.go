@@ -26,6 +26,43 @@ type DockerAuthorityRuntime struct {
 	httpClient *http.Client
 }
 
+type AuthorityAgentdSessionTransport interface {
+	AgentdSessionRequest(context.Context, AuthorityWorker, string, string, json.RawMessage) (int, json.RawMessage, error)
+}
+
+func (r *DockerAuthorityRuntime) AgentdSessionRequest(ctx context.Context, worker AuthorityWorker, method, path string, payload json.RawMessage) (int, json.RawMessage, error) {
+	profile, ok := r.profiles[worker.Profile]
+	readiness := configuredAgentdReadiness(profile)
+	if !ok || readiness.ContractVersion != "agentd/control/v1" || (method != http.MethodGet && method != http.MethodPost) || !strings.HasPrefix(path, "/v1/sessions/") {
+		return 0, nil, fmt.Errorf("agentd session transport request is invalid")
+	}
+	token := strings.TrimSpace(os.Getenv(profile.CoordinatorTokenEnv))
+	address, err := r.docker.InternalAddress(ctx, worker.ContainerID)
+	if err != nil || address == "" || token == "" {
+		return 0, nil, fmt.Errorf("agentd session transport is unavailable")
+	}
+	endpoint := "http://" + address + ":" + strconv.Itoa(readiness.Port) + path
+	//nolint:gosec // Endpoint is derived only from Docker's recorded worker address and the reviewed profile port; path is selected from a fixed broker operation.
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, fmt.Errorf("agentd session transport request is invalid")
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := r.httpClient.Do(req) //nolint:gosec // Endpoint is derived only from the broker-recorded worker and fixed profile port/path.
+	if err != nil {
+		return 0, nil, fmt.Errorf("agentd session transport is unavailable")
+	}
+	defer closeBody(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024+1))
+	if err != nil || len(body) > 1024*1024 || !json.Valid(body) {
+		return 0, nil, fmt.Errorf("agentd session transport returned invalid JSON")
+	}
+	return resp.StatusCode, bytes.Clone(body), nil
+}
+
 func NewDockerAuthorityRuntime(socket string, cfg Config) *DockerAuthorityRuntime {
 	return &DockerAuthorityRuntime{docker: NewDockerBackend(socket), profiles: cfg.AuthorityProfiles, httpClient: &http.Client{Timeout: 5 * time.Second}}
 }

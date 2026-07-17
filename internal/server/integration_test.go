@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"io"
@@ -221,6 +222,51 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 
 	if !sawProbe || !sawPull || !sawIssue || sawComment != 1 || !sawDismiss || !sawGraphQLDismiss || !sawResolve || sawAddLabels != 1 || sawRemoveLabel != 1 {
 		t.Fatalf("fake REST handlers were not all exercised: probe=%v pull=%v issue=%v comment=%d dismiss=%v graphqlDismiss=%v resolve=%v addLabels=%d removeLabel=%d", sawProbe, sawPull, sawIssue, sawComment, sawDismiss, sawGraphQLDismiss, sawResolve, sawAddLabels, sawRemoveLabel)
+	}
+}
+
+func TestCredentialShapedTextIsBlockedBeforeGitHubTokenIssuance(t *testing.T) {
+	upstreamRequests := 0
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer apiServer.Close()
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:             "agent-1",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"pull.create", "pull.review.dismiss", "pull.review_thread.resolve", "issue.comment", "issue.create"},
+		BaseBranches:   []string{"main"},
+		BranchPatterns: []string{"^agent/agent-1/.+$"},
+	})
+	canary := "PR10-CREDENTIAL-CANARY:github-only-test"
+	encodedCanary := base64.RawURLEncoding.EncodeToString([]byte(canary))
+	tests := []struct {
+		name, method, path string
+		body               map[string]interface{}
+	}{
+		{"pull", http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{"title": "change", "head": "agent/agent-1/test", "base": "main", "body": canary}},
+		{"issue", http.MethodPost, "/v1/repos/owner/repo/issues", map[string]interface{}{"title": "report", "body": canary}},
+		{"comment", http.MethodPost, "/v1/repos/owner/repo/issues/7/comments", map[string]interface{}{"body": canary}},
+		{"dismissal", http.MethodPut, "/v1/repos/owner/repo/pulls/7/reviews/80/dismissal", map[string]interface{}{"message": canary}},
+		{"thread", http.MethodPut, "/v1/repos/owner/repo/pulls/7/review-threads/PRRT_test_thread/resolve", map[string]interface{}{"message": canary}},
+		{"encoded-comment", http.MethodPost, "/v1/repos/owner/repo/issues/8/comments", map[string]interface{}{"body": "AA" + encodedCanary + "AA"}},
+		{"split-pull", http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{"title": "PR10-CREDENTIAL-", "body": "CANARY:split-field-test", "head": "agent/agent-1/split", "base": "main"}},
+		{"split-encoded-pull", http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{"title": ("AA" + encodedCanary)[:len(encodedCanary)/2], "body": ("AA" + encodedCanary)[len(encodedCanary)/2:] + "AA", "head": "agent/agent-1/split-encoded", "base": "main"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := brokerRequest(t, broker, tc.method, tc.path, tc.body)
+			assertStatus(t, resp, http.StatusUnprocessableEntity)
+			if strings.Contains(resp.Body.String(), canary) || strings.Contains(resp.Body.String(), encodedCanary) || !strings.Contains(resp.Body.String(), `"code":"security_egress_blocked"`) {
+				t.Fatalf("unsafe response = %s", resp.Body.String())
+			}
+		})
+	}
+	if upstreamRequests != 0 {
+		t.Fatalf("blocked output caused %d GitHub/token requests", upstreamRequests)
 	}
 }
 
@@ -511,6 +557,40 @@ func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 
 	if !sawUploadPack || !sawReceivePack {
 		t.Fatalf("fake Git handlers were not all exercised: upload=%v receive=%v", sawUploadPack, sawReceivePack)
+	}
+}
+
+func TestOpaqueGitReceivePackPolicyDeniesBeforeTokenOrUpstream(t *testing.T) {
+	apiRequests, gitRequests := 0, 0
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiRequests++
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer apiServer.Close()
+	gitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gitRequests++
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer gitServer.Close()
+	broker := newTestBroker(t, apiServer.URL, gitServer.URL, config.Agent{
+		ID:             "authority-worker",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"git.receive-pack"},
+		BranchPatterns: []string{"^refs/heads/agent/authority-worker/.+$"},
+		GitReceivePack: config.GitReceivePackDenyOpaque,
+	})
+	body := append(pktLine("0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/agent/authority-worker/test\x00 report-status\n"), []byte("0000")...)
+	req := httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", bytes.NewReader(body))
+	req.SetBasicAuth("authority-worker", "agent-secret")
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	if resp.Code != http.StatusForbidden || !strings.Contains(resp.Body.String(), "semantic packfile inspection") {
+		t.Fatalf("receive-pack denial = %d %q", resp.Code, resp.Body.String())
+	}
+	if apiRequests != 0 || gitRequests != 0 {
+		t.Fatalf("denied receive-pack reached token/upstream: api=%d git=%d", apiRequests, gitRequests)
 	}
 }
 

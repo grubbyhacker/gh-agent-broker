@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"gh-agent-broker/internal/securityscan"
 )
 
 const defaultInlineLimit = 8 * 1024
@@ -31,8 +34,13 @@ func collectFiles(base, runID string, redactor Redactor, inlineLimit int64) (Col
 		inlineLimit = defaultInlineLimit
 	}
 	base = filepath.Clean(base)
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return CollectionOutput{}, err
+	}
+	defer closeBody(root)
 	var files []FileManifest
-	err := filepath.WalkDir(base, func(path string, entry os.DirEntry, err error) error {
+	err = filepath.WalkDir(base, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -60,20 +68,36 @@ func collectFiles(base, runID string, redactor Redactor, inlineLimit int64) (Col
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		hash, err := fileSHA256(path)
+		if finding := securityscan.Fields(map[string]string{"artifact_path": rel}); finding != nil {
+			return &securityscan.DetectionError{Finding: *finding}
+		}
+		// Read once so the scan, hash, and optional inline response describe the
+		// same bytes even if the worker is still writing its output directory.
+		// Files beyond the bounded scanner capacity fail closed.
+		file, err := root.Open(filepath.FromSlash(rel))
 		if err != nil {
 			return err
 		}
-		item := FileManifest{Path: rel, Size: info.Size(), SHA256: hash}
-		if info.Size() <= inlineLimit && looksText(path) {
-			// #nosec G304 -- path comes from walking a sandbox run output directory.
-			//nolint:gosec // G122: path is rejected if it is a symlink before this read and collection only returns a manifest/snippet.
-			b, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			item.Inline = redactor.Redact(string(b))
-		} else if info.Size() > inlineLimit {
+		content, readErr := io.ReadAll(io.LimitReader(file, securityscan.MaxStreamBytes+1))
+		closeErr := file.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if len(content) > securityscan.MaxStreamBytes {
+			return &securityscan.DetectionError{Finding: securityscan.Finding{Code: "scan_limit_exceeded", Field: "artifact_content"}}
+		}
+		finding := securityscan.Reader("artifact_content", bytes.NewReader(content), securityscan.MaxStreamBytes)
+		if finding != nil {
+			return &securityscan.DetectionError{Finding: *finding}
+		}
+		hash := sha256.Sum256(content)
+		item := FileManifest{Path: rel, Size: int64(len(content)), SHA256: hex.EncodeToString(hash[:])}
+		if int64(len(content)) <= inlineLimit && looksText(path) {
+			item.Inline = redactor.Redact(string(content))
+		} else if int64(len(content)) > inlineLimit {
 			item.Truncated = true
 		}
 		files = append(files, item)
@@ -84,20 +108,6 @@ func collectFiles(base, runID string, redactor Redactor, inlineLimit int64) (Col
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	return CollectionOutput{RunID: runID, Files: files}, nil
-}
-
-func fileSHA256(path string) (string, error) {
-	// #nosec G304 -- path comes from walking a sandbox run output directory.
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer closeBody(f)
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func looksText(path string) bool {
