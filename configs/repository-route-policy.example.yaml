@@ -1,5 +1,11 @@
 version: repository-route-policy/v1
 routes:
-  - repository: local/repository-proof
+  - repository: local/repository-agent-lifecycle-fixture
     backend_url: http://repository-backend:8081
-    writable_namespace: refs/heads/agent/repository-proof/
+    readable_refs:
+      - refs/heads/main
+      - refs/heads/agent/repository-proof/**
+    writable_refs:
+      - refs/heads/agent/repository-proof/**
+    fast_forward_only: true
+    no_delete: true

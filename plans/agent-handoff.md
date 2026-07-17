@@ -12,11 +12,22 @@ any GitHub installation or token resolution, then forward only to their fixed
 backend URL without forwarding authorization or broker authority headers.
 
 `cmd/repository-backend` serves only health plus smart-HTTP discovery/RPC for
-one fixed bare repository. Its container pins Git's hidden-ref, object-want,
-delete, and non-fast-forward settings and installs a pre-receive hook that
-rejects deletes, out-of-namespace writes, and non-ancestor updates. Deployment
+the fixed `repository-agent-lifecycle-fixture` bare repository. Its container
+pins Git's hidden-ref, object-want, delete, and non-fast-forward settings and
+installs a pre-receive hook that rejects deletes, out-of-namespace writes, and
+non-ancestor updates. The HTTP boundary accepts only protocol v0 (no
+`Git-Protocol`) and v1 (`Git-Protocol: version=1`), rejecting v2 instead of
+silently downgrading it. Deployment
 configuration remains owned by `vps-ops`; use the exact manifest key above and
 the example in `configs/repository-route-policy.example.yaml`.
+
+The route manifest is strict YAML and binds exact readable refs
+`refs/heads/main` and `refs/heads/agent/repository-proof/**`, exact writable
+`refs/heads/agent/repository-proof/**`, plus `fast_forward_only` and
+`no_delete`; backend URLs are origin-only and cannot carry credentials, a path,
+query, or fragment. Health checks stat only the configured repository root and
+bare repository, verifying mode, Linux ownership, and read/write access without
+enumerating refs or mutating the repository.
 
 `gh-agent-broker` provides deny-by-default GitHub policy enforcement, sandbox
 lifecycle management, fixed operator launch profiles, durable idempotent launch

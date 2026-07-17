@@ -1969,7 +1969,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		}
 		if operation == "git.receive-pack" && r.Method == http.MethodPost {
 			for _, update := range updates {
-				if update.After == strings.Repeat("0", 40) || !strings.HasPrefix(update.Ref, route.WritableNamespace) {
+				if update.After == strings.Repeat("0", 40) || !route.AllowsWrite(update.Ref) {
 					s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, update.Ref, "local_ref_policy_denied", "local pushes must be non-deleting updates in the configured writable namespace")
 					return
 				}

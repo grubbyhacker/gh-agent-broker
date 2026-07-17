@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo="${REPOSITORY_PATH:-/var/lib/repository-backend/repository-proof.git}"
+repo="${REPOSITORY_PATH:-/var/lib/repository-backend/repository-agent-lifecycle-fixture.git}"
 if [ ! -d "$repo" ]; then
   git init --bare "$repo"
 fi
