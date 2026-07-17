@@ -1,0 +1,5 @@
+version: repository-route-policy/v1
+routes:
+  - repository: local/repository-proof
+    backend_url: http://repository-backend:8081
+    writable_namespace: refs/heads/agent/repository-proof/

@@ -1,0 +1,15 @@
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum* ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/repository-backend ./cmd/repository-backend
+
+FROM alpine:3.22
+RUN apk add --no-cache git && mkdir -p /var/lib/repository-backend && chown 65532:65532 /var/lib/repository-backend
+COPY --from=build /out/repository-backend /usr/local/bin/repository-backend
+COPY scripts/repository-backend-entrypoint.sh /usr/local/bin/repository-backend-entrypoint
+COPY scripts/repository-backend-pre-receive /usr/local/libexec/repository-backend-pre-receive
+RUN chmod 0755 /usr/local/bin/repository-backend-entrypoint /usr/local/libexec/repository-backend-pre-receive
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/repository-backend-entrypoint"]

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+zero=0000000000000000000000000000000000000000
+namespace=refs/heads/agent/repository-proof/
+while read -r old new ref; do
+  case "$ref" in "$namespace"*) ;; *) echo "outside writable namespace" >&2; exit 1;; esac
+  [ "$new" != "$zero" ] || { echo "deletion rejected" >&2; exit 1; }
+  [ "$old" = "$zero" ] || git merge-base --is-ancestor "$old" "$new" || { echo "non-fast-forward rejected" >&2; exit 1; }
+done

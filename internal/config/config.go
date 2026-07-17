@@ -8,17 +8,21 @@ import (
 	"regexp"
 	"strings"
 
+	"gh-agent-broker/internal/repositoryroutepolicy"
+
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Server         ServerConfig         `yaml:"server"`
-	Audit          AuditConfig          `yaml:"audit"`
-	GitHub         GitHubConfig         `yaml:"github"`
-	MutationLimits MutationLimitsConfig `yaml:"mutation_limits"`
-	Idempotency    IdempotencyConfig    `yaml:"idempotency"`
-	PushTripwire   PushTripwireConfig   `yaml:"push_tripwire"`
-	Agents         []Agent              `yaml:"agents"`
+	Server                    ServerConfig                  `yaml:"server"`
+	Audit                     AuditConfig                   `yaml:"audit"`
+	GitHub                    GitHubConfig                  `yaml:"github"`
+	MutationLimits            MutationLimitsConfig          `yaml:"mutation_limits"`
+	Idempotency               IdempotencyConfig             `yaml:"idempotency"`
+	PushTripwire              PushTripwireConfig            `yaml:"push_tripwire"`
+	Agents                    []Agent                       `yaml:"agents"`
+	RepositoryRoutePolicyPath string                        `yaml:"repository_route_policy_path"`
+	RepositoryRoutePolicy     *repositoryroutepolicy.Policy `yaml:"-"`
 }
 
 type PushTripwireConfig struct {
@@ -157,6 +161,13 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	cfg.applyDefaults()
+	if cfg.RepositoryRoutePolicyPath != "" {
+		policy, err := repositoryroutepolicy.Load(cfg.RepositoryRoutePolicyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load repository route policy: %w", err)
+		}
+		cfg.RepositoryRoutePolicy = policy
+	}
 	if err := cfg.resolveSecrets(); err != nil {
 		return nil, err
 	}

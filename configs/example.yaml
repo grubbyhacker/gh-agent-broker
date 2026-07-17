@@ -5,6 +5,10 @@ server:
 audit:
   path: "/var/log/gh-agent-broker/audit.jsonl"
 
+# Optional reviewed local-repository routes. The sandbox configuration uses
+# the identical repository_route_policy_path so authority policy digests bind it.
+# repository_route_policy_path: "/etc/gh-agent-broker/repository-route-policy.yaml"
+
 idempotency:
   state_path: "/var/log/gh-agent-broker/idempotency.json"
 

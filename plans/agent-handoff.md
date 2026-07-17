@@ -2,6 +2,22 @@
 
 ## Current State
 
+### Repository-route-policy/v1 and local smart HTTP backend
+
+The broker and sandbox now load the same optional
+`repository_route_policy_path` YAML manifest (`repository-route-policy/v1`).
+Its canonical SHA-256 digest is included in each authority profile policy
+digest. Local `local/...` routes are authenticated and policy-checked before
+any GitHub installation or token resolution, then forward only to their fixed
+backend URL without forwarding authorization or broker authority headers.
+
+`cmd/repository-backend` serves only health plus smart-HTTP discovery/RPC for
+one fixed bare repository. Its container pins Git's hidden-ref, object-want,
+delete, and non-fast-forward settings and installs a pre-receive hook that
+rejects deletes, out-of-namespace writes, and non-ancestor updates. Deployment
+configuration remains owned by `vps-ops`; use the exact manifest key above and
+the example in `configs/repository-route-policy.example.yaml`.
+
 `gh-agent-broker` provides deny-by-default GitHub policy enforcement, sandbox
 lifecycle management, fixed operator launch profiles, durable idempotent launch
 intents, recovery/reconciliation, scoped run visibility, and brokered GitHub
