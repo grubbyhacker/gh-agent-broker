@@ -311,6 +311,19 @@ production route or alter an authority profile.
 
 ## Validation
 
+Issue #112 introduces a tiered sandbox E2E gate. Relevant pull requests run
+the representative `make sandbox-e2e-fast` lifecycle in parallel with the Go
+gate. Relevant `main` pushes and every version tag retain the complete
+`make sandbox-e2e` suite, and `.github/workflows/sandbox-e2e-scheduled.yml`
+runs it weekly or on demand. The contract-aware path filter follows the local
+dependency closure of the sandbox broker and E2E client instead of all
+`cmd/**` and `internal/**`; update that filter whenever either command imports
+a new local package. CI uses the BuildKit Actions cache for the sandbox image,
+starts independent container smoke work without waiting for `check`, and limits
+the Codex worker image to its broker CLI/config dependency. Image publication
+still waits for every applicable gate. `docs/sandbox-e2e-ci.md` records the
+measured baseline, scenario coverage, and invalidation rules.
+
 Run `make fmt` after changing Go code and `make check` before handoff. Also run
 `git diff --check` and confirm searches for retired dispatcher/profile names do
 not find active configuration or future-facing guidance.

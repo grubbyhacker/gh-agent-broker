@@ -8,6 +8,19 @@ IMAGE="${SANDBOX_E2E_IMAGE:-gh-agent-broker:sandbox-e2e}"
 BROKER_CID=""
 SANDBOX_CID=""
 
+case "${SANDBOX_E2E_MODE:-full}" in
+  full)
+    E2E_ARG=""
+    ;;
+  fast)
+    E2E_ARG="--fast"
+    ;;
+  *)
+    echo "SANDBOX_E2E_MODE must be full or fast" >&2
+    exit 2
+    ;;
+esac
+
 cleanup() {
   if [[ -n "${SANDBOX_CID}" ]]; then
     docker rm -f "${SANDBOX_CID}" >/dev/null 2>&1 || true
@@ -240,9 +253,9 @@ echo "running MCP-driven sandbox E2E client"
   export SANDBOX_E2E_RUNS_DIR="${RUNS}"
   export SANDBOX_E2E_TIMEOUT="${SANDBOX_E2E_TIMEOUT:-180s}"
   if command -v mise >/dev/null 2>&1; then
-    mise exec -- go run ./cmd/sandbox-e2e
+    mise exec -- go run ./cmd/sandbox-e2e ${E2E_ARG:+"${E2E_ARG}"}
   else
-    go run ./cmd/sandbox-e2e
+    go run ./cmd/sandbox-e2e ${E2E_ARG:+"${E2E_ARG}"}
   fi
 )
 
