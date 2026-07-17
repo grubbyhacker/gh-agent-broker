@@ -79,3 +79,49 @@ func (s *AuthorityWorkerStore) BindAgentdSession(ctx context.Context, binding, s
 	}
 	return nil
 }
+
+// IssueAgentdSession linearizes the external agentd mutation with push-tripwire
+// halt application. The SQLite writer lock is held from the exact enforcement
+// read through the durable agentd binding commit.
+func (s *AuthorityWorkerStore) IssueAgentdSession(ctx context.Context, binding, profile string, issuanceGeneration int64, issue func() (string, error)) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeAuthorityConn(conn)
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			rollbackAuthorityConn(context.WithoutCancel(ctx), conn)
+		}
+	}()
+	if err := s.checkIssuanceInTransaction(ctx, conn, profile, issuanceGeneration); err != nil {
+		return err
+	}
+	sessionID, err := issue()
+	if err != nil {
+		return err
+	}
+	if !validAgentdID(sessionID) {
+		return fmt.Errorf("agentd session identity is malformed")
+	}
+	result, err := conn.ExecContext(ctx, `UPDATE authority_session_workspaces SET agentd_session_id=? WHERE binding_digest=? AND (agentd_session_id='' OR agentd_session_id=?)`, sessionID, s.requestDigest(binding), sessionID)
+	if err != nil {
+		return fmt.Errorf("record agentd session identity: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("agentd session identity conflicts with durable workspace")
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}

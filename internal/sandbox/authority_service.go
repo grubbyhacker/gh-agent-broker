@@ -64,6 +64,9 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkIssuance(ctx, lease.Profile, profile); err != nil {
+		return nil, err
+	}
 	if err := s.store.RequireConfirmedCoordinatorRouting(ctx, binding, lease); err != nil {
 		return nil, err
 	}
@@ -95,28 +98,30 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("agentd session create: %w", err)
-	}
-	//nolint:errcheck // The response is decoded before return; a close error cannot alter admission state.
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("agentd session create rejected")
-	}
-	status, err := decodeAgentdSessionStatus(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("agentd session create returned an invalid status")
-	}
-	expectedBinding := agentdWorkerBinding{WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch}
-	expectedWorkspace := agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}
-	if !exactAgentdSessionStatus(status, status.SessionID, binding, lease.Profile, lease.SessionLineageID, expectedWorkspace, expectedBinding) {
-		return nil, fmt.Errorf("agentd session create returned a mismatched status")
-	}
-	if err := s.store.BindAgentdSession(ctx, binding, status.SessionID); err != nil {
-		return nil, err
-	}
-	return marshalAgentdSessionStatus(status)
+	var encoded json.RawMessage
+	err = s.store.IssueAgentdSession(ctx, binding, lease.Profile, profile.IssuanceGeneration, func() (string, error) {
+		resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+		if err != nil {
+			return "", fmt.Errorf("agentd session create: %w", err)
+		}
+		//nolint:errcheck // The response is decoded before return; a close error cannot alter admission state.
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			return "", fmt.Errorf("agentd session create rejected")
+		}
+		status, err := decodeAgentdSessionStatus(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("agentd session create returned an invalid status")
+		}
+		expectedBinding := agentdWorkerBinding{WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch}
+		expectedWorkspace := agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}
+		if !exactAgentdSessionStatus(status, status.SessionID, binding, lease.Profile, lease.SessionLineageID, expectedWorkspace, expectedBinding) {
+			return "", fmt.Errorf("agentd session create returned a mismatched status")
+		}
+		encoded, err = marshalAgentdSessionStatus(status)
+		return status.SessionID, err
+	})
+	return encoded, err
 }
 
 func (r *AuthorityWorkerRequest) UnmarshalJSON(data []byte) error {
@@ -226,7 +231,12 @@ type AuthorityWorkerService struct {
 	now          func() time.Time
 	newID        func() (string, error)
 	checkpoints  *CheckpointStore
+	issuance     AuthorityIssuanceGuard
 	retirementMu sync.Mutex
+}
+
+type AuthorityIssuanceGuard interface {
+	CheckIssuance(context.Context, string, int64) error
 }
 
 type AuthoritySessionAdmission struct {
@@ -242,7 +252,7 @@ func (s *AuthorityWorkerService) AcquireSession(ctx context.Context, principal s
 	if err := validateAuthorityRequest(request); err != nil {
 		return AuthoritySessionAdmission{}, err
 	}
-	lease, err := s.store.Acquire(ctx, principal, request)
+	lease, err := s.store.Acquire(ctx, principal, request, profile.IssuanceGeneration)
 	if err != nil {
 		return AuthoritySessionAdmission{}, err
 	}
@@ -253,12 +263,22 @@ func (s *AuthorityWorkerService) AcquireSession(ctx context.Context, principal s
 	return AuthoritySessionAdmission{Lease: lease, Workspace: workspace}, nil
 }
 
-func NewAuthorityWorkerService(cfg Config, store *AuthorityWorkerStore, runtime AuthorityWorkerRuntime, audit *AuditLogger) *AuthorityWorkerService {
+func NewAuthorityWorkerService(cfg Config, store *AuthorityWorkerStore, runtime AuthorityWorkerRuntime, audit *AuditLogger, issuance AuthorityIssuanceGuard) *AuthorityWorkerService {
 	return &AuthorityWorkerService{
-		cfg: cfg, store: store, runtime: runtime, audit: audit,
+		cfg: cfg, store: store, runtime: runtime, audit: audit, issuance: issuance,
 		now:   func() time.Time { return time.Now().UTC() },
 		newID: newRunID,
 	}
+}
+
+func (s *AuthorityWorkerService) checkIssuance(ctx context.Context, name string, profile AuthorityProfile) error {
+	if s.issuance == nil {
+		return errors.New("authority issuance guard is unavailable")
+	}
+	if err := s.issuance.CheckIssuance(ctx, name, profile.IssuanceGeneration); err != nil {
+		return fmt.Errorf("authority issuance denied: %w", err)
+	}
+	return nil
 }
 
 func (s *AuthorityWorkerService) WithCheckpointStore(store *CheckpointStore) *AuthorityWorkerService {
@@ -402,6 +422,9 @@ func (s *AuthorityWorkerService) Provision(ctx context.Context, principal, profi
 		s.log("authority_worker.provision", principal, profileName, AuthorityWorker{}, "deny", err)
 		return AuthorityWorker{}, err
 	}
+	if err := s.checkIssuance(ctx, profileName, profile); err != nil {
+		return AuthorityWorker{}, err
+	}
 	profileVersion, policyDigest, err := authorityProfileDigest(profileName, profile)
 	if err != nil {
 		return AuthorityWorker{}, err
@@ -411,7 +434,7 @@ func (s *AuthorityWorkerService) Provision(ctx context.Context, principal, profi
 		return AuthorityWorker{}, err
 	}
 	worker := AuthorityWorker{WorkerID: workerID, Profile: profileName, ProfileVersion: profileVersion, PolicyDigest: policyDigest, ImageReference: profile.Image, Generation: 1, State: AuthorityWorkerProvisioning, Capacity: profile.SessionCapacity}
-	worker, err = s.store.CreateWorker(ctx, worker, profile.MaxWorkers)
+	worker, err = s.store.CreateWorker(ctx, worker, profile.MaxWorkers, profile.IssuanceGeneration)
 	if err != nil {
 		s.log("authority_worker.provision", principal, profileName, worker, "deny", err)
 		return AuthorityWorker{}, err
@@ -473,7 +496,8 @@ func (s *AuthorityWorkerService) retireDrainedPredecessor(ctx context.Context, r
 }
 
 func (s *AuthorityWorkerService) Acquire(ctx context.Context, principal string, request AuthorityWorkerRequest) (AuthorityLease, error) {
-	if _, err := s.authorize(principal, request.Profile, "acquire"); err != nil {
+	profile, err := s.authorize(principal, request.Profile, "acquire")
+	if err != nil {
 		s.log("authority_worker.acquire", principal, request.Profile, AuthorityWorker{}, "deny", err)
 		return AuthorityLease{}, err
 	}
@@ -481,7 +505,7 @@ func (s *AuthorityWorkerService) Acquire(ctx context.Context, principal string, 
 		s.log("authority_worker.acquire", principal, request.Profile, AuthorityWorker{}, "deny", err)
 		return AuthorityLease{}, err
 	}
-	lease, err := s.store.Acquire(ctx, principal, request)
+	lease, err := s.store.Acquire(ctx, principal, request, profile.IssuanceGeneration)
 	worker := AuthorityWorker{WorkerID: lease.WorkerID, Profile: request.Profile}
 	s.log("authority_worker.acquire", principal, request.Profile, worker, decision(err), err)
 	return lease, err
@@ -515,7 +539,7 @@ func (s *AuthorityWorkerService) ReassignSession(ctx context.Context, principal 
 	if _, ok := s.runtime.(AuthorityAgentdRebinder); !ok {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
 	}
-	reassignment, err := s.store.Reassign(ctx, principal, request.SessionBinding, request.SessionLineageID, request.PredecessorWorkerID, request.PredecessorWorkerFenceEpoch, request.IdempotencyKey, workspace)
+	reassignment, err := s.store.Reassign(ctx, principal, request.SessionBinding, request.SessionLineageID, request.PredecessorWorkerID, request.PredecessorWorkerFenceEpoch, request.IdempotencyKey, workspace, profile.IssuanceGeneration)
 	if err != nil {
 		worker := AuthorityWorker{WorkerID: reassignment.ReplacementWorkerID, Profile: lease.Profile}
 		s.log("authority_worker.reassign", principal, lease.Profile, worker, decision(err), err)
@@ -669,7 +693,7 @@ func (s *AuthorityWorkerService) Replace(ctx context.Context, principal, workerI
 		return AuthorityWorker{}, err
 	}
 	replacement := AuthorityWorker{WorkerID: newID, Profile: old.Profile, ProfileVersion: old.ProfileVersion, PolicyDigest: old.PolicyDigest, ImageReference: old.ImageReference, Generation: old.Generation + 1, State: AuthorityWorkerProvisioning, Capacity: old.Capacity, DrainReason: reason}
-	replacement, created, err := s.store.LinkReplacement(ctx, old.WorkerID, replacement, profile.MaxWorkers)
+	replacement, created, err := s.store.LinkReplacement(ctx, old.WorkerID, replacement, profile.MaxWorkers, profile.IssuanceGeneration)
 	if err != nil {
 		s.log("authority_worker.replace", principal, old.Profile, old, "deny", err)
 		return AuthorityWorker{}, err

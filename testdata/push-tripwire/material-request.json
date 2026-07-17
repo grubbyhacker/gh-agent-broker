@@ -1,0 +1,8 @@
+{
+  "version": "broker/push-tripwire/v1",
+  "delivery_id": "delivery-01",
+  "repository": "owner/repo",
+  "ref": "refs/heads/agent/worker-01/change",
+  "before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "after": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

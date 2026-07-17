@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"gh-agent-broker/internal/pushtripwire"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -132,9 +134,21 @@ func reassignmentError(code ReassignmentErrorCode, format string, args ...any) e
 }
 
 type AuthorityWorkerStore struct {
-	db        *sql.DB
-	salt      []byte
-	sessionMu sync.Mutex
+	db                         *sql.DB
+	salt                       []byte
+	sessionMu                  sync.Mutex
+	afterIssuanceCheckForTest  func()
+	afterIssuanceCommitForTest func()
+}
+
+func (s *AuthorityWorkerStore) checkIssuanceInTransaction(ctx context.Context, conn *sql.Conn, profile string, generation int64) error {
+	if err := pushtripwire.CheckIssuanceState(ctx, conn, profile, generation); err != nil {
+		return fmt.Errorf("authority issuance denied: %w", err)
+	}
+	if s.afterIssuanceCheckForTest != nil {
+		s.afterIssuanceCheckForTest()
+	}
+	return nil
 }
 
 func OpenAuthorityWorkerStore(ctx context.Context, path string) (*AuthorityWorkerStore, error) {
@@ -471,7 +485,7 @@ func validOpaqueLineageID(value string) bool {
 	return err == nil && len(decoded) == 16
 }
 
-func (s *AuthorityWorkerStore) CreateWorker(ctx context.Context, worker AuthorityWorker, maxWorkers int) (AuthorityWorker, error) {
+func (s *AuthorityWorkerStore) CreateWorker(ctx context.Context, worker AuthorityWorker, maxWorkers int, issuanceGeneration int64) (AuthorityWorker, error) {
 	if worker.WorkerStorageLineageID == "" {
 		lineageID, err := newOpaqueLineageID("worker storage")
 		if err != nil {
@@ -496,6 +510,9 @@ func (s *AuthorityWorkerStore) CreateWorker(ctx context.Context, worker Authorit
 			rollbackAuthorityConn(context.WithoutCancel(ctx), conn)
 		}
 	}()
+	if err := s.checkIssuanceInTransaction(ctx, conn, worker.Profile, issuanceGeneration); err != nil {
+		return AuthorityWorker{}, err
+	}
 	var count int
 	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM authority_workers WHERE profile=? AND state NOT IN (?,?)`, worker.Profile, AuthorityWorkerStopped, AuthorityWorkerFailed).Scan(&count); err != nil {
 		return AuthorityWorker{}, err
@@ -517,6 +534,9 @@ func (s *AuthorityWorkerStore) CreateWorker(ctx context.Context, worker Authorit
 		return AuthorityWorker{}, err
 	}
 	committed = true
+	if s.afterIssuanceCommitForTest != nil {
+		s.afterIssuanceCommitForTest()
+	}
 	return worker, nil
 }
 
@@ -633,7 +653,7 @@ func (s *AuthorityWorkerStore) SetWorkerHealth(ctx context.Context, workerID, he
 	return scanAuthorityWorker(conn.QueryRowContext(ctx, `SELECT worker_id,profile,profile_version,policy_digest,image_reference,image_digest,generation,container_id,state,capacity,assigned_sessions,health,drain_reason,replacement_worker_id,heartbeat_at,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE worker_id=?`, workerID))
 }
 
-func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, request AuthorityWorkerRequest) (AuthorityLease, error) {
+func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, request AuthorityWorkerRequest, issuanceGeneration int64) (AuthorityLease, error) {
 	idem := s.requestDigest(request.IdempotencyKey)
 	binding := s.requestDigest(request.SessionBinding)
 	fingerprint := s.requestDigest("request:" + request.Profile + "\x00" + request.SessionBinding)
@@ -675,6 +695,9 @@ func (s *AuthorityWorkerStore) Acquire(ctx context.Context, principal string, re
 		return lease, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
+		return AuthorityLease{}, err
+	}
+	if err := s.checkIssuanceInTransaction(ctx, conn, request.Profile, issuanceGeneration); err != nil {
 		return AuthorityLease{}, err
 	}
 	var workerID string
@@ -809,7 +832,7 @@ func (s *AuthorityWorkerStore) ValidateSessionFence(ctx context.Context, workerI
 // Reassign moves an active lease only to the replacement durably linked to the
 // supplied predecessor.  Lease ownership, workspace ownership, and capacity
 // accounting commit together, so a process crash leaves either side intact.
-func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionBinding, sessionLineageID, predecessorWorkerID string, predecessorWorkerFenceEpoch int64, idempotencyKey string, workspace SessionWorkspace) (AuthoritySessionReassignment, error) {
+func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionBinding, sessionLineageID, predecessorWorkerID string, predecessorWorkerFenceEpoch int64, idempotencyKey string, workspace SessionWorkspace, issuanceGeneration int64) (AuthoritySessionReassignment, error) {
 	binding := s.requestDigest(sessionBinding)
 	idem := s.requestDigest(idempotencyKey)
 	fingerprint := s.requestDigest(fmt.Sprintf("reassign:%s\x00%s\x00%s\x00%d", sessionBinding, sessionLineageID, predecessorWorkerID, predecessorWorkerFenceEpoch))
@@ -902,6 +925,9 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	}
 	if replacementID == "" {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentNotReady, "predecessor has no broker-recorded replacement")
+	}
+	if err := s.checkIssuanceInTransaction(ctx, conn, predecessorProfile, issuanceGeneration); err != nil {
+		return AuthoritySessionReassignment{}, err
 	}
 	var replacementProfile, replacementProfileVersion, replacementPolicyDigest, replacementImage, replacementStorageLineageID string
 	var replacementState AuthorityWorkerState
@@ -1259,7 +1285,7 @@ func (s *AuthorityWorkerStore) MarkDrainedStopped(ctx context.Context, workerID 
 	return nil
 }
 
-func (s *AuthorityWorkerStore) LinkReplacement(ctx context.Context, oldWorkerID string, replacement AuthorityWorker, maxWorkers int) (AuthorityWorker, bool, error) {
+func (s *AuthorityWorkerStore) LinkReplacement(ctx context.Context, oldWorkerID string, replacement AuthorityWorker, maxWorkers int, issuanceGeneration int64) (AuthorityWorker, bool, error) {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return AuthorityWorker{}, false, err
@@ -1289,6 +1315,9 @@ func (s *AuthorityWorkerStore) LinkReplacement(ctx context.Context, oldWorkerID 
 		}
 		committed = true
 		return worker, false, nil
+	}
+	if err := s.checkIssuanceInTransaction(ctx, conn, replacement.Profile, issuanceGeneration); err != nil {
+		return AuthorityWorker{}, false, err
 	}
 	var active int
 	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM authority_workers WHERE profile=? AND state NOT IN (?,?)`, replacement.Profile, AuthorityWorkerStopped, AuthorityWorkerFailed).Scan(&active); err != nil {

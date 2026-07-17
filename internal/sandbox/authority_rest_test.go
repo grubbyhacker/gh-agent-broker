@@ -57,7 +57,7 @@ func TestCoordinatorV1SubmitIsBrokerMediated(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeTestAudit(t, auditLog)
-	service := NewAuthorityWorkerService(cfg, store, runtime, auditLog)
+	service := NewAuthorityWorkerService(cfg, store, runtime, auditLog, allowTestAuthorityIssuance{})
 	service.newID = func() (string, error) { return "coordinator-worker", nil }
 	worker, err := service.Provision(ctx, "coordinator", "writer")
 	if err != nil {
@@ -136,7 +136,7 @@ func TestCoordinatorV1BlocksCommandsUntilReassignmentAdoptionIsConfirmed(t *test
 	fixture := newAuthorityAdoptionFixture(t, 1)
 	adoption := fixture.commit(t, 0)
 	runtime := &coordinatorTestRuntime{fakeAuthorityRuntime: fixture.runtime}
-	service := NewAuthorityWorkerService(fixture.cfg, fixture.store, runtime, nil)
+	service := NewAuthorityWorkerService(fixture.cfg, fixture.store, runtime, nil, allowTestAuthorityIssuance{})
 	request := CoordinatorSessionRequest{
 		SessionBinding: fixture.bindings[0],
 		IdempotencyKey: "blocked-turn",
@@ -203,7 +203,7 @@ func TestAuthorityRESTSessionReassignmentContract(t *testing.T) {
 	cfg := authorityTestConfig(t)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	ids := []string{"rest-old", "rest-new"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")

@@ -3,11 +3,15 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"gh-agent-broker/internal/config"
+	"gh-agent-broker/internal/pushtripwire"
 )
 
 func TestParseGitPath(t *testing.T) {
@@ -29,6 +33,83 @@ func TestGitOperation(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", nil)
 	if got := gitOperation(req, "/git-receive-pack"); got != "git.receive-pack" {
 		t.Fatalf("gitOperation() = %q", got)
+	}
+}
+
+func TestReceivePackUpdatesAndStableRejection(t *testing.T) {
+	body := append(pktLine("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/heads/agent/a\x00 report-status\n"), pktLine("cccccccccccccccccccccccccccccccccccccccc dddddddddddddddddddddddddddddddddddddddd refs/heads/agent/b\n")...)
+	body = append(body, []byte("0000PACK")...)
+	updates, err := receivePackUpdates(body)
+	if err != nil || len(updates) != 2 || updates[1].Ref != "refs/heads/agent/b" {
+		t.Fatalf("updates=%+v err=%v", updates, err)
+	}
+	result := append(pktLine("unpack ok\n"), pktLine("ng refs/heads/agent/a protected branch hook declined\n")...)
+	result = append(result, []byte("0000")...)
+	if !receivePackRejected(result) {
+		t.Fatal("stable ng status was not classified")
+	}
+	if !receivePackRejected(pktLine("\x01ng refs/heads/agent/a protected branch\n")) {
+		t.Fatal("sideband ng status was not classified")
+	}
+	if receivePackRejected([]byte("protected branch")) {
+		t.Fatal("English prose was incorrectly classified")
+	}
+}
+
+func TestReceivePackCommandPrefixLeavesLargeOpaquePackStreamUnread(t *testing.T) {
+	command := append(pktLine(strings.Repeat("0", 40)+" "+strings.Repeat("1", 40)+" refs/heads/agent/large\x00 report-status\n"), []byte("0000")...)
+	packSize := int64(32 << 20)
+	body := io.MultiReader(bytes.NewReader(command), io.LimitReader(zeroReader{}, packSize))
+	prefix, updates, err := readReceivePackCommandPrefix(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(prefix, command) || len(updates) != 1 {
+		t.Fatalf("prefix/updates mismatch: prefix=%d updates=%+v", len(prefix), updates)
+	}
+	remaining, err := io.Copy(io.Discard, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != packSize {
+		t.Fatalf("remaining pack bytes=%d want=%d", remaining, packSize)
+	}
+}
+
+func TestReceivePackCommandPrefixBound(t *testing.T) {
+	base := strings.Repeat("0", 40) + " " + strings.Repeat("1", 40) + " refs/heads/agent/bound\x00"
+	payload := base + strings.Repeat("x", 65531-len(base))
+	packet := pktLine(payload)
+	body := bytes.NewReader(append(append(append(append(append([]byte{}, packet...), packet...), packet...), packet...), packet...))
+	if _, _, err := readReceivePackCommandPrefix(body); !errors.Is(err, errReceivePackCommandPrefixLimit) {
+		t.Fatalf("prefix bound error=%v", err)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) { clear(p); return len(p), nil }
+
+func TestResponseScopeRejectsArbitraryProfileGenerationAndBinding(t *testing.T) {
+	cfg := config.PushTripwireConfig{ResponseProfiles: map[string]config.PushTripwireResponseProfile{"curator": {Generation: 7, AllowHalt: true, AllowFence: true, Bindings: []config.PushTripwireBinding{{WorkerID: "worker", SessionLineageID: "session", WorkerStorageLineageID: "storage", WorkerFenceEpoch: 2}}}}}
+	base := pushtripwire.ResponseRequest{Version: pushtripwire.Version, FindingID: "finding", Profile: "curator", ProfileGeneration: 7, Actions: []string{"halt_issuance"}}
+	if !responseWithinReviewedScope(cfg, base) {
+		t.Fatal("reviewed halt rejected")
+	}
+	base.Profile = "arbitrary"
+	if responseWithinReviewedScope(cfg, base) {
+		t.Fatal("arbitrary profile accepted")
+	}
+	base.Profile = "curator"
+	base.ProfileGeneration = 8
+	if responseWithinReviewedScope(cfg, base) {
+		t.Fatal("stale generation accepted")
+	}
+	base.ProfileGeneration = 7
+	base.Actions = []string{"fence_worker_session"}
+	base.Binding = &pushtripwire.Binding{WorkerID: "other", SessionLineageID: "session", WorkerStorageLineageID: "storage", WorkerFenceEpoch: 2}
+	if responseWithinReviewedScope(cfg, base) {
+		t.Fatal("unbound worker accepted")
 	}
 }
 

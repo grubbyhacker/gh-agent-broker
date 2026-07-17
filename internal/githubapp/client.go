@@ -4,12 +4,16 @@ package githubapp
 import (
 	"bytes"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,9 +21,253 @@ import (
 
 	"gh-agent-broker/internal/api"
 	"gh-agent-broker/internal/config"
+	"gh-agent-broker/internal/pushtripwire"
 
 	"github.com/golang-jwt/jwt/v4"
 )
+
+var githubSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func (c *Client) GetRef(appName, repo, ref string, installationID int64) (string, bool, error) {
+	if !strings.HasPrefix(ref, "refs/heads/") {
+		return "", false, fmt.Errorf("unsupported ref namespace")
+	}
+	refName := strings.TrimPrefix(ref, "refs/")
+	parts := strings.Split(refName, "/")
+	for i := range parts {
+		parts[i] = url.PathEscape(parts[i])
+	}
+	var out struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/git/ref/"+strings.Join(parts, "/"), installationID, nil, &out)
+	if err != nil {
+		var apiErr APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if !githubSHAPattern.MatchString(out.Object.SHA) {
+		return "", false, errors.New("github ref returned invalid object sha")
+	}
+	return out.Object.SHA, true, nil
+}
+
+func (c *Client) PushTripwireMaterial(appName string, installationID int64, req pushtripwire.MaterialRequest, baseRef string, bounds config.PushTripwireBounds) (pushtripwire.MaterialResponse, error) {
+	out := pushtripwire.MaterialResponse{Version: pushtripwire.Version, DeliveryID: req.DeliveryID, Repository: req.Repository, Ref: req.Ref, Before: req.Before, After: req.After, Commits: []pushtripwire.Commit{}, Files: []pushtripwire.File{}}
+	incomplete := func(code string) (pushtripwire.MaterialResponse, error) {
+		out.Complete = false
+		out.ReasonCode = code
+		out.Commits = []pushtripwire.Commit{}
+		out.Files = []pushtripwire.File{}
+		return out, nil
+	}
+	compareBefore := req.Before
+	if req.Before == strings.Repeat("0", 40) {
+		var found bool
+		var err error
+		compareBefore, found, err = c.GetRef(appName, req.Repository, baseRef, installationID)
+		if err != nil || !found {
+			return incomplete("base_ref_unavailable")
+		}
+	}
+	var comparison struct {
+		TotalCommits int    `json:"total_commits"`
+		Status       string `json:"status"`
+		Commits      []struct {
+			SHA string `json:"sha"`
+		} `json:"commits"`
+	}
+	path := "/repos/" + req.Repository + "/compare/" + compareBefore + "..." + req.After + "?per_page=" + strconv.Itoa(bounds.MaxCommits)
+	if err := c.doJSON(appName, http.MethodGet, path, installationID, nil, &comparison); err != nil {
+		return incomplete("github_material_unavailable")
+	}
+	if comparison.TotalCommits > bounds.MaxCommits || len(comparison.Commits) > bounds.MaxCommits {
+		return incomplete("commit_limit_exceeded")
+	}
+	if comparison.TotalCommits != len(comparison.Commits) {
+		return incomplete("commit_history_incomplete")
+	}
+	statusAllowed := comparison.Status == "ahead" || (req.Before == strings.Repeat("0", 40) && comparison.Status == "diverged")
+	if !statusAllowed || comparison.TotalCommits == 0 || comparison.Commits[len(comparison.Commits)-1].SHA != req.After {
+		return incomplete("commit_history_incomplete")
+	}
+	type treeNode struct {
+		Path, Type, SHA string
+		Size            int64
+	}
+	treeCache := map[string]map[string]treeNode{}
+	loadTree := func(treeSHA string) (map[string]treeNode, string) {
+		if cached, ok := treeCache[treeSHA]; ok {
+			return cached, ""
+		}
+		if !githubSHAPattern.MatchString(treeSHA) {
+			return nil, "invalid_tree_material"
+		}
+		var tree struct {
+			Truncated bool       `json:"truncated"`
+			Tree      []treeNode `json:"tree"`
+		}
+		if err := c.doJSON(appName, http.MethodGet, "/repos/"+req.Repository+"/git/trees/"+treeSHA+"?recursive=1", installationID, nil, &tree); err != nil {
+			return nil, "github_material_unavailable"
+		}
+		if tree.Truncated {
+			return nil, "tree_material_incomplete"
+		}
+		mapped := make(map[string]treeNode, len(tree.Tree))
+		for _, node := range tree.Tree {
+			if node.Path == "" || len(node.Path) > 4096 || strings.ContainsRune(node.Path, '\x00') || (node.Type != "blob" && node.Type != "tree" && node.Type != "commit") {
+				return nil, "invalid_tree_material"
+			}
+			mapped[node.Path] = node
+		}
+		treeCache[treeSHA] = mapped
+		return mapped, ""
+	}
+	var total int64
+	type blobMaterial struct {
+		content string
+		size    int64
+	}
+	blobCache := map[string]blobMaterial{}
+	loadBlob := func(sha string) (string, int64, string) {
+		if material, ok := blobCache[sha]; ok {
+			return material.content, material.size, ""
+		}
+		if !githubSHAPattern.MatchString(sha) {
+			return "", 0, "invalid_blob_material"
+		}
+		var blob struct {
+			Content, Encoding string
+			Size              int64
+		}
+		if err := c.doJSON(appName, http.MethodGet, "/repos/"+req.Repository+"/git/blobs/"+sha, installationID, nil, &blob); err != nil {
+			return "", 0, "github_material_unavailable"
+		}
+		if blob.Encoding != "base64" || blob.Size < 0 || blob.Size > bounds.MaxBlobBytes {
+			return "", 0, "blob_limit_exceeded"
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(blob.Content, "\n", ""))
+		if err != nil || int64(len(decoded)) != blob.Size {
+			return "", 0, "invalid_blob_material"
+		}
+		content := base64.StdEncoding.EncodeToString(decoded)
+		blobCache[sha] = blobMaterial{content: content, size: int64(len(decoded))}
+		return content, int64(len(decoded)), ""
+	}
+	changedPaths := 0
+	for _, listed := range comparison.Commits {
+		if !githubSHAPattern.MatchString(listed.SHA) {
+			return incomplete("commit_history_incomplete")
+		}
+		var commit struct {
+			SHA    string `json:"sha"`
+			Commit struct {
+				Message string `json:"message"`
+				Tree    struct {
+					SHA string `json:"sha"`
+				} `json:"tree"`
+			} `json:"commit"`
+			Parents []struct {
+				SHA string `json:"sha"`
+			} `json:"parents"`
+		}
+		if err := c.doJSON(appName, http.MethodGet, "/repos/"+req.Repository+"/commits/"+listed.SHA, installationID, nil, &commit); err != nil {
+			return incomplete("github_material_unavailable")
+		}
+		if commit.SHA != listed.SHA || len(commit.Parents) == 0 || int64(len(commit.Commit.Message)) > bounds.MaxCommitMessageBytes {
+			return incomplete("commit_history_incomplete")
+		}
+		total += int64(len(commit.Commit.Message))
+		if total > bounds.MaxTotalBytes {
+			return incomplete("total_byte_limit_exceeded")
+		}
+		out.Commits = append(out.Commits, pushtripwire.Commit{SHA: commit.SHA, Message: commit.Commit.Message})
+		var parent struct {
+			Commit struct {
+				Tree struct {
+					SHA string `json:"sha"`
+				} `json:"tree"`
+			} `json:"commit"`
+		}
+		if err := c.doJSON(appName, http.MethodGet, "/repos/"+req.Repository+"/commits/"+commit.Parents[0].SHA, installationID, nil, &parent); err != nil {
+			return incomplete("github_material_unavailable")
+		}
+		beforeTree, code := loadTree(parent.Commit.Tree.SHA)
+		if code != "" {
+			return incomplete(code)
+		}
+		afterTree, code := loadTree(commit.Commit.Tree.SHA)
+		if code != "" {
+			return incomplete(code)
+		}
+		paths := map[string]bool{}
+		for path := range beforeTree {
+			paths[path] = true
+		}
+		for path := range afterTree {
+			paths[path] = true
+		}
+		orderedPaths := make([]string, 0, len(paths))
+		for path := range paths {
+			orderedPaths = append(orderedPaths, path)
+		}
+		sort.Strings(orderedPaths)
+		for _, path := range orderedPaths {
+			before, beforeOK := beforeTree[path]
+			after, afterOK := afterTree[path]
+			if beforeOK && afterOK && before.SHA == after.SHA && before.Type == after.Type {
+				continue
+			}
+			if (beforeOK && before.Type != "blob") || (afterOK && after.Type != "blob") {
+				return incomplete("unsupported_tree_material")
+			}
+			status := "modified"
+			if !beforeOK {
+				status = "added"
+			}
+			if !afterOK {
+				status = "deleted"
+			}
+			if beforeOK {
+				changedPaths++
+				if changedPaths > bounds.MaxPaths {
+					return incomplete("path_limit_exceeded")
+				}
+				content, size, code := loadBlob(before.SHA)
+				if code != "" {
+					return incomplete(code)
+				}
+				total += size
+				if total > bounds.MaxTotalBytes {
+					return incomplete("total_byte_limit_exceeded")
+				}
+				out.Files = append(out.Files, pushtripwire.File{CommitSHA: commit.SHA, Path: path, Side: "before", Status: status, BlobSHA: before.SHA, Size: size, ContentBase64: content})
+			}
+			if afterOK {
+				changedPaths++
+				if changedPaths > bounds.MaxPaths {
+					return incomplete("path_limit_exceeded")
+				}
+				content, size, code := loadBlob(after.SHA)
+				if code != "" {
+					return incomplete(code)
+				}
+				total += size
+				if total > bounds.MaxTotalBytes {
+					return incomplete("total_byte_limit_exceeded")
+				}
+				out.Files = append(out.Files, pushtripwire.File{CommitSHA: commit.SHA, Path: path, Side: "after", Status: status, BlobSHA: after.SHA, Size: size, ContentBase64: content})
+			}
+		}
+	}
+	out.Bounds = pushtripwire.MaterialBounds{CommitCount: len(out.Commits), PathCount: changedPaths, TotalBytes: total}
+	out.Complete = true
+	return out, nil
+}
 
 type Client struct {
 	cfg  config.GitHubConfig

@@ -1,0 +1,31 @@
+{
+  "version": "broker/push-tripwire/v1",
+  "delivery_id": "delivery-01",
+  "repository": "owner/repo",
+  "ref": "refs/heads/agent/worker-01/change",
+  "before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "after": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "complete": true,
+  "bounds": {
+    "commit_count": 1,
+    "path_count": 1,
+    "total_bytes": 37
+  },
+  "commits": [
+    {
+      "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "message": "Add synthetic canary"
+    }
+  ],
+  "files": [
+    {
+      "commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "path": "proof/canary.txt",
+      "side": "after",
+      "status": "added",
+      "blob_sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "size": 17,
+      "content_base64": "c3ludGhldGljLWNhbmFyeQo="
+    }
+  ]
+}

@@ -39,7 +39,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("init github app client: %v", err)
 	}
-	srv := server.New(*configPath, cfg, gh, auditLog)
+	srv, err := server.New(*configPath, cfg, gh, auditLog)
+	if err != nil {
+		log.Fatalf("init broker server: %v", err)
+	}
 	srv.InstallSignalReload()
 	log.Printf("gh-agent-broker listening on %s", cfg.Server.Listen)
 	httpServer := &http.Server{

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"gh-agent-broker/internal/pushtripwire"
 	"gh-agent-broker/internal/sandbox"
 	"gh-agent-broker/internal/server"
 
@@ -110,7 +111,23 @@ func runServerCommand(args []string) {
 				log.Printf("close authority worker store: %v", err)
 			}
 		}()
-		authorityService := sandbox.NewAuthorityWorkerService(cfg, authorityStore, sandbox.NewDockerAuthorityRuntime(*dockerSocket, cfg), auditLog).WithCheckpointStore(sandbox.NewCheckpointStore(cfg, authorityStore))
+		issuanceStore, err := pushtripwire.Open(cfg.AuthorityStore)
+		if err != nil {
+			log.Fatalf("open shared authority issuance state: %v", err)
+		}
+		defer func() {
+			if err := issuanceStore.Close(); err != nil {
+				log.Printf("close authority issuance state: %v", err)
+			}
+		}()
+		generations := make(map[string]int64, len(cfg.AuthorityProfiles))
+		for name, profile := range cfg.AuthorityProfiles {
+			generations[name] = profile.IssuanceGeneration
+		}
+		if err := issuanceStore.ReplaceEnforcementCatalog(context.Background(), generations); err != nil {
+			log.Fatalf("register authority issuance enforcement: %v", err)
+		}
+		authorityService := sandbox.NewAuthorityWorkerService(cfg, authorityStore, sandbox.NewDockerAuthorityRuntime(*dockerSocket, cfg), auditLog, issuanceStore).WithCheckpointStore(sandbox.NewCheckpointStore(cfg, authorityStore))
 		authorityHandler = sandbox.NewAuthorityRESTHandler(authorityService)
 	}
 
