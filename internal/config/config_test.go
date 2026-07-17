@@ -94,6 +94,22 @@ func TestValidateRejectsDuplicateAgent(t *testing.T) {
 	}
 }
 
+func TestPushTripwireRequiresReviewedMaterialAndResponseScope(t *testing.T) {
+	cfg := Config{GitHub: GitHubConfig{AppID: 1, PrivateKeyPath: "key.pem", Installations: map[string]int64{"owner/repo": 2}}, PushTripwire: PushTripwireConfig{Enabled: true, ScannerID: "scanner", ScannerSecret: "secret", StatePath: "tripwire.db", Repositories: map[string]PushTripwireRepository{"owner/repo": {BaseRef: "refs/heads/main", RefPatterns: []string{"^refs/heads/agent/.+$"}}}, ResponseProfiles: map[string]PushTripwireResponseProfile{"curator": {Generation: 7, AllowHalt: true, AllowFence: true, Bindings: []PushTripwireBinding{{WorkerID: "worker", LogicalSessionID: "logical", SessionLineageID: "session", WorkerStorageLineageID: "storage", WorkerFenceEpoch: 2}}}}, Bounds: PushTripwireBounds{MaxCommits: 10, MaxPaths: 20, MaxCommitMessageBytes: 1024, MaxBlobBytes: 4096, MaxTotalBytes: 16384}}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid tripwire config rejected: %v", err)
+	}
+	cfg.PushTripwire.Repositories["owner/repo"] = PushTripwireRepository{}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "base_ref") {
+		t.Fatalf("missing reviewed base accepted: %v", err)
+	}
+	cfg.PushTripwire.Repositories["owner/repo"] = PushTripwireRepository{BaseRef: "refs/heads/main", RefPatterns: []string{"^refs/heads/agent/.+$"}}
+	cfg.PushTripwire.ResponseProfiles["curator"] = PushTripwireResponseProfile{Generation: 7, AllowFence: true}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "reviewed bindings") {
+		t.Fatalf("unbound fence scope accepted: %v", err)
+	}
+}
+
 func TestLoadSupportsNamedGitHubApps(t *testing.T) {
 	t.Setenv("TEST_AGENT_SECRET", "agent-secret")
 	path := filepath.Join(t.TempDir(), "config.yaml")

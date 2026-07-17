@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -16,7 +17,48 @@ type Config struct {
 	GitHub         GitHubConfig         `yaml:"github"`
 	MutationLimits MutationLimitsConfig `yaml:"mutation_limits"`
 	Idempotency    IdempotencyConfig    `yaml:"idempotency"`
+	PushTripwire   PushTripwireConfig   `yaml:"push_tripwire"`
 	Agents         []Agent              `yaml:"agents"`
+}
+
+type PushTripwireConfig struct {
+	Enabled          bool                                   `yaml:"enabled"`
+	ScannerID        string                                 `yaml:"scanner_id"`
+	ScannerSecret    string                                 `yaml:"scanner_secret"`
+	ScannerSecretEnv string                                 `yaml:"scanner_secret_env"`
+	StatePath        string                                 `yaml:"state_path"`
+	Repositories     map[string]PushTripwireRepository      `yaml:"repositories"`
+	ResponseProfiles map[string]PushTripwireResponseProfile `yaml:"response_profiles"`
+	Bounds           PushTripwireBounds                     `yaml:"bounds"`
+}
+
+type PushTripwireRepository struct {
+	GitHubApp   string   `yaml:"github_app"`
+	BaseRef     string   `yaml:"base_ref"`
+	RefPatterns []string `yaml:"ref_patterns"`
+}
+
+type PushTripwireResponseProfile struct {
+	Generation int64                 `yaml:"generation"`
+	AllowHalt  bool                  `yaml:"allow_halt"`
+	AllowFence bool                  `yaml:"allow_fence"`
+	Bindings   []PushTripwireBinding `yaml:"bindings"`
+}
+
+type PushTripwireBinding struct {
+	WorkerID               string `yaml:"worker_id"`
+	LogicalSessionID       string `yaml:"logical_session_id"`
+	SessionLineageID       string `yaml:"session_lineage_id"`
+	WorkerStorageLineageID string `yaml:"worker_storage_lineage_id"`
+	WorkerFenceEpoch       int64  `yaml:"worker_fence_epoch"`
+}
+
+type PushTripwireBounds struct {
+	MaxCommits            int   `yaml:"max_commits"`
+	MaxPaths              int   `yaml:"max_paths"`
+	MaxCommitMessageBytes int64 `yaml:"max_commit_message_bytes"`
+	MaxBlobBytes          int64 `yaml:"max_blob_bytes"`
+	MaxTotalBytes         int64 `yaml:"max_total_bytes"`
 }
 
 type ServerConfig struct {
@@ -134,6 +176,21 @@ func (c *Config) applyDefaults() {
 	if c.GitHub.GitBaseURL == "" {
 		c.GitHub.GitBaseURL = "https://github.com"
 	}
+	if c.PushTripwire.Bounds.MaxCommits == 0 {
+		c.PushTripwire.Bounds.MaxCommits = 100
+	}
+	if c.PushTripwire.Bounds.MaxPaths == 0 {
+		c.PushTripwire.Bounds.MaxPaths = 300
+	}
+	if c.PushTripwire.Bounds.MaxCommitMessageBytes == 0 {
+		c.PushTripwire.Bounds.MaxCommitMessageBytes = 64 << 10
+	}
+	if c.PushTripwire.Bounds.MaxBlobBytes == 0 {
+		c.PushTripwire.Bounds.MaxBlobBytes = 1 << 20
+	}
+	if c.PushTripwire.Bounds.MaxTotalBytes == 0 {
+		c.PushTripwire.Bounds.MaxTotalBytes = 16 << 20
+	}
 	for i := range c.Agents {
 		c.Agents[i].BranchGuard.applyDefaults()
 		if c.Agents[i].GitReceivePack == "" {
@@ -145,6 +202,9 @@ func (c *Config) applyDefaults() {
 func (c *Config) resolveSecrets() error {
 	if c.Server.AdminSecret == "" && c.Server.AdminSecretEnv != "" {
 		c.Server.AdminSecret = os.Getenv(c.Server.AdminSecretEnv)
+	}
+	if c.PushTripwire.ScannerSecret == "" && c.PushTripwire.ScannerSecretEnv != "" {
+		c.PushTripwire.ScannerSecret = os.Getenv(c.PushTripwire.ScannerSecretEnv)
 	}
 	for i := range c.Agents {
 		if c.Agents[i].Secret == "" && c.Agents[i].SecretEnv != "" {
@@ -179,6 +239,68 @@ func (c *Config) Validate() error {
 		}
 		if len(app.Installations) == 0 {
 			errs = append(errs, fmt.Sprintf("github app %q installations must not be empty", name))
+		}
+	}
+	if c.PushTripwire.Enabled {
+		if c.PushTripwire.ScannerID == "" {
+			errs = append(errs, "push_tripwire scanner_id is required")
+		}
+		if c.PushTripwire.ScannerSecret == "" {
+			errs = append(errs, "push_tripwire scanner_secret or scanner_secret_env is required")
+		}
+		if c.PushTripwire.StatePath == "" {
+			errs = append(errs, "push_tripwire state_path is required")
+		}
+		if len(c.PushTripwire.Repositories) == 0 {
+			errs = append(errs, "push_tripwire repositories must not be empty")
+		}
+		if len(c.PushTripwire.ResponseProfiles) == 0 {
+			errs = append(errs, "push_tripwire response_profiles must not be empty")
+		}
+		for profile, scope := range c.PushTripwire.ResponseProfiles {
+			if profile == "" || scope.Generation < 1 || (!scope.AllowHalt && !scope.AllowFence) {
+				errs = append(errs, fmt.Sprintf("push_tripwire response profile %q has invalid generation or no allowed actions", profile))
+			}
+			if scope.AllowFence && len(scope.Bindings) == 0 {
+				errs = append(errs, fmt.Sprintf("push_tripwire response profile %q allows fencing without reviewed bindings", profile))
+			}
+			for _, binding := range scope.Bindings {
+				if binding.WorkerID == "" || binding.LogicalSessionID == "" || binding.SessionLineageID == "" || binding.WorkerStorageLineageID == "" || binding.WorkerFenceEpoch < 1 {
+					errs = append(errs, fmt.Sprintf("push_tripwire response profile %q has an incomplete binding", profile))
+				}
+			}
+		}
+		b := c.PushTripwire.Bounds
+		if b.MaxCommits < 1 || b.MaxCommits > 1000 || b.MaxPaths < 1 || b.MaxPaths > 3000 || b.MaxCommitMessageBytes < 1 || b.MaxCommitMessageBytes > 1<<20 || b.MaxBlobBytes < 1 || b.MaxBlobBytes > 10<<20 || b.MaxTotalBytes < 1 || b.MaxTotalBytes > 64<<20 {
+			errs = append(errs, "push_tripwire bounds are outside supported limits")
+		}
+		for repo, tripwireRepo := range c.PushTripwire.Repositories {
+			if strings.Count(repo, "/") != 1 || strings.ToLower(repo) != repo {
+				errs = append(errs, fmt.Sprintf("push_tripwire repository %q must be lowercase owner/repo", repo))
+				continue
+			}
+			appName := tripwireRepo.GitHubApp
+			if appName == "" {
+				appName = "default"
+			}
+			if _, ok := c.InstallationIDForApp(appName, repo); !ok {
+				errs = append(errs, fmt.Sprintf("push_tripwire repository %q is not covered by github app %q", repo, appName))
+			}
+			if !strings.HasPrefix(tripwireRepo.BaseRef, "refs/heads/") || len(tripwireRepo.BaseRef) > 240 {
+				errs = append(errs, fmt.Sprintf("push_tripwire repository %q requires a reviewed refs/heads base_ref", repo))
+			}
+			if len(tripwireRepo.RefPatterns) == 0 {
+				errs = append(errs, fmt.Sprintf("push_tripwire repository %q requires reviewed ref_patterns", repo))
+			}
+			for _, pattern := range tripwireRepo.RefPatterns {
+				if !strings.HasPrefix(pattern, "^") || !strings.HasSuffix(pattern, "$") {
+					errs = append(errs, fmt.Sprintf("push_tripwire repository %q ref pattern must be anchored", repo))
+					continue
+				}
+				if _, err := regexp.Compile(pattern); err != nil {
+					errs = append(errs, fmt.Sprintf("push_tripwire repository %q has invalid ref pattern", repo))
+				}
+			}
 		}
 	}
 	seen := map[string]bool{}

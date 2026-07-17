@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"gh-agent-broker/internal/limits"
 	"gh-agent-broker/internal/metadata"
 	"gh-agent-broker/internal/policy"
+	"gh-agent-broker/internal/pushtripwire"
 	"gh-agent-broker/internal/securityscan"
 )
 
@@ -40,16 +42,27 @@ type Server struct {
 	gh         *githubapp.Client
 	audit      *audit.Logger
 	http       *http.Client
+	tripwire   *pushtripwire.Store
+	fence      pushtripwire.FenceAdapter
 }
 
-func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *audit.Logger) *Server {
+func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *audit.Logger) (*Server, error) {
+	var tripwire *pushtripwire.Store
+	var err error
+	if cfg.PushTripwire.Enabled {
+		tripwire, err = pushtripwire.Open(cfg.PushTripwire.StatePath)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &Server{
 		configPath: configPath,
 		cfg:        cfg,
 		gh:         gh,
 		audit:      auditLog,
 		http:       &http.Client{Timeout: 10 * time.Minute},
-	}
+		tripwire:   tripwire,
+	}, nil
 }
 
 func (s *Server) InstallSignalReload() {
@@ -65,6 +78,10 @@ func (s *Server) InstallSignalReload() {
 }
 
 func (s *Server) Reload() error {
+	s.mu.RLock()
+	oldTripwireEnabled := s.cfg.PushTripwire.Enabled
+	oldTripwirePath := s.cfg.PushTripwire.StatePath
+	s.mu.RUnlock()
 	cfg, err := config.Load(s.configPath)
 	if err != nil {
 		return err
@@ -73,10 +90,166 @@ func (s *Server) Reload() error {
 	if err != nil {
 		return err
 	}
+	if cfg.PushTripwire.Enabled != oldTripwireEnabled || cfg.PushTripwire.StatePath != oldTripwirePath {
+		return errors.New("push_tripwire enabled state and state_path cannot change on reload; restart is required")
+	}
 	s.mu.Lock()
 	s.cfg = cfg
 	s.gh = gh
 	s.mu.Unlock()
+	return nil
+}
+
+func (s *Server) pushTripwireSnapshot() (*config.Config, *githubapp.Client, *pushtripwire.Store, pushtripwire.FenceAdapter) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg, s.gh, s.tripwire, s.fence
+}
+
+func (s *Server) handlePushTripwireMaterial(w http.ResponseWriter, r *http.Request) {
+	cfg, gh, store, _ := s.pushTripwireSnapshot()
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !cfg.PushTripwire.Enabled || store == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !pushtripwire.Authenticate(r.Header.Get("Authorization"), cfg.PushTripwire.ScannerSecret) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "scanner authentication failed"})
+		return
+	}
+	var req pushtripwire.MaterialRequest
+	if err := decodeStrictJSON(r.Body, &req); err != nil || req.Validate() != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid push tripwire material request"})
+		return
+	}
+	repoCfg, ok := cfg.PushTripwire.Repositories[req.Repository]
+	if !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "repository is not configured for scanning"})
+		return
+	}
+	if !tripwireRefAllowed(repoCfg, req.Ref) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "ref is not configured for scanning"})
+		return
+	}
+	appName := repoCfg.GitHubApp
+	if appName == "" {
+		appName = "default"
+	}
+	inst, ok := cfg.InstallationIDForApp(appName, req.Repository)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "repository installation is not configured"})
+		return
+	}
+	out, err := gh.PushTripwireMaterial(appName, inst, req, repoCfg.BaseRef, cfg.PushTripwire.Bounds)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "scan material unavailable"})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: ids.NewOperationID(), AgentID: cfg.PushTripwire.ScannerID, Operation: "push_tripwire.material", Repo: req.Repository, Branch: req.Ref, Decision: policy.DecisionAllow, Result: map[bool]string{true: "complete", false: "incomplete"}[out.Complete], Extra: map[string]interface{}{"delivery_id": req.DeliveryID, "reason_code": out.ReasonCode}})
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handlePushTripwireResponse(w http.ResponseWriter, r *http.Request) {
+	cfg, _, store, fence := s.pushTripwireSnapshot()
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !cfg.PushTripwire.Enabled || store == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !pushtripwire.Authenticate(r.Header.Get("Authorization"), cfg.PushTripwire.ScannerSecret) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "scanner authentication failed"})
+		return
+	}
+	var req pushtripwire.ResponseRequest
+	if err := decodeStrictJSON(r.Body, &req); err != nil || req.Validate() != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid push tripwire response request"})
+		return
+	}
+	if req.Severity != "high" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "response controls require high severity"})
+		return
+	}
+	repoCfg, ok := cfg.PushTripwire.Repositories[req.Repository]
+	if !ok || !tripwireRefAllowed(repoCfg, req.Ref) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "response repository or ref is outside reviewed broker scope"})
+		return
+	}
+	if !responseWithinReviewedScope(cfg.PushTripwire, req) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "response attribution is outside reviewed broker scope"})
+		return
+	}
+	out, err := store.Apply(r.Context(), strings.TrimSpace(r.Header.Get("Idempotency-Key")), req, fence)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "Idempotency-Key") {
+			status = http.StatusBadRequest
+		}
+		if strings.Contains(err.Error(), "reused") {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": audit.Redact(err.Error())})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: ids.NewOperationID(), AgentID: cfg.PushTripwire.ScannerID, Operation: "push_tripwire.respond", Repo: req.Repository, Branch: req.Ref, Decision: policy.DecisionAllow, Result: "recorded", Extra: map[string]interface{}{"finding_id": req.FindingID, "delivery_id": req.DeliveryID, "fingerprint_id": req.FingerprintID, "severity": req.Severity, "reason_code": req.ReasonCode, "before": req.Before, "after": req.After, "profile": req.Profile, "profile_generation": req.ProfileGeneration, "idempotent_replay": out.IdempotentReplay, "actions": out.Actions}})
+	writeJSON(w, http.StatusOK, out)
+}
+
+func tripwireRefAllowed(repo config.PushTripwireRepository, ref string) bool {
+	for _, pattern := range repo.RefPatterns {
+		if matched, err := regexp.MatchString(pattern, ref); err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+func responseWithinReviewedScope(cfg config.PushTripwireConfig, req pushtripwire.ResponseRequest) bool {
+	scope, ok := cfg.ResponseProfiles[req.Profile]
+	if !ok || scope.Generation != req.ProfileGeneration {
+		return false
+	}
+	for _, action := range req.Actions {
+		if action == "halt_issuance" && !scope.AllowHalt {
+			return false
+		}
+		if action == "fence_worker_session" && !scope.AllowFence {
+			return false
+		}
+	}
+	if req.Binding == nil {
+		return true
+	}
+	for _, binding := range scope.Bindings {
+		if binding.WorkerID == req.Binding.WorkerID && binding.LogicalSessionID == req.Binding.LogicalSessionID && binding.SessionLineageID == req.Binding.SessionLineageID && binding.WorkerStorageLineageID == req.Binding.WorkerStorageLineageID && binding.WorkerFenceEpoch == req.Binding.WorkerFenceEpoch {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeStrictJSON(body io.Reader, out interface{}) error {
+	b, err := io.ReadAll(io.LimitReader(body, (64<<10)+1))
+	if err != nil {
+		return err
+	}
+	if len(b) > 64<<10 {
+		return errors.New("request body exceeds limit")
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	var extra interface{}
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("request must contain one JSON value")
+	}
 	return nil
 }
 
@@ -134,6 +307,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	case r.URL.Path == "/v1/admin/reload":
 		s.handleReload(w, r)
+	case r.URL.Path == "/v1/security/push-tripwire/material":
+		s.handlePushTripwireMaterial(w, r)
+	case r.URL.Path == "/v1/security/push-tripwire/respond":
+		s.handlePushTripwireResponse(w, r)
 	case r.URL.Path == "/v1/policy/dry-run":
 		s.handleDryRun(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/repos/"):
@@ -1702,6 +1879,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	var body []byte
 	var bodyReader io.Reader
 	branch := ""
+	var updates []receivePackUpdate
 	if r.Body != nil {
 		var err error
 		body, err = io.ReadAll(r.Body)
@@ -1712,7 +1890,13 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		bodyReader = bytes.NewReader(body)
 	}
 	if operation == "git.receive-pack" && len(body) > 0 {
-		branch = receivePackBranch(body)
+		parsedUpdates, parseErr := receivePackUpdates(body)
+		if parseErr == nil {
+			updates = parsedUpdates
+		}
+		if len(parsedUpdates) > 0 {
+			branch = parsedUpdates[0].Ref
+		}
 	}
 	if operation == "git.receive-pack" && r.Method == http.MethodPost && branch == "" {
 		result := policy.Result{
@@ -1745,6 +1929,15 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision})
 		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
+	}
+	for i := 1; i < len(updates); i++ {
+		update := updates[i]
+		additional := policy.Check(policy.Request{Agent: principal.Agent, AgentID: principal.ID, Repo: repo, Operation: operation, Branch: update.Ref})
+		if !additional.Allowed {
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: update.Ref, Decision: additional.Decision})
+			writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &additional))
+			return
+		}
 	}
 	if operation == "git.receive-pack" && r.Method == http.MethodPost && principal.Agent.GitReceivePack == config.GitReceivePackDenyOpaque {
 		result = policy.Result{
@@ -1788,6 +1981,25 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: "branch_lifecycle_warning"})
 		}
 	}
+	if operation == "git.receive-pack" && r.Method == http.MethodPost {
+		for _, update := range updates {
+			if update.After == strings.Repeat("0", 40) {
+				s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, update.Ref, "ref_deletion_rejected", "ref deletion is not allowed through opaque receive-pack")
+				return
+			}
+			current, found, err := gh.GetRef(appName, repo, update.Ref, inst)
+			if err != nil {
+				s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: update.Ref, Decision: policy.DecisionDeny, Result: "ref_preflight_unavailable", Error: err.Error()})
+				http.Error(w, "GitHub ref preflight failed", http.StatusBadGateway)
+				return
+			}
+			zeroBefore := update.Before == strings.Repeat("0", 40)
+			if (zeroBefore && found) || (!zeroBefore && (!found || current != update.Before)) {
+				s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, update.Ref, "ref_before_mismatch", "advertised ref state no longer matches GitHub")
+				return
+			}
+		}
+	}
 	token, err := gh.InstallationToken(appName, inst)
 	if err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
@@ -1815,13 +2027,61 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer closeBody(resp.Body)
-	copyGitHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
+	if operation != "git.receive-pack" {
+		copyGitHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
+			return
+		}
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: "status " + strconv.Itoa(resp.StatusCode)})
 		return
 	}
-	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: "status " + strconv.Itoa(resp.StatusCode)})
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, (4<<20)+1))
+	if err != nil || len(responseBody) > 4<<20 {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: policy.DecisionDeny, Result: "receive_pack_status_limit_exceeded"})
+		http.Error(w, "GitHub receive-pack status exceeded broker limit", http.StatusBadGateway)
+		return
+	}
+	copyGitHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if _, err := w.Write(responseBody); err != nil {
+		return
+	}
+	resultCode := "status " + strconv.Itoa(resp.StatusCode)
+	if operation == "git.receive-pack" && receivePackRejected(responseBody) {
+		resultCode = "github_ref_update_rejected"
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: resultCode})
+}
+
+func (s *Server) writeGitPreflightDenial(w http.ResponseWriter, r *http.Request, opID, agentID, repo, ref, code, message string) {
+	result := policy.Result{Allowed: false, Decision: policy.DecisionDeny, FailedChecks: []api.FailedCheck{{Dimension: "git_ref_preflight", Location: ref, Expected: "advertised before SHA equals current GitHub ref and update is not a deletion", SafeToDisplay: true, Message: message}}, RequiredChanges: []api.RequiredChange{{Location: ref, Action: "fetch the current ref and retry a non-deleting update"}}}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: agentID, Operation: "git.receive_pack_preflight", Repo: repo, Branch: ref, Decision: policy.DecisionDeny, Result: code})
+	writeGitPolicyError(w, r, s.errorResponse(opID, code, message, &result))
+}
+
+func receivePackRejected(body []byte) bool {
+	i := 0
+	for i+4 <= len(body) {
+		n, err := strconv.ParseInt(string(body[i:i+4]), 16, 32)
+		if err != nil || n < 4 || i+int(n) > len(body) {
+			return false
+		}
+		if n == 0 {
+			i += 4
+			continue
+		}
+		line := body[i+4 : i+int(n)]
+		if len(line) > 0 && (line[0] == 1 || line[0] == 2 || line[0] == 3) {
+			line = line[1:]
+		}
+		if bytes.HasPrefix(line, []byte("ng ")) {
+			return true
+		}
+		i += int(n)
+	}
+	return false
 }
 
 func (s *Server) reserveMutation(w http.ResponseWriter, opID, agentID, operation, repo, branch string, metadata map[string]string) bool {
@@ -2032,31 +2292,51 @@ func copyGitHeaders(dst, src http.Header) {
 	}
 }
 
-func receivePackBranch(body []byte) string {
+type receivePackUpdate struct{ Before, After, Ref string }
+
+func receivePackUpdates(body []byte) ([]receivePackUpdate, error) {
 	i := 0
+	updates := make([]receivePackUpdate, 0, 1)
 	for i+4 <= len(body) {
 		n, err := strconv.ParseInt(string(body[i:i+4]), 16, 32)
 		if err != nil || n < 0 {
-			return ""
+			return nil, errors.New("invalid pkt-line length")
 		}
 		i += 4
 		if n == 0 {
-			return ""
+			if len(updates) == 0 {
+				return nil, errors.New("no receive-pack updates")
+			}
+			return updates, nil
 		}
 		if int(n) < 4 || i+int(n)-4 > len(body) {
-			return ""
+			return nil, errors.New("truncated receive-pack command")
 		}
 		line := string(body[i : i+int(n)-4])
 		if nul := strings.IndexByte(line, 0); nul >= 0 {
 			line = line[:nul]
 		}
 		fields := strings.Fields(line)
-		if len(fields) >= 3 && strings.HasPrefix(fields[2], "refs/heads/") {
-			return fields[2]
+		if len(fields) != 3 || !strings.HasPrefix(fields[2], "refs/heads/") || !githubSHA.MatchString(fields[0]) || !githubSHA.MatchString(fields[1]) {
+			return nil, errors.New("invalid receive-pack update")
+		}
+		updates = append(updates, receivePackUpdate{Before: fields[0], After: fields[1], Ref: fields[2]})
+		if len(updates) > 64 {
+			return nil, errors.New("too many receive-pack updates")
 		}
 		i += int(n) - 4
 	}
-	return ""
+	return nil, errors.New("receive-pack commands missing flush")
+}
+
+var githubSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func receivePackBranch(body []byte) string {
+	updates, err := receivePackUpdates(body)
+	if err != nil {
+		return ""
+	}
+	return updates[0].Ref
 }
 
 func writeGitPolicyError(w http.ResponseWriter, r *http.Request, errResp api.ErrorResponse) {

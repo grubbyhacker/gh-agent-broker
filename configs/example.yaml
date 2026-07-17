@@ -8,6 +8,37 @@ audit:
 idempotency:
   state_path: "/var/log/gh-agent-broker/idempotency.json"
 
+# Inert until explicitly enabled with a reviewed scanner secret and live
+# response binding. Production values are owned by vps-ops.
+push_tripwire:
+  enabled: false
+  scanner_id: "push-tripwire-scanner"
+  scanner_secret_env: "PUSH_TRIPWIRE_SCANNER_SECRET"
+  state_path: "/var/lib/gh-agent-broker/push-tripwire.db"
+  repositories:
+    example-org/example-repo:
+      github_app: "coder"
+      base_ref: "refs/heads/main"
+      ref_patterns:
+        - "^refs/heads/agent/hermes-coder-01/.+$"
+  response_profiles:
+    general-writer-v1:
+      generation: 1
+      allow_halt: true
+      allow_fence: true
+      bindings:
+        - logical_session_id: "synthetic-logical-session"
+          session_lineage_id: "11111111111111111111111111111111"
+          worker_id: "synthetic-worker"
+          worker_storage_lineage_id: "22222222222222222222222222222222"
+          worker_fence_epoch: 1
+  bounds:
+    max_commits: 100
+    max_paths: 300
+    max_commit_message_bytes: 65536
+    max_blob_bytes: 1048576
+    max_total_bytes: 16777216
+
 github:
   api_base_url: "https://api.github.com"
   git_base_url: "https://github.com"

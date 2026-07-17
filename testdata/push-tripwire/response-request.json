@@ -1,0 +1,25 @@
+{
+  "version": "broker/push-tripwire/v1",
+  "finding_id": "finding-01",
+  "delivery_id": "delivery-01",
+  "repository": "owner/repo",
+  "ref": "refs/heads/agent/worker-01/change",
+  "before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "after": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "severity": "high",
+  "reason_code": "seeded_canary_match",
+  "fingerprint_id": "fingerprint-01",
+  "profile": "curator",
+  "profile_generation": 7,
+  "binding": {
+    "logical_session_id": "logical-session-01",
+    "session_lineage_id": "session-lineage-01",
+    "worker_id": "worker-01",
+    "worker_storage_lineage_id": "storage-lineage-01",
+    "worker_fence_epoch": 3
+  },
+  "actions": [
+    "halt_issuance",
+    "fence_worker_session"
+  ]
+}

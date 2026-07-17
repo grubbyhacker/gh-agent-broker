@@ -45,6 +45,27 @@ policy, global credential halt/revocation, semantic pack inspection, and
 production wiring remain explicit later seams. See
 `docs/pr10-egress-security.md` for the exact boundary.
 
+### Roadmap PR10 asynchronous push tripwire
+
+Ordinary opaque smart-HTTP pushes now retain their existing GitHub App identity
+and pack forwarding behavior while receiving a bounded ref-state preflight:
+deletions and stale advertised `before` SHAs are rejected before forwarding,
+and GitHub remains the enforcement point for protected-branch and non-fast-
+forward rejection. Stable receive-pack `ng` status is audited without parsing
+provider prose. Upload-pack streaming is unchanged.
+
+An inert, configuration-reviewed scanner surface returns exact bounded commit
+messages and both changed blob sides for admitted repository/ref/before/after
+events. New branches resolve a reviewed base ref; incomplete ancestry, tree,
+blob, pagination, or bound results are typed `complete:false`, never clean. A
+durable idempotent response surface records exact-generation issuance halts and
+requests a fully attributed worker/session fence through a strict adapter seam.
+Only `fenced` means the adapter confirmed fencing; otherwise the durable state
+is `fence_requested` and exact replay retries it. Production enablement and a
+live sandbox fence adapter remain later `vps-ops` work. See
+`docs/pr10-async-push-tripwire.md` and the shared wire fixture under
+`testdata/push-tripwire/`.
+
 ### Curator lifecycle incident remediation
 
 Sandbox lifecycle audit records carry the Docker container ID and stable

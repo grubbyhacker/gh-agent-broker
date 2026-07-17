@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"gh-agent-broker/internal/config"
+	"gh-agent-broker/internal/pushtripwire"
 )
 
 func TestParseGitPath(t *testing.T) {
@@ -29,6 +30,49 @@ func TestGitOperation(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", nil)
 	if got := gitOperation(req, "/git-receive-pack"); got != "git.receive-pack" {
 		t.Fatalf("gitOperation() = %q", got)
+	}
+}
+
+func TestReceivePackUpdatesAndStableRejection(t *testing.T) {
+	body := append(pktLine("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/heads/agent/a\x00 report-status\n"), pktLine("cccccccccccccccccccccccccccccccccccccccc dddddddddddddddddddddddddddddddddddddddd refs/heads/agent/b\n")...)
+	body = append(body, []byte("0000PACK")...)
+	updates, err := receivePackUpdates(body)
+	if err != nil || len(updates) != 2 || updates[1].Ref != "refs/heads/agent/b" {
+		t.Fatalf("updates=%+v err=%v", updates, err)
+	}
+	result := append(pktLine("unpack ok\n"), pktLine("ng refs/heads/agent/a protected branch hook declined\n")...)
+	result = append(result, []byte("0000")...)
+	if !receivePackRejected(result) {
+		t.Fatal("stable ng status was not classified")
+	}
+	if !receivePackRejected(pktLine("\x01ng refs/heads/agent/a protected branch\n")) {
+		t.Fatal("sideband ng status was not classified")
+	}
+	if receivePackRejected([]byte("protected branch")) {
+		t.Fatal("English prose was incorrectly classified")
+	}
+}
+
+func TestResponseScopeRejectsArbitraryProfileGenerationAndBinding(t *testing.T) {
+	cfg := config.PushTripwireConfig{ResponseProfiles: map[string]config.PushTripwireResponseProfile{"curator": {Generation: 7, AllowHalt: true, AllowFence: true, Bindings: []config.PushTripwireBinding{{WorkerID: "worker", SessionLineageID: "session", WorkerStorageLineageID: "storage", WorkerFenceEpoch: 2}}}}}
+	base := pushtripwire.ResponseRequest{Version: pushtripwire.Version, FindingID: "finding", Profile: "curator", ProfileGeneration: 7, Actions: []string{"halt_issuance"}}
+	if !responseWithinReviewedScope(cfg, base) {
+		t.Fatal("reviewed halt rejected")
+	}
+	base.Profile = "arbitrary"
+	if responseWithinReviewedScope(cfg, base) {
+		t.Fatal("arbitrary profile accepted")
+	}
+	base.Profile = "curator"
+	base.ProfileGeneration = 8
+	if responseWithinReviewedScope(cfg, base) {
+		t.Fatal("stale generation accepted")
+	}
+	base.ProfileGeneration = 7
+	base.Actions = []string{"fence_worker_session"}
+	base.Binding = &pushtripwire.Binding{WorkerID: "other", SessionLineageID: "session", WorkerStorageLineageID: "storage", WorkerFenceEpoch: 2}
+	if responseWithinReviewedScope(cfg, base) {
+		t.Fatal("unbound worker accepted")
 	}
 }
 
