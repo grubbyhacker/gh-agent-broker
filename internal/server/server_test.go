@@ -3,8 +3,11 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"gh-agent-broker/internal/config"
@@ -52,6 +55,40 @@ func TestReceivePackUpdatesAndStableRejection(t *testing.T) {
 		t.Fatal("English prose was incorrectly classified")
 	}
 }
+
+func TestReceivePackCommandPrefixLeavesLargeOpaquePackStreamUnread(t *testing.T) {
+	command := append(pktLine(strings.Repeat("0", 40)+" "+strings.Repeat("1", 40)+" refs/heads/agent/large\x00 report-status\n"), []byte("0000")...)
+	packSize := int64(32 << 20)
+	body := io.MultiReader(bytes.NewReader(command), io.LimitReader(zeroReader{}, packSize))
+	prefix, updates, err := readReceivePackCommandPrefix(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(prefix, command) || len(updates) != 1 {
+		t.Fatalf("prefix/updates mismatch: prefix=%d updates=%+v", len(prefix), updates)
+	}
+	remaining, err := io.Copy(io.Discard, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != packSize {
+		t.Fatalf("remaining pack bytes=%d want=%d", remaining, packSize)
+	}
+}
+
+func TestReceivePackCommandPrefixBound(t *testing.T) {
+	base := strings.Repeat("0", 40) + " " + strings.Repeat("1", 40) + " refs/heads/agent/bound\x00"
+	payload := base + strings.Repeat("x", 65531-len(base))
+	packet := pktLine(payload)
+	body := bytes.NewReader(append(append(append(append(append([]byte{}, packet...), packet...), packet...), packet...), packet...))
+	if _, _, err := readReceivePackCommandPrefix(body); !errors.Is(err, errReceivePackCommandPrefixLimit) {
+		t.Fatalf("prefix bound error=%v", err)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) { clear(p); return len(p), nil }
 
 func TestResponseScopeRejectsArbitraryProfileGenerationAndBinding(t *testing.T) {
 	cfg := config.PushTripwireConfig{ResponseProfiles: map[string]config.PushTripwireResponseProfile{"curator": {Generation: 7, AllowHalt: true, AllowFence: true, Bindings: []config.PushTripwireBinding{{WorkerID: "worker", SessionLineageID: "session", WorkerStorageLineageID: "storage", WorkerFenceEpoch: 2}}}}}

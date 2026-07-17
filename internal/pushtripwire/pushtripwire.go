@@ -161,6 +161,7 @@ func Open(path string) (*Store, error) {
 	for _, stmt := range []string{
 		`PRAGMA journal_mode=WAL`,
 		`CREATE TABLE IF NOT EXISTS issuance_halts (profile TEXT NOT NULL, generation INTEGER NOT NULL, finding_id TEXT NOT NULL, PRIMARY KEY(profile,generation))`,
+		`CREATE TABLE IF NOT EXISTS issuance_enforcement_catalog (profile TEXT NOT NULL, generation INTEGER NOT NULL, registered_at TEXT NOT NULL, PRIMARY KEY(profile,generation))`,
 		`CREATE TABLE IF NOT EXISTS responses (idempotency_key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, request BLOB NOT NULL, response BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS fence_requests (finding_id TEXT PRIMARY KEY, binding BLOB NOT NULL, state TEXT NOT NULL)`,
 	} {
@@ -172,6 +173,32 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// ReplaceEnforcementCatalog is called by the sandbox authority process at
+// startup. It proves which exact profile generations consult this shared state
+// before issuing new worker or session authority.
+func (s *Store) ReplaceEnforcementCatalog(ctx context.Context, profiles map[string]int64) error {
+	if len(profiles) == 0 {
+		return errors.New("issuance enforcement catalog must not be empty")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM issuance_enforcement_catalog`); err != nil {
+		return errors.Join(err, tx.Rollback())
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for profile, generation := range profiles {
+		if !profilePattern.MatchString(profile) || generation < 1 {
+			return errors.Join(errors.New("invalid issuance enforcement profile generation"), tx.Rollback())
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO issuance_enforcement_catalog(profile,generation,registered_at) VALUES(?,?,?)`, profile, generation, now); err != nil {
+			return errors.Join(err, tx.Rollback())
+		}
+	}
+	return tx.Commit()
+}
 
 func fingerprint(req ResponseRequest) (string, error) {
 	copyReq := req
@@ -240,6 +267,13 @@ func (s *Store) Apply(ctx context.Context, key string, req ResponseRequest, adap
 	for _, action := range req.Actions {
 		switch action {
 		case "halt_issuance":
+			var registered int
+			if err = tx.QueryRowContext(ctx, `SELECT 1 FROM issuance_enforcement_catalog WHERE profile=? AND generation=?`, req.Profile, req.ProfileGeneration).Scan(&registered); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					err = errors.New("authority issuance enforcement is not registered for profile generation")
+				}
+				return ResponseResult{}, errors.Join(err, tx.Rollback())
+			}
 			if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO issuance_halts(profile,generation,finding_id) VALUES(?,?,?)`, req.Profile, req.ProfileGeneration, req.FindingID); err != nil {
 				return ResponseResult{}, errors.Join(err, tx.Rollback())
 			}
@@ -296,6 +330,13 @@ func (s *Store) Apply(ctx context.Context, key string, req ResponseRequest, adap
 // CheckIssuance fails closed: any state read error is returned to the caller,
 // which must not issue credentials or work for the requested generation.
 func (s *Store) CheckIssuance(ctx context.Context, profile string, generation int64) error {
+	var registered int
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM issuance_enforcement_catalog WHERE profile=? AND generation=?`, profile, generation).Scan(&registered); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("authority issuance enforcement registration is unavailable")
+		}
+		return fmt.Errorf("read push tripwire enforcement catalog: %w", err)
+	}
 	var finding string
 	err := s.db.QueryRowContext(ctx, `SELECT finding_id FROM issuance_halts WHERE profile=? AND generation=?`, profile, generation).Scan(&finding)
 	if err == nil {

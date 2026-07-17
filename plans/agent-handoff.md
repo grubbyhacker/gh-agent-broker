@@ -66,6 +66,14 @@ live sandbox fence adapter remain later `vps-ops` work. See
 `docs/pr10-async-push-tripwire.md` and the shared wire fixture under
 `testdata/push-tripwire/`.
 
+The halt is now cross-process enforceable: main broker and sandbox broker share
+the sandbox authority SQLite file, sandbox startup registers exact profile
+generations, and every authority issuance/admission path checks the durable halt
+before mutation. `halted` is unavailable until that registration exists. The
+deployment contract therefore needs a shared read-write state-directory mount,
+matching state-file paths, and matching main response-profile/sandbox authority
+profile generations. The intentionally absent live fence adapter is unchanged.
+
 ### Curator lifecycle incident remediation
 
 Sandbox lifecycle audit records carry the Docker container ID and stable

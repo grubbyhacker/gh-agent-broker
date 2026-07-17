@@ -64,6 +64,9 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkIssuance(ctx, lease.Profile, profile); err != nil {
+		return nil, err
+	}
 	if err := s.store.RequireConfirmedCoordinatorRouting(ctx, binding, lease); err != nil {
 		return nil, err
 	}
@@ -226,7 +229,12 @@ type AuthorityWorkerService struct {
 	now          func() time.Time
 	newID        func() (string, error)
 	checkpoints  *CheckpointStore
+	issuance     AuthorityIssuanceGuard
 	retirementMu sync.Mutex
+}
+
+type AuthorityIssuanceGuard interface {
+	CheckIssuance(context.Context, string, int64) error
 }
 
 type AuthoritySessionAdmission struct {
@@ -242,6 +250,9 @@ func (s *AuthorityWorkerService) AcquireSession(ctx context.Context, principal s
 	if err := validateAuthorityRequest(request); err != nil {
 		return AuthoritySessionAdmission{}, err
 	}
+	if err := s.checkIssuance(ctx, request.Profile, profile); err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
 	lease, err := s.store.Acquire(ctx, principal, request)
 	if err != nil {
 		return AuthoritySessionAdmission{}, err
@@ -253,12 +264,22 @@ func (s *AuthorityWorkerService) AcquireSession(ctx context.Context, principal s
 	return AuthoritySessionAdmission{Lease: lease, Workspace: workspace}, nil
 }
 
-func NewAuthorityWorkerService(cfg Config, store *AuthorityWorkerStore, runtime AuthorityWorkerRuntime, audit *AuditLogger) *AuthorityWorkerService {
+func NewAuthorityWorkerService(cfg Config, store *AuthorityWorkerStore, runtime AuthorityWorkerRuntime, audit *AuditLogger, issuance AuthorityIssuanceGuard) *AuthorityWorkerService {
 	return &AuthorityWorkerService{
-		cfg: cfg, store: store, runtime: runtime, audit: audit,
+		cfg: cfg, store: store, runtime: runtime, audit: audit, issuance: issuance,
 		now:   func() time.Time { return time.Now().UTC() },
 		newID: newRunID,
 	}
+}
+
+func (s *AuthorityWorkerService) checkIssuance(ctx context.Context, name string, profile AuthorityProfile) error {
+	if s.issuance == nil {
+		return errors.New("authority issuance guard is unavailable")
+	}
+	if err := s.issuance.CheckIssuance(ctx, name, profile.IssuanceGeneration); err != nil {
+		return fmt.Errorf("authority issuance denied: %w", err)
+	}
+	return nil
 }
 
 func (s *AuthorityWorkerService) WithCheckpointStore(store *CheckpointStore) *AuthorityWorkerService {
@@ -402,6 +423,9 @@ func (s *AuthorityWorkerService) Provision(ctx context.Context, principal, profi
 		s.log("authority_worker.provision", principal, profileName, AuthorityWorker{}, "deny", err)
 		return AuthorityWorker{}, err
 	}
+	if err := s.checkIssuance(ctx, profileName, profile); err != nil {
+		return AuthorityWorker{}, err
+	}
 	profileVersion, policyDigest, err := authorityProfileDigest(profileName, profile)
 	if err != nil {
 		return AuthorityWorker{}, err
@@ -473,12 +497,16 @@ func (s *AuthorityWorkerService) retireDrainedPredecessor(ctx context.Context, r
 }
 
 func (s *AuthorityWorkerService) Acquire(ctx context.Context, principal string, request AuthorityWorkerRequest) (AuthorityLease, error) {
-	if _, err := s.authorize(principal, request.Profile, "acquire"); err != nil {
+	profile, err := s.authorize(principal, request.Profile, "acquire")
+	if err != nil {
 		s.log("authority_worker.acquire", principal, request.Profile, AuthorityWorker{}, "deny", err)
 		return AuthorityLease{}, err
 	}
 	if err := validateAuthorityRequest(request); err != nil {
 		s.log("authority_worker.acquire", principal, request.Profile, AuthorityWorker{}, "deny", err)
+		return AuthorityLease{}, err
+	}
+	if err := s.checkIssuance(ctx, request.Profile, profile); err != nil {
 		return AuthorityLease{}, err
 	}
 	lease, err := s.store.Acquire(ctx, principal, request)
@@ -504,6 +532,9 @@ func (s *AuthorityWorkerService) ReassignSession(ctx context.Context, principal 
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentStalePredecessor, "supplied predecessor is unavailable")
 	}
 	profile := s.cfg.AuthorityProfiles[lease.Profile]
+	if err := s.checkIssuance(ctx, lease.Profile, profile); err != nil {
+		return AuthoritySessionReassignment{}, err
+	}
 	profileVersion, policyDigest, digestErr := authorityProfileDigest(lease.Profile, profile)
 	if digestErr != nil || predecessor.Profile != lease.Profile || predecessor.ProfileVersion != profileVersion || predecessor.PolicyDigest != policyDigest || predecessor.ImageReference != profile.Image || predecessor.Capacity != profile.SessionCapacity {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "immutable profile/policy/storage identity no longer matches predecessor")
@@ -653,6 +684,9 @@ func (s *AuthorityWorkerService) Replace(ctx context.Context, principal, workerI
 	}
 	if strings.TrimSpace(reason) == "" || len(reason) > 256 {
 		return AuthorityWorker{}, fmt.Errorf("bounded replacement reason is required")
+	}
+	if err := s.checkIssuance(ctx, old.Profile, profile); err != nil {
+		return AuthorityWorker{}, err
 	}
 	profileVersion, policyDigest, err := authorityProfileDigest(old.Profile, profile)
 	if err != nil {

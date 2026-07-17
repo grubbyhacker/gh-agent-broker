@@ -1876,24 +1876,22 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "repository has no configured GitHub App installation", http.StatusForbidden)
 		return
 	}
-	var body []byte
-	var bodyReader io.Reader
+	var bodyReader io.Reader = r.Body
 	branch := ""
 	var updates []receivePackUpdate
-	if r.Body != nil {
-		var err error
-		body, err = io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "read git request body failed", http.StatusBadRequest)
+	if operation == "git.receive-pack" && r.Method == http.MethodPost && r.Body != nil {
+		prefix, parsedUpdates, parseErr := readReceivePackCommandPrefix(r.Body)
+		if parseErr != nil {
+			status := http.StatusBadRequest
+			if errors.Is(parseErr, errReceivePackCommandPrefixLimit) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Decision: policy.DecisionDeny, Result: "receive_pack_command_prefix_rejected"})
+			http.Error(w, "invalid receive-pack command prefix", status)
 			return
 		}
-		bodyReader = bytes.NewReader(body)
-	}
-	if operation == "git.receive-pack" && len(body) > 0 {
-		parsedUpdates, parseErr := receivePackUpdates(body)
-		if parseErr == nil {
-			updates = parsedUpdates
-		}
+		updates = parsedUpdates
+		bodyReader = io.MultiReader(bytes.NewReader(prefix), r.Body)
 		if len(parsedUpdates) > 0 {
 			branch = parsedUpdates[0].Ref
 		}
@@ -2017,6 +2015,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	req.ContentLength = r.ContentLength
 	copyGitHeaders(req.Header, r.Header)
 	req.SetBasicAuth("x-access-token", token)
 	// #nosec G704 -- outbound Git proxy target is constrained by broker config and repo policy.
@@ -2294,39 +2293,62 @@ func copyGitHeaders(dst, src http.Header) {
 
 type receivePackUpdate struct{ Before, After, Ref string }
 
-func receivePackUpdates(body []byte) ([]receivePackUpdate, error) {
-	i := 0
+const maxReceivePackCommandPrefixBytes = 256 << 10
+
+var errReceivePackCommandPrefixLimit = errors.New("receive-pack command prefix exceeds limit")
+
+func readReceivePackCommandPrefix(body io.Reader) ([]byte, []receivePackUpdate, error) {
+	var prefix bytes.Buffer
 	updates := make([]receivePackUpdate, 0, 1)
-	for i+4 <= len(body) {
-		n, err := strconv.ParseInt(string(body[i:i+4]), 16, 32)
-		if err != nil || n < 0 {
-			return nil, errors.New("invalid pkt-line length")
+	for {
+		var header [4]byte
+		if _, err := io.ReadFull(body, header[:]); err != nil {
+			return nil, nil, fmt.Errorf("read receive-pack pkt-line header: %w", err)
 		}
-		i += 4
+		if prefix.Len()+len(header) > maxReceivePackCommandPrefixBytes {
+			return nil, nil, errReceivePackCommandPrefixLimit
+		}
+		prefix.Write(header[:])
+		n, err := strconv.ParseInt(string(header[:]), 16, 32)
+		if err != nil || n < 0 {
+			return nil, nil, errors.New("invalid pkt-line length")
+		}
 		if n == 0 {
 			if len(updates) == 0 {
-				return nil, errors.New("no receive-pack updates")
+				return nil, nil, errors.New("no receive-pack updates")
 			}
-			return updates, nil
+			return prefix.Bytes(), updates, nil
 		}
-		if int(n) < 4 || i+int(n)-4 > len(body) {
-			return nil, errors.New("truncated receive-pack command")
+		if n < 4 {
+			return nil, nil, errors.New("invalid receive-pack command length")
 		}
-		line := string(body[i : i+int(n)-4])
+		payloadSize := int(n) - 4
+		if prefix.Len()+payloadSize > maxReceivePackCommandPrefixBytes {
+			return nil, nil, errReceivePackCommandPrefixLimit
+		}
+		payload := make([]byte, payloadSize)
+		if _, err := io.ReadFull(body, payload); err != nil {
+			return nil, nil, fmt.Errorf("read receive-pack command: %w", err)
+		}
+		prefix.Write(payload)
+		line := string(payload)
 		if nul := strings.IndexByte(line, 0); nul >= 0 {
 			line = line[:nul]
 		}
 		fields := strings.Fields(line)
 		if len(fields) != 3 || !strings.HasPrefix(fields[2], "refs/heads/") || !githubSHA.MatchString(fields[0]) || !githubSHA.MatchString(fields[1]) {
-			return nil, errors.New("invalid receive-pack update")
+			return nil, nil, errors.New("invalid receive-pack update")
 		}
 		updates = append(updates, receivePackUpdate{Before: fields[0], After: fields[1], Ref: fields[2]})
 		if len(updates) > 64 {
-			return nil, errors.New("too many receive-pack updates")
+			return nil, nil, errors.New("too many receive-pack updates")
 		}
-		i += int(n) - 4
 	}
-	return nil, errors.New("receive-pack commands missing flush")
+}
+
+func receivePackUpdates(body []byte) ([]receivePackUpdate, error) {
+	_, updates, err := readReceivePackCommandPrefix(bytes.NewReader(body))
+	return updates, err
 }
 
 var githubSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)

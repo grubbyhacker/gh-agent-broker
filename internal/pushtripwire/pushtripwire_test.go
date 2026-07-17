@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -38,6 +39,9 @@ func TestResponseIsDurableScopedAndIdempotent(t *testing.T) {
 			t.Error(err)
 		}
 	})
+	if err := store.ReplaceEnforcementCatalog(context.Background(), map[string]int64{"curator": 7}); err != nil {
+		t.Fatal(err)
+	}
 	binding := &Binding{WorkerID: "worker-1", SessionLineageID: "session-1", WorkerStorageLineageID: "storage-1", WorkerFenceEpoch: 3}
 	req := ResponseRequest{Version: Version, FindingID: "finding-1", Profile: "curator", ProfileGeneration: 7, Binding: binding, Actions: []string{"halt_issuance", "fence_worker_session"}}
 	fence := &recordingFence{}
@@ -51,8 +55,8 @@ func TestResponseIsDurableScopedAndIdempotent(t *testing.T) {
 	if err := store.CheckIssuance(context.Background(), "curator", 7); err == nil {
 		t.Fatal("halted generation was allowed")
 	}
-	if err := store.CheckIssuance(context.Background(), "curator", 8); err != nil {
-		t.Fatalf("unhalted generation denied: %v", err)
+	if err := store.CheckIssuance(context.Background(), "curator", 8); err == nil || !strings.Contains(err.Error(), "registration is unavailable") {
+		t.Fatalf("unregistered generation did not fail closed: %v", err)
 	}
 	replay, err := store.Apply(context.Background(), "delivery-1", req, fence)
 	if err != nil {
@@ -91,6 +95,9 @@ func TestRequestedFenceRetriesOnExactReplay(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tripwire.db")
 	store, err := Open(path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceEnforcementCatalog(context.Background(), map[string]int64{"curator": 7}); err != nil {
 		t.Fatal(err)
 	}
 	req := ResponseRequest{Version: Version, FindingID: "finding-3", Profile: "curator", ProfileGeneration: 7, Binding: &Binding{WorkerID: "worker-1", SessionLineageID: "session-1", WorkerStorageLineageID: "storage-1", WorkerFenceEpoch: 3}, Actions: []string{"halt_issuance", "fence_worker_session"}}
@@ -138,6 +145,9 @@ func TestGoldenResponseRequest(t *testing.T) {
 			t.Error(err)
 		}
 	})
+	if err := store.ReplaceEnforcementCatalog(context.Background(), map[string]int64{"curator": 7}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.Apply(context.Background(), "golden-response", req, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -151,6 +161,28 @@ func TestGoldenResponseRequest(t *testing.T) {
 	}
 	if stored.DeliveryID != req.DeliveryID || stored.Binding.LogicalSessionID != req.Binding.LogicalSessionID {
 		t.Fatalf("persisted identity mismatch: %+v", stored)
+	}
+}
+
+func TestHaltRequiresRegisteredAuthorityEnforcement(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "unregistered.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	req := ResponseRequest{Version: Version, FindingID: "finding", Profile: "curator", ProfileGeneration: 7, Actions: []string{"halt_issuance"}}
+	if _, err := store.Apply(context.Background(), "unregistered-halt", req, nil); err == nil || !strings.Contains(err.Error(), "enforcement is not registered") {
+		t.Fatalf("unregistered halt error=%v", err)
+	}
+	if err := store.ReplaceEnforcementCatalog(context.Background(), map[string]int64{"curator": 7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CheckIssuance(context.Background(), "curator", 7); err != nil {
+		t.Fatalf("unregistered halt mutated state: %v", err)
 	}
 }
 

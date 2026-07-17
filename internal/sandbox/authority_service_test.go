@@ -12,7 +12,13 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"gh-agent-broker/internal/pushtripwire"
 )
+
+type allowTestAuthorityIssuance struct{}
+
+func (allowTestAuthorityIssuance) CheckIssuance(context.Context, string, int64) error { return nil }
 
 type fakeAuthorityRuntime struct {
 	mu          sync.Mutex
@@ -68,6 +74,69 @@ func (f *fakeAuthorityRuntime) Stop(_ context.Context, containerID string) error
 	return nil
 }
 
+func TestSharedTripwireHaltDeniesAuthorityIssuanceAcrossStores(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	authorityStore := openAuthorityTestStore(t, cfg.AuthorityStore)
+	sandboxGuard, err := pushtripwire.Open(cfg.AuthorityStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sandboxGuard.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := sandboxGuard.ReplaceEnforcementCatalog(ctx, map[string]int64{"writer": 1}); err != nil {
+		t.Fatal(err)
+	}
+	mainBrokerState, err := pushtripwire.Open(cfg.AuthorityStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := mainBrokerState.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	result, err := mainBrokerState.Apply(ctx, "shared-halt", pushtripwire.ResponseRequest{FindingID: "finding-shared", Profile: "writer", ProfileGeneration: 1, Actions: []string{"halt_issuance"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Actions) != 1 || result.Actions[0].State != "halted" {
+		t.Fatalf("halt result=%+v", result)
+	}
+	runtime := &fakeAuthorityRuntime{}
+	withoutGuard := NewAuthorityWorkerService(cfg, authorityStore, runtime, nil, nil)
+	if _, err := withoutGuard.Provision(ctx, "coordinator", "writer"); err == nil || !strings.Contains(err.Error(), "guard is unavailable") {
+		t.Fatalf("missing guard error=%v", err)
+	}
+	service := NewAuthorityWorkerService(cfg, authorityStore, runtime, nil, sandboxGuard)
+	if _, err := service.Provision(ctx, "coordinator", "writer"); err == nil || !strings.Contains(err.Error(), "finding-shared") {
+		t.Fatalf("provision halt error=%v", err)
+	}
+	if len(runtime.created) != 0 {
+		t.Fatalf("halted provision reached runtime: %+v", runtime.created)
+	}
+	request := AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "halted-lease", SessionBinding: "halted-session"}
+	if _, err := service.Acquire(ctx, "coordinator", request); err == nil || !strings.Contains(err.Error(), "finding-shared") {
+		t.Fatalf("acquire halt error=%v", err)
+	}
+	if _, err := service.AcquireSession(ctx, "coordinator", request); err == nil || !strings.Contains(err.Error(), "finding-shared") {
+		t.Fatalf("session admission halt error=%v", err)
+	}
+}
+
+func TestAuthorityProfileRequiresIssuanceGeneration(t *testing.T) {
+	cfg := authorityTestConfig(t)
+	profile := cfg.AuthorityProfiles["writer"]
+	profile.IssuanceGeneration = 0
+	cfg.AuthorityProfiles["writer"] = profile
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "issuance_generation must be positive") {
+		t.Fatalf("validation error=%v", err)
+	}
+}
+
 func (f *fakeAuthorityRuntime) Healthy(_ context.Context, _ string) (bool, string, error) {
 	if f.unhealthy {
 		return false, "synthetic_unhealthy", nil
@@ -101,7 +170,7 @@ func TestAuthorityReconcileAppliesAuthenticatedReadinessOnlyToConfiguredProfiles
 
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthenticatedReadinessRuntime{fakeAuthorityRuntime: &fakeAuthorityRuntime{}}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	agentdWorker, err := service.Provision(ctx, "coordinator", "writer")
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +220,7 @@ func TestAuthorityReconcileUnhealthyCheckpointsAndReplaces(t *testing.T) {
 	t.Setenv(profile.Checkpoint.KeyEnv, base64.StdEncoding.EncodeToString(key))
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil).WithCheckpointStore(NewCheckpointStore(cfg, store))
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{}).WithCheckpointStore(NewCheckpointStore(cfg, store))
 	ids := []string{"old-reconcile-health", "new-reconcile-health"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
@@ -459,7 +528,7 @@ func TestAuthorityWorkerLifecycleCapacityDrainReleaseAndReplacement(t *testing.T
 			t.Errorf("close audit: %v", err)
 		}
 	})
-	service := NewAuthorityWorkerService(cfg, store, runtime, audit)
+	service := NewAuthorityWorkerService(cfg, store, runtime, audit, allowTestAuthorityIssuance{})
 	ids := []string{"worker-one", "worker-two", "worker-three"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 
@@ -565,7 +634,7 @@ func TestAuthorityWorkerStoreRecoversAndSerializesCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	service.newID = func() (string, error) { return "worker-persisted", nil }
 	worker, err := service.Provision(ctx, "coordinator", "writer")
 	if err != nil {
@@ -624,7 +693,7 @@ func TestAuthorityWorkerReplacementFailureKeepsOldWorkerAvailableAndRetries(t *t
 	cfg := authorityTestConfig(t)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	ids := []string{"old-worker", "failed-replacement", "retry-replacement"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
@@ -680,7 +749,7 @@ func TestAuthorityWorkerReplacementReconcilesPersistedProvisioningIntent(t *test
 	cfg := authorityTestConfig(t)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	service.newID = func() (string, error) { return "old-reconcile", nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
 	if err != nil {
@@ -733,7 +802,7 @@ func TestAuthorityWorkerConcurrentReplacementReconciliationSharesRuntimeIdentity
 	cfg := authorityTestConfig(t)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	service.newID = func() (string, error) { return "old-concurrent", nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
 	if err != nil {
@@ -800,7 +869,7 @@ func TestAuthorityWorkerHungAndUnhealthyReplacementPreservesOldCapacityUntilRead
 	cfg := authorityTestConfig(t)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	ids := []string{"old-capacity", "replacement-capacity"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
@@ -890,7 +959,7 @@ func TestAuthorityWorkerCompensatesPostCreatePersistenceFailure(t *testing.T) {
 	cfg := authorityTestConfig(t)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{afterCreate: cancel}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	service.newID = func() (string, error) { return "cancelled-worker", nil }
 	_, provisionErr := service.Provision(ctx, "coordinator", "writer")
 	if provisionErr == nil {
@@ -912,7 +981,7 @@ func TestAuthorityWorkerReleaseAuthorizesBeforeMutation(t *testing.T) {
 	ctx := context.Background()
 	cfg := authorityTestConfig(t)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
-	service := NewAuthorityWorkerService(cfg, store, &fakeAuthorityRuntime{}, nil)
+	service := NewAuthorityWorkerService(cfg, store, &fakeAuthorityRuntime{}, nil, allowTestAuthorityIssuance{})
 	service.newID = func() (string, error) { return "release-worker", nil }
 	worker, err := service.Provision(ctx, "coordinator", "writer")
 	if err != nil {
@@ -953,7 +1022,7 @@ func TestDrainWritesEncryptedCheckpointEvidenceAndRestoreFailsClosed(t *testing.
 	}
 	t.Setenv(profile.Checkpoint.KeyEnv, base64.StdEncoding.EncodeToString(key))
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
-	service := NewAuthorityWorkerService(cfg, store, &fakeAuthorityRuntime{}, nil).WithCheckpointStore(NewCheckpointStore(cfg, store))
+	service := NewAuthorityWorkerService(cfg, store, &fakeAuthorityRuntime{}, nil, allowTestAuthorityIssuance{}).WithCheckpointStore(NewCheckpointStore(cfg, store))
 	service.newID = func() (string, error) { return "checkpoint-worker", nil }
 	worker, err := service.Provision(ctx, "coordinator", "writer")
 	if err != nil {
@@ -1005,7 +1074,7 @@ func TestAuthoritySessionReassignmentIsAtomicIdempotentAndProfileBound(t *testin
 	cfg.AuthorityProfiles["writer"] = profile
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	ids := []string{"reassign-old", "reassign-new"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
@@ -1116,7 +1185,7 @@ func TestAuthoritySessionFenceDeniesPredecessorAndReplaysCutover(t *testing.T) {
 	t.Setenv("WRITER_BROKER_CREDENTIAL", "agentd-broker-test-token")
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	ids := []string{"fence-old", "fence-new"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
@@ -1214,7 +1283,7 @@ func TestAuthoritySessionRebindRetriesAfterCASWithStableAgentdCommand(t *testing
 	cfg := authorityTestConfig(t)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	ids := []string{"ordered-old", "ordered-successor"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
@@ -1297,7 +1366,7 @@ func TestAuthoritySessionRebindRejectsMismatchedSuccessBeforeRetirement(t *testi
 	cfg := authorityTestConfig(t)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	ids := []string{"mismatch-old", "mismatch-successor"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
@@ -1364,7 +1433,7 @@ func TestAuthorityReconcileRecoversCrashBeforeAgentdAdoption(t *testing.T) {
 		}
 	})
 	fixture.store = reopened
-	fixture.service = NewAuthorityWorkerService(fixture.cfg, reopened, fixture.runtime, nil)
+	fixture.service = NewAuthorityWorkerService(fixture.cfg, reopened, fixture.runtime, nil, allowTestAuthorityIssuance{})
 
 	var calls []agentdRebindRequest
 	fixture.runtime.rebind = func(ctx context.Context, worker AuthorityWorker, sessionID string, request agentdRebindRequest) (agentdSessionStatus, error) {
@@ -1608,7 +1677,7 @@ func newAuthorityAdoptionFixture(t *testing.T, sessions int) *authorityAdoptionF
 	cfg := authorityTestConfig(t)
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &fakeAuthorityRuntime{}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
 	ids := []string{"adoption-old", "adoption-successor"}
 	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
 	old, err := service.Provision(ctx, "coordinator", "writer")
@@ -1731,11 +1800,12 @@ func authorityTestConfig(t *testing.T) Config {
 	//nolint:gosec // G101: this is a synthetic environment-variable name, not a credential value.
 	cfg.AuthorityProfiles = map[string]AuthorityProfile{
 		"writer": {
-			Image:         "example.com/agentd@sha256:1111111111111111111111111111111111111111111111111111111111111111",
-			Platform:      "linux/amd64",
-			Command:       []string{"bun", "run", "src/cli.ts", "serve"},
-			Resources:     Resources{CPUShares: 128, MemoryMB: 512, PidsLimit: 128},
-			NetworkPolicy: "sandbox", BrokerAgentID: "writer", BrokerSecretEnv: "WRITER_BROKER_CREDENTIAL", CoordinatorTokenEnv: "AGENTD_COORDINATOR_TOKEN",
+			Image:              "example.com/agentd@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+			IssuanceGeneration: 1,
+			Platform:           "linux/amd64",
+			Command:            []string{"bun", "run", "src/cli.ts", "serve"},
+			Resources:          Resources{CPUShares: 128, MemoryMB: 512, PidsLimit: 128},
+			NetworkPolicy:      "sandbox", BrokerAgentID: "writer", BrokerSecretEnv: "WRITER_BROKER_CREDENTIAL", CoordinatorTokenEnv: "AGENTD_COORDINATOR_TOKEN",
 			Repositories: []string{"owner/repo", "owner/other"},
 			BranchPolicy: BranchPolicy{AllowedPatterns: []string{`^agent/writer/[A-Za-z0-9_.:-]+$`}, BaseBranches: []string{"main"}, GeneratePrefix: "agent/writer"},
 			Operations:   []string{"git.receive-pack", "pull.create"}, MaxWorkers: 2, SessionCapacity: 2,

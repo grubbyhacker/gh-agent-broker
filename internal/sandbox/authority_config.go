@@ -18,6 +18,9 @@ import (
 // registered profile.
 type AuthorityProfile struct {
 	Image string `json:"image" yaml:"image"`
+	// IssuanceGeneration binds this profile to the shared push-tripwire halt
+	// generation. It changes only through reviewed configuration.
+	IssuanceGeneration int64 `json:"issuance_generation" yaml:"issuance_generation"`
 	// Platform is a reviewed runtime constraint, not a caller preference. The
 	// first authority-worker release is published only for linux/amd64.
 	Platform string `json:"platform" yaml:"platform"`
@@ -93,6 +96,9 @@ func (c Config) validateAuthorityProfile(name string, profile AuthorityProfile) 
 	var errs []string
 	if !safeAuthorityName(name) {
 		errs = append(errs, fmt.Sprintf("authority profile %q has an invalid name", name))
+	}
+	if profile.IssuanceGeneration < 1 {
+		errs = append(errs, fmt.Sprintf("authority profile %q issuance_generation must be positive", name))
 	}
 	if strings.TrimSpace(profile.Image) == "" {
 		errs = append(errs, fmt.Sprintf("authority profile %q image is required", name))

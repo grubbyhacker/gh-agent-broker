@@ -497,6 +497,7 @@ func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 	defer apiServer.Close()
 
 	var sawUploadPack, sawReceivePack bool
+	var expectedReceivePackLength int64
 	gitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, pass, ok := r.BasicAuth()
 		if !ok || user != "x-access-token" || pass != "fake-install-token" {
@@ -516,6 +517,9 @@ func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 			writeTestBody(t, w, "upload-pack-ok")
 		case r.Method == http.MethodPost && r.URL.Path == "/owner/repo.git/git-receive-pack":
 			sawReceivePack = true
+			if r.ContentLength != expectedReceivePackLength {
+				t.Fatalf("receive-pack ContentLength=%d want=%d", r.ContentLength, expectedReceivePackLength)
+			}
 			if !strings.Contains(readBody(t, r), "refs/heads/agent/agent-1/test") {
 				t.Fatalf("receive-pack body missing branch")
 			}
@@ -547,6 +551,7 @@ func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 	}
 
 	body := append(pktLine("0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/agent/agent-1/test\x00 report-status\n"), []byte("0000")...)
+	expectedReceivePackLength = int64(len(body))
 	req = httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", bytes.NewReader(body))
 	req.Header.Set("X-Agent-ID", "agent-1")
 	req.Header.Set("X-Agent-Secret", "agent-secret")
@@ -561,6 +566,59 @@ func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 		t.Fatalf("fake Git handlers were not all exercised: upload=%v receive=%v", sawUploadPack, sawReceivePack)
 	}
 }
+
+func TestLargeOpaquePackIsStreamedAfterBoundedPrefix(t *testing.T) {
+	apiServer := fakeTokenServer(t)
+	defer apiServer.Close()
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{ID: "agent-1", Enabled: true, Secret: "agent-secret", Repositories: []string{"owner/repo"}, Operations: []string{"git.receive-pack"}, BranchPatterns: []string{"^refs/heads/agent/agent-1/.+$"}})
+	prefix := append(pktLine(strings.Repeat("0", 40)+" "+strings.Repeat("1", 40)+" refs/heads/agent/agent-1/large\x00 report-status\n"), []byte("0000")...)
+	packSize := int64(32 << 20)
+	source := &countingReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), io.LimitReader(zeroReader{}, packSize))}
+	total := int64(len(prefix)) + packSize
+	broker.http = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if source.read != int64(len(prefix)) {
+			return nil, fmt.Errorf("broker consumed %d bytes before upstream, want command prefix %d", source.read, len(prefix))
+		}
+		if req.ContentLength != total {
+			return nil, fmt.Errorf("upstream ContentLength=%d want=%d", req.ContentLength, total)
+		}
+		n, err := io.Copy(io.Discard, req.Body)
+		if err != nil {
+			return nil, err
+		}
+		if n != total {
+			return nil, fmt.Errorf("forwarded bytes=%d want=%d", n, total)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/x-git-receive-pack-result"}}, Body: io.NopCloser(strings.NewReader("receive-pack-ok"))}, nil
+	})}
+	req := httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", source)
+	req.ContentLength = total
+	req.SetBasicAuth("agent-1", "agent-secret")
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK || resp.Body.String() != "receive-pack-ok" {
+		t.Fatalf("response=%d %q", resp.Code, resp.Body.String())
+	}
+	if source.read != total {
+		t.Fatalf("source read=%d want=%d", source.read, total)
+	}
+}
+
+type countingReadCloser struct {
+	io.Reader
+	read int64
+}
+
+func (r *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.read += int64(n)
+	return n, err
+}
+func (*countingReadCloser) Close() error { return nil }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestPushTripwireFirstPushIncludesIntroducedThenRemovedAndDeletedBytes(t *testing.T) {
 	before, first, after := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)
@@ -668,6 +726,9 @@ func TestReloadPreservesTripwireIssuanceHalt(t *testing.T) {
 		}
 	})
 	broker.tripwire = store
+	if err := store.ReplaceEnforcementCatalog(context.Background(), map[string]int64{"curator": 7}); err != nil {
+		t.Fatal(err)
+	}
 	req := pushtripwire.ResponseRequest{Version: pushtripwire.Version, FindingID: "finding", DeliveryID: "delivery", Repository: "owner/repo", Ref: "refs/heads/agent/test", Before: strings.Repeat("a", 40), After: strings.Repeat("b", 40), Severity: "high", ReasonCode: "seeded_canary_match", Profile: "curator", ProfileGeneration: 7, Actions: []string{"halt_issuance"}}
 	if _, err := store.Apply(context.Background(), "reload-proof", req, nil); err != nil {
 		t.Fatal(err)
@@ -687,6 +748,38 @@ func TestReloadPreservesTripwireIssuanceHalt(t *testing.T) {
 	}
 	if err := reloaded.CheckIssuance(context.Background(), "curator", 7); err == nil {
 		t.Fatal("reload abandoned issuance halt")
+	}
+}
+
+func TestPushTripwireRespondReportsHaltedOnlyAfterAuthorityRegistration(t *testing.T) {
+	apiServer := fakeTokenServer(t)
+	defer apiServer.Close()
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{ID: "agent-1", Enabled: true, Secret: "agent-secret", Repositories: []string{"owner/repo"}})
+	cfg, _ := broker.snapshot()
+	statePath := filepath.Join(t.TempDir(), "shared-authority.db")
+	cfg.PushTripwire = config.PushTripwireConfig{Enabled: true, ScannerID: "scanner", ScannerSecret: "scan-secret", StatePath: statePath, Repositories: map[string]config.PushTripwireRepository{"owner/repo": {BaseRef: "refs/heads/main", RefPatterns: []string{"^refs/heads/agent/.+$"}}}, ResponseProfiles: map[string]config.PushTripwireResponseProfile{"writer": {Generation: 1, AllowHalt: true}}, Bounds: config.PushTripwireBounds{MaxCommits: 10, MaxPaths: 10, MaxCommitMessageBytes: 1024, MaxBlobBytes: 1024, MaxTotalBytes: 8192}}
+	store, err := pushtripwire.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	broker.tripwire = store
+	body := map[string]interface{}{"version": pushtripwire.Version, "finding_id": "finding-registration", "delivery_id": "delivery-registration", "repository": "owner/repo", "ref": "refs/heads/agent/proof", "before": strings.Repeat("a", 40), "after": strings.Repeat("b", 40), "severity": "high", "reason_code": "seeded_canary_match", "profile": "writer", "profile_generation": 1, "actions": []string{"halt_issuance"}}
+	headers := map[string]string{"Authorization": "Bearer scan-secret", "Idempotency-Key": "registration-proof"}
+	resp := brokerRequestHeaders(t, broker, http.MethodPost, "/v1/security/push-tripwire/respond", body, headers)
+	if resp.Code != http.StatusInternalServerError || strings.Contains(resp.Body.String(), `"state":"halted"`) {
+		t.Fatalf("unregistered response=%d %s", resp.Code, resp.Body.String())
+	}
+	if err := store.ReplaceEnforcementCatalog(context.Background(), map[string]int64{"writer": 1}); err != nil {
+		t.Fatal(err)
+	}
+	resp = brokerRequestHeaders(t, broker, http.MethodPost, "/v1/security/push-tripwire/respond", body, headers)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"state":"halted"`) {
+		t.Fatalf("registered response=%d %s", resp.Code, resp.Body.String())
 	}
 }
 
@@ -758,6 +851,26 @@ func TestOpaquePushPreflightRejectsDeletionAndBeforeMismatch(t *testing.T) {
 				t.Fatal("rejected update reached Git upstream")
 			}
 		})
+	}
+}
+
+func TestMalformedReceivePackPrefixIsRejectedWithoutForwardingConsumedBytes(t *testing.T) {
+	apiRequests, gitRequests := 0, 0
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { apiRequests++; w.WriteHeader(http.StatusTeapot) }))
+	defer apiServer.Close()
+	gitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { gitRequests++; w.WriteHeader(http.StatusTeapot) }))
+	defer gitServer.Close()
+	broker := newTestBroker(t, apiServer.URL, gitServer.URL, config.Agent{ID: "agent-1", Enabled: true, Secret: "agent-secret", Repositories: []string{"owner/repo"}, Operations: []string{"git.receive-pack"}, BranchPatterns: []string{"^refs/heads/agent/agent-1/.+$"}})
+	body := append(pktLine("not-a-valid-update\n"), []byte("0000PACK")...)
+	req := httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", bytes.NewReader(body))
+	req.SetBasicAuth("agent-1", "agent-secret")
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if apiRequests != 0 || gitRequests != 0 {
+		t.Fatalf("malformed prefix forwarded: api=%d git=%d", apiRequests, gitRequests)
 	}
 }
 
