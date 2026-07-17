@@ -184,11 +184,19 @@ func canonicalDecodings(value string) ([]string, bool) {
 		if len(match) > maxCanonicalBytes {
 			return nil, true
 		}
-		for offset := 0; offset < 4 && len(match)-offset >= 16; offset++ {
-			candidate := match[offset:]
-			for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
-				if decoded, err := encoding.DecodeString(candidate); err == nil {
-					values = append(values, string(decoded))
+		// A credential encoding can be embedded in a larger base64-alphabet run.
+		// Trying every alignment trim on both ends makes that bounded subrun
+		// visible without admitting attacker-selected quadratic expansion.
+		for startTrim := 0; startTrim < 4; startTrim++ {
+			for endTrim := 0; endTrim < 4; endTrim++ {
+				if len(match)-startTrim-endTrim < 16 {
+					continue
+				}
+				candidate := match[startTrim : len(match)-endTrim]
+				for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+					if decoded, err := encoding.DecodeString(candidate); err == nil {
+						values = append(values, string(decoded))
+					}
 				}
 			}
 		}

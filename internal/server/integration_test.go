@@ -252,8 +252,9 @@ func TestCredentialShapedTextIsBlockedBeforeGitHubTokenIssuance(t *testing.T) {
 		{"comment", http.MethodPost, "/v1/repos/owner/repo/issues/7/comments", map[string]interface{}{"body": canary}},
 		{"dismissal", http.MethodPut, "/v1/repos/owner/repo/pulls/7/reviews/80/dismissal", map[string]interface{}{"message": canary}},
 		{"thread", http.MethodPut, "/v1/repos/owner/repo/pulls/7/review-threads/PRRT_test_thread/resolve", map[string]interface{}{"message": canary}},
-		{"encoded-comment", http.MethodPost, "/v1/repos/owner/repo/issues/8/comments", map[string]interface{}{"body": encodedCanary}},
+		{"encoded-comment", http.MethodPost, "/v1/repos/owner/repo/issues/8/comments", map[string]interface{}{"body": "AA" + encodedCanary + "AA"}},
 		{"split-pull", http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{"title": "PR10-CREDENTIAL-", "body": "CANARY:split-field-test", "head": "agent/agent-1/split", "base": "main"}},
+		{"split-encoded-pull", http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{"title": ("AA" + encodedCanary)[:len(encodedCanary)/2], "body": ("AA" + encodedCanary)[len(encodedCanary)/2:] + "AA", "head": "agent/agent-1/split-encoded", "base": "main"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

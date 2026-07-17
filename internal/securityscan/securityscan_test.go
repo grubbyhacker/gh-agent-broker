@@ -32,11 +32,14 @@ func TestFieldsDetectsCredentialShapesWithoutReturningMaterial(t *testing.T) {
 func TestCanonicalEncodingsAndSequencesAreDetected(t *testing.T) {
 	canary := "PR10-CREDENTIAL-CANARY:encoded-test-value"
 	tests := map[string]string{
-		"base64":    base64.StdEncoding.EncodeToString([]byte(canary)),
-		"base64url": base64.RawURLEncoding.EncodeToString([]byte(canary)),
-		"hex":       hex.EncodeToString([]byte(canary)),
-		"url":       url.PathEscape(canary),
-		"nested":    base64.RawURLEncoding.EncodeToString([]byte(hex.EncodeToString([]byte(canary)))),
+		"base64":           base64.StdEncoding.EncodeToString([]byte(canary)),
+		"base64url":        base64.RawURLEncoding.EncodeToString([]byte(canary)),
+		"base64url-prefix": "AA" + base64.RawURLEncoding.EncodeToString([]byte(canary)),
+		"base64url-suffix": base64.RawURLEncoding.EncodeToString([]byte(canary)) + "AA",
+		"base64url-subrun": "AA" + base64.RawURLEncoding.EncodeToString([]byte(canary)) + "AA",
+		"hex":              hex.EncodeToString([]byte(canary)),
+		"url":              url.PathEscape(canary),
+		"nested":           base64.RawURLEncoding.EncodeToString([]byte(hex.EncodeToString([]byte(canary)))),
 	}
 	for name, value := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -49,6 +52,11 @@ func TestCanonicalEncodingsAndSequencesAreDetected(t *testing.T) {
 	finding := Sequence([]Segment{{Name: "chunk[0]", Value: "PR10-CREDENTIAL-"}, {Name: "chunk[1]", Value: "CANARY:split-value"}})
 	if finding == nil || finding.Code != "credential_canary" || finding.Field != "field_sequence" {
 		t.Fatalf("split finding = %+v", finding)
+	}
+	encoded := "AA" + base64.RawURLEncoding.EncodeToString([]byte(canary)) + "AA"
+	finding = Sequence([]Segment{{Name: "chunk[0]", Value: encoded[:len(encoded)/2]}, {Name: "chunk[1]", Value: encoded[len(encoded)/2:]}})
+	if finding == nil || finding.Code != "credential_canary" || finding.Field != "field_sequence" {
+		t.Fatalf("encoded split finding = %+v", finding)
 	}
 }
 
