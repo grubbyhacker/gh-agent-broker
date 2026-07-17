@@ -79,9 +79,10 @@ func main() {
 	hermesAuthOnly := flag.Bool("hermes-auth-only", false, "run only the Hermes credential bundle auth probe")
 	taskMarkerOnly := flag.Bool("task-marker-only", false, "run only the task marker delivery regression")
 	finalizationLive := flag.Bool("finalization-live", false, "run live finalization checks against a persistent sandbox broker")
+	fast := flag.Bool("fast", false, "run the representative PR-gating sandbox lifecycle path")
 	flag.Parse()
 	selectedModes := 0
-	for _, selected := range []bool{*codexAuthOnly, *hermesAuthOnly, *taskMarkerOnly, *finalizationLive} {
+	for _, selected := range []bool{*codexAuthOnly, *hermesAuthOnly, *taskMarkerOnly, *finalizationLive, *fast} {
 		if selected {
 			selectedModes++
 		}
@@ -209,6 +210,11 @@ func main() {
 	if !authOnly {
 		assertContains("final summary marker", final.Inline, "SMOKE-E2E-ONE")
 		assertContains("lesson summary marker", lesson.Inline, "SMOKE-E2E-ONE")
+	}
+	if *fast {
+		assertCleanup(ctx, session, runsDir, worker.RunID)
+		fmt.Println("sandbox MCP fast E2E ok")
+		return
 	}
 
 	if authOnly {

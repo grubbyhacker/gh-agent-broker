@@ -84,9 +84,14 @@ Docker-dependent checks are separate:
 
 ```sh
 make smoke-container
+make sandbox-e2e-fast
 make sandbox-e2e
 make proxy-codex-e2e
 ```
+
+`sandbox-e2e-fast` runs the representative live lifecycle used to gate relevant
+pull requests. `sandbox-e2e` retains the complete lifecycle and negative-path
+suite used on relevant `main` pushes, release tags, and the scheduled workflow.
 
 Supported setup paths are `.mise.toml` and `.devcontainer/devcontainer.json`.
 With `mise` installed:
