@@ -3,6 +3,8 @@
   "session_binding": "logical-session",
   "session_lineage_id": "11111111111111111111111111111111",
   "authority_profile": "writer",
+  "profile_version": "profile-v1",
+  "policy_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "predecessor": {
     "workerId": "worker-1",
     "storageLineageId": "22222222222222222222222222222222",

@@ -24,7 +24,12 @@ type coordinatorTestRuntime struct {
 
 func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker AuthorityWorker, method, path string, body json.RawMessage) (int, json.RawMessage, error) {
 	r.worker, r.method, r.path, r.body = worker, method, path, bytes.Clone(body)
-	return http.StatusAccepted, json.RawMessage(`{"sessionId":"agentd-session","turnId":"turn-1","phase":"queued"}`), nil
+	parts := strings.Split(path, "/")
+	sessionID := "agentd-session"
+	if len(parts) > 3 && parts[1] == "v1" && parts[2] == "sessions" {
+		sessionID = parts[3]
+	}
+	return http.StatusAccepted, json.RawMessage(`{"sessionId":"` + sessionID + `","turnId":"turn-1","phase":"queued"}`), nil
 }
 
 func TestCoordinatorV1SubmitIsBrokerMediated(t *testing.T) {
@@ -82,11 +87,39 @@ func TestCoordinatorV1SubmitIsBrokerMediated(t *testing.T) {
 	}
 }
 
+func TestCoordinatorV1BlocksCommandsUntilReassignmentAdoptionIsConfirmed(t *testing.T) {
+	fixture := newAuthorityAdoptionFixture(t, 1)
+	adoption := fixture.commit(t, 0)
+	runtime := &coordinatorTestRuntime{fakeAuthorityRuntime: fixture.runtime}
+	service := NewAuthorityWorkerService(fixture.cfg, fixture.store, runtime, nil)
+	request := CoordinatorSessionRequest{
+		SessionBinding: fixture.bindings[0],
+		IdempotencyKey: "blocked-turn",
+		Prompt:         "make the registered change",
+	}
+
+	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err == nil || !strings.Contains(err.Error(), "not confirmed") {
+		t.Fatalf("pending adoption routed command: %v", err)
+	}
+	if runtime.path != "" {
+		t.Fatalf("pending adoption reached agentd path %q", runtime.path)
+	}
+	if err := fixture.store.ConfirmAgentdAdoption(context.Background(), adoption); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err != nil {
+		t.Fatalf("confirmed adoption did not route: %v", err)
+	}
+	if runtime.path == "" {
+		t.Fatal("confirmed adoption did not reach agentd")
+	}
+}
+
 func TestCoordinatorWireFixturesAreStable(t *testing.T) {
 	created := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
-	lease := AuthorityLease{Principal: "coordinator", Profile: "writer", WorkerID: "worker-1", SessionLineageID: "11111111111111111111111111111111", WorkerStorageLineageID: "22222222222222222222222222222222", WorkerFenceEpoch: 1, ProfileVersion: "profile-v1", PolicyDigest: "policy-v1", BindingDigest: "binding-digest", IdempotencyDigest: "idempotency-digest", CreatedAt: created}
+	lease := AuthorityLease{Principal: "coordinator", Profile: "writer", WorkerID: "worker-1", SessionLineageID: "11111111111111111111111111111111", WorkerStorageLineageID: "22222222222222222222222222222222", WorkerFenceEpoch: 1, ProfileVersion: "profile-v1", PolicyDigest: strings.Repeat("a", 64), BindingDigest: "binding-digest", IdempotencyDigest: "idempotency-digest", CreatedAt: created}
 	admission := CoordinatorLeaseAdmission{Version: coordinatorProtocolVersion, Admission: AuthoritySessionAdmission{Lease: lease, Workspace: SessionWorkspace{UID: 20000, GID: 20000, Path: "/var/lib/agentd/workspaces/11111111111111111111111111111111", SessionLineageID: lease.SessionLineageID}}}
-	status := CoordinatorReassignmentStatus{Version: coordinatorProtocolVersion, SessionBinding: "logical-session", SessionLineageID: lease.SessionLineageID, AuthorityProfile: "writer", Predecessor: agentdWorkerBinding{WorkerID: "worker-1", StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: 1}, Successor: agentdWorkerBinding{WorkerID: "worker-2", StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: 2}, IdempotencyKey: "opaque-rebind-key", State: "confirmed"}
+	status := CoordinatorReassignmentStatus{Version: coordinatorProtocolVersion, SessionBinding: "logical-session", SessionLineageID: lease.SessionLineageID, AuthorityProfile: "writer", ProfileVersion: lease.ProfileVersion, PolicyDigest: lease.PolicyDigest, Predecessor: agentdWorkerBinding{WorkerID: "worker-1", StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: 1}, Successor: agentdWorkerBinding{WorkerID: "worker-2", StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: 2}, IdempotencyKey: "opaque-rebind-key", State: "confirmed"}
 	for _, fixture := range []struct {
 		name, path string
 		value      any

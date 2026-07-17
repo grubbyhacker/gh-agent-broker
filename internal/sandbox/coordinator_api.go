@@ -37,6 +37,8 @@ type CoordinatorReassignmentStatus struct {
 	SessionBinding   string              `json:"session_binding"`
 	SessionLineageID string              `json:"session_lineage_id"`
 	AuthorityProfile string              `json:"authority_profile"`
+	ProfileVersion   string              `json:"profile_version"`
+	PolicyDigest     string              `json:"policy_digest"`
 	Predecessor      agentdWorkerBinding `json:"predecessor"`
 	Successor        agentdWorkerBinding `json:"successor"`
 	IdempotencyKey   string              `json:"rebind_idempotency_key"`
@@ -53,6 +55,9 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 		return CoordinatorSessionResponse{}, fmt.Errorf("active coordinator session binding is required")
 	}
 	if _, err := s.authorize(principal, lease.Profile, "acquire"); err != nil {
+		return CoordinatorSessionResponse{}, err
+	}
+	if err := s.store.RequireConfirmedCoordinatorRouting(ctx, request.SessionBinding, lease); err != nil {
 		return CoordinatorSessionResponse{}, err
 	}
 	workspace, err := s.store.SessionWorkspace(ctx, request.SessionBinding)
@@ -201,5 +206,5 @@ func (s *AuthorityWorkerService) CoordinatorReassignmentStatus(ctx context.Conte
 	if _, err := s.authorize(principal, adoption.AuthorityBinding, "reassign"); err != nil {
 		return CoordinatorReassignmentStatus{}, err
 	}
-	return CoordinatorReassignmentStatus{Version: coordinatorProtocolVersion, SessionBinding: adoption.CoordinatorBinding, SessionLineageID: adoption.SessionLineageID, AuthorityProfile: adoption.AuthorityBinding, Predecessor: adoption.Predecessor, Successor: adoption.Successor, IdempotencyKey: adoption.RebindIdempotencyKey, State: adoption.State, ErrorCode: adoption.ErrorCode}, nil
+	return CoordinatorReassignmentStatus{Version: coordinatorProtocolVersion, SessionBinding: adoption.CoordinatorBinding, SessionLineageID: adoption.SessionLineageID, AuthorityProfile: adoption.AuthorityBinding, ProfileVersion: adoption.ProfileVersion, PolicyDigest: adoption.PolicyDigest, Predecessor: adoption.Predecessor, Successor: adoption.Successor, IdempotencyKey: adoption.RebindIdempotencyKey, State: adoption.State, ErrorCode: adoption.ErrorCode}, nil
 }

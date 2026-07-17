@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 8
+const authorityStoreSchemaVersion = 9
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -93,6 +93,8 @@ type authorityAgentdAdoption struct {
 	BindingDigest        string
 	CoordinatorBinding   string
 	AuthorityBinding     string
+	ProfileVersion       string
+	PolicyDigest         string
 	SessionLineageID     string
 	AgentdSessionID      string
 	Predecessor          agentdWorkerBinding
@@ -223,6 +225,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	}
 	if version == 7 {
 		if err := s.migrateV8(ctx); err != nil {
+			return err
+		}
+		version = 8
+	}
+	if version == 8 {
+		if err := s.migrateV9(ctx); err != nil {
 			return err
 		}
 	}
@@ -418,6 +426,18 @@ func (s *AuthorityWorkerStore) migrateV8(ctx context.Context) error {
 	CREATE INDEX authority_session_reassignments_replacement ON authority_session_reassignments(replacement_worker_id);
 	CREATE INDEX authority_session_reassignments_adoption ON authority_session_reassignments(adoption_state,created_at,binding_digest);
 	PRAGMA user_version=8`)
+	return err
+}
+
+// V9 snapshots the immutable profile identity needed by a coordinator to
+// reconcile a lost reassignment response against the complete transition.
+func (s *AuthorityWorkerStore) migrateV9(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE authority_session_reassignments ADD COLUMN profile_version TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_session_reassignments ADD COLUMN policy_digest TEXT NOT NULL DEFAULT '';
+	UPDATE authority_session_reassignments SET
+		profile_version=coalesce((SELECT profile_version FROM authority_workers worker WHERE worker.worker_id=authority_session_reassignments.replacement_worker_id),''),
+		policy_digest=coalesce((SELECT policy_digest FROM authority_workers worker WHERE worker.worker_id=authority_session_reassignments.replacement_worker_id),'');
+	PRAGMA user_version=9`)
 	return err
 }
 
@@ -953,12 +973,12 @@ func (s *AuthorityWorkerStore) Reassign(ctx context.Context, principal, sessionB
 	rebindIdempotencyKey := s.rebindIdempotencyKey(workspace.AgentdSessionID, predecessorBinding, successorBinding)
 	if _, err := conn.ExecContext(ctx, `INSERT INTO authority_session_reassignments(
 		principal,idempotency_digest,request_fingerprint,binding_digest,predecessor_worker_id,replacement_worker_id,created_at,
-		coordinator_binding,authority_binding,session_lineage_id,agentd_session_id,
+		coordinator_binding,authority_binding,profile_version,policy_digest,session_lineage_id,agentd_session_id,
 		predecessor_storage_lineage_id,predecessor_fence_epoch,replacement_storage_lineage_id,replacement_fence_epoch,
 		rebind_idempotency_key,workspace_ref,workspace_uid,workspace_gid,adoption_state)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		principal, idem, fingerprint, binding, predecessorWorkerID, replacementID, formatAuthorityTime(now),
-		sessionBinding, lease.Profile, sessionLineageID, workspace.AgentdSessionID,
+		sessionBinding, lease.Profile, replacementProfileVersion, replacementPolicyDigest, sessionLineageID, workspace.AgentdSessionID,
 		predecessorBinding.StorageLineageID, predecessorBinding.FenceEpoch, successorBinding.StorageLineageID, successorBinding.FenceEpoch,
 		rebindIdempotencyKey, workspace.Path, workspace.UID, workspace.GID, authorityAdoptionPending); err != nil {
 		return AuthoritySessionReassignment{}, err
@@ -993,7 +1013,7 @@ func getLeaseByDigest(ctx context.Context, queryer interface {
 	return lease, err
 }
 
-const authorityAdoptionSelect = `SELECT binding_digest,coordinator_binding,authority_binding,session_lineage_id,agentd_session_id,
+const authorityAdoptionSelect = `SELECT binding_digest,coordinator_binding,authority_binding,profile_version,policy_digest,session_lineage_id,agentd_session_id,
 	predecessor_worker_id,predecessor_storage_lineage_id,predecessor_fence_epoch,
 	replacement_worker_id,replacement_storage_lineage_id,replacement_fence_epoch,
 	rebind_idempotency_key,workspace_ref,workspace_uid,workspace_gid,adoption_state,adoption_error_code
@@ -1002,7 +1022,7 @@ const authorityAdoptionSelect = `SELECT binding_digest,coordinator_binding,autho
 func scanAuthorityAgentdAdoption(scanner interface{ Scan(...any) error }) (authorityAgentdAdoption, error) {
 	var adoption authorityAgentdAdoption
 	err := scanner.Scan(
-		&adoption.BindingDigest, &adoption.CoordinatorBinding, &adoption.AuthorityBinding, &adoption.SessionLineageID, &adoption.AgentdSessionID,
+		&adoption.BindingDigest, &adoption.CoordinatorBinding, &adoption.AuthorityBinding, &adoption.ProfileVersion, &adoption.PolicyDigest, &adoption.SessionLineageID, &adoption.AgentdSessionID,
 		&adoption.Predecessor.WorkerID, &adoption.Predecessor.StorageLineageID, &adoption.Predecessor.FenceEpoch,
 		&adoption.Successor.WorkerID, &adoption.Successor.StorageLineageID, &adoption.Successor.FenceEpoch,
 		&adoption.RebindIdempotencyKey, &adoption.Workspace.WorkspaceRef, &adoption.Workspace.UID, &adoption.Workspace.GID,
@@ -1013,6 +1033,28 @@ func scanAuthorityAgentdAdoption(scanner interface{ Scan(...any) error }) (autho
 
 func (s *AuthorityWorkerStore) AgentdAdoption(ctx context.Context, bindingDigest string) (authorityAgentdAdoption, error) {
 	return scanAuthorityAgentdAdoption(s.db.QueryRowContext(ctx, authorityAdoptionSelect+` WHERE binding_digest=? ORDER BY predecessor_fence_epoch DESC LIMIT 1`, bindingDigest))
+}
+
+// RequireConfirmedCoordinatorRouting blocks all session traffic while the
+// latest durable reassignment generation is incomplete or does not describe
+// the active lease exactly. A binding with no reassignment history is ready.
+func (s *AuthorityWorkerStore) RequireConfirmedCoordinatorRouting(ctx context.Context, binding string, lease AuthorityLease) error {
+	adoption, err := s.AgentdAdoption(ctx, lease.BindingDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if adoption.State != authorityAdoptionConfirmed {
+		return fmt.Errorf("coordinator session reassignment is not confirmed")
+	}
+	if adoption.CoordinatorBinding != binding || adoption.AuthorityBinding != lease.Profile ||
+		adoption.SessionLineageID != lease.SessionLineageID || adoption.Successor.WorkerID != lease.WorkerID ||
+		adoption.Successor.StorageLineageID != lease.WorkerStorageLineageID || adoption.Successor.FenceEpoch != lease.WorkerFenceEpoch {
+		return fmt.Errorf("coordinator session reassignment does not match the active lease")
+	}
+	return nil
 }
 
 func (s *AuthorityWorkerStore) AgentdAdoptionAtEpoch(ctx context.Context, bindingDigest string, predecessorEpoch int64) (authorityAgentdAdoption, error) {
@@ -1045,12 +1087,12 @@ func (s *AuthorityWorkerStore) UnconfirmedAgentdAdoptions(ctx context.Context) (
 
 func (s *AuthorityWorkerStore) ConfirmAgentdAdoption(ctx context.Context, adoption authorityAgentdAdoption) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE authority_session_reassignments SET adoption_state=?,adoption_error_code='',adoption_confirmed_at=?
-		WHERE binding_digest=? AND coordinator_binding=? AND authority_binding=? AND session_lineage_id=? AND agentd_session_id=?
+		WHERE binding_digest=? AND coordinator_binding=? AND authority_binding=? AND profile_version=? AND policy_digest=? AND session_lineage_id=? AND agentd_session_id=?
 		AND predecessor_worker_id=? AND predecessor_storage_lineage_id=? AND predecessor_fence_epoch=?
 		AND replacement_worker_id=? AND replacement_storage_lineage_id=? AND replacement_fence_epoch=?
 		AND rebind_idempotency_key=? AND workspace_ref=? AND workspace_uid=? AND workspace_gid=? AND adoption_state=?`,
 		authorityAdoptionConfirmed, formatAuthorityTime(time.Now().UTC()),
-		adoption.BindingDigest, adoption.CoordinatorBinding, adoption.AuthorityBinding, adoption.SessionLineageID, adoption.AgentdSessionID,
+		adoption.BindingDigest, adoption.CoordinatorBinding, adoption.AuthorityBinding, adoption.ProfileVersion, adoption.PolicyDigest, adoption.SessionLineageID, adoption.AgentdSessionID,
 		adoption.Predecessor.WorkerID, adoption.Predecessor.StorageLineageID, adoption.Predecessor.FenceEpoch,
 		adoption.Successor.WorkerID, adoption.Successor.StorageLineageID, adoption.Successor.FenceEpoch,
 		adoption.RebindIdempotencyKey, adoption.Workspace.WorkspaceRef, adoption.Workspace.UID, adoption.Workspace.GID, authorityAdoptionPending)

@@ -28,6 +28,12 @@ Lease responses include the complete immutable routing identity:
 `worker_fence_epoch`. The stable cross-repository JSON fixtures are in
 `testdata/coordinator-wire/`.
 
+Reassignment status additionally snapshots `profile_version` and
+`policy_digest` with both worker generations. Coordinators can therefore
+reconcile a lost response against the complete immutable transition identity.
+Session create and command routing fail closed while the latest adoption is
+anything other than `confirmed`.
+
 Reassignment is a durable saga. The broker transaction transfers capacity,
 lease ownership, workspace association, and writes a pending adoption before
 calling agentd. History is unique per logical binding and predecessor fence

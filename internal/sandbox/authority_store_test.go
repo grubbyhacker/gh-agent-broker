@@ -36,12 +36,12 @@ func TestAuthorityWorkerStoreMigratesV1WorkspaceSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := migrated.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('authority_session_reassignments') WHERE name IN (
-		'coordinator_binding','authority_binding','session_lineage_id','agentd_session_id',
+		'coordinator_binding','authority_binding','profile_version','policy_digest','session_lineage_id','agentd_session_id',
 		'predecessor_storage_lineage_id','predecessor_fence_epoch','replacement_storage_lineage_id','replacement_fence_epoch',
 		'rebind_idempotency_key','workspace_ref','workspace_uid','workspace_gid','adoption_state','adoption_error_code','adoption_confirmed_at')`).Scan(&adoptionColumns); err != nil {
 		t.Fatal(err)
 	}
-	if version != authorityStoreSchemaVersion || table != 1 || reassignmentTable != 1 || adoptionColumns != 15 {
+	if version != authorityStoreSchemaVersion || table != 1 || reassignmentTable != 1 || adoptionColumns != 17 {
 		t.Fatalf("migration version=%d workspace_table=%d reassignment_table=%d adoption_columns=%d", version, table, reassignmentTable, adoptionColumns)
 	}
 }
