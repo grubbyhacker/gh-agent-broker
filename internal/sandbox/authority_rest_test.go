@@ -107,6 +107,20 @@ func TestCoordinatorV1BlocksCommandsUntilReassignmentAdoptionIsConfirmed(t *test
 	if err := fixture.store.ConfirmAgentdAdoption(context.Background(), adoption); err != nil {
 		t.Fatal(err)
 	}
+	activeLease, err := fixture.store.GetLease(context.Background(), "coordinator", fixture.bindings[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*AuthorityLease){
+		"profile version": func(lease *AuthorityLease) { lease.ProfileVersion = "wrong-profile-version" },
+		"policy digest":   func(lease *AuthorityLease) { lease.PolicyDigest = strings.Repeat("f", 64) },
+	} {
+		mismatched := activeLease
+		mutate(&mismatched)
+		if err := fixture.store.RequireConfirmedCoordinatorRouting(context.Background(), fixture.bindings[0], mismatched); err == nil || !strings.Contains(err.Error(), "does not match") {
+			t.Fatalf("mismatched %s routed: %v", name, err)
+		}
+	}
 	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err != nil {
 		t.Fatalf("confirmed adoption did not route: %v", err)
 	}

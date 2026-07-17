@@ -1050,6 +1050,7 @@ func (s *AuthorityWorkerStore) RequireConfirmedCoordinatorRouting(ctx context.Co
 		return fmt.Errorf("coordinator session reassignment is not confirmed")
 	}
 	if adoption.CoordinatorBinding != binding || adoption.AuthorityBinding != lease.Profile ||
+		adoption.ProfileVersion != lease.ProfileVersion || adoption.PolicyDigest != lease.PolicyDigest ||
 		adoption.SessionLineageID != lease.SessionLineageID || adoption.Successor.WorkerID != lease.WorkerID ||
 		adoption.Successor.StorageLineageID != lease.WorkerStorageLineageID || adoption.Successor.FenceEpoch != lease.WorkerFenceEpoch {
 		return fmt.Errorf("coordinator session reassignment does not match the active lease")
