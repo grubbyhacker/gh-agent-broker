@@ -16,11 +16,20 @@ denies the operation.
 - Small text artifacts and lessons are scanned before their inline content is
   returned. Manifest paths are scanned for every collected file.
 - Successful raw agentd session-command results, including event and evidence
-  payloads represented in those results, are scanned before coordinator API
-  validation and response serialization.
+  payloads represented in those results, are scanned before status handling,
+  validation, or response serialization. Non-success agentd codes are reduced
+  to a fixed safe enum.
 - Both broker audit serializers scan the fully rendered JSON event. A finding
   replaces the event with a bounded, sanitized security event rather than
   writing the unsafe event.
+- Canonical scanning covers bounded raw, URL-escaped, hex, base64, and
+  base64url representations through two decoding layers. Broker-controlled
+  field and stream sequences are scanned without separators so split matches
+  fail closed. Candidate count, decoded bytes, field bytes, and stream bytes
+  all have explicit fail-closed limits.
+- Every collected artifact and lesson file is scanned before either inline
+  content or a hash-only manifest is returned. Files beyond the 16 MiB stream
+  bound are denied as unscanned rather than returned.
 
 These checks halt credential issuance for the attempted GitHub operation:
 textual mutations are denied before the broker asks GitHub for an installation
@@ -29,17 +38,18 @@ that may already exist for unrelated operations.
 
 ## Deliberate limits
 
-- Git pushes use Git smart HTTP. Commit trees and messages arrive inside opaque
-  packfiles, so this slice does not claim semantic commit-content scanning.
-  Closing that gap requires a reviewed receive-pack inspection or verifier
-  boundary that can parse the negotiated object graph before forwarding it.
-- Files larger than the inline limit are represented only by path, size, hash,
-  and a truncation marker. Their paths are scanned, but their bytes are not an
-  API egress payload and are not scanned by this collection path.
+- Git pushes use Git smart HTTP, whose commit trees and messages arrive inside
+  opaque packfiles. Agents configured with
+  `git_receive_pack_policy: deny_opaque` are denied before branch-lifecycle
+  probes, installation-token issuance, or upstream forwarding. Existing
+  legacy identities default to `allow_opaque`; any credential-bearing authority
+  worker must use a dedicated broker identity configured `deny_opaque` until a
+  reviewed semantic receive-pack inspector exists.
 - The scanner is a deterministic credential-shape detector, not a general
   content classifier or malware scanner.
 - Durable worker quarantine, worker maximum-age enforcement, global credential
-  issuance halt, credential revocation, and production policy activation are
+  issuance halt, credential revocation, semantic Git pack inspection, and
+  production policy activation are
   outside this staged subset. They require explicit lifecycle/store policy and
   deployment-owner contracts rather than a process-local side effect.
 

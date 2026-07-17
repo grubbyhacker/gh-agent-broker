@@ -79,18 +79,6 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 	if err != nil {
 		return CoordinatorSessionResponse{}, err
 	}
-	if status < 200 || status >= 300 {
-		var denied struct {
-			Error string `json:"error"`
-		}
-		if err := json.Unmarshal(result, &denied); err != nil {
-			denied.Error = "agentd_session_rejected"
-		}
-		if denied.Error == "" || len(denied.Error) > 128 {
-			denied.Error = "agentd_session_rejected"
-		}
-		return CoordinatorSessionResponse{}, &CoordinatorAgentdError{Status: status, Code: denied.Error}
-	}
 	if finding := securityscan.Fields(map[string]string{"agentd_result": string(result)}); finding != nil {
 		s.audit.Log(AuditEvent{
 			Operation:         "security.egress_blocked",
@@ -107,6 +95,15 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 			},
 		}, NewRedactor(nil))
 		return CoordinatorSessionResponse{}, &securityscan.DetectionError{Finding: *finding}
+	}
+	if status < 200 || status >= 300 {
+		var denied struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(result, &denied); err != nil {
+			denied.Error = "agentd_session_rejected"
+		}
+		return CoordinatorSessionResponse{}, &CoordinatorAgentdError{Status: status, Code: safeAgentdErrorCode(denied.Error)}
 	}
 	if operation == "status" || operation == "checkpoint" || operation == "resume" {
 		decoded, err := decodeAgentdSessionStatus(strings.NewReader(string(result)))
@@ -157,6 +154,17 @@ type CoordinatorAgentdError struct {
 }
 
 func (e *CoordinatorAgentdError) Error() string { return "agentd session command was rejected" }
+
+func safeAgentdErrorCode(code string) string {
+	switch code {
+	case "unauthorized", "invalid_request", "not_found", "method_not_allowed",
+		"session_fenced", "broker_validator_unavailable", "session_storage_unavailable",
+		"rebind_required", "rebind_conflict", "invalid_command":
+		return code
+	default:
+		return "agentd_session_rejected"
+	}
+}
 
 func validateCoordinatorSessionRequest(operation string, request CoordinatorSessionRequest) error {
 	if strings.TrimSpace(request.SessionBinding) == "" || len(request.SessionBinding) > 256 || request.After < 0 {

@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -324,11 +325,19 @@ func TestLogsArtifactsAndLessonsFailClosedOnCredentialShapes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	largeEncoded := base64.RawURLEncoding.EncodeToString([]byte(canary))
+	largePath := filepath.Join(cfg.RunsDir, out.RunID, "output", "large.bin")
+	if err := os.WriteFile(largePath, []byte(strings.Repeat("x", defaultInlineLimit+1)+largeEncoded), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CollectArtifacts(context.Background(), RunInput{RunID: out.RunID}); err == nil || strings.Contains(err.Error(), canary) || strings.Contains(err.Error(), largeEncoded) {
+		t.Fatalf("unsafe large artifact error = %v", err)
+	}
 	auditBytes, err := os.ReadFile(auditPath) //nolint:gosec // G304: path is a test-owned temporary audit file.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(auditBytes, []byte(canary)) || bytes.Count(auditBytes, []byte(`"operation":"security.egress_blocked"`)) != 3 {
+	if bytes.Contains(auditBytes, []byte(canary)) || bytes.Contains(auditBytes, []byte(largeEncoded)) || bytes.Count(auditBytes, []byte(`"operation":"security.egress_blocked"`)) != 4 {
 		t.Fatalf("unsafe sandbox audit = %s", auditBytes)
 	}
 }

@@ -62,6 +62,13 @@ type IdempotencyConfig struct {
 	StatePath string `yaml:"state_path"`
 }
 
+type GitReceivePackPolicy string
+
+const (
+	GitReceivePackAllowOpaque GitReceivePackPolicy = "allow_opaque"
+	GitReceivePackDenyOpaque  GitReceivePackPolicy = "deny_opaque"
+)
+
 type Agent struct {
 	ID                 string                     `yaml:"id"`
 	Enabled            bool                       `yaml:"enabled"`
@@ -75,6 +82,7 @@ type Agent struct {
 	BranchGuard        BranchLifecycleGuard       `yaml:"branch_lifecycle_guard"`
 	Permissions        []string                   `yaml:"permissions"`
 	MetadataAssertions map[string]AssertionPolicy `yaml:"metadata_assertions"`
+	GitReceivePack     GitReceivePackPolicy       `yaml:"git_receive_pack_policy"`
 }
 
 type BranchLifecycleGuard struct {
@@ -128,6 +136,9 @@ func (c *Config) applyDefaults() {
 	}
 	for i := range c.Agents {
 		c.Agents[i].BranchGuard.applyDefaults()
+		if c.Agents[i].GitReceivePack == "" {
+			c.Agents[i].GitReceivePack = GitReceivePackAllowOpaque
+		}
 	}
 }
 
@@ -177,6 +188,9 @@ func (c *Config) Validate() error {
 		}
 		if seen[a.ID] {
 			errs = append(errs, fmt.Sprintf("duplicate agent id %q", a.ID))
+		}
+		if a.GitReceivePack != "" && a.GitReceivePack != GitReceivePackAllowOpaque && a.GitReceivePack != GitReceivePackDenyOpaque {
+			errs = append(errs, fmt.Sprintf("agent %q git_receive_pack_policy must be allow_opaque or deny_opaque", a.ID))
 		}
 		seen[a.ID] = true
 		if a.Enabled && a.Secret == "" {

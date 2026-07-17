@@ -1,6 +1,13 @@
 package securityscan
 
-import "testing"
+import (
+	"encoding/base64"
+	"encoding/hex"
+	"io"
+	"net/url"
+	"strings"
+	"testing"
+)
 
 func TestFieldsDetectsCredentialShapesWithoutReturningMaterial(t *testing.T) {
 	//nolint:gosec // G101: intentionally synthetic credential shapes exercise the detector.
@@ -20,6 +27,57 @@ func TestFieldsDetectsCredentialShapesWithoutReturningMaterial(t *testing.T) {
 			t.Fatal("detection error returned matched material")
 		}
 	}
+}
+
+func TestCanonicalEncodingsAndSequencesAreDetected(t *testing.T) {
+	canary := "PR10-CREDENTIAL-CANARY:encoded-test-value"
+	tests := map[string]string{
+		"base64":    base64.StdEncoding.EncodeToString([]byte(canary)),
+		"base64url": base64.RawURLEncoding.EncodeToString([]byte(canary)),
+		"hex":       hex.EncodeToString([]byte(canary)),
+		"url":       url.PathEscape(canary),
+		"nested":    base64.RawURLEncoding.EncodeToString([]byte(hex.EncodeToString([]byte(canary)))),
+	}
+	for name, value := range tests {
+		t.Run(name, func(t *testing.T) {
+			finding := Fields(map[string]string{"body": "prefix " + value + " suffix"})
+			if finding == nil || finding.Code != "credential_canary" {
+				t.Fatalf("encoded finding = %+v", finding)
+			}
+		})
+	}
+	finding := Sequence([]Segment{{Name: "chunk[0]", Value: "PR10-CREDENTIAL-"}, {Name: "chunk[1]", Value: "CANARY:split-value"}})
+	if finding == nil || finding.Code != "credential_canary" || finding.Field != "field_sequence" {
+		t.Fatalf("split finding = %+v", finding)
+	}
+}
+
+func TestReaderDetectsAcrossChunksAndFailsClosedAtLimit(t *testing.T) {
+	reader := &chunkReader{chunks: []string{"prefix PR10-CREDENTIAL-", "CANARY:chunked-value suffix"}}
+	if finding := Reader("artifact", reader, 1024); finding == nil || finding.Code != "credential_canary" {
+		t.Fatalf("chunked finding = %+v", finding)
+	}
+	if finding := Reader("artifact", strings.NewReader(strings.Repeat("a", 33)), 32); finding == nil || finding.Code != "scan_limit_exceeded" {
+		t.Fatalf("bounded finding = %+v", finding)
+	}
+}
+
+func TestCanonicalCandidateLimitFailsClosed(t *testing.T) {
+	value := strings.Repeat("QUFBQUFBQUFBQUFB ", maxCanonicalValues+1)
+	if finding := Fields(map[string]string{"body": value}); finding == nil || finding.Code != "canonical_scan_limit_exceeded" {
+		t.Fatalf("canonical limit finding = %+v", finding)
+	}
+}
+
+type chunkReader struct{ chunks []string }
+
+func (reader *chunkReader) Read(value []byte) (int, error) {
+	if len(reader.chunks) == 0 {
+		return 0, io.EOF
+	}
+	chunk := reader.chunks[0]
+	reader.chunks = reader.chunks[1:]
+	return copy(value, chunk), nil
 }
 
 func TestFieldsIsDeterministicAndAllowsOrdinaryText(t *testing.T) {

@@ -89,8 +89,8 @@ func (s *Server) snapshot() (*config.Config, *githubapp.Client) {
 // blockUnsafeEgress is deliberately called after authentication/policy but
 // before any GitHub client mutation. A finding therefore halts installation
 // token issuance and the external write for this operation.
-func (s *Server) blockUnsafeEgress(w http.ResponseWriter, operationID, agentID, repo, operation string, fields map[string]string) bool {
-	finding := securityscan.Fields(fields)
+func (s *Server) blockUnsafeEgress(w http.ResponseWriter, operationID, agentID, repo, operation string, fields []securityscan.Segment) bool {
+	finding := securityscan.Sequence(fields)
 	if finding == nil {
 		return false
 	}
@@ -990,7 +990,7 @@ func (s *Server) handlePullReviewDismiss(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull review dismissal denied by policy", &result))
 		return
 	}
-	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "pull.review.dismiss", map[string]string{"message": req.Message}) {
+	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "pull.review.dismiss", []securityscan.Segment{{Name: "message", Value: req.Message}}) {
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("pull.review.dismiss:%s:%d:%s", repo, number, reviewID))
@@ -1070,7 +1070,7 @@ func (s *Server) handlePullReviewThreadResolve(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull review thread resolution denied by policy", &result))
 		return
 	}
-	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "pull.review_thread.resolve", map[string]string{"message": req.Message}) {
+	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "pull.review_thread.resolve", []securityscan.Segment{{Name: "message", Value: req.Message}}) {
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("pull.review_thread.resolve:%s:%d:%s", repo, number, threadID))
@@ -1390,8 +1390,8 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 		return
 	}
 	body := req.Body + metadata.RenderBlock(enriched)
-	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "pull.create", map[string]string{
-		"base": req.Base, "body": body, "head": req.Head, "title": req.Title,
+	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "pull.create", []securityscan.Segment{
+		{Name: "title", Value: req.Title}, {Name: "body", Value: body}, {Name: "head", Value: req.Head}, {Name: "base", Value: req.Base},
 	}) {
 		return
 	}
@@ -1467,9 +1467,9 @@ func (s *Server) handleIssueCreate(w http.ResponseWriter, r *http.Request, repo 
 		return
 	}
 	body := req.Body + metadata.RenderBlock(enriched)
-	fields := map[string]string{"body": body, "title": req.Title}
+	fields := []securityscan.Segment{{Name: "title", Value: req.Title}, {Name: "body", Value: body}}
 	for i, label := range req.Labels {
-		fields[fmt.Sprintf("labels[%d]", i)] = label
+		fields = append(fields, securityscan.Segment{Name: fmt.Sprintf("labels[%d]", i), Value: label})
 	}
 	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "issue.create", fields) {
 		return
@@ -1525,7 +1525,7 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		return
 	}
 	body := req.Body + metadata.RenderBlock(enriched)
-	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "issue.comment", map[string]string{"body": body}) {
+	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "issue.comment", []securityscan.Segment{{Name: "body", Value: body}}) {
 		return
 	}
 	key := idempotencyHeader(r)
@@ -1744,6 +1744,35 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	if !result.Allowed {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision})
 		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
+		return
+	}
+	if operation == "git.receive-pack" && r.Method == http.MethodPost && principal.Agent.GitReceivePack == config.GitReceivePackDenyOpaque {
+		result = policy.Result{
+			Allowed:  false,
+			Decision: policy.DecisionDeny,
+			FailedChecks: []api.FailedCheck{{
+				Dimension:     "security_egress",
+				Location:      "git.receive-pack",
+				Expected:      "semantic packfile inspection before forwarding",
+				SafeToDisplay: true,
+				Message:       "opaque Git pushes are disabled for this broker identity until semantic packfile inspection is available",
+			}},
+			RequiredChanges: []api.RequiredChange{{
+				Location: "git.receive-pack",
+				Action:   "use broker-controlled textual mutation paths or an identity explicitly allowed to forward opaque packfiles",
+			}},
+		}
+		s.audit.Log(audit.Event{
+			OperationID: opID,
+			AgentID:     principal.ID,
+			Operation:   "security.egress_blocked",
+			Repo:        repo,
+			Branch:      branch,
+			Decision:    policy.DecisionDeny,
+			Result:      "semantic_pack_inspection_unavailable",
+			Extra:       map[string]interface{}{"attempted_operation": operation, "surface": "git_receive_pack"},
+		})
+		writeGitPolicyError(w, r, s.errorResponse(opID, "security_egress_blocked", "opaque Git push denied by security policy", &result))
 		return
 	}
 	guardResult := s.checkBranchLifecycle(opID, gh, appName, inst, repo, branch, operation, principal.Agent)

@@ -3,7 +3,9 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +23,7 @@ type coordinatorTestRuntime struct {
 	path   string
 	body   json.RawMessage
 	result json.RawMessage
+	status int
 }
 
 func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker AuthorityWorker, method, path string, body json.RawMessage) (int, json.RawMessage, error) {
@@ -31,7 +34,11 @@ func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker 
 		sessionID = parts[3]
 	}
 	if len(r.result) != 0 {
-		return http.StatusAccepted, bytes.Clone(r.result), nil
+		status := r.status
+		if status == 0 {
+			status = http.StatusAccepted
+		}
+		return status, bytes.Clone(r.result), nil
 	}
 	return http.StatusAccepted, json.RawMessage(`{"sessionId":"` + sessionID + `","turnId":"turn-1","phase":"queued"}`), nil
 }
@@ -107,6 +114,21 @@ func TestCoordinatorV1SubmitIsBrokerMediated(t *testing.T) {
 	}
 	if bytes.Contains(auditBytes, []byte(canary)) || !bytes.Contains(auditBytes, []byte(`"operation":"security.egress_blocked"`)) {
 		t.Fatalf("unsafe coordinator audit = %s", auditBytes)
+	}
+
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(canary))
+	runtime.status = http.StatusUnauthorized
+	runtime.result = json.RawMessage(`{"error":"` + encoded + `"}`)
+	_, err = service.CoordinatorSessionCommand(ctx, "coordinator", "submit", CoordinatorSessionRequest{SessionBinding: "logical-session", IdempotencyKey: "blocked-error-turn", Prompt: "return error"})
+	if err == nil || strings.Contains(err.Error(), encoded) || !strings.Contains(err.Error(), "credential_canary") {
+		t.Fatalf("encoded unsafe agentd error = %v", err)
+	}
+
+	runtime.result = json.RawMessage(`{"error":"caller_selected_error"}`)
+	_, err = service.CoordinatorSessionCommand(ctx, "coordinator", "submit", CoordinatorSessionRequest{SessionBinding: "logical-session", IdempotencyKey: "safe-error-turn", Prompt: "return safe error"})
+	var agentdErr *CoordinatorAgentdError
+	if !errors.As(err, &agentdErr) || agentdErr.Code != "agentd_session_rejected" {
+		t.Fatalf("unsafe exported agentd error = %#v", err)
 	}
 }
 

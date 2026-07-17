@@ -28,18 +28,22 @@ or activate production authority.
 ### Roadmap PR10 egress security subset
 
 Broker-owned textual GitHub mutations, sandbox logs and inline text
-artifact/lesson responses, successful raw coordinator agentd results, and both
-audit serializers now fail closed on the synthetic PR10 canary or common
+artifact/lesson responses, raw coordinator agentd results, and both audit
+serializers now fail closed on the synthetic PR10 canary or common
 credential-shaped material. Findings expose only a stable code and field,
 produce sanitized `security.egress_blocked` audit events, and stop GitHub
 installation-token issuance for the attempted mutation. The implementation
 does not load or compare real secret values and does not activate production.
 
-Git smart-HTTP commit packfiles remain opaque, so semantic commit scanning is
-not claimed. Large artifact bytes are not returned inline and only their
-manifest paths are scanned. Durable worker quarantine, maximum-age policy,
-global credential halt/revocation, and production wiring remain explicit later
-seams. See `docs/pr10-egress-security.md` for the exact boundary.
+Canonical decoding covers bounded URL, hex, base64, and base64url forms plus
+broker-controlled split sequences. All artifact bytes are scanned within a
+16 MiB per-file bound; larger files fail closed. Git smart-HTTP commit packfiles
+remain opaque, so credential-bearing authority identities must set
+`git_receive_pack_policy: deny_opaque`, which denies before token issuance while
+leaving legacy identities compatible. Durable worker quarantine, maximum-age
+policy, global credential halt/revocation, semantic pack inspection, and
+production wiring remain explicit later seams. See
+`docs/pr10-egress-security.md` for the exact boundary.
 
 ### Curator lifecycle incident remediation
 
