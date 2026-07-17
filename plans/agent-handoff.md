@@ -25,6 +25,22 @@ fixtures live under `testdata/coordinator-wire/`. This slice does not implement
 the credential holder or app-server boundary, change deployment configuration,
 or activate production authority.
 
+### Roadmap PR10 egress security subset
+
+Broker-owned textual GitHub mutations, sandbox logs and inline text
+artifact/lesson responses, successful raw coordinator agentd results, and both
+audit serializers now fail closed on the synthetic PR10 canary or common
+credential-shaped material. Findings expose only a stable code and field,
+produce sanitized `security.egress_blocked` audit events, and stop GitHub
+installation-token issuance for the attempted mutation. The implementation
+does not load or compare real secret values and does not activate production.
+
+Git smart-HTTP commit packfiles remain opaque, so semantic commit scanning is
+not claimed. Large artifact bytes are not returned inline and only their
+manifest paths are scanned. Durable worker quarantine, maximum-age policy,
+global credential halt/revocation, and production wiring remain explicit later
+seams. See `docs/pr10-egress-security.md` for the exact boundary.
+
 ### Curator lifecycle incident remediation
 
 Sandbox lifecycle audit records carry the Docker container ID and stable

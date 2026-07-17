@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gh-agent-broker/internal/securityscan"
 )
 
 type Logger struct {
@@ -70,6 +72,23 @@ func (l *Logger) Log(ev Event) {
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return
+	}
+	if finding := securityscan.Fields(map[string]string{"audit_event": string(b)}); finding != nil {
+		ev = Event{
+			Timestamp:   ev.Timestamp,
+			OperationID: ev.OperationID,
+			AgentID:     ev.AgentID,
+			Operation:   "security.egress_blocked",
+			Repo:        ev.Repo,
+			RunID:       ev.RunID,
+			Decision:    "deny",
+			Result:      finding.Code,
+			Extra:       map[string]interface{}{"surface": "audit_log", "field": finding.Field},
+		}
+		b, err = json.Marshal(ev)
+		if err != nil {
+			return
+		}
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()

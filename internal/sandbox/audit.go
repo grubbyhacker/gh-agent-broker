@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"gh-agent-broker/internal/securityscan"
 )
 
 type AuditLogger struct {
@@ -80,6 +82,24 @@ func (l *AuditLogger) Log(ev AuditEvent, redactor Redactor) {
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return
+	}
+	if finding := securityscan.Fields(map[string]string{"audit_event": string(b)}); finding != nil {
+		ev = AuditEvent{
+			Timestamp: ev.Timestamp,
+			Operation: "security.egress_blocked",
+			RunID:     ev.RunID,
+			Principal: ev.Principal,
+			Profile:   ev.Profile,
+			Template:  ev.Template,
+			Repo:      ev.Repo,
+			Decision:  "deny",
+			Status:    finding.Code,
+			Error:     "credential-shaped material suppressed from audit log",
+		}
+		b, err = json.Marshal(ev)
+		if err != nil {
+			return
+		}
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()

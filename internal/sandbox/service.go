@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gh-agent-broker/internal/securityscan"
 )
 
 const (
@@ -963,6 +965,11 @@ func (s *Service) GetAgentLogs(ctx context.Context, in LogsInput) (LogsOutput, e
 	if err != nil {
 		return LogsOutput{}, err
 	}
+	if finding := securityscan.Fields(map[string]string{"sandbox_logs": logs}); finding != nil {
+		err := &securityscan.DetectionError{Finding: *finding}
+		s.auditSecurityEgress(meta, "sandbox_logs", err)
+		return LogsOutput{}, err
+	}
 	return LogsOutput{RunID: meta.RunID, Logs: s.redactor(meta).Redact(logs)}, nil
 }
 
@@ -1010,7 +1017,11 @@ func (s *Service) CollectArtifacts(ctx context.Context, in RunInput) (Collection
 	if err != nil {
 		return CollectionOutput{}, err
 	}
-	return collectFiles(filepath.Join(s.runDir(meta.RunID), "output"), meta.RunID, s.redactor(meta), defaultInlineLimit)
+	out, err := collectFiles(filepath.Join(s.runDir(meta.RunID), "output"), meta.RunID, s.redactor(meta), defaultInlineLimit)
+	if err != nil {
+		s.auditSecurityEgress(meta, "sandbox_artifacts", err)
+	}
+	return out, err
 }
 
 func (s *Service) CollectLessons(ctx context.Context, in RunInput) (CollectionOutput, error) {
@@ -1019,7 +1030,11 @@ func (s *Service) CollectLessons(ctx context.Context, in RunInput) (CollectionOu
 	if err != nil {
 		return CollectionOutput{}, err
 	}
-	return collectFiles(filepath.Join(s.runDir(meta.RunID), "lessons"), meta.RunID, s.redactor(meta), defaultInlineLimit)
+	out, err := collectFiles(filepath.Join(s.runDir(meta.RunID), "lessons"), meta.RunID, s.redactor(meta), defaultInlineLimit)
+	if err != nil {
+		s.auditSecurityEgress(meta, "sandbox_lessons", err)
+	}
+	return out, err
 }
 
 func (s *Service) CleanupRun(ctx context.Context, in RunInput) (StatusOutput, error) {
@@ -1407,6 +1422,25 @@ func (s *Service) auditEvent(operation string, meta RunMetadata, decision string
 		ev.Error = err.Error()
 	}
 	return ev
+}
+
+func (s *Service) auditSecurityEgress(meta RunMetadata, surface string, err error) {
+	var detection *securityscan.DetectionError
+	if !errors.As(err, &detection) {
+		return
+	}
+	s.audit.Log(AuditEvent{
+		Operation: "security.egress_blocked",
+		RunID:     meta.RunID,
+		Template:  meta.Template,
+		Repo:      meta.Repo,
+		Decision:  "deny",
+		Status:    detection.Finding.Code,
+		Parameters: map[string]any{
+			"surface": surface,
+			"field":   detection.Finding.Field,
+		},
+	}, NewRedactor(nil))
 }
 
 // auditLifecycle records a bounded, redacted runtime observation. These events

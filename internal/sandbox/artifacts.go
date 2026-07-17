@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"gh-agent-broker/internal/securityscan"
 )
 
 const defaultInlineLimit = 8 * 1024
@@ -60,6 +62,9 @@ func collectFiles(base, runID string, redactor Redactor, inlineLimit int64) (Col
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		if finding := securityscan.Fields(map[string]string{"artifact_path": rel}); finding != nil {
+			return &securityscan.DetectionError{Finding: *finding}
+		}
 		hash, err := fileSHA256(path)
 		if err != nil {
 			return err
@@ -71,6 +76,9 @@ func collectFiles(base, runID string, redactor Redactor, inlineLimit int64) (Col
 			b, err := os.ReadFile(path)
 			if err != nil {
 				return err
+			}
+			if finding := securityscan.Fields(map[string]string{"artifact_inline": string(b)}); finding != nil {
+				return &securityscan.DetectionError{Finding: *finding}
 			}
 			item.Inline = redactor.Redact(string(b))
 		} else if info.Size() > inlineLimit {

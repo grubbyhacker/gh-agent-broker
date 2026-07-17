@@ -20,6 +20,7 @@ type coordinatorTestRuntime struct {
 	method string
 	path   string
 	body   json.RawMessage
+	result json.RawMessage
 }
 
 func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker AuthorityWorker, method, path string, body json.RawMessage) (int, json.RawMessage, error) {
@@ -28,6 +29,9 @@ func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker 
 	sessionID := "agentd-session"
 	if len(parts) > 3 && parts[1] == "v1" && parts[2] == "sessions" {
 		sessionID = parts[3]
+	}
+	if len(r.result) != 0 {
+		return http.StatusAccepted, bytes.Clone(r.result), nil
 	}
 	return http.StatusAccepted, json.RawMessage(`{"sessionId":"` + sessionID + `","turnId":"turn-1","phase":"queued"}`), nil
 }
@@ -40,7 +44,13 @@ func TestCoordinatorV1SubmitIsBrokerMediated(t *testing.T) {
 	cfg.AuthorityProfiles["writer"] = profile
 	store := openAuthorityTestStore(t, cfg.AuthorityStore)
 	runtime := &coordinatorTestRuntime{fakeAuthorityRuntime: &fakeAuthorityRuntime{}}
-	service := NewAuthorityWorkerService(cfg, store, runtime, nil)
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := NewAuditLogger(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestAudit(t, auditLog)
+	service := NewAuthorityWorkerService(cfg, store, runtime, auditLog)
 	service.newID = func() (string, error) { return "coordinator-worker", nil }
 	worker, err := service.Provision(ctx, "coordinator", "writer")
 	if err != nil {
@@ -84,6 +94,19 @@ func TestCoordinatorV1SubmitIsBrokerMediated(t *testing.T) {
 		if resp.Code != http.StatusBadRequest {
 			t.Fatalf("forbidden %s status=%d body=%s", forbidden, resp.Code, resp.Body.String())
 		}
+	}
+	canary := "PR10-CREDENTIAL-CANARY:coordinator-only-test"
+	runtime.result = json.RawMessage(`{"sessionId":"agentd-session","turnId":"turn-2","phase":"queued","evidence":"` + canary + `"}`)
+	_, err = service.CoordinatorSessionCommand(ctx, "coordinator", "submit", CoordinatorSessionRequest{SessionBinding: "logical-session", IdempotencyKey: "blocked-turn", Prompt: "return evidence"})
+	if err == nil || strings.Contains(err.Error(), canary) || !strings.Contains(err.Error(), "credential_canary") {
+		t.Fatalf("unsafe coordinator result error = %v", err)
+	}
+	auditBytes, err := os.ReadFile(auditPath) //nolint:gosec // G304: path is a test-owned temporary audit file.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(auditBytes, []byte(canary)) || !bytes.Contains(auditBytes, []byte(`"operation":"security.egress_blocked"`)) {
+		t.Fatalf("unsafe coordinator audit = %s", auditBytes)
 	}
 }
 

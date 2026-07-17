@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -275,6 +276,60 @@ func TestLogsAndArtifactsAreRedactedAndSymlinkSafe(t *testing.T) {
 	}
 	if strings.Contains(lessons.Files[0].Inline, "bundle-secret") || strings.Contains(lessons.Files[0].Inline, "abc123secret456") {
 		t.Fatalf("lesson inline was not redacted: %q", lessons.Files[0].Inline)
+	}
+}
+
+func TestLogsArtifactsAndLessonsFailClosedOnCredentialShapes(t *testing.T) {
+	cfg := baseTestConfig(t)
+	runtime := newFakeRuntime()
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := NewAuditLogger(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTestAudit(t, auditLog)
+	service := NewService(cfg, runtime, auditLog)
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{Template: "worker", Task: "task", Repo: "owner/repo", BaseBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canary := "PR10-CREDENTIAL-CANARY:sandbox-only-test"
+	runtime.logs = "worker output " + canary
+	if _, err := service.GetAgentLogs(context.Background(), LogsInput{RunID: out.RunID}); err == nil || strings.Contains(err.Error(), canary) {
+		t.Fatalf("unsafe logs error = %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		dir  string
+		call func() error
+	}{
+		{name: "artifact", dir: "output", call: func() error {
+			_, err := service.CollectArtifacts(context.Background(), RunInput{RunID: out.RunID})
+			return err
+		}},
+		{name: "lesson", dir: "lessons", call: func() error {
+			_, err := service.CollectLessons(context.Background(), RunInput{RunID: out.RunID})
+			return err
+		}},
+	} {
+		path := filepath.Join(cfg.RunsDir, out.RunID, tc.dir, tc.name+".md")
+		if err := os.WriteFile(path, []byte("evidence "+canary), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := tc.call(); err == nil || strings.Contains(err.Error(), canary) {
+			t.Fatalf("unsafe %s error = %v", tc.name, err)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	auditBytes, err := os.ReadFile(auditPath) //nolint:gosec // G304: path is a test-owned temporary audit file.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(auditBytes, []byte(canary)) || bytes.Count(auditBytes, []byte(`"operation":"security.egress_blocked"`)) != 3 {
+		t.Fatalf("unsafe sandbox audit = %s", auditBytes)
 	}
 }
 

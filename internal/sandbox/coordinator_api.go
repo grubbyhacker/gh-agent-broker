@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"gh-agent-broker/internal/securityscan"
 )
 
 const coordinatorProtocolVersion = "broker/coordinator/v1"
@@ -88,6 +90,23 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 			denied.Error = "agentd_session_rejected"
 		}
 		return CoordinatorSessionResponse{}, &CoordinatorAgentdError{Status: status, Code: denied.Error}
+	}
+	if finding := securityscan.Fields(map[string]string{"agentd_result": string(result)}); finding != nil {
+		s.audit.Log(AuditEvent{
+			Operation:         "security.egress_blocked",
+			Principal:         principal,
+			Profile:           lease.Profile,
+			AuthorityWorkerID: lease.WorkerID,
+			ProfileVersion:    lease.ProfileVersion,
+			PolicyDigest:      lease.PolicyDigest,
+			Decision:          "deny",
+			Status:            finding.Code,
+			Parameters: map[string]any{
+				"surface": "coordinator_agentd_result",
+				"field":   finding.Field,
+			},
+		}, NewRedactor(nil))
+		return CoordinatorSessionResponse{}, &securityscan.DetectionError{Finding: *finding}
 	}
 	if operation == "status" || operation == "checkpoint" || operation == "resume" {
 		decoded, err := decodeAgentdSessionStatus(strings.NewReader(string(result)))

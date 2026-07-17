@@ -30,6 +30,7 @@ import (
 	"gh-agent-broker/internal/limits"
 	"gh-agent-broker/internal/metadata"
 	"gh-agent-broker/internal/policy"
+	"gh-agent-broker/internal/securityscan"
 )
 
 type Server struct {
@@ -83,6 +84,36 @@ func (s *Server) snapshot() (*config.Config, *githubapp.Client) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.cfg, s.gh
+}
+
+// blockUnsafeEgress is deliberately called after authentication/policy but
+// before any GitHub client mutation. A finding therefore halts installation
+// token issuance and the external write for this operation.
+func (s *Server) blockUnsafeEgress(w http.ResponseWriter, operationID, agentID, repo, operation string, fields map[string]string) bool {
+	finding := securityscan.Fields(fields)
+	if finding == nil {
+		return false
+	}
+	s.audit.Log(audit.Event{
+		OperationID: operationID,
+		AgentID:     agentID,
+		Operation:   "security.egress_blocked",
+		Repo:        repo,
+		Decision:    policy.DecisionDeny,
+		Result:      finding.Code,
+		Extra: map[string]interface{}{
+			"attempted_operation": operation,
+			"field":               finding.Field,
+			"surface":             "github_mutation",
+		},
+	})
+	writeJSON(w, http.StatusUnprocessableEntity, api.ErrorResponse{
+		Code:        "security_egress_blocked",
+		Message:     "credential-shaped material is not allowed in broker-controlled output",
+		OperationID: operationID,
+		Decision:    policy.DecisionDeny,
+	})
+	return true
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -959,6 +990,9 @@ func (s *Server) handlePullReviewDismiss(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull review dismissal denied by policy", &result))
 		return
 	}
+	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "pull.review.dismiss", map[string]string{"message": req.Message}) {
+		return
+	}
 	key := idempotencyKey(r, fmt.Sprintf("pull.review.dismiss:%s:%d:%s", repo, number, reviewID))
 	extra := map[string]interface{}{"pull_number": number, "review_id": reviewID, "idempotency_key": key}
 	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
@@ -1034,6 +1068,9 @@ func (s *Server) handlePullReviewThreadResolve(w http.ResponseWriter, r *http.Re
 	if !result.Allowed {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Extra: map[string]interface{}{"pull_number": number, "thread_id": threadID}})
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull review thread resolution denied by policy", &result))
+		return
+	}
+	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "pull.review_thread.resolve", map[string]string{"message": req.Message}) {
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("pull.review_thread.resolve:%s:%d:%s", repo, number, threadID))
@@ -1352,6 +1389,12 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "pull request creation denied by policy", &result))
 		return
 	}
+	body := req.Body + metadata.RenderBlock(enriched)
+	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "pull.create", map[string]string{
+		"base": req.Base, "body": body, "head": req.Head, "title": req.Title,
+	}) {
+		return
+	}
 	guardResult := s.checkBranchLifecycle(opID, gh, appName, inst, repo, req.Head, "pull.create", principal.Agent)
 	if guardResult != nil {
 		result.Warnings = append(result.Warnings, guardResult.Warnings...)
@@ -1368,7 +1411,6 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 	if !s.reserveMutation(w, opID, principal.ID, "pull.create", repo, req.Head, req.Metadata) {
 		return
 	}
-	body := req.Body + metadata.RenderBlock(enriched)
 	ghResult, err := gh.CreatePull(appName, repo, inst, req.Title, req.Head, req.Base, body, req.Draft)
 	if err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.create", Repo: repo, Branch: req.Head, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error()})
@@ -1424,10 +1466,17 @@ func (s *Server) handleIssueCreate(w http.ResponseWriter, r *http.Request, repo 
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "issue creation denied by policy", &result))
 		return
 	}
+	body := req.Body + metadata.RenderBlock(enriched)
+	fields := map[string]string{"body": body, "title": req.Title}
+	for i, label := range req.Labels {
+		fields[fmt.Sprintf("labels[%d]", i)] = label
+	}
+	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "issue.create", fields) {
+		return
+	}
 	if !s.reserveMutation(w, opID, principal.ID, "issue.create", repo, "", req.Metadata) {
 		return
 	}
-	body := req.Body + metadata.RenderBlock(enriched)
 	ghResult, err := gh.CreateIssue(appName, repo, inst, req.Title, body, req.Labels)
 	if err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.create", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error()})
@@ -1475,6 +1524,10 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "comment creation denied by policy", &result))
 		return
 	}
+	body := req.Body + metadata.RenderBlock(enriched)
+	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "issue.comment", map[string]string{"body": body}) {
+		return
+	}
 	key := idempotencyHeader(r)
 	extra := map[string]interface{}{"issue_number": issueNumber, "idempotency_key": key}
 	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
@@ -1485,7 +1538,6 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
 		return
 	}
-	body := req.Body + metadata.RenderBlock(enriched)
 	ghResult, err := gh.CreateIssueComment(appName, repo, issueNumber, inst, body)
 	if err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})

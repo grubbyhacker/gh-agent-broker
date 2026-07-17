@@ -224,6 +224,47 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 	}
 }
 
+func TestCredentialShapedTextIsBlockedBeforeGitHubTokenIssuance(t *testing.T) {
+	upstreamRequests := 0
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	defer apiServer.Close()
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:             "agent-1",
+		Enabled:        true,
+		Secret:         "agent-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"pull.create", "pull.review.dismiss", "pull.review_thread.resolve", "issue.comment", "issue.create"},
+		BaseBranches:   []string{"main"},
+		BranchPatterns: []string{"^agent/agent-1/.+$"},
+	})
+	canary := "PR10-CREDENTIAL-CANARY:github-only-test"
+	tests := []struct {
+		name, method, path string
+		body               map[string]interface{}
+	}{
+		{"pull", http.MethodPost, "/v1/repos/owner/repo/pulls", map[string]interface{}{"title": "change", "head": "agent/agent-1/test", "base": "main", "body": canary}},
+		{"issue", http.MethodPost, "/v1/repos/owner/repo/issues", map[string]interface{}{"title": "report", "body": canary}},
+		{"comment", http.MethodPost, "/v1/repos/owner/repo/issues/7/comments", map[string]interface{}{"body": canary}},
+		{"dismissal", http.MethodPut, "/v1/repos/owner/repo/pulls/7/reviews/80/dismissal", map[string]interface{}{"message": canary}},
+		{"thread", http.MethodPut, "/v1/repos/owner/repo/pulls/7/review-threads/PRRT_test_thread/resolve", map[string]interface{}{"message": canary}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := brokerRequest(t, broker, tc.method, tc.path, tc.body)
+			assertStatus(t, resp, http.StatusUnprocessableEntity)
+			if strings.Contains(resp.Body.String(), canary) || !strings.Contains(resp.Body.String(), `"code":"security_egress_blocked"`) {
+				t.Fatalf("unsafe response = %s", resp.Body.String())
+			}
+		})
+	}
+	if upstreamRequests != 0 {
+		t.Fatalf("blocked output caused %d GitHub/token requests", upstreamRequests)
+	}
+}
+
 func TestFakeGitHubReadRESTIntegration(t *testing.T) {
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
