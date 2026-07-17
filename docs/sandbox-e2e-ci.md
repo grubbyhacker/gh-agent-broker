@@ -17,8 +17,9 @@ by the GitHub Actions API on 2026-07-16:
 - sandbox E2E waited for the serial `check` job before it could start.
 
 These are runner wall-clock measurements, not estimates from local execution.
-The old path filter selected the suite for every change under `cmd/**` or
-`internal/**`, including proxy, reporter, deploy-contract, and CLI-only work.
+The old path filters selected the sandbox suite and Codex worker image for
+every change under `cmd/**` or `internal/**`, including proxy, reporter,
+deploy-contract, and unrelated service work.
 
 ## Scenario-to-contract coverage
 
@@ -52,6 +53,13 @@ deploy-contract-only, worker-image-only, documentation, and unrelated CLI
 changes do not invalidate this boundary. A newer package import must be added
 to the filter in the same change that introduces the dependency.
 
+The sandbox image is built with the GitHub Actions BuildKit cache, so repeated
+revisions reuse unchanged module-download and compile layers. Container smoke
+also starts after path classification instead of waiting for `check`; image
+publication still requires both gates. The Codex worker image filter follows
+its actual broker CLI dependency (`cmd/gh-agent-broker` and `internal/config`)
+rather than all commands and packages.
+
 Relevant pushes to `main` run `make sandbox-e2e`, so no PR-fast change reaches
 the published broker image without the full suite. Every version tag also runs
 the full suite before release artifacts publish, regardless of changed paths.
@@ -65,6 +73,6 @@ scheduled runs are never cancelled by this policy.
 
 The fast mode is a strict prefix of the existing full client flow; the full
 mode remains the default. The rollout therefore does not remove a scenario
-from `main` or release gating. Further optimization of the serial hygiene gate
-or Docker build reuse can land independently after its own measurements,
-without changing this coverage split.
+from `main` or release gating. Further optimization inside the serial hygiene
+gate can land independently after its own measurements, without changing this
+coverage split.
