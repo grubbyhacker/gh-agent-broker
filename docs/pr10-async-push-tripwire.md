@@ -59,9 +59,24 @@ generations, actions, and unreviewed bindings are rejected before persistence.
 same SQLite authority state file. Sandbox startup atomically registers every
 reviewed `authority_profiles.*.issuance_generation`; the response transaction
 refuses to record or return `halted` unless that exact profile/generation is
-registered. Provision, replacement, lease acquisition, combined session
-admission, reassignment, and agentd session creation all call `CheckIssuance`
-before mutation and fail closed on a halt, missing guard, or state read error.
+registered. Both halt application and every authority-issuing store operation
+use `BEGIN IMMEDIATE`. Provision/CreateWorker, lease acquisition (including
+combined session admission), replacement, reassignment, and agentd session
+creation query the exact catalog row and halt row on the same SQLite connection
+and inside the transaction that owns the issuance mutation. Missing catalog
+rows and catalog/halt read failures roll back without issuing authority.
+
+The writer lock is the linearization boundary. If issuance owns it first,
+`/respond` waits until that issuance commits or rolls back before it can return
+`halted`. If the halt owns and commits the lock first, a fresh issuance observes
+the halt and rolls back. Agentd session creation deliberately holds the writer
+transaction across the external create and the durable session-ID bind, so the
+same ordering covers that authority mutation. Combined session admission is
+linearized by its lease commit; workspace allocation is non-authority
+preparation, and the later agentd create has its own guarded transaction.
+Already-committed exact lease, replacement, and reassignment results are read
+before the fresh-issuance check and remain replayable after a halt; new effects
+are denied.
 
 Deployment must bind-mount the containing state directory read-write into both
 containers, because SQLite also owns adjacent WAL/SHM files. Set main-broker

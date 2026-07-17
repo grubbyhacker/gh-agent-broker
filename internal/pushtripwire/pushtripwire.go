@@ -158,8 +158,11 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	for _, stmt := range []string{
 		`PRAGMA journal_mode=WAL`,
+		`PRAGMA busy_timeout=5000`,
 		`CREATE TABLE IF NOT EXISTS issuance_halts (profile TEXT NOT NULL, generation INTEGER NOT NULL, finding_id TEXT NOT NULL, PRIMARY KEY(profile,generation))`,
 		`CREATE TABLE IF NOT EXISTS issuance_enforcement_catalog (profile TEXT NOT NULL, generation INTEGER NOT NULL, registered_at TEXT NOT NULL, PRIMARY KEY(profile,generation))`,
 		`CREATE TABLE IF NOT EXISTS responses (idempotency_key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, request BLOB NOT NULL, response BLOB NOT NULL)`,
@@ -258,49 +261,63 @@ func (s *Store) Apply(ctx context.Context, key string, req ResponseRequest, adap
 		return ResponseResult{}, err
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return ResponseResult{}, err
 	}
+	defer closeStoreConn(conn)
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return ResponseResult{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			rollbackStoreConn(context.WithoutCancel(ctx), conn)
+		}
+	}()
 	out := ResponseResult{Version: Version, FindingID: req.FindingID}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, action := range req.Actions {
 		switch action {
 		case "halt_issuance":
 			var registered int
-			if err = tx.QueryRowContext(ctx, `SELECT 1 FROM issuance_enforcement_catalog WHERE profile=? AND generation=?`, req.Profile, req.ProfileGeneration).Scan(&registered); err != nil {
+			if err = conn.QueryRowContext(ctx, `SELECT 1 FROM issuance_enforcement_catalog WHERE profile=? AND generation=?`, req.Profile, req.ProfileGeneration).Scan(&registered); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					err = errors.New("authority issuance enforcement is not registered for profile generation")
 				}
-				return ResponseResult{}, errors.Join(err, tx.Rollback())
+				return ResponseResult{}, err
 			}
-			if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO issuance_halts(profile,generation,finding_id) VALUES(?,?,?)`, req.Profile, req.ProfileGeneration, req.FindingID); err != nil {
-				return ResponseResult{}, errors.Join(err, tx.Rollback())
+			if _, err = conn.ExecContext(ctx, `INSERT OR IGNORE INTO issuance_halts(profile,generation,finding_id) VALUES(?,?,?)`, req.Profile, req.ProfileGeneration, req.FindingID); err != nil {
+				return ResponseResult{}, err
 			}
 			out.Actions = append(out.Actions, ActionState{Action: action, State: "halted", CompletedAt: now})
 		case "fence_worker_session":
 			binding, marshalErr := json.Marshal(req.Binding)
 			if marshalErr != nil {
-				return ResponseResult{}, errors.Join(marshalErr, tx.Rollback())
+				return ResponseResult{}, marshalErr
 			}
-			if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO fence_requests(finding_id,binding,state) VALUES(?,?,'requested')`, req.FindingID, binding); err != nil {
-				return ResponseResult{}, errors.Join(err, tx.Rollback())
+			if _, err = conn.ExecContext(ctx, `INSERT OR IGNORE INTO fence_requests(finding_id,binding,state) VALUES(?,?,'requested')`, req.FindingID, binding); err != nil {
+				return ResponseResult{}, err
 			}
 			out.Actions = append(out.Actions, ActionState{Action: action, State: "fence_requested", CompletedAt: now})
 		}
 	}
 	body, err := json.Marshal(out)
 	if err != nil {
-		return ResponseResult{}, errors.Join(err, tx.Rollback())
+		return ResponseResult{}, err
 	}
 	requestBody, err := json.Marshal(req)
 	if err != nil {
-		return ResponseResult{}, errors.Join(err, tx.Rollback())
+		return ResponseResult{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO responses(idempotency_key,fingerprint,request,response) VALUES(?,?,?,?)`, key, fp, requestBody, body); err != nil {
-		return ResponseResult{}, errors.Join(err, tx.Rollback())
+	if _, err = conn.ExecContext(ctx, `INSERT INTO responses(idempotency_key,fingerprint,request,response) VALUES(?,?,?,?)`, key, fp, requestBody, body); err != nil {
+		return ResponseResult{}, err
 	}
-	if err = tx.Commit(); err != nil {
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return ResponseResult{}, err
+	}
+	committed = true
+	if err = conn.Close(); err != nil {
 		return ResponseResult{}, err
 	}
 
@@ -327,18 +344,43 @@ func (s *Store) Apply(ctx context.Context, key string, req ResponseRequest, adap
 	return out, nil
 }
 
+func rollbackStoreConn(ctx context.Context, conn *sql.Conn) {
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		return
+	}
+}
+
+func closeStoreConn(conn *sql.Conn) {
+	if err := conn.Close(); err != nil {
+		return
+	}
+}
+
 // CheckIssuance fails closed: any state read error is returned to the caller,
 // which must not issue credentials or work for the requested generation.
 func (s *Store) CheckIssuance(ctx context.Context, profile string, generation int64) error {
+	return CheckIssuanceState(ctx, s.db, profile, generation)
+}
+
+// IssuanceStateReader is implemented by both sql.DB and the exact sql.Conn
+// that owns an authority issuance transaction.
+type IssuanceStateReader interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+// CheckIssuanceState checks the exact registered profile generation and halt.
+// Callers that issue authority must invoke it after BEGIN IMMEDIATE and before
+// their first issuance write on that same connection.
+func CheckIssuanceState(ctx context.Context, reader IssuanceStateReader, profile string, generation int64) error {
 	var registered int
-	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM issuance_enforcement_catalog WHERE profile=? AND generation=?`, profile, generation).Scan(&registered); err != nil {
+	if err := reader.QueryRowContext(ctx, `SELECT 1 FROM issuance_enforcement_catalog WHERE profile=? AND generation=?`, profile, generation).Scan(&registered); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return errors.New("authority issuance enforcement registration is unavailable")
 		}
 		return fmt.Errorf("read push tripwire enforcement catalog: %w", err)
 	}
 	var finding string
-	err := s.db.QueryRowContext(ctx, `SELECT finding_id FROM issuance_halts WHERE profile=? AND generation=?`, profile, generation).Scan(&finding)
+	err := reader.QueryRowContext(ctx, `SELECT finding_id FROM issuance_halts WHERE profile=? AND generation=?`, profile, generation).Scan(&finding)
 	if err == nil {
 		return fmt.Errorf("issuance halted by push tripwire finding %s", finding)
 	}

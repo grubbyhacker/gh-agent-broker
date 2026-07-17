@@ -69,7 +69,12 @@ live sandbox fence adapter remain later `vps-ops` work. See
 The halt is now cross-process enforceable: main broker and sandbox broker share
 the sandbox authority SQLite file, sandbox startup registers exact profile
 generations, and every authority issuance/admission path checks the durable halt
-before mutation. `halted` is unavailable until that registration exists. The
+inside its own `BEGIN IMMEDIATE` transaction before mutation. The shared writer
+lock is the linearization point: `/respond` cannot return `halted` ahead of an
+issuance transaction that already owns the lock, while issuance that starts
+after the halt commit fails closed. Exact committed lease, replacement, and
+reassignment replays remain available without creating a new effect. `halted`
+is unavailable until enforcement registration exists. The
 deployment contract therefore needs a shared read-write state-directory mount,
 matching state-file paths, and matching main response-profile/sandbox authority
 profile generations. The intentionally absent live fence adapter is unchanged.
