@@ -14,6 +14,13 @@ trap cleanup EXIT
 
 fail() { echo "repository-backend image proof: $*" >&2; exit 1; }
 expect_fail() { "$@" && fail "unexpected success: $*" || true; }
+expect_rejected() {
+  local output
+  if output=$("$@" 2>&1); then
+    fail "unexpected success: $*"
+  fi
+  grep -Fq "$EXPECT_REJECTION" <<<"$output" || fail "rejection for $* did not contain $EXPECT_REJECTION: $output"
+}
 
 git init --initial-branch=main "$tmp/source" >/dev/null
 git -C "$tmp/source" config user.email proof@example.invalid
@@ -51,7 +58,7 @@ fi
 docker exec -u 0 "$container" chmod 0750 /var/lib/repository-backend/repository-agent-lifecycle-fixture.git
 curl --fail --silent "http://127.0.0.1:${port}/healthz" >/dev/null || fail "health did not recover after mode restoration"
 
-docker exec -u 65532:65532 "$container" git -C /var/lib/repository-backend/repository-agent-lifecycle-fixture.git fetch /seed \
+docker exec -u 65532:65532 "$container" git -c safe.directory=/seed -C /var/lib/repository-backend/repository-agent-lifecycle-fixture.git fetch /seed \
   refs/heads/main:refs/heads/main \
   refs/heads/hidden:refs/heads/hidden \
   refs/heads/agent/repository-proof/initial:refs/heads/agent/repository-proof/initial >/dev/null
@@ -74,29 +81,39 @@ git -C "$tmp/writer-a" config user.name proof
 git -C "$tmp/writer-a" config protocol.version 1
 git -C "$tmp/writer-a" fetch origin refs/heads/agent/repository-proof/initial:refs/remotes/origin/proof
 git -C "$tmp/writer-a" checkout -b proof origin/proof >/dev/null
-expect_fail git -C "$tmp/writer-a" push origin :refs/heads/agent/repository-proof/initial
+EXPECT_REJECTION='deletion prohibited' expect_rejected git -C "$tmp/writer-a" push origin :refs/heads/agent/repository-proof/initial
+EXPECT_REJECTION='outside writable namespace' expect_rejected git -C "$tmp/writer-a" push origin HEAD:refs/tags/repository-proof-outside
 printf 'fast-forward\n' >>"$tmp/writer-a/agent"
 git -C "$tmp/writer-a" commit -am fast-forward >/dev/null
 git -C "$tmp/writer-a" push origin HEAD:refs/heads/agent/repository-proof/initial >/dev/null
 git -C "$tmp/writer-a" reset --hard HEAD~1 >/dev/null
 printf 'force\n' >>"$tmp/writer-a/agent"
 git -C "$tmp/writer-a" commit -am force >/dev/null
-expect_fail git -C "$tmp/writer-a" push --force origin HEAD:refs/heads/agent/repository-proof/initial
+EXPECT_REJECTION='non-fast-forward' expect_rejected git -C "$tmp/writer-a" push --force origin HEAD:refs/heads/agent/repository-proof/initial
 
-git -c protocol.version=1 clone "$url" "$tmp/stale-a" >/dev/null
-git -c protocol.version=1 clone "$url" "$tmp/stale-b" >/dev/null
-for client in "$tmp/stale-a" "$tmp/stale-b"; do
-  git -C "$client" config user.email proof@example.invalid
-  git -C "$client" config user.name proof
-  git -C "$client" config protocol.version 1
-  git -C "$client" fetch origin refs/heads/agent/repository-proof/initial:refs/remotes/origin/proof
-  git -C "$client" checkout -b proof origin/proof >/dev/null
-done
-printf 'winner\n' >>"$tmp/stale-b/agent"
-git -C "$tmp/stale-b" commit -am winner >/dev/null
-git -C "$tmp/stale-b" push origin HEAD:refs/heads/agent/repository-proof/initial >/dev/null
-printf 'stale\n' >>"$tmp/stale-a/agent"
-git -C "$tmp/stale-a" commit -am stale >/dev/null
-expect_fail git -C "$tmp/stale-a" push --force origin HEAD:refs/heads/agent/repository-proof/initial
+cas="$tmp/writer-a"
+git -C "$cas" fetch origin refs/heads/agent/repository-proof/initial:refs/remotes/origin/proof
+git -C "$cas" checkout proof >/dev/null
+git -C "$cas" reset --hard origin/proof >/dev/null
+advertised_old=$(git -C "$cas" rev-parse HEAD)
+printf 'winner\n' >>"$cas/agent"
+git -C "$cas" commit -am winner >/dev/null
+winner=$(git -C "$cas" rev-parse HEAD)
+printf 'loser\n' >>"$cas/agent"
+git -C "$cas" commit -am loser >/dev/null
+loser=$(git -C "$cas" rev-parse HEAD)
+git -C "$cas" merge-base --is-ancestor "$advertised_old" "$winner" || fail "winner did not descend from advertised old SHA"
+git -C "$cas" merge-base --is-ancestor "$advertised_old" "$loser" || fail "loser did not descend from advertised old SHA"
+git -C "$cas" merge-base --is-ancestor "$winner" "$loser" || fail "loser did not pass current-tip ancestry policy"
+git -C "$cas" push origin "$winner":refs/heads/agent/repository-proof/initial >/dev/null
+
+# Send the losing receive-pack request with the old SHA both proposals observed.
+# Its new tip fast-forwards the winning ref, so the receive-pack update failure
+# is solely the stale expected-old compare-and-swap check.
+update="$advertised_old $loser refs/heads/agent/repository-proof/initial"
+request="$tmp/stale-receive-pack.request"
+{ printf '%04x%s\0report-status\n0000' $(( ${#update} + 19 )) "$update"; printf '%s\n^%s\n' "$loser" "$winner" | git -C "$cas" pack-objects --stdout --revs; } >"$request"
+response=$(curl --silent --show-error --fail --header 'Content-Type: application/x-git-receive-pack-request' --data-binary @"$request" "$url/git-receive-pack") || fail "stale receive-pack RPC failed"
+grep -Fq 'ng refs/heads/agent/repository-proof/initial failed to update ref' <<<"$response" || fail "fast-forward stale CAS rejection did not fail its expected-old update: $response"
 
 echo "repository-backend image proof passed"
