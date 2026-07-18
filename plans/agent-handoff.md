@@ -2,6 +2,41 @@
 
 ## Current State
 
+### Repository-route-policy/v1 and local smart HTTP backend
+
+The broker and sandbox now load the same optional
+`repository_route_policy_path` YAML manifest (`repository-route-policy/v1`).
+Its canonical SHA-256 digest is included in each authority profile policy
+digest. Local `local/...` routes are authenticated and policy-checked before
+any GitHub installation or token resolution, then forward only to their fixed
+backend URL without forwarding authorization or broker authority headers.
+
+`cmd/repository-backend` serves only health plus smart-HTTP discovery/RPC for
+the fixed `repository-agent-lifecycle-fixture` bare repository. Its container
+pins Git's hidden-ref, object-want, delete, and non-fast-forward settings and
+installs a pre-receive hook that rejects deletes, out-of-namespace writes, and
+non-ancestor updates. The HTTP boundary accepts only protocol v0 (no
+`Git-Protocol`) and v1 (`Git-Protocol: version=1`), rejecting v2 instead of
+silently downgrading it. Discovery accepts exactly one `service` query key with
+exactly one `git-upload-pack` or `git-receive-pack` value; malformed query
+encoding, extra query keys, and duplicate values are denied. Both smart-HTTP
+RPC paths require an empty query. Deployment
+configuration remains owned by `vps-ops`; use the exact manifest key above and
+the example in `configs/repository-route-policy.example.yaml`. The repository
+root and bare repository are both owned by `65532:65532` with exact `0750`
+mode; health fails closed on either mismatch.
+
+The route manifest is strict YAML and binds exact readable refs
+`refs/heads/main` and `refs/heads/agent/repository-proof/**`, exact writable
+`refs/heads/agent/repository-proof/**`, plus `fast_forward_only` and
+`no_delete`; backend URLs are origin-only and cannot carry credentials, a path,
+query, or fragment. Health checks stat only the configured repository root and
+bare repository, verifying mode, Linux ownership, and read/write access without
+enumerating refs or mutating the repository. `make repository-backend-image-proof`
+builds the target image and exercises health/mode negatives plus real smart-HTTP
+v0/v1 advertisements, hidden-tip rejection, deletion, non-fast-forward, and
+stale expected-old update rejection.
+
 `gh-agent-broker` provides deny-by-default GitHub policy enforcement, sandbox
 lifecycle management, fixed operator launch profiles, durable idempotent launch
 intents, recovery/reconciliation, scoped run visibility, and brokered GitHub

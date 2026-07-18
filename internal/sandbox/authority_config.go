@@ -27,23 +27,24 @@ type AuthorityProfile struct {
 	// Command is deliberately not configurable by callers.  The only accepted
 	// authority worker process is the agentd bootstrap command from agentd's
 	// immutable OCI contract.
-	Command             []string         `json:"command" yaml:"command"`
-	Resources           Resources        `json:"resources" yaml:"resources"`
-	NetworkPolicy       string           `json:"network_policy" yaml:"network_policy"`
-	BrokerAgentID       string           `json:"broker_agent_id" yaml:"broker_agent_id"`
-	BrokerSecretEnv     string           `json:"broker_agent_secret_env" yaml:"broker_agent_secret_env"`
-	CoordinatorTokenEnv string           `json:"coordinator_token_env" yaml:"coordinator_token_env"`
-	AgentdReadiness     *AgentdReadiness `json:"agentd_readiness,omitempty" yaml:"agentd_readiness,omitempty"`
-	CredentialBundle    string           `json:"credential_bundle,omitempty" yaml:"credential_bundle"`
-	Repositories        []string         `json:"repositories" yaml:"repositories"`
-	BranchPolicy        BranchPolicy     `json:"branch_policy" yaml:"branch_policy"`
-	Operations          []string         `json:"operations" yaml:"operations"`
-	ExtraMounts         []ExtraMount     `json:"extra_mounts,omitempty" yaml:"extra_mounts"`
-	SessionIsolation    SessionIsolation `json:"session_isolation" yaml:"session_isolation"`
-	Checkpoint          CheckpointPolicy `json:"checkpoint" yaml:"checkpoint"`
-	Storage             AuthorityStorage `json:"storage" yaml:"storage"`
-	MaxWorkers          int              `json:"max_workers" yaml:"max_workers"`
-	SessionCapacity     int              `json:"session_capacity" yaml:"session_capacity"`
+	Command                     []string         `json:"command" yaml:"command"`
+	Resources                   Resources        `json:"resources" yaml:"resources"`
+	NetworkPolicy               string           `json:"network_policy" yaml:"network_policy"`
+	BrokerAgentID               string           `json:"broker_agent_id" yaml:"broker_agent_id"`
+	BrokerSecretEnv             string           `json:"broker_agent_secret_env" yaml:"broker_agent_secret_env"`
+	CoordinatorTokenEnv         string           `json:"coordinator_token_env" yaml:"coordinator_token_env"`
+	AgentdReadiness             *AgentdReadiness `json:"agentd_readiness,omitempty" yaml:"agentd_readiness,omitempty"`
+	CredentialBundle            string           `json:"credential_bundle,omitempty" yaml:"credential_bundle"`
+	Repositories                []string         `json:"repositories" yaml:"repositories"`
+	BranchPolicy                BranchPolicy     `json:"branch_policy" yaml:"branch_policy"`
+	Operations                  []string         `json:"operations" yaml:"operations"`
+	ExtraMounts                 []ExtraMount     `json:"extra_mounts,omitempty" yaml:"extra_mounts"`
+	SessionIsolation            SessionIsolation `json:"session_isolation" yaml:"session_isolation"`
+	Checkpoint                  CheckpointPolicy `json:"checkpoint" yaml:"checkpoint"`
+	Storage                     AuthorityStorage `json:"storage" yaml:"storage"`
+	RepositoryRoutePolicyDigest string           `json:"repository_route_policy_digest,omitempty" yaml:"repository_route_policy_digest,omitempty"`
+	MaxWorkers                  int              `json:"max_workers" yaml:"max_workers"`
+	SessionCapacity             int              `json:"session_capacity" yaml:"session_capacity"`
 }
 
 // AgentdReadiness versions the authenticated worker-generation attestation.

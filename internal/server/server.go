@@ -32,6 +32,7 @@ import (
 	"gh-agent-broker/internal/metadata"
 	"gh-agent-broker/internal/policy"
 	"gh-agent-broker/internal/pushtripwire"
+	"gh-agent-broker/internal/repositoryroutepolicy"
 	"gh-agent-broker/internal/securityscan"
 )
 
@@ -1870,12 +1871,6 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported git operation", http.StatusBadRequest)
 		return
 	}
-	appName := config.GitHubAppName(principal.Agent)
-	inst, ok := cfg.InstallationIDForApp(appName, repo)
-	if !ok {
-		http.Error(w, "repository has no configured GitHub App installation", http.StatusForbidden)
-		return
-	}
 	var bodyReader io.Reader = r.Body
 	branch := ""
 	var updates []receivePackUpdate
@@ -1964,6 +1959,33 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			Extra:       map[string]interface{}{"attempted_operation": operation, "surface": "git_receive_pack"},
 		})
 		writeGitPolicyError(w, r, s.errorResponse(opID, "security_egress_blocked", "opaque Git push denied by security policy", &result))
+		return
+	}
+	if strings.HasPrefix(repo, "local/") {
+		route, found := localRepositoryRoute(cfg, repo)
+		if !found {
+			http.Error(w, "local repository is not configured", http.StatusForbidden)
+			return
+		}
+		if operation == "git.receive-pack" && r.Method == http.MethodPost {
+			for _, update := range updates {
+				if update.After == strings.Repeat("0", 40) || !route.AllowsWrite(update.Ref) {
+					s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, update.Ref, "local_ref_policy_denied", "local pushes must be non-deleting updates in the configured writable namespace")
+					return
+				}
+			}
+			if !s.localReceivePackBeforeMatches(r.Context(), route, repo, updates) {
+				s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, branch, "ref_before_mismatch", "advertised ref state no longer matches the repository backend")
+				return
+			}
+		}
+		s.forwardLocalGit(w, r, opID, principal.ID, repo, branch, operation, result, route, suffix, bodyReader)
+		return
+	}
+	appName := config.GitHubAppName(principal.Agent)
+	inst, ok := cfg.InstallationIDForApp(appName, repo)
+	if !ok {
+		http.Error(w, "repository has no configured GitHub App installation", http.StatusForbidden)
 		return
 	}
 	guardResult := s.checkBranchLifecycle(opID, gh, appName, inst, repo, branch, operation, principal.Agent)
@@ -2254,20 +2276,32 @@ func parseGitPath(path string) (repo, suffix string, ok bool) {
 
 func gitOperation(r *http.Request, suffix string) string {
 	if r.Method == http.MethodGet && suffix == "/info/refs" {
-		switch r.URL.Query().Get("service") {
+		service, ok := gitDiscoveryService(r.URL.RawQuery)
+		if !ok {
+			return ""
+		}
+		switch service {
 		case "git-upload-pack":
 			return "git.upload-pack"
 		case "git-receive-pack":
 			return "git.receive-pack"
 		}
 	}
-	if r.Method == http.MethodPost && suffix == "/git-upload-pack" {
+	if r.Method == http.MethodPost && r.URL.RawQuery == "" && suffix == "/git-upload-pack" {
 		return "git.upload-pack"
 	}
-	if r.Method == http.MethodPost && suffix == "/git-receive-pack" {
+	if r.Method == http.MethodPost && r.URL.RawQuery == "" && suffix == "/git-receive-pack" {
 		return "git.receive-pack"
 	}
 	return ""
+}
+
+func gitDiscoveryService(rawQuery string) (string, bool) {
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil || len(query) != 1 || len(query["service"]) != 1 {
+		return "", false
+	}
+	return query["service"][0], true
 }
 
 func gitUpstreamURL(base, repo, suffix, rawQuery string) (string, error) {
@@ -2277,6 +2311,109 @@ func gitUpstreamURL(base, repo, suffix, rawQuery string) (string, error) {
 	}
 	u.RawQuery = rawQuery
 	return u.String(), nil
+}
+
+func localRepositoryRoute(cfg *config.Config, repo string) (repositoryroutepolicy.Route, bool) {
+	if cfg.RepositoryRoutePolicy == nil {
+		return repositoryroutepolicy.Route{}, false
+	}
+	return cfg.RepositoryRoutePolicy.Route(repo)
+}
+
+func localGitURL(route repositoryroutepolicy.Route, repo, suffix, rawQuery string) (string, error) {
+	name := strings.TrimPrefix(repo, "local/")
+	u, err := url.Parse(strings.TrimRight(route.BackendURL, "/") + "/" + name + ".git" + suffix)
+	if err != nil {
+		return "", err
+	}
+	u.RawQuery = rawQuery
+	return u.String(), nil
+}
+
+// localReceivePackBeforeMatches obtains the backend's advertised receive refs immediately
+// before the push is forwarded. The backend owns the final transaction check as well.
+func (s *Server) localReceivePackBeforeMatches(ctx context.Context, route repositoryroutepolicy.Route, repo string, updates []receivePackUpdate) bool {
+	u, err := localGitURL(route, repo, "/info/refs", "service=git-receive-pack")
+	if err != nil {
+		return false
+	}
+	//nolint:gosec // URL is constructed solely from the reviewed route manifest.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return false
+	}
+	//nolint:gosec // request target is constrained by the reviewed route manifest.
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return false
+	}
+	defer closeBody(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return false
+	}
+	refs := advertisedRefs(b)
+	zero := strings.Repeat("0", 40)
+	for _, update := range updates {
+		current, found := refs[update.Ref]
+		if (update.Before == zero && found) || (update.Before != zero && (!found || current != update.Before)) {
+			return false
+		}
+	}
+	return true
+}
+
+func advertisedRefs(body []byte) map[string]string {
+	refs := map[string]string{}
+	for i := 0; i+4 <= len(body); {
+		n, err := strconv.ParseInt(string(body[i:i+4]), 16, 32)
+		if err != nil || n < 4 || i+int(n) > len(body) {
+			break
+		}
+		if n == 0 {
+			i += 4
+			continue
+		}
+		line := string(body[i+4 : i+int(n)])
+		fields := strings.Fields(strings.TrimPrefix(line, "\x01"))
+		if len(fields) >= 2 && githubSHA.MatchString(fields[0]) {
+			refs[fields[1]] = fields[0]
+		}
+		i += int(n)
+	}
+	return refs
+}
+
+func (s *Server) forwardLocalGit(w http.ResponseWriter, r *http.Request, opID, agentID, repo, branch, operation string, result policy.Result, route repositoryroutepolicy.Route, suffix string, body io.Reader) {
+	u, err := localGitURL(route, repo, suffix, r.URL.RawQuery)
+	if err != nil {
+		http.Error(w, "invalid local backend URL", http.StatusBadGateway)
+		return
+	}
+	//nolint:gosec // URL is constructed solely from the reviewed route manifest.
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, u, body)
+	if err != nil {
+		http.Error(w, "invalid local backend request", http.StatusBadGateway)
+		return
+	}
+	req.ContentLength = r.ContentLength
+	copyGitHeaders(req.Header, r.Header)
+	//nolint:gosec // request target is constrained by the reviewed route manifest.
+	resp, err := s.http.Do(req)
+	if err != nil {
+		http.Error(w, "repository backend unavailable", http.StatusBadGateway)
+		return
+	}
+	defer closeBody(resp.Body)
+	copyGitHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: opID, AgentID: agentID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: "local backend status " + strconv.Itoa(resp.StatusCode)})
 }
 
 func copyGitHeaders(dst, src http.Header) {

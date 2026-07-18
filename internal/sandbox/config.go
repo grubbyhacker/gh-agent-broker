@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"gh-agent-broker/internal/repositoryroutepolicy"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -26,31 +28,33 @@ const (
 )
 
 type Config struct {
-	Listen              string                        `yaml:"listen"`
-	MCPPath             string                        `yaml:"mcp_path"`
-	AuthToken           string                        `yaml:"auth_token"`
-	AuthTokenEnv        string                        `yaml:"auth_token_env"`
-	RunsDir             string                        `yaml:"runs_dir"`
-	LaunchIntentStore   string                        `yaml:"launch_intent_store_path"`
-	AuthorityStore      string                        `yaml:"authority_worker_store_path"`
-	BrokerURL           string                        `yaml:"broker_url"`
-	Production          bool                          `yaml:"production"`
-	Repositories        []string                      `yaml:"repositories"`
-	Networks            map[string]NetworkPolicy      `yaml:"network_policies"`
-	Bundles             map[string]CredentialBundle   `yaml:"credential_bundles"`
-	Templates           map[string]Template           `yaml:"templates"`
-	LaunchProfiles      map[string]LaunchProfile      `yaml:"launch_profiles"`
-	AuthorityProfiles   map[string]AuthorityProfile   `yaml:"authority_profiles"`
-	AuthorityPrincipals map[string]AuthorityPrincipal `yaml:"authority_principals"`
-	OperatorPrincipals  map[string]OperatorPrincipal  `yaml:"operator_principals"`
-	Audit               SandboxAuditConfig            `yaml:"audit"`
-	MaxTaskBytes        int                           `yaml:"max_task_bytes"`
-	MaxParameterBytes   int                           `yaml:"max_parameter_bytes"`
-	LogByteLimit        int                           `yaml:"log_byte_limit"`
-	StopGrace           Duration                      `yaml:"stop_grace"`
-	ResolvedPaths       map[string]CredentialBundle   `yaml:"-"`
-	ConfigLoadedAt      time.Time                     `yaml:"-"`
-	ConfigVersion       string                        `yaml:"-"`
+	Listen                      string                        `yaml:"listen"`
+	MCPPath                     string                        `yaml:"mcp_path"`
+	AuthToken                   string                        `yaml:"auth_token"`
+	AuthTokenEnv                string                        `yaml:"auth_token_env"`
+	RunsDir                     string                        `yaml:"runs_dir"`
+	LaunchIntentStore           string                        `yaml:"launch_intent_store_path"`
+	AuthorityStore              string                        `yaml:"authority_worker_store_path"`
+	BrokerURL                   string                        `yaml:"broker_url"`
+	Production                  bool                          `yaml:"production"`
+	Repositories                []string                      `yaml:"repositories"`
+	RepositoryRoutePolicyPath   string                        `yaml:"repository_route_policy_path"`
+	RepositoryRoutePolicyDigest string                        `yaml:"-"`
+	Networks                    map[string]NetworkPolicy      `yaml:"network_policies"`
+	Bundles                     map[string]CredentialBundle   `yaml:"credential_bundles"`
+	Templates                   map[string]Template           `yaml:"templates"`
+	LaunchProfiles              map[string]LaunchProfile      `yaml:"launch_profiles"`
+	AuthorityProfiles           map[string]AuthorityProfile   `yaml:"authority_profiles"`
+	AuthorityPrincipals         map[string]AuthorityPrincipal `yaml:"authority_principals"`
+	OperatorPrincipals          map[string]OperatorPrincipal  `yaml:"operator_principals"`
+	Audit                       SandboxAuditConfig            `yaml:"audit"`
+	MaxTaskBytes                int                           `yaml:"max_task_bytes"`
+	MaxParameterBytes           int                           `yaml:"max_parameter_bytes"`
+	LogByteLimit                int                           `yaml:"log_byte_limit"`
+	StopGrace                   Duration                      `yaml:"stop_grace"`
+	ResolvedPaths               map[string]CredentialBundle   `yaml:"-"`
+	ConfigLoadedAt              time.Time                     `yaml:"-"`
+	ConfigVersion               string                        `yaml:"-"`
 }
 
 type SandboxAuditConfig struct {
@@ -172,6 +176,17 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.ApplyDefaults()
+	if cfg.RepositoryRoutePolicyPath != "" {
+		policy, err := repositoryroutepolicy.Load(cfg.RepositoryRoutePolicyPath)
+		if err != nil {
+			return Config{}, fmt.Errorf("load repository route policy: %w", err)
+		}
+		cfg.RepositoryRoutePolicyDigest = policy.Digest
+		for name, profile := range cfg.AuthorityProfiles {
+			profile.RepositoryRoutePolicyDigest = policy.Digest
+			cfg.AuthorityProfiles[name] = profile
+		}
+	}
 	cfg.ResolveSecrets()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err

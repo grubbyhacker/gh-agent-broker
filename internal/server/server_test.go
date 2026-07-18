@@ -36,6 +36,26 @@ func TestGitOperation(t *testing.T) {
 	}
 }
 
+func TestGitOperationRejectsMalformedQueryShapes(t *testing.T) {
+	for _, test := range []struct {
+		method string
+		target string
+		suffix string
+	}{
+		{method: http.MethodGet, target: "/git/owner/repo.git/info/refs?service=git-upload-pack&%zz", suffix: "/info/refs"},
+		{method: http.MethodGet, target: "/git/owner/repo.git/info/refs?service=git-receive-pack&%zz", suffix: "/info/refs"},
+		{method: http.MethodPost, target: "/git/owner/repo.git/git-upload-pack?service=git-upload-pack", suffix: "/git-upload-pack"},
+		{method: http.MethodPost, target: "/git/owner/repo.git/git-receive-pack?service=git-receive-pack", suffix: "/git-receive-pack"},
+	} {
+		t.Run(test.target, func(t *testing.T) {
+			req := httptest.NewRequest(test.method, test.target, nil)
+			if got := gitOperation(req, test.suffix); got != "" {
+				t.Fatalf("gitOperation() = %q, want empty", got)
+			}
+		})
+	}
+}
+
 func TestReceivePackUpdatesAndStableRejection(t *testing.T) {
 	body := append(pktLine("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/heads/agent/a\x00 report-status\n"), pktLine("cccccccccccccccccccccccccccccccccccccccc dddddddddddddddddddddddddddddddddddddddd refs/heads/agent/b\n")...)
 	body = append(body, []byte("0000PACK")...)

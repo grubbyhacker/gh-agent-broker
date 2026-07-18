@@ -462,6 +462,19 @@ func TestAuthorityProfileValidationAndDigest(t *testing.T) {
 	if first != second || policy != reorderedPolicy {
 		t.Fatal("profile digest changed under set reordering")
 	}
+	profile.RepositoryRoutePolicyDigest = "route-policy-digest-one"
+	withFirstRouteDigest, _, err := authorityProfileDigest("writer", profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.RepositoryRoutePolicyDigest = "route-policy-digest-two"
+	withSecondRouteDigest, _, err := authorityProfileDigest("writer", profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withFirstRouteDigest == withSecondRouteDigest {
+		t.Fatal("authority profile digest did not bind the repository route policy digest")
+	}
 
 	cfg.Production = true
 	profile.Image = "example.com/agentd:latest"
