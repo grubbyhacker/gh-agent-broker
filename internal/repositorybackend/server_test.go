@@ -35,8 +35,16 @@ func TestOnlyHealthAndSmartHTTPShapesAreAccepted(t *testing.T) {
 		"/repository-agent-lifecycle-fixture.git/info/refs?service=git-upload-pack&extra=1",
 		"/repository-agent-lifecycle-fixture.git/info/refs?service=git-upload-pack&service=git-upload-pack",
 		"/repository-agent-lifecycle-fixture.git/info/refs?service=git-upload-pack&service=git-receive-pack",
+		"/repository-agent-lifecycle-fixture.git/info/refs?service=git-upload-pack&%zz",
+		"/repository-agent-lifecycle-fixture.git/info/refs?service=git-receive-pack&%zz",
+		"/repository-agent-lifecycle-fixture.git/git-upload-pack?service=git-upload-pack",
+		"/repository-agent-lifecycle-fixture.git/git-receive-pack?service=git-receive-pack",
 	} {
-		r := httptest.NewRequest(http.MethodGet, target, nil)
+		method := http.MethodGet
+		if target == "/repository-agent-lifecycle-fixture.git/git-upload-pack?service=git-upload-pack" || target == "/repository-agent-lifecycle-fixture.git/git-receive-pack?service=git-receive-pack" {
+			method = http.MethodPost
+		}
+		r := httptest.NewRequest(method, target, nil)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
 		if w.Code != http.StatusNotFound {

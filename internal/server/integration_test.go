@@ -634,9 +634,19 @@ func TestLocalRepositoryRouteForwardsOnlyReviewedGitTraffic(t *testing.T) {
 	for _, query := range []string{
 		"service=git-upload-pack&extra=1",
 		"service=git-upload-pack&service=git-upload-pack",
+		"service=git-upload-pack&%zz",
+		"service=git-receive-pack&%zz",
 	} {
-		if resp := request(http.MethodGet, "/git/"+repo+".git/info/refs?"+query, nil); resp.Code != http.StatusNotFound {
+		if resp := request(http.MethodGet, "/git/"+repo+".git/info/refs?"+query, nil); resp.Code != http.StatusBadRequest {
 			t.Fatalf("malformed discovery query %q status = %d body=%q", query, resp.Code, resp.Body.String())
+		}
+	}
+	for _, target := range []string{
+		"/git/" + repo + ".git/git-upload-pack?service=git-upload-pack",
+		"/git/" + repo + ".git/git-receive-pack?service=git-receive-pack",
+	} {
+		if resp := request(http.MethodPost, target, bytes.NewReader(nil)); resp.Code != http.StatusBadRequest {
+			t.Fatalf("nonempty RPC query %q status = %d body=%q", target, resp.Code, resp.Body.String())
 		}
 	}
 	if resp := request(http.MethodGet, "/git/"+repo+".git/info/refs?service=git-upload-pack", nil); resp.Code != http.StatusOK || resp.Body.String() != "upload-ok" {
@@ -655,8 +665,8 @@ func TestLocalRepositoryRouteForwardsOnlyReviewedGitTraffic(t *testing.T) {
 			t.Fatalf("rejected local update status = %d body=%q", resp.Code, resp.Body.String())
 		}
 	}
-	if upstreamCalls != 6 { // two refused discovery queries, then upload, approved receive advertisement/RPC, and stale-update advertisement.
-		t.Fatalf("local backend calls = %d, want 6", upstreamCalls)
+	if upstreamCalls != 4 { // upload, approved receive advertisement/RPC, and stale-update advertisement.
+		t.Fatalf("local backend calls = %d, want 4", upstreamCalls)
 	}
 }
 

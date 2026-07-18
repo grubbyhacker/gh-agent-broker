@@ -2276,20 +2276,32 @@ func parseGitPath(path string) (repo, suffix string, ok bool) {
 
 func gitOperation(r *http.Request, suffix string) string {
 	if r.Method == http.MethodGet && suffix == "/info/refs" {
-		switch r.URL.Query().Get("service") {
+		service, ok := gitDiscoveryService(r.URL.RawQuery)
+		if !ok {
+			return ""
+		}
+		switch service {
 		case "git-upload-pack":
 			return "git.upload-pack"
 		case "git-receive-pack":
 			return "git.receive-pack"
 		}
 	}
-	if r.Method == http.MethodPost && suffix == "/git-upload-pack" {
+	if r.Method == http.MethodPost && r.URL.RawQuery == "" && suffix == "/git-upload-pack" {
 		return "git.upload-pack"
 	}
-	if r.Method == http.MethodPost && suffix == "/git-receive-pack" {
+	if r.Method == http.MethodPost && r.URL.RawQuery == "" && suffix == "/git-receive-pack" {
 		return "git.receive-pack"
 	}
 	return ""
+}
+
+func gitDiscoveryService(rawQuery string) (string, bool) {
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil || len(query) != 1 || len(query["service"]) != 1 {
+		return "", false
+	}
+	return query["service"][0], true
 }
 
 func gitUpstreamURL(base, repo, suffix, rawQuery string) (string, error) {

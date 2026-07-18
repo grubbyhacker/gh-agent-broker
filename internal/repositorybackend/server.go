@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -68,7 +69,7 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	base := "/" + h.cfg.RepositoryName + ".git"
 	_, discoveryValid := discoveryService(r)
-	valid := (r.Method == http.MethodGet && r.URL.Path == base+"/info/refs" && discoveryValid) || (r.Method == http.MethodPost && (r.URL.Path == base+"/git-upload-pack" || r.URL.Path == base+"/git-receive-pack"))
+	valid := (r.Method == http.MethodGet && r.URL.Path == base+"/info/refs" && discoveryValid) || (r.Method == http.MethodPost && r.URL.RawQuery == "" && (r.URL.Path == base+"/git-upload-pack" || r.URL.Path == base+"/git-receive-pack"))
 	if !valid {
 		http.NotFound(w, r)
 		return
@@ -107,7 +108,10 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func discoveryService(r *http.Request) (string, bool) {
-	query := r.URL.Query()
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return "", false
+	}
 	if len(query) != 1 || len(query["service"]) != 1 {
 		return "", false
 	}
