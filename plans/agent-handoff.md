@@ -14,8 +14,8 @@ backend URL without forwarding authorization or broker authority headers.
 `cmd/repository-backend` serves only health plus smart-HTTP discovery/RPC for
 the fixed `repository-agent-lifecycle-fixture` bare repository. Its container
 pins Git's hidden-ref, object-want, delete, and non-fast-forward settings and
-installs a pre-receive hook that rejects out-of-namespace writes independently
-of Git's receive policy. The HTTP boundary accepts only protocol v0 (no
+installs a pre-receive hook that rejects deletes, out-of-namespace writes, and
+non-ancestor updates. The HTTP boundary accepts only protocol v0 (no
 `Git-Protocol`) and v1 (`Git-Protocol: version=1`), rejecting v2 instead of
 silently downgrading it. Deployment
 configuration remains owned by `vps-ops`; use the exact manifest key above and

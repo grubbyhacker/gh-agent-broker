@@ -58,7 +58,7 @@ fi
 docker exec -u 0 "$container" chmod 0750 /var/lib/repository-backend/repository-agent-lifecycle-fixture.git
 curl --fail --silent "http://127.0.0.1:${port}/healthz" >/dev/null || fail "health did not recover after mode restoration"
 
-docker exec -u 65532:65532 "$container" git -c safe.directory=/seed -C /var/lib/repository-backend/repository-agent-lifecycle-fixture.git fetch /seed \
+docker exec -u 65532:65532 "$container" git -c safe.directory=/seed/.git -C /var/lib/repository-backend/repository-agent-lifecycle-fixture.git fetch /seed \
   refs/heads/main:refs/heads/main \
   refs/heads/hidden:refs/heads/hidden \
   refs/heads/agent/repository-proof/initial:refs/heads/agent/repository-proof/initial >/dev/null
@@ -81,7 +81,7 @@ git -C "$tmp/writer-a" config user.name proof
 git -C "$tmp/writer-a" config protocol.version 1
 git -C "$tmp/writer-a" fetch origin refs/heads/agent/repository-proof/initial:refs/remotes/origin/proof
 git -C "$tmp/writer-a" checkout -b proof origin/proof >/dev/null
-EXPECT_REJECTION='deletion prohibited' expect_rejected git -C "$tmp/writer-a" push origin :refs/heads/agent/repository-proof/initial
+EXPECT_REJECTION='deletion rejected' expect_rejected git -C "$tmp/writer-a" push origin :refs/heads/agent/repository-proof/initial
 EXPECT_REJECTION='outside writable namespace' expect_rejected git -C "$tmp/writer-a" push origin HEAD:refs/tags/repository-proof-outside
 printf 'fast-forward\n' >>"$tmp/writer-a/agent"
 git -C "$tmp/writer-a" commit -am fast-forward >/dev/null
@@ -89,7 +89,7 @@ git -C "$tmp/writer-a" push origin HEAD:refs/heads/agent/repository-proof/initia
 git -C "$tmp/writer-a" reset --hard HEAD~1 >/dev/null
 printf 'force\n' >>"$tmp/writer-a/agent"
 git -C "$tmp/writer-a" commit -am force >/dev/null
-EXPECT_REJECTION='non-fast-forward' expect_rejected git -C "$tmp/writer-a" push --force origin HEAD:refs/heads/agent/repository-proof/initial
+EXPECT_REJECTION='non-fast-forward rejected' expect_rejected git -C "$tmp/writer-a" push --force origin HEAD:refs/heads/agent/repository-proof/initial
 
 cas="$tmp/writer-a"
 git -C "$cas" fetch origin refs/heads/agent/repository-proof/initial:refs/remotes/origin/proof
