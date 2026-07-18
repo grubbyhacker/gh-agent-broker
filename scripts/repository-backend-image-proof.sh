@@ -58,7 +58,8 @@ fi
 docker exec -u 0 "$container" chmod 0750 /var/lib/repository-backend/repository-agent-lifecycle-fixture.git
 curl --fail --silent "http://127.0.0.1:${port}/healthz" >/dev/null || fail "health did not recover after mode restoration"
 
-docker exec -u 65532:65532 "$container" git -c safe.directory=/seed/.git -C /var/lib/repository-backend/repository-agent-lifecycle-fixture.git fetch /seed \
+docker exec -u 65532:65532 "$container" env HOME=/tmp git config --global --add safe.directory /seed/.git
+docker exec -u 65532:65532 "$container" env HOME=/tmp git -C /var/lib/repository-backend/repository-agent-lifecycle-fixture.git fetch /seed \
   refs/heads/main:refs/heads/main \
   refs/heads/hidden:refs/heads/hidden \
   refs/heads/agent/repository-proof/initial:refs/heads/agent/repository-proof/initial >/dev/null
