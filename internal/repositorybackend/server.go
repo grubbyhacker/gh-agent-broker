@@ -67,7 +67,8 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	base := "/" + h.cfg.RepositoryName + ".git"
-	valid := (r.Method == http.MethodGet && r.URL.Path == base+"/info/refs" && (r.URL.Query().Get("service") == "git-upload-pack" || r.URL.Query().Get("service") == "git-receive-pack")) || (r.Method == http.MethodPost && (r.URL.Path == base+"/git-upload-pack" || r.URL.Path == base+"/git-receive-pack"))
+	_, discoveryValid := discoveryService(r)
+	valid := (r.Method == http.MethodGet && r.URL.Path == base+"/info/refs" && discoveryValid) || (r.Method == http.MethodPost && (r.URL.Path == base+"/git-upload-pack" || r.URL.Path == base+"/git-receive-pack"))
 	if !valid {
 		http.NotFound(w, r)
 		return
@@ -103,6 +104,15 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, bytes.NewReader(body)); err != nil {
 		return
 	}
+}
+
+func discoveryService(r *http.Request) (string, bool) {
+	query := r.URL.Query()
+	if len(query) != 1 || len(query["service"]) != 1 {
+		return "", false
+	}
+	service := query["service"][0]
+	return service, service == "git-upload-pack" || service == "git-receive-pack"
 }
 
 // acceptedProtocol pins this backend to v0 (no header) and v1. Git protocol v2

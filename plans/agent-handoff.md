@@ -17,7 +17,9 @@ pins Git's hidden-ref, object-want, delete, and non-fast-forward settings and
 installs a pre-receive hook that rejects deletes, out-of-namespace writes, and
 non-ancestor updates. The HTTP boundary accepts only protocol v0 (no
 `Git-Protocol`) and v1 (`Git-Protocol: version=1`), rejecting v2 instead of
-silently downgrading it. Deployment
+silently downgrading it. Discovery accepts exactly one `service` query key with
+exactly one `git-upload-pack` or `git-receive-pack` value; extra query keys and
+duplicate values are denied. Deployment
 configuration remains owned by `vps-ops`; use the exact manifest key above and
 the example in `configs/repository-route-policy.example.yaml`. The repository
 root and bare repository are both owned by `65532:65532` with exact `0750`

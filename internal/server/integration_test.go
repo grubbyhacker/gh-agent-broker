@@ -586,9 +586,9 @@ func TestLocalRepositoryRouteForwardsOnlyReviewedGitTraffic(t *testing.T) {
 			t.Fatal("broker credentials or authority headers reached local backend")
 		}
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/repository-agent-lifecycle-fixture.git/info/refs" && r.URL.Query().Get("service") == "git-upload-pack":
+		case r.Method == http.MethodGet && r.URL.Path == "/repository-agent-lifecycle-fixture.git/info/refs" && r.URL.RawQuery == "service=git-upload-pack":
 			writeTestBody(t, w, "upload-ok")
-		case r.Method == http.MethodGet && r.URL.Path == "/repository-agent-lifecycle-fixture.git/info/refs" && r.URL.Query().Get("service") == "git-receive-pack":
+		case r.Method == http.MethodGet && r.URL.Path == "/repository-agent-lifecycle-fixture.git/info/refs" && r.URL.RawQuery == "service=git-receive-pack":
 			w.WriteHeader(http.StatusOK)
 			if _, err := w.Write(pktLine(old + " " + branch + "\n")); err != nil {
 				t.Fatal(err)
@@ -599,7 +599,7 @@ func TestLocalRepositoryRouteForwardsOnlyReviewedGitTraffic(t *testing.T) {
 			}
 			writeTestBody(t, w, "receive-ok")
 		default:
-			t.Fatalf("unexpected local backend request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			http.NotFound(w, r)
 		}
 	}))
 	defer backend.Close()
@@ -631,6 +631,14 @@ func TestLocalRepositoryRouteForwardsOnlyReviewedGitTraffic(t *testing.T) {
 		broker.ServeHTTP(resp, req)
 		return resp
 	}
+	for _, query := range []string{
+		"service=git-upload-pack&extra=1",
+		"service=git-upload-pack&service=git-upload-pack",
+	} {
+		if resp := request(http.MethodGet, "/git/"+repo+".git/info/refs?"+query, nil); resp.Code != http.StatusNotFound {
+			t.Fatalf("malformed discovery query %q status = %d body=%q", query, resp.Code, resp.Body.String())
+		}
+	}
 	if resp := request(http.MethodGet, "/git/"+repo+".git/info/refs?service=git-upload-pack", nil); resp.Code != http.StatusOK || resp.Body.String() != "upload-ok" {
 		t.Fatalf("upload response = %d %q", resp.Code, resp.Body.String())
 	}
@@ -647,8 +655,8 @@ func TestLocalRepositoryRouteForwardsOnlyReviewedGitTraffic(t *testing.T) {
 			t.Fatalf("rejected local update status = %d body=%q", resp.Code, resp.Body.String())
 		}
 	}
-	if upstreamCalls != 4 { // upload, approved receive advertisement/RPC, and stale-update advertisement.
-		t.Fatalf("local backend calls = %d, want 4", upstreamCalls)
+	if upstreamCalls != 6 { // two refused discovery queries, then upload, approved receive advertisement/RPC, and stale-update advertisement.
+		t.Fatalf("local backend calls = %d, want 6", upstreamCalls)
 	}
 }
 
