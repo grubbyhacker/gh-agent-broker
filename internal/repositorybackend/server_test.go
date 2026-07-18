@@ -11,19 +11,19 @@ import (
 func TestOnlyHealthAndSmartHTTPShapesAreAccepted(t *testing.T) {
 	dir := t.TempDir()
 	//nolint:gosec // health contract intentionally requires the production repository mode.
-	if err := os.Chmod(dir, 0o755); err != nil {
+	if err := os.Chmod(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	repo := filepath.Join(dir, "repository-agent-lifecycle-fixture.git")
 	//nolint:gosec // health contract intentionally requires the production repository mode.
-	if err := os.Mkdir(repo, 0o755); err != nil {
+	if err := os.Mkdir(repo, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	//nolint:gosec // Git's HEAD must be readable by the repository service.
 	if err := os.WriteFile(filepath.Join(repo, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h, err := New(Config{RepositoryPath: repo, RepositoryName: "repository-agent-lifecycle-fixture", ExpectedUID: os.Getuid(), ExpectedGID: os.Getgid(), RepositoryMode: 0o755})
+	h, err := New(Config{RepositoryPath: repo, RepositoryName: "repository-agent-lifecycle-fixture", ExpectedUID: os.Getuid(), ExpectedGID: os.Getgid(), RepositoryMode: 0o750})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestOnlyHealthAndSmartHTTPShapesAreAccepted(t *testing.T) {
 func TestHealthFailsClosedForRepositoryOwnershipAndMode(t *testing.T) {
 	dir := t.TempDir()
 	//nolint:gosec // health contract intentionally requires the production repository mode.
-	if err := os.Chmod(dir, 0o755); err != nil {
+	if err := os.Chmod(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	repo := filepath.Join(dir, "repo.git")
@@ -57,7 +57,7 @@ func TestHealthFailsClosedForRepositoryOwnershipAndMode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h, err := New(Config{RepositoryPath: repo, RepositoryName: "repo", ExpectedUID: os.Getuid(), ExpectedGID: os.Getgid(), RepositoryMode: 0o755})
+	h, err := New(Config{RepositoryPath: repo, RepositoryName: "repo", ExpectedUID: os.Getuid(), ExpectedGID: os.Getgid(), RepositoryMode: 0o750})
 	if err != nil {
 		t.Fatal(err)
 	}

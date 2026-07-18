@@ -15,7 +15,7 @@ func main() {
 	repository := flag.String("repository", "/var/lib/repository-backend/repository-agent-lifecycle-fixture.git", "absolute bare repository path")
 	name := flag.String("repository-name", "repository-agent-lifecycle-fixture", "fixed repository name")
 	flag.Parse()
-	h, err := repositorybackend.New(repositorybackend.Config{RepositoryPath: *repository, RepositoryName: *name, ExpectedUID: os.Getuid(), ExpectedGID: os.Getgid(), RepositoryMode: 0o755})
+	h, err := repositorybackend.New(repositorybackend.Config{RepositoryPath: *repository, RepositoryName: *name, ExpectedUID: os.Getuid(), ExpectedGID: os.Getgid(), RepositoryMode: 0o750})
 	if err != nil {
 		log.Fatal(err)
 	}

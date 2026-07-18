@@ -24,6 +24,7 @@ import (
 	"gh-agent-broker/internal/config"
 	"gh-agent-broker/internal/githubapp"
 	"gh-agent-broker/internal/pushtripwire"
+	"gh-agent-broker/internal/repositoryroutepolicy"
 )
 
 func TestFakeGitHubRESTIntegration(t *testing.T) {
@@ -564,6 +565,90 @@ func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 
 	if !sawUploadPack || !sawReceivePack {
 		t.Fatalf("fake Git handlers were not all exercised: upload=%v receive=%v", sawUploadPack, sawReceivePack)
+	}
+}
+
+func TestLocalRepositoryRouteForwardsOnlyReviewedGitTraffic(t *testing.T) {
+	const (
+		repo   = "local/repository-agent-lifecycle-fixture"
+		old    = "1111111111111111111111111111111111111111"
+		new    = "2222222222222222222222222222222222222222"
+		branch = "refs/heads/agent/repository-proof/test"
+	)
+	var upstreamCalls int
+	var backendHost string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		if r.Host != backendHost {
+			t.Fatalf("unexpected backend host %q", r.Host)
+		}
+		if r.Header.Get("Authorization") != "" || r.Header.Get("X-Agent-ID") != "" || r.Header.Get("X-Agent-Secret") != "" || r.Header.Get("X-Admin-Secret") != "" {
+			t.Fatal("broker credentials or authority headers reached local backend")
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repository-agent-lifecycle-fixture.git/info/refs" && r.URL.Query().Get("service") == "git-upload-pack":
+			writeTestBody(t, w, "upload-ok")
+		case r.Method == http.MethodGet && r.URL.Path == "/repository-agent-lifecycle-fixture.git/info/refs" && r.URL.Query().Get("service") == "git-receive-pack":
+			w.WriteHeader(http.StatusOK)
+			if _, err := w.Write(pktLine(old + " " + branch + "\n")); err != nil {
+				t.Fatal(err)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/repository-agent-lifecycle-fixture.git/git-receive-pack":
+			if !strings.Contains(readBody(t, r), branch) {
+				t.Fatal("receive-pack update was not forwarded")
+			}
+			writeTestBody(t, w, "receive-ok")
+		default:
+			t.Fatalf("unexpected local backend request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer backend.Close()
+	backendHost = strings.TrimPrefix(backend.URL, "http://")
+
+	broker := newTestBroker(t, "http://github-api-must-not-be-called.invalid", "http://github-git-must-not-be-called.invalid", config.Agent{
+		ID: "agent-1", Enabled: true, Secret: "agent-secret", Repositories: []string{repo}, Operations: []string{"git.upload-pack", "git.receive-pack"}, BranchPatterns: []string{"^refs/heads/agent/repository-proof/.+$"},
+	})
+	policyPath := filepath.Join(t.TempDir(), "repository-route-policy.yaml")
+	policyYAML := "version: repository-route-policy/v1\nroutes:\n- repository: " + repo + "\n  backend_url: " + backend.URL + "\n  readable_refs: [refs/heads/main, refs/heads/agent/repository-proof/**]\n  writable_refs: [refs/heads/agent/repository-proof/**]\n  fast_forward_only: true\n  no_delete: true\n"
+	if err := os.WriteFile(policyPath, []byte(policyYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	routePolicy, err := repositoryroutepolicy.Load(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := broker.snapshot()
+	cfg.RepositoryRoutePolicy = routePolicy
+
+	request := func(method, target string, body io.Reader) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, body)
+		req.Header.Set("X-Agent-ID", "agent-1")
+		req.Header.Set("X-Agent-Secret", "agent-secret")
+		req.Header.Set("X-Admin-Secret", "must-not-forward")
+		req.Header.Set("Authorization", "Bearer must-not-forward")
+		req.Header.Set("Git-Protocol", "version=1")
+		resp := httptest.NewRecorder()
+		broker.ServeHTTP(resp, req)
+		return resp
+	}
+	if resp := request(http.MethodGet, "/git/"+repo+".git/info/refs?service=git-upload-pack", nil); resp.Code != http.StatusOK || resp.Body.String() != "upload-ok" {
+		t.Fatalf("upload response = %d %q", resp.Code, resp.Body.String())
+	}
+	valid := append(pktLine(old+" "+new+" "+branch+"\x00report-status\n"), []byte("0000")...)
+	if resp := request(http.MethodPost, "/git/"+repo+".git/git-receive-pack", bytes.NewReader(valid)); resp.Code != http.StatusOK || resp.Body.String() != "receive-ok" {
+		t.Fatalf("receive response = %d %q", resp.Code, resp.Body.String())
+	}
+	for _, body := range [][]byte{
+		append(pktLine(old+" "+strings.Repeat("0", 40)+" "+branch+"\x00report-status\n"), []byte("0000")...),
+		append(pktLine(old+" "+new+" refs/heads/main\x00report-status\n"), []byte("0000")...),
+		append(pktLine(strings.Repeat("3", 40)+" "+new+" "+branch+"\x00report-status\n"), []byte("0000")...),
+	} {
+		if resp := request(http.MethodPost, "/git/"+repo+".git/git-receive-pack", bytes.NewReader(body)); resp.Code != http.StatusForbidden {
+			t.Fatalf("rejected local update status = %d body=%q", resp.Code, resp.Body.String())
+		}
+	}
+	if upstreamCalls != 4 { // upload, approved receive advertisement/RPC, and stale-update advertisement.
+		t.Fatalf("local backend calls = %d, want 4", upstreamCalls)
 	}
 }
 

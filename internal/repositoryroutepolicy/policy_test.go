@@ -49,6 +49,17 @@ func TestLoadFailsClosedForUnknownAndUnsafeRouteFields(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsSecondYAMLDocument(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	content := "version: repository-route-policy/v1\nroutes:\n- repository: local/a\n  backend_url: http://backend\n  readable_refs: [refs/heads/main, refs/heads/agent/repository-proof/**]\n  writable_refs: [refs/heads/agent/repository-proof/**]\n  fast_forward_only: true\n  no_delete: true\n---\nroutes:\n- repository: local/a\n  backend_url: http://attacker\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load accepted a second YAML document")
+	}
+}
+
 func TestDigestChangesForEveryContractField(t *testing.T) {
 	dir := t.TempDir()
 	base := "version: repository-route-policy/v1\nroutes:\n- repository: local/a\n  backend_url: http://backend\n  readable_refs: [refs/heads/main, refs/heads/agent/repository-proof/**]\n  writable_refs: [refs/heads/agent/repository-proof/**]\n  fast_forward_only: true\n  no_delete: true\n"

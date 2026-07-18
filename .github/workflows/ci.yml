@@ -173,7 +173,7 @@ jobs:
     if: needs.changed-paths.outputs.repository-backend-image == 'true'
     steps:
       - uses: actions/checkout@v7
-      - run: docker build -f Dockerfile.repository-backend -t gh-agent-broker/repository-backend:ci .
+      - run: make repository-backend-image-proof
 
   publish-image:
     runs-on: ubuntu-latest

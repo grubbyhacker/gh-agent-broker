@@ -38,7 +38,7 @@ func (c Config) Validate() error {
 
 func New(cfg Config) (http.Handler, error) {
 	if cfg.RepositoryMode == 0 {
-		cfg.RepositoryMode = 0o755
+		cfg.RepositoryMode = 0o750
 	}
 	if cfg.ExpectedUID == 0 {
 		cfg.ExpectedUID = os.Getuid()

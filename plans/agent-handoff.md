@@ -19,7 +19,9 @@ non-ancestor updates. The HTTP boundary accepts only protocol v0 (no
 `Git-Protocol`) and v1 (`Git-Protocol: version=1`), rejecting v2 instead of
 silently downgrading it. Deployment
 configuration remains owned by `vps-ops`; use the exact manifest key above and
-the example in `configs/repository-route-policy.example.yaml`.
+the example in `configs/repository-route-policy.example.yaml`. The repository
+root and bare repository are both owned by `65532:65532` with exact `0750`
+mode; health fails closed on either mismatch.
 
 The route manifest is strict YAML and binds exact readable refs
 `refs/heads/main` and `refs/heads/agent/repository-proof/**`, exact writable
@@ -27,7 +29,10 @@ The route manifest is strict YAML and binds exact readable refs
 `no_delete`; backend URLs are origin-only and cannot carry credentials, a path,
 query, or fragment. Health checks stat only the configured repository root and
 bare repository, verifying mode, Linux ownership, and read/write access without
-enumerating refs or mutating the repository.
+enumerating refs or mutating the repository. `make repository-backend-image-proof`
+builds the target image and exercises health/mode negatives plus real smart-HTTP
+v0/v1 advertisements, hidden-tip rejection, deletion, non-fast-forward, and
+stale expected-old update rejection.
 
 `gh-agent-broker` provides deny-by-default GitHub policy enforcement, sandbox
 lifecycle management, fixed operator launch profiles, durable idempotent launch

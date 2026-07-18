@@ -2,10 +2,15 @@
 set -eu
 
 repo="${REPOSITORY_PATH:-/var/lib/repository-backend/repository-agent-lifecycle-fixture.git}"
+root=$(dirname "$repo")
+mkdir -p "$root"
+chmod 0750 "$root"
 if [ ! -d "$repo" ]; then
   git init --bare "$repo"
 fi
+chmod 0750 "$repo"
 git -C "$repo" config http.getanyfile false
+git -C "$repo" config http.receivepack true
 git -C "$repo" config uploadpack.hideRefs refs/heads/
 git -C "$repo" config --add uploadpack.hideRefs '!refs/heads/main'
 git -C "$repo" config --add uploadpack.hideRefs '!refs/heads/agent/repository-proof/'

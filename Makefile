@@ -12,7 +12,7 @@ GOVULNCHECK_VERSION := v1.1.4
 GOFILES := $(shell find . -name '*.go' -not -path './.git/*' -not -path './.tools/*')
 PACKAGES := ./...
 
-.PHONY: check ci fmt fmt-check lint test race vuln build tidy-check tools clean-tools smoke-container sandbox-e2e sandbox-e2e-fast proxy-codex-e2e
+.PHONY: check ci fmt fmt-check lint test race vuln build tidy-check tools clean-tools smoke-container sandbox-e2e sandbox-e2e-fast proxy-codex-e2e repository-backend-image-proof
 
 check: fmt-check tidy-check lint test race vuln build
 
@@ -56,6 +56,10 @@ sandbox-e2e-fast:
 
 proxy-codex-e2e:
 	./scripts/proxy-codex-e2e.sh
+
+repository-backend-image-proof:
+	docker build -f Dockerfile.repository-backend -t gh-agent-broker/repository-backend:proof .
+	./scripts/repository-backend-image-proof.sh
 
 tidy-check:
 	@tmp="$$(mktemp -d)"; \

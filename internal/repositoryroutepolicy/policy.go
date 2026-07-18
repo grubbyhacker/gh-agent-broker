@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"regexp"
@@ -46,6 +47,13 @@ func Load(path string) (*Policy, error) {
 	decoder := yaml.NewDecoder(strings.NewReader(string(b)))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&m); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("repository route policy must contain exactly one YAML document")
+		}
 		return nil, err
 	}
 	if m.Version != Version {
