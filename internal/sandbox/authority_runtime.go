@@ -263,8 +263,34 @@ func (r *DockerAuthorityRuntime) RebindAgentdSession(ctx context.Context, worker
 	return postAgentdRebind(ctx, r.httpClient, endpoint, token, rebind)
 }
 
+func (r *DockerAuthorityRuntime) AdoptRegisteredAgentdSession(ctx context.Context, worker AuthorityWorker, sessionID string, adoption agentdRegisteredAdoptRequest) (agentdSessionStatus, error) {
+	profile, ok := r.profiles[worker.Profile]
+	readiness := configuredAgentdReadiness(profile)
+	if !ok || readiness.ContractVersion != "agentd/control/v1" || !validAgentdID(sessionID) {
+		return agentdSessionStatus{}, &agentdRebindError{}
+	}
+	token := strings.TrimSpace(os.Getenv(profile.CoordinatorTokenEnv))
+	if token == "" {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	address, err := r.docker.InternalAddress(ctx, worker.ContainerID)
+	if err != nil || address == "" {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	endpoint := "http://" + address + ":" + strconv.Itoa(readiness.Port) + "/v1/registered-sessions/" + url.PathEscape(sessionID) + "/adopt"
+	return postAgentdRegisteredAdoption(ctx, r.httpClient, endpoint, token, adoption)
+}
+
 func postAgentdRebind(ctx context.Context, client *http.Client, endpoint, token string, rebind agentdRebindRequest) (agentdSessionStatus, error) {
-	payload, err := json.Marshal(rebind)
+	return postAgentdSessionTransition(ctx, client, endpoint, token, rebind)
+}
+
+func postAgentdRegisteredAdoption(ctx context.Context, client *http.Client, endpoint, token string, adoption agentdRegisteredAdoptRequest) (agentdSessionStatus, error) {
+	return postAgentdSessionTransition(ctx, client, endpoint, token, adoption)
+}
+
+func postAgentdSessionTransition(ctx context.Context, client *http.Client, endpoint, token string, transition any) (agentdSessionStatus, error) {
+	payload, err := json.Marshal(transition)
 	if err != nil {
 		return agentdSessionStatus{}, &agentdRebindError{}
 	}

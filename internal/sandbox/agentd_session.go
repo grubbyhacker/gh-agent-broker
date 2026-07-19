@@ -22,6 +22,13 @@ type agentdRebindRequest struct {
 	Successor      agentdWorkerBinding `json:"successor"`
 }
 
+type agentdRegisteredAdoptRequest struct {
+	Version           string `json:"version"`
+	IdempotencyKey    string `json:"idempotencyKey"`
+	PredecessorWorker string `json:"predecessorWorker"`
+	PredecessorEpoch  int64  `json:"predecessorEpoch"`
+}
+
 type agentdConversationRef struct {
 	AdapterKind      string `json:"adapterKind"`
 	AdapterVersion   string `json:"adapterVersion"`

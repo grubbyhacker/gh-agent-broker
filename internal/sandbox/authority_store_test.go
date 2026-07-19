@@ -13,6 +13,16 @@ func TestAuthorityWorkerStoreMigratesV1WorkspaceSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var firstVersion, partialTable int
+	if err := store.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&firstVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table' AND name='authority_registered_admissions_v12'`).Scan(&partialTable); err != nil {
+		t.Fatal(err)
+	}
+	if firstVersion != authorityStoreSchemaVersion || partialTable != 0 {
+		t.Fatalf("first open version=%d partial_table=%d", firstVersion, partialTable)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}

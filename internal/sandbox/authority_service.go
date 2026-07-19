@@ -84,7 +84,7 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if err := s.store.RequireConfirmedCoordinatorRouting(ctx, binding, lease); err != nil {
 		return nil, err
 	}
-	registered, admissionErr := s.store.RegisteredAdmission(ctx, binding)
+	registered, admissionErr := s.store.RegisteredAdmission(ctx, principal, binding)
 	isRegistered := admissionErr == nil
 	if admissionErr != nil && !errors.Is(admissionErr, sql.ErrNoRows) {
 		return nil, admissionErr
@@ -232,6 +232,12 @@ type AuthorityAgentdReadiness interface {
 // endpoint for the broker-recorded successor worker.
 type AuthorityAgentdRebinder interface {
 	RebindAgentdSession(context.Context, AuthorityWorker, string, agentdRebindRequest) (agentdSessionStatus, error)
+}
+
+// AuthorityAgentdRegisteredAdopter is the registered-lifecycle counterpart to
+// legacy rebind. The successor remains entirely broker-derived.
+type AuthorityAgentdRegisteredAdopter interface {
+	AdoptRegisteredAgentdSession(context.Context, AuthorityWorker, string, agentdRegisteredAdoptRequest) (agentdSessionStatus, error)
 }
 
 type AgentdSessionValidationRequest struct {
@@ -580,7 +586,16 @@ func (s *AuthorityWorkerService) ReassignSession(ctx context.Context, principal 
 	if err != nil || !validAgentdID(workspace.AgentdSessionID) {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "session has no durable agentd identity")
 	}
-	if _, ok := s.runtime.(AuthorityAgentdRebinder); !ok {
+	_, admissionErr := s.store.RegisteredAdmission(ctx, principal, request.SessionBinding)
+	isRegistered := admissionErr == nil
+	if admissionErr != nil && !errors.Is(admissionErr, sql.ErrNoRows) {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentRebindConflict, "registered admission state is unavailable")
+	}
+	if isRegistered {
+		if _, ok := s.runtime.(AuthorityAgentdRegisteredAdopter); !ok {
+			return AuthoritySessionReassignment{}, reassignmentError(ReassignmentRebindRetryable, "agentd registered adoption transport is unavailable")
+		}
+	} else if _, ok := s.runtime.(AuthorityAgentdRebinder); !ok {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
 	}
 	reassignment, err := s.store.Reassign(ctx, principal, request.SessionBinding, request.SessionLineageID, request.PredecessorWorkerID, request.PredecessorWorkerFenceEpoch, request.IdempotencyKey, workspace, profile.IssuanceGeneration)
@@ -637,12 +652,28 @@ func (s *AuthorityWorkerService) confirmAgentdAdoption(ctx context.Context, adop
 	if err != nil || replacement.Profile != adoption.AuthorityBinding || replacement.WorkerStorageLineageID != adoption.Successor.StorageLineageID || replacement.WorkerFenceEpoch != adoption.Successor.FenceEpoch {
 		return reassignmentError(ReassignmentRebindRetryable, "broker-recorded adoption successor is temporarily unavailable")
 	}
-	rebinder, ok := s.runtime.(AuthorityAgentdRebinder)
-	if !ok {
-		return reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
+	_, admissionErr := s.store.RegisteredAdmission(ctx, adoption.Principal, adoption.CoordinatorBinding)
+	isRegistered := admissionErr == nil
+	if admissionErr != nil && !errors.Is(admissionErr, sql.ErrNoRows) {
+		return reassignmentError(ReassignmentRebindRetryable, "registered admission state is unavailable")
 	}
-	request := agentdRebindRequest{IdempotencyKey: adoption.RebindIdempotencyKey, Predecessor: adoption.Predecessor, Successor: adoption.Successor}
-	status, rebindErr := rebinder.RebindAgentdSession(ctx, replacement, adoption.AgentdSessionID, request)
+	var status agentdSessionStatus
+	var rebindErr error
+	if isRegistered {
+		adopter, ok := s.runtime.(AuthorityAgentdRegisteredAdopter)
+		if !ok {
+			return reassignmentError(ReassignmentRebindRetryable, "agentd registered adoption transport is unavailable")
+		}
+		request := agentdRegisteredAdoptRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: adoption.RebindIdempotencyKey, PredecessorWorker: adoption.Predecessor.WorkerID, PredecessorEpoch: adoption.Predecessor.FenceEpoch}
+		status, rebindErr = adopter.AdoptRegisteredAgentdSession(ctx, replacement, adoption.AgentdSessionID, request)
+	} else {
+		rebinder, ok := s.runtime.(AuthorityAgentdRebinder)
+		if !ok {
+			return reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
+		}
+		request := agentdRebindRequest{IdempotencyKey: adoption.RebindIdempotencyKey, Predecessor: adoption.Predecessor, Successor: adoption.Successor}
+		status, rebindErr = rebinder.RebindAgentdSession(ctx, replacement, adoption.AgentdSessionID, request)
+	}
 	if rebindErr != nil {
 		var typed *agentdRebindError
 		if errors.As(rebindErr, &typed) && !typed.retryable {

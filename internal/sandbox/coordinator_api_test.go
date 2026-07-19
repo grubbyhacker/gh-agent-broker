@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"testing"
 )
@@ -38,24 +39,32 @@ func TestRegisteredCoordinatorAgentdRequestUsesRegisteredRoutes(t *testing.T) {
 		request         CoordinatorSessionRequest
 	}{
 		{"submit", "/v1/registered-sessions/session-1/turns", CoordinatorSessionRequest{SessionBinding: "binding", IdempotencyKey: "key"}},
-		{"events", "/v1/registered-sessions/session-1/events?after=7", CoordinatorSessionRequest{SessionBinding: "binding", After: 7}},
+		{"events", "/v1/registered-sessions/session-1/events?version=agentd%2Fregistered-lifecycle%2Fv1&after=7", CoordinatorSessionRequest{SessionBinding: "binding", After: 7}},
 		{"checkpoint", "/v1/registered-sessions/session-1/checkpoint", CoordinatorSessionRequest{SessionBinding: "binding", CheckpointRef: "checkpoint-1"}},
-		{"resume", "/v1/registered-sessions/session-1/resume", CoordinatorSessionRequest{SessionBinding: "binding"}},
-		{"cancel", "/v1/registered-sessions/session-1/cancel", CoordinatorSessionRequest{SessionBinding: "binding", TurnID: "turn-1"}},
-		{"status", "/v1/registered-sessions/session-1/status", CoordinatorSessionRequest{SessionBinding: "binding"}},
+		{"cancel", "/v1/registered-sessions/session-1/cancel", CoordinatorSessionRequest{SessionBinding: "binding", IdempotencyKey: "key"}},
+		{"status", "/v1/registered-sessions/session-1/status?version=agentd%2Fregistered-lifecycle%2Fv1", CoordinatorSessionRequest{SessionBinding: "binding"}},
 	} {
 		t.Run(test.operation, func(t *testing.T) {
 			if err := validateCoordinatorSessionRequestForBinding(test.operation, test.request, true); err != nil {
 				t.Fatal(err)
 			}
-			_, path, body := coordinatorRegisteredAgentdRequest(test.operation, "session-1", test.request, task)
+			method, path, body := coordinatorRegisteredAgentdRequest(test.operation, "session-1", test.request, task)
 			if path != test.path {
 				t.Fatalf("path=%s", path)
 			}
-			if test.operation == "submit" && (bytes.Contains(body, []byte("prompt")) || !bytes.Contains(body, []byte(task.Parameters.BranchRef))) {
+			if test.operation == "submit" && (method != http.MethodPost || bytes.Contains(body, []byte("prompt")) || !bytes.Contains(body, []byte(task.Parameters.BranchRef))) {
 				t.Fatalf("body=%s", body)
 			}
+			if test.operation == "checkpoint" || test.operation == "cancel" {
+				var got map[string]string
+				if err := json.Unmarshal(body, &got); err != nil || got["version"] != "agentd/registered-lifecycle/v1" {
+					t.Fatalf("body=%s err=%v", body, err)
+				}
+			}
 		})
+	}
+	if err := validateCoordinatorSessionRequestForBinding("resume", CoordinatorSessionRequest{SessionBinding: "binding"}, true); err == nil {
+		t.Fatal("registered resume accepted")
 	}
 }
 

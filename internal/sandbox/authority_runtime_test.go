@@ -149,6 +149,27 @@ func TestAgentdRebindUsesCoordinatorChannelAndExactBody(t *testing.T) {
 	}
 }
 
+func TestRegisteredAgentdAdoptionUsesExactRouteAndBody(t *testing.T) {
+	request := agentdRegisteredAdoptRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: "broker-derived-key", PredecessorWorker: "old", PredecessorEpoch: 1}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/registered-sessions/agentd-session/adopt" {
+			t.Fatalf("request method=%s path=%s", r.Method, r.URL.Path)
+		}
+		var got agentdRegisteredAdoptRequest
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&got); err != nil || got != request {
+			t.Fatalf("body decoded=%+v err=%v", got, err)
+		}
+		writeJSON(w, http.StatusOK, agentdSessionStatus{Version: agentdSessionProtocolVersion, SessionID: "agentd-session", CoordinatorBinding: "binding", AuthorityBinding: "writer", WorkerID: "new", StorageLineageID: "storage", FenceEpoch: 2, SessionLineageID: "session-lineage", Workspace: agentdSessionWorkspace{WorkspaceRef: "/workspace", UID: 20000, GID: 20000}, Phase: "active", TurnIDs: []string{}, NextCursor: 2})
+	}))
+	t.Cleanup(server.Close)
+	status, err := postAgentdRegisteredAdoption(context.Background(), server.Client(), server.URL+"/v1/registered-sessions/agentd-session/adopt", "coordinator-secret", request)
+	if err != nil || status.WorkerID != "new" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
 func TestAgentdRebindClassifiesRetryableAndTerminalResponses(t *testing.T) {
 	request := agentdRebindRequest{IdempotencyKey: "key", Predecessor: agentdWorkerBinding{WorkerID: "old", StorageLineageID: "storage", FenceEpoch: 1}, Successor: agentdWorkerBinding{WorkerID: "new", StorageLineageID: "storage", FenceEpoch: 2}}
 	for name, response := range map[string]struct {

@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 12
+const authorityStoreSchemaVersion = 11
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -92,6 +92,7 @@ type AuthoritySessionReassignment struct {
 // Every value needed to reproduce and verify the agentd command is captured in
 // the same transaction as the lease/workspace CAS.
 type authorityAgentdAdoption struct {
+	Principal            string
 	BindingDigest        string
 	CoordinatorBinding   string
 	AuthorityBinding     string
@@ -261,11 +262,6 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 			return err
 		}
 	}
-	if version == 11 {
-		if err := s.migrateV12(ctx); err != nil {
-			return err
-		}
-	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -286,41 +282,32 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	return nil
 }
 
-// V11 records the immutable registered-task input with the lease.  Legacy
-// leases deliberately have no row and therefore cannot enter this lifecycle.
+// V11 atomically records immutable registered-task input with its owning lease.
+// V10 is the last released schema, so there is no intermediate schema to repair.
 func (s *AuthorityWorkerStore) migrateV11(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX authority_session_leases_principal_binding ON authority_session_leases(principal,binding_digest);
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollbackAuthorityTx(tx)
+	if _, err = tx.ExecContext(ctx, `CREATE UNIQUE INDEX authority_session_leases_principal_binding ON authority_session_leases(principal,binding_digest);
 	CREATE TABLE authority_registered_admissions (
 		principal TEXT NOT NULL, binding_digest TEXT NOT NULL,
 		protocol_version TEXT NOT NULL, work_item_id TEXT NOT NULL, route_snapshot_id TEXT NOT NULL,
 		canonical_task_json TEXT NOT NULL, admission_task_digest TEXT NOT NULL,
 		PRIMARY KEY(principal,binding_digest),
 		FOREIGN KEY(principal,binding_digest) REFERENCES authority_session_leases(principal,binding_digest)
-	) STRICT; PRAGMA user_version=11`)
-	return err
-}
-
-// V12 repairs databases created by the original V11 migration, whose
-// single-column relationship did not model the lease's principal binding.
-func (s *AuthorityWorkerStore) migrateV12(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `PRAGMA foreign_keys=OFF;
-	CREATE UNIQUE INDEX IF NOT EXISTS authority_session_leases_principal_binding ON authority_session_leases(principal,binding_digest);
-	CREATE TABLE authority_registered_admissions_v12 (
-		principal TEXT NOT NULL, binding_digest TEXT NOT NULL,
-		protocol_version TEXT NOT NULL, work_item_id TEXT NOT NULL, route_snapshot_id TEXT NOT NULL,
-		canonical_task_json TEXT NOT NULL, admission_task_digest TEXT NOT NULL,
-		PRIMARY KEY(principal,binding_digest),
-		FOREIGN KEY(principal,binding_digest) REFERENCES authority_session_leases(principal,binding_digest)
-	) STRICT;
-	INSERT INTO authority_registered_admissions_v12(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest)
-	SELECT l.principal,a.binding_digest,a.protocol_version,a.work_item_id,a.route_snapshot_id,a.canonical_task_json,a.admission_task_digest
-	FROM authority_registered_admissions a JOIN authority_session_leases l ON l.binding_digest=a.binding_digest;
-	DROP TABLE authority_registered_admissions;
-	ALTER TABLE authority_registered_admissions_v12 RENAME TO authority_registered_admissions;
-	PRAGMA foreign_keys=ON;
-	PRAGMA user_version=12;
-	PRAGMA foreign_key_check`)
-	return err
+	) STRICT`); err != nil {
+		return err
+	}
+	var violations int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
+		return fmt.Errorf("registered admission migration foreign key check failed: %d: %w", violations, err)
+	}
+	if _, err = tx.ExecContext(ctx, `PRAGMA user_version=11`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *AuthorityWorkerStore) migrateV1(ctx context.Context) error {
@@ -1135,7 +1122,7 @@ func getLeaseByDigest(ctx context.Context, queryer interface {
 	return lease, err
 }
 
-const authorityAdoptionSelect = `SELECT binding_digest,coordinator_binding,authority_binding,profile_version,policy_digest,session_lineage_id,agentd_session_id,
+const authorityAdoptionSelect = `SELECT principal,binding_digest,coordinator_binding,authority_binding,profile_version,policy_digest,session_lineage_id,agentd_session_id,
 	predecessor_worker_id,predecessor_storage_lineage_id,predecessor_fence_epoch,
 	replacement_worker_id,replacement_storage_lineage_id,replacement_fence_epoch,
 	rebind_idempotency_key,workspace_ref,workspace_uid,workspace_gid,adoption_state,adoption_error_code
@@ -1144,7 +1131,7 @@ const authorityAdoptionSelect = `SELECT binding_digest,coordinator_binding,autho
 func scanAuthorityAgentdAdoption(scanner interface{ Scan(...any) error }) (authorityAgentdAdoption, error) {
 	var adoption authorityAgentdAdoption
 	err := scanner.Scan(
-		&adoption.BindingDigest, &adoption.CoordinatorBinding, &adoption.AuthorityBinding, &adoption.ProfileVersion, &adoption.PolicyDigest, &adoption.SessionLineageID, &adoption.AgentdSessionID,
+		&adoption.Principal, &adoption.BindingDigest, &adoption.CoordinatorBinding, &adoption.AuthorityBinding, &adoption.ProfileVersion, &adoption.PolicyDigest, &adoption.SessionLineageID, &adoption.AgentdSessionID,
 		&adoption.Predecessor.WorkerID, &adoption.Predecessor.StorageLineageID, &adoption.Predecessor.FenceEpoch,
 		&adoption.Successor.WorkerID, &adoption.Successor.StorageLineageID, &adoption.Successor.FenceEpoch,
 		&adoption.RebindIdempotencyKey, &adoption.Workspace.WorkspaceRef, &adoption.Workspace.UID, &adoption.Workspace.GID,

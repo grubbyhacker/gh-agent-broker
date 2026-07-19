@@ -4,9 +4,9 @@
 
 ### Durable registered-task admission (candidate A)
 
-The authority store schema v12 repairs the original v11 registered-admission
-foreign-key association and adds a principal-plus-binding composite relationship
-to the lease. It enables SQLite foreign-key enforcement on every store open.
+The authority store schema v11 atomically migrates the released v10 schema to
+a registered-admission table with a principal-plus-binding composite foreign
+key to the lease. It enables SQLite foreign-key enforcement on every store open.
 Registered durable reads fetch and verify the stored protocol version, strict
 canonical JSON, source columns, canonical bytes, and digest, failing closed on
 any mismatch. `POST /v1/authority-workers/coordinator/v2/leases` requires the
@@ -20,7 +20,9 @@ gated by the configured `registered_coordinator_principal`; production remains
 unconfigured and inactive. Existing v1 leases have no snapshot and registered
 create/turn paths refuse before agentd routing. Broker-derived registered open
 and turn payloads use only the stored snapshot and broker lineage/workspace
-identities.
+identities. Registered coordinator commands use the exact versioned
+registered-lifecycle routes and refuse resume; registered reassignment uses
+`/adopt`, while legacy reassignment retains `/rebind`.
 
 ### Settled 2a/2b repository transport journal
 

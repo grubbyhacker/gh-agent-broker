@@ -92,7 +92,7 @@ func validateRegisteredAdmission(r RegisteredAdmissionRequest) (registeredAdmiss
 	}
 	// All accepted strings are ASCII-safe identifiers, so this literal is also
 	// RFC 8785/JCS canonical JSON (lexicographic keys, no insignificant space).
-	c := `{"registered_task":{"completionContract":"` + t.CompletionContract + `","contractDigest":"` + t.ContractDigest + `","parameters":{"baseRevision":"` + t.Parameters.BaseRevision + `","branchRef":"` + t.Parameters.BranchRef + `","repositoryId":"` + t.Parameters.RepositoryID + `","validationSelection":"required"},"taskEvidenceDigest":"` + t.TaskEvidenceDigest + `","taskKind":"` + t.TaskKind + `","taskVersion":"` + t.TaskVersion + `","verifierId":"` + t.VerifierID + `"},"registered_task_source":{"route_snapshot_id":"` + r.Source.RouteSnapshotID + `","work_item_id":"` + r.Source.WorkItemID + `}}`
+	c := `{"registered_task":{"completionContract":"` + t.CompletionContract + `","contractDigest":"` + t.ContractDigest + `","parameters":{"baseRevision":"` + t.Parameters.BaseRevision + `","branchRef":"` + t.Parameters.BranchRef + `","repositoryId":"` + t.Parameters.RepositoryID + `","validationSelection":"required"},"taskEvidenceDigest":"` + t.TaskEvidenceDigest + `","taskKind":"` + t.TaskKind + `","taskVersion":"` + t.TaskVersion + `","verifierId":"` + t.VerifierID + `"},"registered_task_source":{"route_snapshot_id":"` + r.Source.RouteSnapshotID + `","work_item_id":"` + r.Source.WorkItemID + `"}}`
 	s := sha256.Sum256([]byte(c))
 	digest := "sha256:" + hex.EncodeToString(s[:])
 	if r.AdmissionTaskDigest != digest {
@@ -193,10 +193,10 @@ func (s *AuthorityWorkerStore) AcquireRegistered(ctx context.Context, principal 
 	return lease, nil
 }
 
-func (s *AuthorityWorkerStore) RegisteredAdmission(ctx context.Context, binding string) (registeredAdmission, error) {
+func (s *AuthorityWorkerStore) RegisteredAdmission(ctx context.Context, principal, binding string) (registeredAdmission, error) {
 	var a registeredAdmission
-	var protocol string
-	err := s.db.QueryRowContext(ctx, `SELECT a.protocol_version,a.work_item_id,a.route_snapshot_id,a.canonical_task_json,a.admission_task_digest FROM authority_registered_admissions a JOIN authority_session_leases l ON l.principal=a.principal AND l.binding_digest=a.binding_digest WHERE a.binding_digest=?`, s.requestDigest(binding)).Scan(&protocol, &a.Source.WorkItemID, &a.Source.RouteSnapshotID, &a.CanonicalJSON, &a.Digest)
+	var protocol, profile string
+	err := s.db.QueryRowContext(ctx, `SELECT a.protocol_version,l.profile,a.work_item_id,a.route_snapshot_id,a.canonical_task_json,a.admission_task_digest FROM authority_registered_admissions a JOIN authority_session_leases l ON l.principal=a.principal AND l.binding_digest=a.binding_digest WHERE a.principal=? AND a.binding_digest=?`, principal, s.requestDigest(binding)).Scan(&protocol, &profile, &a.Source.WorkItemID, &a.Source.RouteSnapshotID, &a.CanonicalJSON, &a.Digest)
 	if err != nil {
 		return registeredAdmission{}, err
 	}
@@ -218,7 +218,7 @@ func (s *AuthorityWorkerStore) RegisteredAdmission(ctx context.Context, binding 
 		return registeredAdmission{}, fmt.Errorf("registered admission state is corrupt: trailing JSON")
 	}
 	validated, err := validateRegisteredAdmission(RegisteredAdmissionRequest{
-		Version: coordinatorRegisteredProtocolVersion, Profile: "writer", IdempotencyKey: "registered-read",
+		Version: coordinatorRegisteredProtocolVersion, Profile: profile, IdempotencyKey: "registered-read",
 		SessionBinding: "session:" + wire.Source.WorkItemID, Source: wire.Source, Task: wire.Task,
 		AdmissionTaskDigest: a.Digest,
 	})

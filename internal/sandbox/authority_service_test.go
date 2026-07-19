@@ -31,6 +31,7 @@ type fakeAuthorityRuntime struct {
 	unhealthy   bool
 	afterCreate func()
 	rebind      func(context.Context, AuthorityWorker, string, agentdRebindRequest) (agentdSessionStatus, error)
+	adopt       func(context.Context, AuthorityWorker, string, agentdRegisteredAdoptRequest) (agentdSessionStatus, error)
 }
 
 type fakeAuthenticatedReadinessRuntime struct {
@@ -329,6 +330,13 @@ func (f *fakeAuthorityRuntime) RebindAgentdSession(ctx context.Context, worker A
 		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
 	}
 	return f.rebind(ctx, worker, sessionID, request)
+}
+
+func (f *fakeAuthorityRuntime) AdoptRegisteredAgentdSession(ctx context.Context, worker AuthorityWorker, sessionID string, request agentdRegisteredAdoptRequest) (agentdSessionStatus, error) {
+	if f.adopt == nil {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	return f.adopt(ctx, worker, sessionID, request)
 }
 
 func TestAuthorityReconcileAppliesAuthenticatedReadinessOnlyToConfiguredProfiles(t *testing.T) {

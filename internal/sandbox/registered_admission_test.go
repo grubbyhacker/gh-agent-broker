@@ -11,13 +11,14 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func registeredRequest(t *testing.T, work, route string) RegisteredAdmissionRequest {
 	t.Helper()
 	r := RegisteredAdmissionRequest{Version: coordinatorRegisteredProtocolVersion, Profile: "writer", IdempotencyKey: "registered-key", SessionBinding: "session:" + work, Source: RegisteredTaskSource{WorkItemID: work, RouteSnapshotID: route}, Task: RegisteredTask{TaskKind: "repository_change_v1", TaskVersion: "1.0.0", CompletionContract: "repository_state_v1", VerifierID: "repository_state_v1", ContractDigest: repositoryContractDigest, TaskEvidenceDigest: "sha256:" + strings.Repeat("a", 64), Parameters: RegisteredTaskParameters{RepositoryID: "neutral/repository-proof", BaseRevision: strings.Repeat("b", 40), BranchRef: "agent/repository-proof/settled", ValidationSelection: "required"}}}
 	task := r.Task
-	canonical := `{"registered_task":{"completionContract":"` + task.CompletionContract + `","contractDigest":"` + task.ContractDigest + `","parameters":{"baseRevision":"` + task.Parameters.BaseRevision + `","branchRef":"` + task.Parameters.BranchRef + `","repositoryId":"` + task.Parameters.RepositoryID + `","validationSelection":"required"},"taskEvidenceDigest":"` + task.TaskEvidenceDigest + `","taskKind":"` + task.TaskKind + `","taskVersion":"` + task.TaskVersion + `","verifierId":"` + task.VerifierID + `"},"registered_task_source":{"route_snapshot_id":"` + r.Source.RouteSnapshotID + `","work_item_id":"` + r.Source.WorkItemID + `}}`
+	canonical := `{"registered_task":{"completionContract":"` + task.CompletionContract + `","contractDigest":"` + task.ContractDigest + `","parameters":{"baseRevision":"` + task.Parameters.BaseRevision + `","branchRef":"` + task.Parameters.BranchRef + `","repositoryId":"` + task.Parameters.RepositoryID + `","validationSelection":"required"},"taskEvidenceDigest":"` + task.TaskEvidenceDigest + `","taskKind":"` + task.TaskKind + `","taskVersion":"` + task.TaskVersion + `","verifierId":"` + task.VerifierID + `"},"registered_task_source":{"route_snapshot_id":"` + r.Source.RouteSnapshotID + `","work_item_id":"` + r.Source.WorkItemID + `"}}`
 	s := sha256.Sum256([]byte(canonical))
 	r.AdmissionTaskDigest = "sha256:" + hex.EncodeToString(s[:])
 	return r
@@ -130,6 +131,66 @@ func TestRegisteredAdmissionRejectsUnconfiguredPrincipalAndDigest(t *testing.T) 
 	}
 }
 
+func TestRegisteredReassignmentUsesAdoptionAndReplays(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	p := cfg.AuthorityProfiles["writer"]
+	p.SessionCapacity = 1
+	cfg.AuthorityProfiles["writer"] = p
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &fakeAuthorityRuntime{}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
+	ids := []string{"registered-old", "registered-new"}
+	service.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
+	old, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.AcquireRegistered(ctx, "coordinator", registeredRequest(t, "adopt-work", "adopt-route"), p.IssuanceGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := SessionWorkspace{UID: 20000, GID: 20000, Path: "/durable/registered-adopt", SessionLineageID: lease.SessionLineageID, AgentdSessionID: "registered-agentd-session"}
+	if _, err = store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, old.WorkerID, workspace.UID, workspace.GID, workspace.Path, formatAuthorityTime(time.Now().UTC()), lease.SessionLineageID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.BindAgentdSession(ctx, "session:adopt-work", "registered-agentd-session"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", old.WorkerID, "lost", false); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := service.Replace(ctx, "coordinator", old.WorkerID, "lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", replacement.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.RegisteredAdmission(ctx, "coordinator", "session:adopt-work"); err != nil {
+		t.Fatal(err)
+	}
+	var calls []agentdRegisteredAdoptRequest
+	runtime.adopt = func(_ context.Context, worker AuthorityWorker, sessionID string, request agentdRegisteredAdoptRequest) (agentdSessionStatus, error) {
+		calls = append(calls, request)
+		return agentdSessionStatus{Version: agentdSessionProtocolVersion, SessionID: sessionID, CoordinatorBinding: "session:adopt-work", AuthorityBinding: "writer", WorkerID: worker.WorkerID, StorageLineageID: worker.WorkerStorageLineageID, FenceEpoch: worker.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}, Phase: "active", TurnIDs: []string{}, NextCursor: 1}, nil
+	}
+	request := AuthoritySessionReassignmentRequest{SessionBinding: "session:adopt-work", SessionLineageID: lease.SessionLineageID, PredecessorWorkerID: old.WorkerID, PredecessorWorkerFenceEpoch: old.WorkerFenceEpoch, IdempotencyKey: "registered-adopt-one"}
+	if _, err = service.ReassignSession(ctx, "coordinator", request); err != nil {
+		t.Fatal(err)
+	}
+	request.IdempotencyKey = "registered-adopt-two"
+	if replay, err := service.ReassignSession(ctx, "coordinator", request); err != nil || !replay.Replay {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	if len(calls) != 1 || calls[0].Version != "agentd/registered-lifecycle/v1" || calls[0].PredecessorWorker != old.WorkerID || calls[0].PredecessorEpoch != old.WorkerFenceEpoch || calls[0].IdempotencyKey == request.IdempotencyKey {
+		t.Fatalf("registered adoption calls=%+v", calls)
+	}
+}
+
 func TestRegisteredAdmissionDurableReadFailsClosedOnCorruption(t *testing.T) {
 	ctx := context.Background()
 	cfg := authorityTestConfig(t)
@@ -163,7 +224,7 @@ func TestRegisteredAdmissionDurableReadFailsClosedOnCorruption(t *testing.T) {
 			if _, err := store.db.ExecContext(ctx, change, lease.BindingDigest); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.RegisteredAdmission(ctx, request.SessionBinding); err == nil {
+			if _, err := store.RegisteredAdmission(ctx, "coordinator", request.SessionBinding); err == nil {
 				t.Fatal("corrupt durable admission was accepted")
 			}
 			if _, err := store.db.ExecContext(ctx, `UPDATE authority_registered_admissions SET protocol_version=?,work_item_id=?,route_snapshot_id=?,canonical_task_json=?,admission_task_digest=? WHERE binding_digest=?`, coordinatorRegisteredProtocolVersion, request.Source.WorkItemID, request.Source.RouteSnapshotID, mustRegisteredCanonical(t, request), request.AdmissionTaskDigest, lease.BindingDigest); err != nil {

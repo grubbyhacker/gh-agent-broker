@@ -61,7 +61,7 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 	if _, err := s.authorize(principal, lease.Profile, "acquire"); err != nil {
 		return CoordinatorSessionResponse{}, err
 	}
-	registered, admissionErr := s.store.RegisteredAdmission(ctx, request.SessionBinding)
+	registered, admissionErr := s.store.RegisteredAdmission(ctx, principal, request.SessionBinding)
 	isRegistered := admissionErr == nil
 	if admissionErr != nil && !errors.Is(admissionErr, sql.ErrNoRows) {
 		return CoordinatorSessionResponse{}, admissionErr
@@ -130,19 +130,20 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 }
 
 func coordinatorRegisteredAgentdRequest(operation, sessionID string, request CoordinatorSessionRequest, task RegisteredTask) (string, string, json.RawMessage) {
-	path := "/v1/registered-sessions/" + url.PathEscape(sessionID) + "/" + operation
+	path := "/v1/registered-sessions/" + url.PathEscape(sessionID)
+	versionQuery := "?version=agentd%2Fregistered-lifecycle%2Fv1"
 	if operation != "submit" {
 		method := http.MethodPost
 		payload := map[string]any{}
 		switch operation {
 		case "events":
-			method, payload, path = http.MethodGet, nil, path+"?after="+strconv.FormatInt(request.After, 10)
+			method, payload, path = http.MethodGet, nil, path+"/events"+versionQuery+"&after="+strconv.FormatInt(request.After, 10)
 		case "status":
-			method, payload = http.MethodGet, nil
+			method, payload, path = http.MethodGet, nil, path+"/status"+versionQuery
 		case "cancel":
-			payload = map[string]any{"turnId": request.TurnID}
+			path, payload = path+"/cancel", map[string]any{"version": "agentd/registered-lifecycle/v1", "idempotencyKey": request.IdempotencyKey}
 		case "checkpoint":
-			payload = map[string]any{"checkpointRef": request.CheckpointRef}
+			path, payload = path+"/checkpoint", map[string]any{"version": "agentd/registered-lifecycle/v1", "checkpointRef": request.CheckpointRef}
 		}
 		encoded, err := json.Marshal(payload)
 		if err != nil {
@@ -227,7 +228,11 @@ func validateCoordinatorSessionRequestForBinding(operation string, request Coord
 			return fmt.Errorf("submit requires only bounded prompt and idempotency_key")
 		}
 	case "cancel":
-		if !validAgentdID(request.TurnID) || request.IdempotencyKey != "" || request.Prompt != "" || request.CheckpointRef != "" || request.After != 0 {
+		if registered {
+			if !validAgentdID(request.IdempotencyKey) || request.TurnID != "" || request.Prompt != "" || request.CheckpointRef != "" || request.After != 0 {
+				return fmt.Errorf("registered cancel requires only idempotency_key")
+			}
+		} else if !validAgentdID(request.TurnID) || request.IdempotencyKey != "" || request.Prompt != "" || request.CheckpointRef != "" || request.After != 0 {
 			return fmt.Errorf("cancel requires only turn_id")
 		}
 	case "checkpoint":
@@ -238,7 +243,12 @@ func validateCoordinatorSessionRequestForBinding(operation string, request Coord
 		if request.IdempotencyKey != "" || request.Prompt != "" || request.TurnID != "" || request.CheckpointRef != "" {
 			return fmt.Errorf("events accepts only after")
 		}
-	case "resume", "status":
+	case "resume":
+		if registered {
+			return fmt.Errorf("registered session resume is unsupported")
+		}
+		fallthrough
+	case "status":
 		if request.IdempotencyKey != "" || request.Prompt != "" || request.TurnID != "" || request.CheckpointRef != "" || request.After != 0 {
 			return fmt.Errorf("session command has forbidden fields")
 		}
