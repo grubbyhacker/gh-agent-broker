@@ -35,6 +35,10 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			return
 		}
 		if r.Method == http.MethodPost && path == "coordinator/v1/leases" {
+			if principal == service.cfg.RegisteredCoordinatorPrincipal && principal != "" {
+				writeRESTCodeError(w, http.StatusConflict, "lease_denied", "policy denial: registered coordinator principal must use coordinator/v2 leases")
+				return
+			}
 			var in AuthorityWorkerRequest
 			if !decodeAuthorityJSON(w, r, &in) {
 				return

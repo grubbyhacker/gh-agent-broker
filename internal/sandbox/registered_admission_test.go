@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -78,6 +80,93 @@ func TestRegisteredAdmissionRESTRequiresExactVersionAndStrictJSON(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestRegisteredCoordinatorLeaseAdmissionVersions(t *testing.T) {
+	ctx := context.Background()
+	newService := func(t *testing.T) (*AuthorityWorkerStore, http.Handler) {
+		t.Helper()
+		cfg := authorityTestConfig(t)
+		profile := cfg.AuthorityProfiles["writer"]
+		profile.SessionIsolation.WorkspaceRoot = t.TempDir()
+		profile.SessionIsolation.UIDStart = os.Getuid()
+		profile.SessionIsolation.GIDStart = os.Getgid()
+		cfg.AuthorityProfiles["writer"] = profile
+		cfg.AuthorityPrincipals["legacy-coordinator"] = AuthorityPrincipal{
+			Token:           "legacy-coordinator-test-token",
+			AllowedProfiles: []string{"writer"},
+			AllowedActions:  []string{"acquire"},
+		}
+		store := openAuthorityTestStore(t, cfg.AuthorityStore)
+		service := NewAuthorityWorkerService(cfg, store, &fakeAuthorityRuntime{}, nil, allowTestAuthorityIssuance{})
+		service.newID = func() (string, error) { return "registered-version-worker", nil }
+		worker, err := service.Provision(ctx, "coordinator", "writer")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = service.SetHealth(ctx, "coordinator", worker.WorkerID, "ready", true); err != nil {
+			t.Fatal(err)
+		}
+		return store, NewAuthorityRESTHandler(service)
+	}
+
+	t.Run("registered principal is refused on v1 before effects", func(t *testing.T) {
+		store, handler := newService(t)
+		req := httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v1/leases", strings.NewReader(`not-json`))
+		req.Header.Set("Authorization", "Bearer coordinator-test-token")
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusConflict || !strings.Contains(resp.Body.String(), "registered coordinator principal must use coordinator/v2 leases") {
+			t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+		}
+		var leases, workspaces, admissions int
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM authority_session_leases`).Scan(&leases); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM authority_session_workspaces`).Scan(&workspaces); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM authority_registered_admissions`).Scan(&admissions); err != nil {
+			t.Fatal(err)
+		}
+		if leases != 0 || workspaces != 0 || admissions != 0 {
+			t.Fatalf("v1 denial had effects: leases=%d workspaces=%d admissions=%d", leases, workspaces, admissions)
+		}
+	})
+
+	t.Run("separately authorized non-registered principal retains v1", func(t *testing.T) {
+		store, handler := newService(t)
+		body := `{"profile":"writer","idempotency_key":"legacy-key","session_binding":"legacy-session"}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v1/leases", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer legacy-coordinator-test-token")
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+		}
+		if _, err := store.RegisteredAdmission(ctx, "legacy-coordinator", "legacy-session"); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("legacy v1 admission err=%v", err)
+		}
+	})
+
+	t.Run("v2 remains the registered acquisition", func(t *testing.T) {
+		store, handler := newService(t)
+		request := registeredRequest(t, "version-work", "version-route")
+		body, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v2/leases", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer coordinator-test-token")
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+		}
+		if _, err := store.RegisteredAdmission(ctx, "coordinator", request.SessionBinding); err != nil {
+			t.Fatalf("v2 registered admission err=%v", err)
+		}
+	})
 }
 
 func TestRegisteredAdmissionV2IsDurableAndRejectsConflicts(t *testing.T) {

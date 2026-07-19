@@ -4,6 +4,12 @@
 
 ### Durable registered-task admission (candidate A)
 
+The configured registered coordinator principal is refused at the legacy
+`POST /v1/authority-workers/coordinator/v1/leases` boundary before request
+decoding or admission effects; it must use the durable registered v2
+acquisition path. Separately authorized non-registered principals retain the
+legacy v1 behavior.
+
 The authority store schema v11 atomically migrates the released v10 schema to
 a registered-admission table with a principal-plus-binding composite foreign
 key to the lease. It enables SQLite foreign-key enforcement on every store open.
