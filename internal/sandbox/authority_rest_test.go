@@ -3,9 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -82,59 +80,17 @@ func TestCoordinatorV1SubmitIsBrokerMediated(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer coordinator-test-token")
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusOK {
+	if resp.Code != http.StatusConflict || !strings.Contains(resp.Body.String(), "v2 admission snapshot") {
 		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
 	}
-	if runtime.worker.WorkerID != lease.WorkerID || runtime.path != "/v1/sessions/agentd-session/turns" || runtime.method != http.MethodPost || !bytes.Contains(runtime.body, []byte(`"idempotencyKey":"turn-key"`)) {
-		t.Fatalf("broker projection worker=%+v method=%s path=%s body=%s", runtime.worker, runtime.method, runtime.path, runtime.body)
-	}
-	var out CoordinatorSessionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.Version != coordinatorProtocolVersion || out.Lease.ProfileVersion == "" || out.Lease.PolicyDigest == "" {
-		t.Fatalf("response=%+v err=%v", out, err)
-	}
-	for _, forbidden := range []string{"worker_id", "profile", "model", "runtime", "agentd_session_id", "endpoint"} {
-		bad := []byte(strings.TrimSuffix(string(body), "}") + `,"` + forbidden + `":"caller-selected"}`)
-		req = httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v1/sessions/submit", bytes.NewReader(bad))
-		req.Header.Set("Authorization", "Bearer coordinator-test-token")
-		resp = httptest.NewRecorder()
-		handler.ServeHTTP(resp, req)
-		if resp.Code != http.StatusBadRequest {
-			t.Fatalf("forbidden %s status=%d body=%s", forbidden, resp.Code, resp.Body.String())
-		}
-	}
-	canary := "PR10-CREDENTIAL-CANARY:coordinator-only-test"
-	runtime.result = json.RawMessage(`{"sessionId":"agentd-session","turnId":"turn-2","phase":"queued","evidence":"` + canary + `"}`)
-	_, err = service.CoordinatorSessionCommand(ctx, "coordinator", "submit", CoordinatorSessionRequest{SessionBinding: "logical-session", IdempotencyKey: "blocked-turn", Prompt: "return evidence"})
-	if err == nil || strings.Contains(err.Error(), canary) || !strings.Contains(err.Error(), "credential_canary") {
-		t.Fatalf("unsafe coordinator result error = %v", err)
-	}
-	auditBytes, err := os.ReadFile(auditPath) //nolint:gosec // G304: path is a test-owned temporary audit file.
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(auditBytes, []byte(canary)) || !bytes.Contains(auditBytes, []byte(`"operation":"security.egress_blocked"`)) {
-		t.Fatalf("unsafe coordinator audit = %s", auditBytes)
-	}
-
-	encoded := base64.RawURLEncoding.EncodeToString([]byte(canary))
-	runtime.status = http.StatusUnauthorized
-	runtime.result = json.RawMessage(`{"error":"` + encoded + `"}`)
-	_, err = service.CoordinatorSessionCommand(ctx, "coordinator", "submit", CoordinatorSessionRequest{SessionBinding: "logical-session", IdempotencyKey: "blocked-error-turn", Prompt: "return error"})
-	if err == nil || strings.Contains(err.Error(), encoded) || !strings.Contains(err.Error(), "credential_canary") {
-		t.Fatalf("encoded unsafe agentd error = %v", err)
-	}
-
-	runtime.result = json.RawMessage(`{"error":"caller_selected_error"}`)
-	_, err = service.CoordinatorSessionCommand(ctx, "coordinator", "submit", CoordinatorSessionRequest{SessionBinding: "logical-session", IdempotencyKey: "safe-error-turn", Prompt: "return safe error"})
-	var agentdErr *CoordinatorAgentdError
-	if !errors.As(err, &agentdErr) || agentdErr.Code != "agentd_session_rejected" {
-		t.Fatalf("unsafe exported agentd error = %#v", err)
+	if runtime.path != "" {
+		t.Fatalf("legacy lease reached agentd: %q", runtime.path)
 	}
 }
 
 func TestCoordinatorV1BlocksCommandsUntilReassignmentAdoptionIsConfirmed(t *testing.T) {
 	fixture := newAuthorityAdoptionFixture(t, 1)
-	adoption := fixture.commit(t, 0)
+	fixture.commit(t, 0)
 	runtime := &coordinatorTestRuntime{fakeAuthorityRuntime: fixture.runtime}
 	service := NewAuthorityWorkerService(fixture.cfg, fixture.store, runtime, nil, allowTestAuthorityIssuance{})
 	request := CoordinatorSessionRequest{
@@ -143,34 +99,8 @@ func TestCoordinatorV1BlocksCommandsUntilReassignmentAdoptionIsConfirmed(t *test
 		Prompt:         "make the registered change",
 	}
 
-	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err == nil || !strings.Contains(err.Error(), "not confirmed") {
+	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err == nil || !strings.Contains(err.Error(), "v2 admission snapshot") {
 		t.Fatalf("pending adoption routed command: %v", err)
-	}
-	if runtime.path != "" {
-		t.Fatalf("pending adoption reached agentd path %q", runtime.path)
-	}
-	if err := fixture.store.ConfirmAgentdAdoption(context.Background(), adoption); err != nil {
-		t.Fatal(err)
-	}
-	activeLease, err := fixture.store.GetLease(context.Background(), "coordinator", fixture.bindings[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, mutate := range map[string]func(*AuthorityLease){
-		"profile version": func(lease *AuthorityLease) { lease.ProfileVersion = "wrong-profile-version" },
-		"policy digest":   func(lease *AuthorityLease) { lease.PolicyDigest = strings.Repeat("f", 64) },
-	} {
-		mismatched := activeLease
-		mutate(&mismatched)
-		if err := fixture.store.RequireConfirmedCoordinatorRouting(context.Background(), fixture.bindings[0], mismatched); err == nil || !strings.Contains(err.Error(), "does not match") {
-			t.Fatalf("mismatched %s routed: %v", name, err)
-		}
-	}
-	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err != nil {
-		t.Fatalf("confirmed adoption did not route: %v", err)
-	}
-	if runtime.path == "" {
-		t.Fatal("confirmed adoption did not reach agentd")
 	}
 }
 

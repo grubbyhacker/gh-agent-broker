@@ -2,6 +2,19 @@
 
 ## Current State
 
+### Durable registered-task admission (candidate A)
+
+The authority store schema v11 adds a fail-closed registered-admission snapshot
+table. `POST /v1/authority-workers/coordinator/v2/leases` accepts only the
+settled `broker/coordinator/v2` registered task/source shape, verifies its
+lowercase SHA-256 JCS digest, requires `session:<work_item_id>`, and atomically
+persists the snapshot alongside the lease admission. Registered admission is
+gated by the configured `registered_coordinator_principal`; production remains
+unconfigured and inactive. Existing v1 leases have no snapshot and registered
+create/turn paths refuse before agentd routing. Broker-derived registered open
+and turn payloads use only the stored snapshot and broker lineage/workspace
+identities.
+
 ### Settled 2a/2b repository transport journal
 
 The authority SQLite store schema v10 adds the broker-owned append-only

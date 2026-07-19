@@ -47,6 +47,19 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			writeJSON(w, http.StatusOK, CoordinatorLeaseAdmission{Version: coordinatorProtocolVersion, Admission: out})
 			return
 		}
+		if r.Method == http.MethodPost && path == "coordinator/v2/leases" {
+			var in RegisteredAdmissionRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.AcquireRegisteredSession(r.Context(), principal, in)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusConflict, "registered_lease_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, CoordinatorLeaseAdmission{Version: coordinatorRegisteredProtocolVersion, Admission: out})
+			return
+		}
 		if r.Method == http.MethodPost && strings.HasPrefix(path, "coordinator/v1/sessions/") {
 			operation := strings.TrimPrefix(path, "coordinator/v1/sessions/")
 			var in CoordinatorSessionRequest

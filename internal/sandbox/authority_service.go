@@ -47,6 +47,20 @@ type agentdCreateSessionRequest struct {
 	Workspace          agentdSessionWorkspace `json:"workspace"`
 }
 
+type agentdRegisteredSessionOpenRequest struct {
+	Version                 string                   `json:"version"`
+	SessionID               string                   `json:"sessionId"`
+	CoordinatorBinding      string                   `json:"coordinatorBinding"`
+	SessionLineageID        string                   `json:"sessionLineageId"`
+	AuthorityProfile        string                   `json:"authorityProfile"`
+	AuthorityProfileVersion string                   `json:"authorityProfileVersion"`
+	PolicyDigest            string                   `json:"policyDigest"`
+	TaskKind                string                   `json:"taskKind"`
+	TaskEvidenceDigest      string                   `json:"taskEvidenceDigest"`
+	Parameters              RegisteredTaskParameters `json:"parameters"`
+	Workspace               agentdSessionWorkspace   `json:"workspace"`
+}
+
 type agentdSessionWorkspace struct {
 	WorkspaceRef  string `json:"workspaceRef"`
 	UID           int    `json:"uid"`
@@ -70,6 +84,10 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if err := s.store.RequireConfirmedCoordinatorRouting(ctx, binding, lease); err != nil {
 		return nil, err
 	}
+	registered, err := s.store.RegisteredAdmission(ctx, binding)
+	if err != nil {
+		return nil, fmt.Errorf("registered session requires a v2 admission snapshot")
+	}
 	workspace, err := s.store.SessionWorkspace(ctx, binding)
 	if err != nil {
 		return nil, err
@@ -78,16 +96,8 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if token == "" {
 		return nil, fmt.Errorf("authority worker coordinator credential is unavailable")
 	}
-	payload, err := json.Marshal(agentdCreateSessionRequest{
-		Version:            "agentd/v1",
-		CoordinatorBinding: binding,
-		AuthorityBinding:   lease.Profile,
-		WorkerID:           lease.WorkerID,
-		StorageLineageID:   lease.WorkerStorageLineageID,
-		FenceEpoch:         lease.WorkerFenceEpoch,
-		SessionLineageID:   lease.SessionLineageID,
-		Workspace:          agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID},
-	})
+	derivedSessionID := "agentd-" + lease.SessionLineageID
+	payload, err := json.Marshal(agentdRegisteredSessionOpenRequest{Version: "agentd/registered-lifecycle/v1", SessionID: derivedSessionID, CoordinatorBinding: binding, SessionLineageID: lease.SessionLineageID, AuthorityProfile: lease.Profile, AuthorityProfileVersion: lease.ProfileVersion, PolicyDigest: lease.PolicyDigest, TaskKind: registered.Task.TaskKind, TaskEvidenceDigest: registered.Task.TaskEvidenceDigest, Parameters: registered.Task.Parameters, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}})
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +125,7 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 		}
 		expectedBinding := agentdWorkerBinding{WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch}
 		expectedWorkspace := agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}
-		if !exactAgentdSessionStatus(status, status.SessionID, binding, lease.Profile, lease.SessionLineageID, expectedWorkspace, expectedBinding) {
+		if !exactAgentdSessionStatus(status, derivedSessionID, binding, lease.Profile, lease.SessionLineageID, expectedWorkspace, expectedBinding) {
 			return "", fmt.Errorf("agentd session create returned a mismatched status")
 		}
 		encoded, err = marshalAgentdSessionStatus(status)
@@ -253,6 +263,27 @@ func (s *AuthorityWorkerService) AcquireSession(ctx context.Context, principal s
 		return AuthoritySessionAdmission{}, err
 	}
 	lease, err := s.store.Acquire(ctx, principal, request, profile.IssuanceGeneration)
+	if err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
+	workspace, err := s.store.AllocateSessionWorkspace(ctx, lease, profile.SessionIsolation)
+	if err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
+	return AuthoritySessionAdmission{Lease: lease, Workspace: workspace}, nil
+}
+
+// AcquireRegisteredSession is the sole registered-task admission seam.  It is
+// intentionally unavailable unless configuration names the Signal principal.
+func (s *AuthorityWorkerService) AcquireRegisteredSession(ctx context.Context, principal string, request RegisteredAdmissionRequest) (AuthoritySessionAdmission, error) {
+	if s.cfg.RegisteredCoordinatorPrincipal == "" || principal != s.cfg.RegisteredCoordinatorPrincipal {
+		return AuthoritySessionAdmission{}, fmt.Errorf("policy denial: registered admission principal is not configured")
+	}
+	profile, err := s.authorize(principal, request.Profile, "acquire")
+	if err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
+	lease, err := s.store.AcquireRegistered(ctx, principal, request, profile.IssuanceGeneration)
 	if err != nil {
 		return AuthoritySessionAdmission{}, err
 	}

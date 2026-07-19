@@ -2034,6 +2034,7 @@ func authorityTestConfig(t *testing.T) Config {
 		"coordinator":  {Token: "coordinator-test-token", AllowedProfiles: []string{"writer"}, AllowedActions: []string{"provision", "health", "acquire", "release", "drain", "replace", "reassign"}},
 		"session-only": {Token: "session-test-token", AllowedProfiles: []string{"writer"}, AllowedActions: []string{"acquire", "release"}},
 	}
+	cfg.RegisteredCoordinatorPrincipal = "coordinator"
 	return cfg
 }
 

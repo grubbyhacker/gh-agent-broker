@@ -59,6 +59,13 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 	if _, err := s.authorize(principal, lease.Profile, "acquire"); err != nil {
 		return CoordinatorSessionResponse{}, err
 	}
+	registered, err := s.store.RegisteredAdmission(ctx, request.SessionBinding)
+	if err != nil {
+		return CoordinatorSessionResponse{}, fmt.Errorf("registered session requires a v2 admission snapshot")
+	}
+	if operation == "submit" && request.Prompt != "" {
+		return CoordinatorSessionResponse{}, fmt.Errorf("registered turn does not accept a prompt")
+	}
 	if err := s.store.RequireConfirmedCoordinatorRouting(ctx, request.SessionBinding, lease); err != nil {
 		return CoordinatorSessionResponse{}, err
 	}
@@ -74,7 +81,7 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 	if !ok {
 		return CoordinatorSessionResponse{}, fmt.Errorf("agentd session transport is unavailable")
 	}
-	method, path, payload := coordinatorAgentdRequest(operation, workspace.AgentdSessionID, request)
+	method, path, payload := coordinatorRegisteredAgentdRequest(operation, workspace.AgentdSessionID, request, registered.Task)
 	status, result, err := transport.AgentdSessionRequest(ctx, worker, method, path, payload)
 	if err != nil {
 		return CoordinatorSessionResponse{}, err
@@ -114,6 +121,23 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 		return CoordinatorSessionResponse{}, err
 	}
 	return CoordinatorSessionResponse{Version: coordinatorProtocolVersion, Lease: lease, Result: result}, nil
+}
+
+func coordinatorRegisteredAgentdRequest(operation, sessionID string, request CoordinatorSessionRequest, task RegisteredTask) (string, string, json.RawMessage) {
+	if operation != "submit" {
+		return coordinatorAgentdRequest(operation, sessionID, request)
+	}
+	payload, err := json.Marshal(struct {
+		Version            string                   `json:"version"`
+		IdempotencyKey     string                   `json:"idempotencyKey"`
+		TaskKind           string                   `json:"taskKind"`
+		TaskEvidenceDigest string                   `json:"taskEvidenceDigest"`
+		Parameters         RegisteredTaskParameters `json:"parameters"`
+	}{"agentd/registered-lifecycle/v1", request.IdempotencyKey, task.TaskKind, task.TaskEvidenceDigest, task.Parameters})
+	if err != nil {
+		return http.MethodPost, "/v1/sessions/" + url.PathEscape(sessionID) + "/turns", nil
+	}
+	return http.MethodPost, "/v1/sessions/" + url.PathEscape(sessionID) + "/turns", payload
 }
 
 func validateCoordinatorAgentdResult(operation, sessionID string, after int64, result json.RawMessage) error {

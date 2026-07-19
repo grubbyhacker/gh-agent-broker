@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 10
+const authorityStoreSchemaVersion = 11
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -253,6 +253,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		if err := s.migrateV10(ctx); err != nil {
 			return err
 		}
+		version = 10
+	}
+	if version == 10 {
+		if err := s.migrateV11(ctx); err != nil {
+			return err
+		}
 	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
@@ -272,6 +278,17 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	}
 	s.salt = append([]byte(nil), salt...)
 	return nil
+}
+
+// V11 records the immutable registered-task input with the lease.  Legacy
+// leases deliberately have no row and therefore cannot enter this lifecycle.
+func (s *AuthorityWorkerStore) migrateV11(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE authority_registered_admissions (
+		binding_digest TEXT PRIMARY KEY REFERENCES authority_session_leases(binding_digest),
+		protocol_version TEXT NOT NULL, work_item_id TEXT NOT NULL, route_snapshot_id TEXT NOT NULL,
+		canonical_task_json TEXT NOT NULL, admission_task_digest TEXT NOT NULL
+	) STRICT; PRAGMA user_version=11`)
+	return err
 }
 
 func (s *AuthorityWorkerStore) migrateV1(ctx context.Context) error {
