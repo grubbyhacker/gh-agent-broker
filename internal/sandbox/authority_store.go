@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 11
+const authorityStoreSchemaVersion = 12
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -176,6 +176,7 @@ func OpenAuthorityWorkerStore(ctx context.Context, path string) (*AuthorityWorke
 
 func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	for _, statement := range []string{
+		"PRAGMA foreign_keys=ON",
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=FULL",
 		"PRAGMA busy_timeout=5000",
@@ -260,6 +261,11 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 			return err
 		}
 	}
+	if version == 11 {
+		if err := s.migrateV12(ctx); err != nil {
+			return err
+		}
+	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -283,11 +289,37 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 // V11 records the immutable registered-task input with the lease.  Legacy
 // leases deliberately have no row and therefore cannot enter this lifecycle.
 func (s *AuthorityWorkerStore) migrateV11(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `CREATE TABLE authority_registered_admissions (
-		binding_digest TEXT PRIMARY KEY REFERENCES authority_session_leases(binding_digest),
+	_, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX authority_session_leases_principal_binding ON authority_session_leases(principal,binding_digest);
+	CREATE TABLE authority_registered_admissions (
+		principal TEXT NOT NULL, binding_digest TEXT NOT NULL,
 		protocol_version TEXT NOT NULL, work_item_id TEXT NOT NULL, route_snapshot_id TEXT NOT NULL,
-		canonical_task_json TEXT NOT NULL, admission_task_digest TEXT NOT NULL
+		canonical_task_json TEXT NOT NULL, admission_task_digest TEXT NOT NULL,
+		PRIMARY KEY(principal,binding_digest),
+		FOREIGN KEY(principal,binding_digest) REFERENCES authority_session_leases(principal,binding_digest)
 	) STRICT; PRAGMA user_version=11`)
+	return err
+}
+
+// V12 repairs databases created by the original V11 migration, whose
+// single-column relationship did not model the lease's principal binding.
+func (s *AuthorityWorkerStore) migrateV12(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `PRAGMA foreign_keys=OFF;
+	CREATE UNIQUE INDEX IF NOT EXISTS authority_session_leases_principal_binding ON authority_session_leases(principal,binding_digest);
+	CREATE TABLE authority_registered_admissions_v12 (
+		principal TEXT NOT NULL, binding_digest TEXT NOT NULL,
+		protocol_version TEXT NOT NULL, work_item_id TEXT NOT NULL, route_snapshot_id TEXT NOT NULL,
+		canonical_task_json TEXT NOT NULL, admission_task_digest TEXT NOT NULL,
+		PRIMARY KEY(principal,binding_digest),
+		FOREIGN KEY(principal,binding_digest) REFERENCES authority_session_leases(principal,binding_digest)
+	) STRICT;
+	INSERT INTO authority_registered_admissions_v12(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest)
+	SELECT l.principal,a.binding_digest,a.protocol_version,a.work_item_id,a.route_snapshot_id,a.canonical_task_json,a.admission_task_digest
+	FROM authority_registered_admissions a JOIN authority_session_leases l ON l.binding_digest=a.binding_digest;
+	DROP TABLE authority_registered_admissions;
+	ALTER TABLE authority_registered_admissions_v12 RENAME TO authority_registered_admissions;
+	PRAGMA foreign_keys=ON;
+	PRAGMA user_version=12;
+	PRAGMA foreign_key_check`)
 	return err
 }
 

@@ -1,21 +1,82 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
 
 func registeredRequest(t *testing.T, work, route string) RegisteredAdmissionRequest {
 	t.Helper()
-	r := RegisteredAdmissionRequest{Profile: "writer", IdempotencyKey: "registered-key", SessionBinding: "session:" + work, Source: RegisteredTaskSource{WorkItemID: work, RouteSnapshotID: route}, Task: RegisteredTask{TaskKind: "repository_change_v1", TaskVersion: "1.0.0", CompletionContract: "repository_state_v1", VerifierID: "repository_state_v1", ContractDigest: repositoryContractDigest, TaskEvidenceDigest: "sha256:" + strings.Repeat("a", 64), Parameters: RegisteredTaskParameters{RepositoryID: "neutral/repository-proof", BaseRevision: strings.Repeat("b", 40), BranchRef: "agent/repository-proof/settled", ValidationSelection: "required"}}}
+	r := RegisteredAdmissionRequest{Version: coordinatorRegisteredProtocolVersion, Profile: "writer", IdempotencyKey: "registered-key", SessionBinding: "session:" + work, Source: RegisteredTaskSource{WorkItemID: work, RouteSnapshotID: route}, Task: RegisteredTask{TaskKind: "repository_change_v1", TaskVersion: "1.0.0", CompletionContract: "repository_state_v1", VerifierID: "repository_state_v1", ContractDigest: repositoryContractDigest, TaskEvidenceDigest: "sha256:" + strings.Repeat("a", 64), Parameters: RegisteredTaskParameters{RepositoryID: "neutral/repository-proof", BaseRevision: strings.Repeat("b", 40), BranchRef: "agent/repository-proof/settled", ValidationSelection: "required"}}}
 	task := r.Task
 	canonical := `{"registered_task":{"completionContract":"` + task.CompletionContract + `","contractDigest":"` + task.ContractDigest + `","parameters":{"baseRevision":"` + task.Parameters.BaseRevision + `","branchRef":"` + task.Parameters.BranchRef + `","repositoryId":"` + task.Parameters.RepositoryID + `","validationSelection":"required"},"taskEvidenceDigest":"` + task.TaskEvidenceDigest + `","taskKind":"` + task.TaskKind + `","taskVersion":"` + task.TaskVersion + `","verifierId":"` + task.VerifierID + `"},"registered_task_source":{"route_snapshot_id":"` + r.Source.RouteSnapshotID + `","work_item_id":"` + r.Source.WorkItemID + `}}`
 	s := sha256.Sum256([]byte(canonical))
 	r.AdmissionTaskDigest = "sha256:" + hex.EncodeToString(s[:])
 	return r
+}
+
+func TestRegisteredAdmissionRESTRequiresExactVersionAndStrictJSON(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	profile := cfg.AuthorityProfiles["writer"]
+	profile.SessionIsolation.WorkspaceRoot = t.TempDir()
+	profile.SessionIsolation.UIDStart = os.Getuid()
+	profile.SessionIsolation.GIDStart = os.Getgid()
+	cfg.AuthorityProfiles["writer"] = profile
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	service := NewAuthorityWorkerService(cfg, store, &fakeAuthorityRuntime{}, nil, allowTestAuthorityIssuance{})
+	service.newID = func() (string, error) { return "registered-rest-worker", nil }
+	worker, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", worker.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAuthorityRESTHandler(service)
+	request := registeredRequest(t, "rest-work", "rest-route")
+	for name, mutate := range map[string]func(map[string]any){
+		"success":         func(_ map[string]any) {},
+		"missing_version": func(v map[string]any) { delete(v, "version") },
+		"wrong_version":   func(v map[string]any) { v["version"] = "broker/coordinator/v1" },
+		"unknown_version": func(v map[string]any) { v["version"] = "broker/coordinator/v3" },
+		"unknown_field":   func(v map[string]any) { v["caller_task"] = "forbidden" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy := request
+			raw, err := json.Marshal(copy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire map[string]any
+			if err := json.Unmarshal(raw, &wire); err != nil {
+				t.Fatal(err)
+			}
+			mutate(wire)
+			raw, err = json.Marshal(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v2/leases", bytes.NewReader(raw))
+			req.Header.Set("Authorization", "Bearer coordinator-test-token")
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
+			if name == "success" && resp.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+			}
+			if name != "success" && resp.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+			}
+		})
+	}
 }
 
 func TestRegisteredAdmissionV2IsDurableAndRejectsConflicts(t *testing.T) {
@@ -67,4 +128,56 @@ func TestRegisteredAdmissionRejectsUnconfiguredPrincipalAndDigest(t *testing.T) 
 	if _, err := service.AcquireRegisteredSession(context.Background(), "coordinator", registeredRequest(t, "work-3", "route-3")); err == nil || !strings.Contains(err.Error(), "not configured") {
 		t.Fatalf("err=%v", err)
 	}
+}
+
+func TestRegisteredAdmissionDurableReadFailsClosedOnCorruption(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	profile := cfg.AuthorityProfiles["writer"]
+	profile.SessionIsolation.WorkspaceRoot = t.TempDir()
+	profile.SessionIsolation.UIDStart = os.Getuid()
+	profile.SessionIsolation.GIDStart = os.Getgid()
+	cfg.AuthorityProfiles["writer"] = profile
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	service := NewAuthorityWorkerService(cfg, store, &fakeAuthorityRuntime{}, nil, allowTestAuthorityIssuance{})
+	service.newID = func() (string, error) { return "corruption-worker", nil }
+	worker, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", worker.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	request := registeredRequest(t, "corrupt-work", "corrupt-route")
+	lease, err := store.AcquireRegistered(ctx, "coordinator", request, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]string{
+		"protocol": "UPDATE authority_registered_admissions SET protocol_version='broker/coordinator/v1' WHERE binding_digest=?",
+		"source":   "UPDATE authority_registered_admissions SET work_item_id='other-work' WHERE binding_digest=?",
+		"json":     "UPDATE authority_registered_admissions SET canonical_task_json='{}' WHERE binding_digest=?",
+		"digest":   "UPDATE authority_registered_admissions SET admission_task_digest='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE binding_digest=?",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := store.db.ExecContext(ctx, change, lease.BindingDigest); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.RegisteredAdmission(ctx, request.SessionBinding); err == nil {
+				t.Fatal("corrupt durable admission was accepted")
+			}
+			if _, err := store.db.ExecContext(ctx, `UPDATE authority_registered_admissions SET protocol_version=?,work_item_id=?,route_snapshot_id=?,canonical_task_json=?,admission_task_digest=? WHERE binding_digest=?`, coordinatorRegisteredProtocolVersion, request.Source.WorkItemID, request.Source.RouteSnapshotID, mustRegisteredCanonical(t, request), request.AdmissionTaskDigest, lease.BindingDigest); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func mustRegisteredCanonical(t *testing.T, request RegisteredAdmissionRequest) string {
+	t.Helper()
+	admission, err := validateRegisteredAdmission(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return admission.CanonicalJSON
 }

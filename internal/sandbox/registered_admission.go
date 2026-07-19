@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ type RegisteredTask struct {
 	Parameters         RegisteredTaskParameters `json:"parameters"`
 }
 type RegisteredAdmissionRequest struct {
+	Version             string               `json:"version"`
 	Profile             string               `json:"profile"`
 	IdempotencyKey      string               `json:"idempotency_key"`
 	SessionBinding      string               `json:"session_binding"`
@@ -45,6 +47,22 @@ type RegisteredAdmissionRequest struct {
 	Task                RegisteredTask       `json:"registered_task"`
 	AdmissionTaskDigest string               `json:"admission_task_digest"`
 }
+
+func (r *RegisteredAdmissionRequest) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	type request RegisteredAdmissionRequest
+	var decoded request
+	if err := decoder.Decode(&decoded); err != nil {
+		return fmt.Errorf("invalid registered admission request: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("invalid registered admission request: trailing JSON value")
+	}
+	*r = RegisteredAdmissionRequest(decoded)
+	return nil
+}
+
 type registeredAdmission struct {
 	Source                RegisteredTaskSource
 	Task                  RegisteredTask
@@ -59,6 +77,9 @@ var (
 )
 
 func validateRegisteredAdmission(r RegisteredAdmissionRequest) (registeredAdmission, error) {
+	if r.Version != coordinatorRegisteredProtocolVersion {
+		return registeredAdmission{}, fmt.Errorf("registered admission version is invalid")
+	}
 	if err := validateAuthorityRequest(AuthorityWorkerRequest{Profile: r.Profile, IdempotencyKey: r.IdempotencyKey, SessionBinding: r.SessionBinding}); err != nil {
 		return registeredAdmission{}, err
 	}
@@ -111,7 +132,7 @@ func (s *AuthorityWorkerStore) AcquireRegistered(ctx context.Context, principal 
 		}
 		var c, d string
 		var work, route string
-		if err = conn.QueryRowContext(ctx, `SELECT work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest FROM authority_registered_admissions WHERE binding_digest=?`, binding).Scan(&work, &route, &c, &d); err != nil || work != a.Source.WorkItemID || route != a.Source.RouteSnapshotID || c != a.CanonicalJSON || d != a.Digest {
+		if err = conn.QueryRowContext(ctx, `SELECT work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest FROM authority_registered_admissions WHERE principal=? AND binding_digest=?`, principal, binding).Scan(&work, &route, &c, &d); err != nil || work != a.Source.WorkItemID || route != a.Source.RouteSnapshotID || c != a.CanonicalJSON || d != a.Digest {
 			return AuthorityLease{}, fmt.Errorf("registered admission conflict")
 		}
 		lease.Principal, lease.Replay = principal, true
@@ -158,7 +179,7 @@ func (s *AuthorityWorkerStore) AcquireRegistered(ctx context.Context, principal 
 	if _, e = conn.ExecContext(ctx, `INSERT INTO authority_session_leases(principal,profile,idempotency_digest,request_fingerprint,binding_digest,worker_id,session_lineage_id,created_at) VALUES(?,?,?,?,?,?,?,?)`, principal, request.Profile, idem, fingerprint, binding, worker, lineage, formatAuthorityTime(now)); e != nil {
 		return AuthorityLease{}, e
 	}
-	if _, e = conn.ExecContext(ctx, `INSERT INTO authority_registered_admissions(binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest) VALUES(?,?,?,?,?,?)`, binding, coordinatorRegisteredProtocolVersion, a.Source.WorkItemID, a.Source.RouteSnapshotID, a.CanonicalJSON, a.Digest); e != nil {
+	if _, e = conn.ExecContext(ctx, `INSERT INTO authority_registered_admissions(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest) VALUES(?,?,?,?,?,?,?)`, principal, binding, coordinatorRegisteredProtocolVersion, a.Source.WorkItemID, a.Source.RouteSnapshotID, a.CanonicalJSON, a.Digest); e != nil {
 		return AuthorityLease{}, e
 	}
 	if _, e = conn.ExecContext(ctx, "COMMIT"); e != nil {
@@ -174,9 +195,13 @@ func (s *AuthorityWorkerStore) AcquireRegistered(ctx context.Context, principal 
 
 func (s *AuthorityWorkerStore) RegisteredAdmission(ctx context.Context, binding string) (registeredAdmission, error) {
 	var a registeredAdmission
-	err := s.db.QueryRowContext(ctx, `SELECT work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest FROM authority_registered_admissions WHERE binding_digest=?`, s.requestDigest(binding)).Scan(&a.Source.WorkItemID, &a.Source.RouteSnapshotID, &a.CanonicalJSON, &a.Digest)
+	var protocol string
+	err := s.db.QueryRowContext(ctx, `SELECT a.protocol_version,a.work_item_id,a.route_snapshot_id,a.canonical_task_json,a.admission_task_digest FROM authority_registered_admissions a JOIN authority_session_leases l ON l.principal=a.principal AND l.binding_digest=a.binding_digest WHERE a.binding_digest=?`, s.requestDigest(binding)).Scan(&protocol, &a.Source.WorkItemID, &a.Source.RouteSnapshotID, &a.CanonicalJSON, &a.Digest)
 	if err != nil {
 		return registeredAdmission{}, err
+	}
+	if protocol != coordinatorRegisteredProtocolVersion {
+		return registeredAdmission{}, fmt.Errorf("registered admission state is corrupt: protocol version")
 	}
 	// Re-validate the durable canonical JSON by decoding it through the same
 	// strict request validator; this makes corrupt or partial state fail closed.
@@ -184,14 +209,27 @@ func (s *AuthorityWorkerStore) RegisteredAdmission(ctx context.Context, binding 
 		Source RegisteredTaskSource `json:"registered_task_source"`
 		Task   RegisteredTask       `json:"registered_task"`
 	}
-	if err := json.Unmarshal([]byte(a.CanonicalJSON), &wire); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(a.CanonicalJSON))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
 		return registeredAdmission{}, fmt.Errorf("registered admission state is corrupt: JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return registeredAdmission{}, fmt.Errorf("registered admission state is corrupt: trailing JSON")
+	}
+	validated, err := validateRegisteredAdmission(RegisteredAdmissionRequest{
+		Version: coordinatorRegisteredProtocolVersion, Profile: "writer", IdempotencyKey: "registered-read",
+		SessionBinding: "session:" + wire.Source.WorkItemID, Source: wire.Source, Task: wire.Task,
+		AdmissionTaskDigest: a.Digest,
+	})
+	if err != nil || validated.CanonicalJSON != a.CanonicalJSON || validated.Digest != a.Digest || validated.Source != a.Source {
+		return registeredAdmission{}, fmt.Errorf("registered admission state is corrupt: canonical task")
 	}
 	sum := sha256.Sum256([]byte(a.CanonicalJSON))
 	if "sha256:"+hex.EncodeToString(sum[:]) != a.Digest {
 		return registeredAdmission{}, fmt.Errorf("registered admission state is corrupt: digest")
 	}
-	a.Task = wire.Task
+	a.Task = validated.Task
 	return a, nil
 }
 

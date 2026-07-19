@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"net/http"
 	"testing"
 )
@@ -25,6 +26,34 @@ func TestCoordinatorAgentdRequestUsesOnlyFixedOperations(t *testing.T) {
 			method, path, _ := coordinatorAgentdRequest(test.operation, "session-1", test.request)
 			if method != test.method || path != test.path {
 				t.Fatalf("method=%s path=%s", method, path)
+			}
+		})
+	}
+}
+
+func TestRegisteredCoordinatorAgentdRequestUsesRegisteredRoutes(t *testing.T) {
+	task := registeredRequest(t, "route-work", "route-snapshot").Task
+	for _, test := range []struct {
+		operation, path string
+		request         CoordinatorSessionRequest
+	}{
+		{"submit", "/v1/registered-sessions/session-1/turns", CoordinatorSessionRequest{SessionBinding: "binding", IdempotencyKey: "key"}},
+		{"events", "/v1/registered-sessions/session-1/events?after=7", CoordinatorSessionRequest{SessionBinding: "binding", After: 7}},
+		{"checkpoint", "/v1/registered-sessions/session-1/checkpoint", CoordinatorSessionRequest{SessionBinding: "binding", CheckpointRef: "checkpoint-1"}},
+		{"resume", "/v1/registered-sessions/session-1/resume", CoordinatorSessionRequest{SessionBinding: "binding"}},
+		{"cancel", "/v1/registered-sessions/session-1/cancel", CoordinatorSessionRequest{SessionBinding: "binding", TurnID: "turn-1"}},
+		{"status", "/v1/registered-sessions/session-1/status", CoordinatorSessionRequest{SessionBinding: "binding"}},
+	} {
+		t.Run(test.operation, func(t *testing.T) {
+			if err := validateCoordinatorSessionRequestForBinding(test.operation, test.request, true); err != nil {
+				t.Fatal(err)
+			}
+			_, path, body := coordinatorRegisteredAgentdRequest(test.operation, "session-1", test.request, task)
+			if path != test.path {
+				t.Fatalf("path=%s", path)
+			}
+			if test.operation == "submit" && (bytes.Contains(body, []byte("prompt")) || !bytes.Contains(body, []byte(task.Parameters.BranchRef))) {
+				t.Fatalf("body=%s", body)
 			}
 		})
 	}

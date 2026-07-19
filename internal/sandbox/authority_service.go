@@ -84,9 +84,10 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if err := s.store.RequireConfirmedCoordinatorRouting(ctx, binding, lease); err != nil {
 		return nil, err
 	}
-	registered, err := s.store.RegisteredAdmission(ctx, binding)
-	if err != nil {
-		return nil, fmt.Errorf("registered session requires a v2 admission snapshot")
+	registered, admissionErr := s.store.RegisteredAdmission(ctx, binding)
+	isRegistered := admissionErr == nil
+	if admissionErr != nil && !errors.Is(admissionErr, sql.ErrNoRows) {
+		return nil, admissionErr
 	}
 	workspace, err := s.store.SessionWorkspace(ctx, binding)
 	if err != nil {
@@ -97,11 +98,19 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 		return nil, fmt.Errorf("authority worker coordinator credential is unavailable")
 	}
 	derivedSessionID := "agentd-" + lease.SessionLineageID
-	payload, err := json.Marshal(agentdRegisteredSessionOpenRequest{Version: "agentd/registered-lifecycle/v1", SessionID: derivedSessionID, CoordinatorBinding: binding, SessionLineageID: lease.SessionLineageID, AuthorityProfile: lease.Profile, AuthorityProfileVersion: lease.ProfileVersion, PolicyDigest: lease.PolicyDigest, TaskKind: registered.Task.TaskKind, TaskEvidenceDigest: registered.Task.TaskEvidenceDigest, Parameters: registered.Task.Parameters, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}})
+	var createPayload any = agentdCreateSessionRequest{Version: "agentd/v1", CoordinatorBinding: binding, AuthorityBinding: lease.Profile, WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}}
+	if isRegistered {
+		createPayload = agentdRegisteredSessionOpenRequest{Version: "agentd/registered-lifecycle/v1", SessionID: derivedSessionID, CoordinatorBinding: binding, SessionLineageID: lease.SessionLineageID, AuthorityProfile: lease.Profile, AuthorityProfileVersion: lease.ProfileVersion, PolicyDigest: lease.PolicyDigest, TaskKind: registered.Task.TaskKind, TaskEvidenceDigest: registered.Task.TaskEvidenceDigest, Parameters: registered.Task.Parameters, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}}
+	}
+	payload, err := json.Marshal(createPayload)
 	if err != nil {
 		return nil, err
 	}
-	url := "http://sandbox-authority-" + lease.WorkerID + ":8080/v1/sessions"
+	path := "/v1/sessions"
+	if isRegistered {
+		path = "/v1/registered-sessions"
+	}
+	url := "http://sandbox-authority-" + lease.WorkerID + ":8080" + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -125,7 +134,11 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 		}
 		expectedBinding := agentdWorkerBinding{WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch}
 		expectedWorkspace := agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}
-		if !exactAgentdSessionStatus(status, derivedSessionID, binding, lease.Profile, lease.SessionLineageID, expectedWorkspace, expectedBinding) {
+		expectedSessionID := status.SessionID
+		if isRegistered {
+			expectedSessionID = derivedSessionID
+		}
+		if !exactAgentdSessionStatus(status, expectedSessionID, binding, lease.Profile, lease.SessionLineageID, expectedWorkspace, expectedBinding) {
 			return "", fmt.Errorf("agentd session create returned a mismatched status")
 		}
 		encoded, err = marshalAgentdSessionStatus(status)

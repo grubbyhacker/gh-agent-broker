@@ -52,6 +52,10 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			if !decodeAuthorityJSON(w, r, &in) {
 				return
 			}
+			if _, err := validateRegisteredAdmission(in); err != nil {
+				writeRESTCodeError(w, http.StatusBadRequest, "invalid_registered_admission", err.Error())
+				return
+			}
 			out, err := service.AcquireRegisteredSession(r.Context(), principal, in)
 			if err != nil {
 				writeRESTCodeError(w, http.StatusConflict, "registered_lease_denied", err.Error())

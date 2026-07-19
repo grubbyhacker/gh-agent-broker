@@ -2,7 +2,9 @@ package sandbox
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -49,8 +51,8 @@ type CoordinatorReassignmentStatus struct {
 }
 
 func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, principal, operation string, request CoordinatorSessionRequest) (CoordinatorSessionResponse, error) {
-	if err := validateCoordinatorSessionRequest(operation, request); err != nil {
-		return CoordinatorSessionResponse{}, err
+	if strings.TrimSpace(request.SessionBinding) == "" || len(request.SessionBinding) > 256 || request.After < 0 {
+		return CoordinatorSessionResponse{}, fmt.Errorf("bounded session_binding and cursor are required")
 	}
 	lease, err := s.store.GetLease(ctx, principal, request.SessionBinding)
 	if err != nil || !lease.ReleasedAt.IsZero() {
@@ -59,12 +61,13 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 	if _, err := s.authorize(principal, lease.Profile, "acquire"); err != nil {
 		return CoordinatorSessionResponse{}, err
 	}
-	registered, err := s.store.RegisteredAdmission(ctx, request.SessionBinding)
-	if err != nil {
-		return CoordinatorSessionResponse{}, fmt.Errorf("registered session requires a v2 admission snapshot")
+	registered, admissionErr := s.store.RegisteredAdmission(ctx, request.SessionBinding)
+	isRegistered := admissionErr == nil
+	if admissionErr != nil && !errors.Is(admissionErr, sql.ErrNoRows) {
+		return CoordinatorSessionResponse{}, admissionErr
 	}
-	if operation == "submit" && request.Prompt != "" {
-		return CoordinatorSessionResponse{}, fmt.Errorf("registered turn does not accept a prompt")
+	if err := validateCoordinatorSessionRequestForBinding(operation, request, isRegistered); err != nil {
+		return CoordinatorSessionResponse{}, err
 	}
 	if err := s.store.RequireConfirmedCoordinatorRouting(ctx, request.SessionBinding, lease); err != nil {
 		return CoordinatorSessionResponse{}, err
@@ -81,7 +84,10 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 	if !ok {
 		return CoordinatorSessionResponse{}, fmt.Errorf("agentd session transport is unavailable")
 	}
-	method, path, payload := coordinatorRegisteredAgentdRequest(operation, workspace.AgentdSessionID, request, registered.Task)
+	method, path, payload := coordinatorAgentdRequest(operation, workspace.AgentdSessionID, request)
+	if isRegistered {
+		method, path, payload = coordinatorRegisteredAgentdRequest(operation, workspace.AgentdSessionID, request, registered.Task)
+	}
 	status, result, err := transport.AgentdSessionRequest(ctx, worker, method, path, payload)
 	if err != nil {
 		return CoordinatorSessionResponse{}, err
@@ -124,8 +130,25 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 }
 
 func coordinatorRegisteredAgentdRequest(operation, sessionID string, request CoordinatorSessionRequest, task RegisteredTask) (string, string, json.RawMessage) {
+	path := "/v1/registered-sessions/" + url.PathEscape(sessionID) + "/" + operation
 	if operation != "submit" {
-		return coordinatorAgentdRequest(operation, sessionID, request)
+		method := http.MethodPost
+		payload := map[string]any{}
+		switch operation {
+		case "events":
+			method, payload, path = http.MethodGet, nil, path+"?after="+strconv.FormatInt(request.After, 10)
+		case "status":
+			method, payload = http.MethodGet, nil
+		case "cancel":
+			payload = map[string]any{"turnId": request.TurnID}
+		case "checkpoint":
+			payload = map[string]any{"checkpointRef": request.CheckpointRef}
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return method, path, nil
+		}
+		return method, path, encoded
 	}
 	payload, err := json.Marshal(struct {
 		Version            string                   `json:"version"`
@@ -135,9 +158,9 @@ func coordinatorRegisteredAgentdRequest(operation, sessionID string, request Coo
 		Parameters         RegisteredTaskParameters `json:"parameters"`
 	}{"agentd/registered-lifecycle/v1", request.IdempotencyKey, task.TaskKind, task.TaskEvidenceDigest, task.Parameters})
 	if err != nil {
-		return http.MethodPost, "/v1/sessions/" + url.PathEscape(sessionID) + "/turns", nil
+		return http.MethodPost, "/v1/registered-sessions/" + url.PathEscape(sessionID) + "/turns", nil
 	}
-	return http.MethodPost, "/v1/sessions/" + url.PathEscape(sessionID) + "/turns", payload
+	return http.MethodPost, "/v1/registered-sessions/" + url.PathEscape(sessionID) + "/turns", payload
 }
 
 func validateCoordinatorAgentdResult(operation, sessionID string, after int64, result json.RawMessage) error {
@@ -191,12 +214,16 @@ func safeAgentdErrorCode(code string) string {
 }
 
 func validateCoordinatorSessionRequest(operation string, request CoordinatorSessionRequest) error {
+	return validateCoordinatorSessionRequestForBinding(operation, request, false)
+}
+
+func validateCoordinatorSessionRequestForBinding(operation string, request CoordinatorSessionRequest, registered bool) error {
 	if strings.TrimSpace(request.SessionBinding) == "" || len(request.SessionBinding) > 256 || request.After < 0 {
 		return fmt.Errorf("bounded session_binding and cursor are required")
 	}
 	switch operation {
 	case "submit":
-		if !validAgentdID(request.IdempotencyKey) || request.Prompt == "" || len(request.Prompt) > 256*1024 || request.TurnID != "" || request.CheckpointRef != "" || request.After != 0 {
+		if !validAgentdID(request.IdempotencyKey) || request.TurnID != "" || request.CheckpointRef != "" || request.After != 0 || (registered && request.Prompt != "") || (!registered && (request.Prompt == "" || len(request.Prompt) > 256*1024)) {
 			return fmt.Errorf("submit requires only bounded prompt and idempotency_key")
 		}
 	case "cancel":

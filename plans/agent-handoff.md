@@ -4,7 +4,14 @@
 
 ### Durable registered-task admission (candidate A)
 
-The authority store schema v11 adds a fail-closed registered-admission snapshot
+The authority store schema v12 repairs the original v11 registered-admission
+foreign-key association and adds a principal-plus-binding composite relationship
+to the lease. It enables SQLite foreign-key enforcement on every store open.
+Registered durable reads fetch and verify the stored protocol version, strict
+canonical JSON, source columns, canonical bytes, and digest, failing closed on
+any mismatch. `POST /v1/authority-workers/coordinator/v2/leases` requires the
+exact top-level `broker/coordinator/v2` version and rejects unknown or trailing
+JSON. The authority store adds a fail-closed registered-admission snapshot
 table. `POST /v1/authority-workers/coordinator/v2/leases` accepts only the
 settled `broker/coordinator/v2` registered task/source shape, verifies its
 lowercase SHA-256 JCS digest, requires `session:<work_item_id>`, and atomically
@@ -77,7 +84,11 @@ operations without returning installation credentials to workers.
 The private `broker/coordinator/v1` REST surface now mediates the complete
 authority session command set: acquire, create, submit, events, checkpoint,
 resume, cancel, status, reassign, and reassignment status. Signal Plane supplies
-only a logical binding and operation-specific typed data. The broker resolves
+only a logical binding and operation-specific typed data. Legacy v1 lease
+bindings remain mediated through the legacy `/v1/sessions` agentd routes and
+continue to require a prompt for submit. Only bindings with the durable v2
+admission snapshot use `/v1/registered-sessions`; their submit derives task
+data from the snapshot and rejects caller prompts. The broker resolves
 the immutable profile version, policy digest, worker/session/storage lineages,
 fence epoch, agentd identity, and fixed Docker endpoint; callers cannot address
 agentd or select runtime authority.

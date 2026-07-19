@@ -80,11 +80,11 @@ func TestCoordinatorV1SubmitIsBrokerMediated(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer coordinator-test-token")
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusConflict || !strings.Contains(resp.Body.String(), "v2 admission snapshot") {
+	if resp.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
 	}
-	if runtime.path != "" {
-		t.Fatalf("legacy lease reached agentd: %q", runtime.path)
+	if runtime.path != "/v1/sessions/agentd-session/turns" {
+		t.Fatalf("legacy lease did not use legacy path: %q", runtime.path)
 	}
 }
 
@@ -99,7 +99,7 @@ func TestCoordinatorV1BlocksCommandsUntilReassignmentAdoptionIsConfirmed(t *test
 		Prompt:         "make the registered change",
 	}
 
-	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err == nil || !strings.Contains(err.Error(), "v2 admission snapshot") {
+	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err == nil || !strings.Contains(err.Error(), "not confirmed") {
 		t.Fatalf("pending adoption routed command: %v", err)
 	}
 }

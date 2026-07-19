@@ -33,7 +33,7 @@ type AuthorityAgentdSessionTransport interface {
 func (r *DockerAuthorityRuntime) AgentdSessionRequest(ctx context.Context, worker AuthorityWorker, method, path string, payload json.RawMessage) (int, json.RawMessage, error) {
 	profile, ok := r.profiles[worker.Profile]
 	readiness := configuredAgentdReadiness(profile)
-	if !ok || readiness.ContractVersion != "agentd/control/v1" || (method != http.MethodGet && method != http.MethodPost) || !strings.HasPrefix(path, "/v1/sessions/") {
+	if !ok || readiness.ContractVersion != "agentd/control/v1" || (method != http.MethodGet && method != http.MethodPost) || (!strings.HasPrefix(path, "/v1/sessions/") && !strings.HasPrefix(path, "/v1/registered-sessions/")) {
 		return 0, nil, fmt.Errorf("agentd session transport request is invalid")
 	}
 	token := strings.TrimSpace(os.Getenv(profile.CoordinatorTokenEnv))
