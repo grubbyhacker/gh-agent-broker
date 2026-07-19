@@ -33,18 +33,21 @@ import (
 	"gh-agent-broker/internal/policy"
 	"gh-agent-broker/internal/pushtripwire"
 	"gh-agent-broker/internal/repositoryroutepolicy"
+	"gh-agent-broker/internal/sandbox"
 	"gh-agent-broker/internal/securityscan"
 )
 
 type Server struct {
-	configPath string
-	mu         sync.RWMutex
-	cfg        *config.Config
-	gh         *githubapp.Client
-	audit      *audit.Logger
-	http       *http.Client
-	tripwire   *pushtripwire.Store
-	fence      pushtripwire.FenceAdapter
+	configPath        string
+	mu                sync.RWMutex
+	cfg               *config.Config
+	gh                *githubapp.Client
+	audit             *audit.Logger
+	http              *http.Client
+	tripwire          *pushtripwire.Store
+	fence             pushtripwire.FenceAdapter
+	transport         *sandbox.TransportObserver
+	transportProfiles map[string]string
 }
 
 func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *audit.Logger) (*Server, error) {
@@ -56,14 +59,51 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 			return nil, err
 		}
 	}
+	var transport *sandbox.TransportObserver
+	if cfg.TransportObservation.Enabled {
+		transport, err = sandbox.OpenTransportObserver(context.Background(), cfg.TransportObservation.AuthorityStorePath)
+		if err != nil {
+			return nil, fmt.Errorf("open transport observer: %w", err)
+		}
+	}
 	return &Server{
-		configPath: configPath,
-		cfg:        cfg,
-		gh:         gh,
-		audit:      auditLog,
-		http:       &http.Client{Timeout: 10 * time.Minute},
-		tripwire:   tripwire,
+		configPath:        configPath,
+		cfg:               cfg,
+		gh:                gh,
+		audit:             auditLog,
+		http:              &http.Client{Timeout: 10 * time.Minute},
+		tripwire:          tripwire,
+		transport:         transport,
+		transportProfiles: cfg.TransportObservation.ProfileAgentIDs,
 	}, nil
+}
+
+func (s *Server) beginTransport(ctx context.Context, principal auth.Principal, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
+	profiles := make([]string, 0, 1)
+	for profile, agentID := range s.transportProfiles {
+		if agentID == principal.ID {
+			profiles = append(profiles, profile)
+		}
+	}
+	if len(profiles) != 1 {
+		return nil, errors.New("transport authority correlation is ambiguous or unavailable")
+	}
+	authority, err := s.transport.ResolveAuthority(ctx, profiles[0])
+	if err != nil {
+		return nil, err
+	}
+	op := &sandbox.TransportOperation{OperationID: ids.NewOperationID(), Method: method, Service: service, Repository: repo, RequestPath: path, RequestedRefs: []string{}, RefUpdates: []any{}, CredentialHeaderPresent: credentialHeader, Authority: authority}
+	if err := s.transport.Received(ctx, op); err != nil {
+		return nil, err
+	}
+	return op, nil
+}
+
+func (s *Server) denyTransport(ctx context.Context, op *sandbox.TransportOperation, code string, status int) bool {
+	if op == nil {
+		return true
+	}
+	return s.transport.Terminal(ctx, op, "denied", "denied", code, status, 0) == nil
 }
 
 func (s *Server) InstallSignalReload() {
@@ -1871,6 +1911,15 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported git operation", http.StatusBadRequest)
 		return
 	}
+	var transport *sandbox.TransportOperation
+	if s.transport != nil {
+		var err error
+		transport, err = s.beginTransport(r.Context(), principal, r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, r.Header.Get("Authorization") != "")
+		if err != nil {
+			http.Error(w, "transport authority observation unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	var bodyReader io.Reader = r.Body
 	branch := ""
 	var updates []receivePackUpdate
@@ -1882,10 +1931,17 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 				status = http.StatusRequestEntityTooLarge
 			}
 			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Decision: policy.DecisionDeny, Result: "receive_pack_command_prefix_rejected"})
+			if !s.denyTransport(r.Context(), transport, "receive_pack_command_prefix_rejected", status) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
 			http.Error(w, "invalid receive-pack command prefix", status)
 			return
 		}
 		updates = parsedUpdates
+		if transport != nil {
+			transport.RefUpdates = parsedUpdates
+		}
 		bodyReader = io.MultiReader(bytes.NewReader(prefix), r.Body)
 		if len(parsedUpdates) > 0 {
 			branch = parsedUpdates[0].Ref
@@ -1907,6 +1963,10 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 				Action:   "push a named branch ref that the broker can parse and policy allows",
 			}},
 		}
+		if !s.denyTransport(r.Context(), transport, "branch_unparseable", http.StatusForbidden) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Decision: result.Decision})
 		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
@@ -1919,6 +1979,10 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		Branch:    branch,
 	})
 	if !result.Allowed {
+		if !s.denyTransport(r.Context(), transport, "policy_denied", http.StatusForbidden) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision})
 		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
@@ -1958,33 +2022,53 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			Result:      "semantic_pack_inspection_unavailable",
 			Extra:       map[string]interface{}{"attempted_operation": operation, "surface": "git_receive_pack"},
 		})
+		if !s.denyTransport(r.Context(), transport, "security_egress_blocked", http.StatusForbidden) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		writeGitPolicyError(w, r, s.errorResponse(opID, "security_egress_blocked", "opaque Git push denied by security policy", &result))
 		return
 	}
 	if strings.HasPrefix(repo, "local/") {
 		route, found := localRepositoryRoute(cfg, repo)
 		if !found {
+			if !s.denyTransport(r.Context(), transport, "local_repository_not_configured", http.StatusForbidden) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
 			http.Error(w, "local repository is not configured", http.StatusForbidden)
 			return
 		}
 		if operation == "git.receive-pack" && r.Method == http.MethodPost {
 			for _, update := range updates {
 				if update.After == strings.Repeat("0", 40) || !route.AllowsWrite(update.Ref) {
+					if !s.denyTransport(r.Context(), transport, "local_ref_policy_denied", http.StatusForbidden) {
+						http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+						return
+					}
 					s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, update.Ref, "local_ref_policy_denied", "local pushes must be non-deleting updates in the configured writable namespace")
 					return
 				}
 			}
 			if !s.localReceivePackBeforeMatches(r.Context(), route, repo, updates) {
+				if !s.denyTransport(r.Context(), transport, "ref_before_mismatch", http.StatusForbidden) {
+					http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+					return
+				}
 				s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, branch, "ref_before_mismatch", "advertised ref state no longer matches the repository backend")
 				return
 			}
 		}
-		s.forwardLocalGit(w, r, opID, principal.ID, repo, branch, operation, result, route, suffix, bodyReader)
+		s.forwardLocalGit(w, r, opID, principal.ID, repo, branch, operation, result, route, suffix, bodyReader, transport)
 		return
 	}
 	appName := config.GitHubAppName(principal.Agent)
 	inst, ok := cfg.InstallationIDForApp(appName, repo)
 	if !ok {
+		if !s.denyTransport(r.Context(), transport, "installation_not_configured", http.StatusForbidden) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "repository has no configured GitHub App installation", http.StatusForbidden)
 		return
 	}
@@ -1992,6 +2076,10 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	if guardResult != nil {
 		result.Warnings = append(result.Warnings, guardResult.Warnings...)
 		if !guardResult.Allowed {
+			if !s.denyTransport(r.Context(), transport, "policy_denied", http.StatusForbidden) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
 			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: guardResult.Decision})
 			writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", guardResult))
 			return
@@ -2004,17 +2092,29 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	if operation == "git.receive-pack" && r.Method == http.MethodPost {
 		for _, update := range updates {
 			if update.After == strings.Repeat("0", 40) {
+				if !s.denyTransport(r.Context(), transport, "ref_deletion_rejected", http.StatusForbidden) {
+					http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+					return
+				}
 				s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, update.Ref, "ref_deletion_rejected", "ref deletion is not allowed through opaque receive-pack")
 				return
 			}
 			current, found, err := gh.GetRef(appName, repo, update.Ref, inst)
 			if err != nil {
+				if !s.denyTransport(r.Context(), transport, "ref_preflight_unavailable", http.StatusBadGateway) {
+					http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+					return
+				}
 				s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: update.Ref, Decision: policy.DecisionDeny, Result: "ref_preflight_unavailable", Error: err.Error()})
 				http.Error(w, "GitHub ref preflight failed", http.StatusBadGateway)
 				return
 			}
 			zeroBefore := update.Before == strings.Repeat("0", 40)
 			if (zeroBefore && found) || (!zeroBefore && (!found || current != update.Before)) {
+				if !s.denyTransport(r.Context(), transport, "ref_before_mismatch", http.StatusForbidden) {
+					http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+					return
+				}
 				s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, update.Ref, "ref_before_mismatch", "advertised ref state no longer matches GitHub")
 				return
 			}
@@ -2022,32 +2122,58 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	}
 	token, err := gh.InstallationToken(appName, inst)
 	if err != nil {
+		if !s.denyTransport(r.Context(), transport, "token_exchange_failed", http.StatusBadGateway) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
 		http.Error(w, "github token exchange failed", http.StatusBadGateway)
 		return
 	}
 	upstream, err := gitUpstreamURL(cfg.GitHub.GitBaseURL, repo, suffix, r.URL.RawQuery)
 	if err != nil {
+		if !s.denyTransport(r.Context(), transport, "upstream_url_invalid", http.StatusBadRequest) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	//nolint:gosec // upstream is constructed from validated repo path and configured Git base URL.
 	req, err := http.NewRequest(r.Method, upstream, bodyReader)
 	if err != nil {
+		if !s.denyTransport(r.Context(), transport, "upstream_request_invalid", http.StatusBadRequest) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	req.ContentLength = r.ContentLength
 	copyGitHeaders(req.Header, r.Header)
 	req.SetBasicAuth("x-access-token", token)
+	if transport != nil && s.transport.Forwarded(r.Context(), transport) != nil {
+		http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+		return
+	}
 	// #nosec G704 -- outbound Git proxy target is constrained by broker config and repo policy.
 	resp, err := s.http.Do(req)
 	if err != nil {
+		if transport != nil {
+			if terminalErr := s.transport.Terminal(r.Context(), transport, "failed", "failed", "github_git_upstream_failed", http.StatusBadGateway, 0); terminalErr != nil {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
+		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
 		http.Error(w, "github git upstream failed", http.StatusBadGateway)
 		return
 	}
 	defer closeBody(resp.Body)
+	if transport != nil && s.transport.Terminal(r.Context(), transport, "completed", "allowed", "", resp.StatusCode, resp.StatusCode) != nil {
+		http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+		return
+	}
 	if operation != "git.receive-pack" {
 		copyGitHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
@@ -2387,27 +2513,49 @@ func advertisedRefs(body []byte) map[string]string {
 	return refs
 }
 
-func (s *Server) forwardLocalGit(w http.ResponseWriter, r *http.Request, opID, agentID, repo, branch, operation string, result policy.Result, route repositoryroutepolicy.Route, suffix string, body io.Reader) {
+func (s *Server) forwardLocalGit(w http.ResponseWriter, r *http.Request, opID, agentID, repo, branch, operation string, result policy.Result, route repositoryroutepolicy.Route, suffix string, body io.Reader, transport *sandbox.TransportOperation) {
 	u, err := localGitURL(route, repo, suffix, r.URL.RawQuery)
 	if err != nil {
+		if !s.denyTransport(r.Context(), transport, "local_backend_url_invalid", http.StatusBadGateway) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "invalid local backend URL", http.StatusBadGateway)
 		return
 	}
 	//nolint:gosec // URL is constructed solely from the reviewed route manifest.
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, u, body)
 	if err != nil {
+		if !s.denyTransport(r.Context(), transport, "local_backend_request_invalid", http.StatusBadGateway) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "invalid local backend request", http.StatusBadGateway)
 		return
 	}
 	req.ContentLength = r.ContentLength
 	copyGitHeaders(req.Header, r.Header)
+	if transport != nil && s.transport.Forwarded(r.Context(), transport) != nil {
+		http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+		return
+	}
 	//nolint:gosec // request target is constrained by the reviewed route manifest.
 	resp, err := s.http.Do(req)
 	if err != nil {
+		if transport != nil {
+			if terminalErr := s.transport.Terminal(r.Context(), transport, "failed", "failed", "backend_unavailable", http.StatusBadGateway, 0); terminalErr != nil {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
+		}
 		http.Error(w, "repository backend unavailable", http.StatusBadGateway)
 		return
 	}
 	defer closeBody(resp.Body)
+	if transport != nil && s.transport.Terminal(r.Context(), transport, "completed", "allowed", "", resp.StatusCode, resp.StatusCode) != nil {
+		http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+		return
+	}
 	copyGitHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {

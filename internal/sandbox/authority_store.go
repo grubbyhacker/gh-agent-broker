@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 9
+const authorityStoreSchemaVersion = 10
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -247,6 +247,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		if err := s.migrateV9(ctx); err != nil {
 			return err
 		}
+		version = 9
+	}
+	if version == 9 {
+		if err := s.migrateV10(ctx); err != nil {
+			return err
+		}
 	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
@@ -452,6 +458,47 @@ func (s *AuthorityWorkerStore) migrateV9(ctx context.Context) error {
 		profile_version=coalesce((SELECT profile_version FROM authority_workers worker WHERE worker.worker_id=authority_session_reassignments.replacement_worker_id),''),
 		policy_digest=coalesce((SELECT policy_digest FROM authority_workers worker WHERE worker.worker_id=authority_session_reassignments.replacement_worker_id),'');
 	PRAGMA user_version=9`)
+	return err
+}
+
+// V10 adds the broker-owned, append-only smart-HTTP transport journal. The
+// table is deliberately in the authority database so one durable boundary
+// binds the active lease and the observed operation.
+func (s *AuthorityWorkerStore) migrateV10(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE repository_transport_events (
+		cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+		operation_id TEXT NOT NULL,
+		phase_ordinal INTEGER NOT NULL,
+		phase TEXT NOT NULL,
+		principal TEXT NOT NULL,
+		worker_id TEXT NOT NULL,
+		session_lineage_id TEXT NOT NULL,
+		worker_storage_lineage_id TEXT NOT NULL,
+		worker_fence_epoch INTEGER NOT NULL,
+		profile_version TEXT NOT NULL,
+		policy_digest TEXT NOT NULL,
+		method TEXT NOT NULL,
+		service TEXT NOT NULL,
+		repository TEXT NOT NULL,
+		request_path TEXT NOT NULL,
+		requested_refs_json TEXT NOT NULL,
+		ref_updates_json TEXT NOT NULL,
+		credential_header_present INTEGER NOT NULL,
+		decision TEXT NOT NULL,
+		outcome_code TEXT NOT NULL,
+		http_status INTEGER NOT NULL,
+		backend_status INTEGER NOT NULL,
+		before_refs_digest TEXT NOT NULL,
+		after_refs_digest TEXT NOT NULL,
+		previous_event_digest TEXT NOT NULL,
+		event_digest TEXT NOT NULL UNIQUE,
+		UNIQUE(operation_id, phase_ordinal),
+		CHECK(phase_ordinal >= 1),
+		CHECK(phase IN ('received','forwarded','denied','completed','failed')),
+		CHECK(credential_header_present IN (0,1))
+	) STRICT;
+	CREATE INDEX repository_transport_events_operation ON repository_transport_events(operation_id,phase_ordinal);
+	PRAGMA user_version=10`)
 	return err
 }
 

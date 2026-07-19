@@ -2,6 +2,23 @@
 
 ## Current State
 
+### Settled 2a/2b repository transport journal
+
+The authority SQLite store schema v10 adds the broker-owned append-only
+`repository_transport_events` table with the settled 2b reader columns. The
+main broker can enable the staging-only `transport_observation` configuration,
+which opens the existing authority store, resolves exactly one unreleased lease
+through a reviewed profile-to-agent mapping, and persists `received`,
+`forwarded`, and terminal `denied`/`completed`/`failed` phases before the
+corresponding policy, backend, or client response. It stores only normalized
+metadata and digests; credential values and Git pack bodies are excluded.
+
+This path is disabled by default and configuration rejects it in production.
+The evidence runner has no broker write API; its settled database mount/query
+remains read-only work owned by the topology. Focused tests cover no-op state,
+internal authority resolution, append failure, incomplete/denied/failed/success
+phase chains, replay, digest linkage, and ambiguous leases.
+
 ### Repository-route-policy/v1 and local smart HTTP backend
 
 The broker and sandbox now load the same optional
