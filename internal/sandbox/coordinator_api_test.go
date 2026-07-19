@@ -79,3 +79,19 @@ func TestCoordinatorAgentdResultsRejectCrossSessionEvidence(t *testing.T) {
 		t.Fatal("regressing cursor accepted")
 	}
 }
+
+func TestRegisteredCoordinatorCancelAcceptsCanonicalSessionStatus(t *testing.T) {
+	lease := AuthorityLease{
+		Profile:                "writer",
+		WorkerID:               "worker-1",
+		WorkerStorageLineageID: "storage-1",
+		WorkerFenceEpoch:       2,
+		SessionLineageID:       "lineage-1",
+	}
+	workspace := SessionWorkspace{AgentdSessionID: "agentd-session", Path: "/workspace", UID: 20000, GID: 20000}
+	result := json.RawMessage(`{"version":"agentd/v1","sessionId":"agentd-session","coordinatorBinding":"binding","authorityBinding":"writer","workerId":"worker-1","storageLineageId":"storage-1","fenceEpoch":2,"sessionLineageId":"lineage-1","workspace":{"workspaceRef":"/workspace","uid":20000,"gid":20000,"branchRef":"main","checkpointRef":"checkpoint-1"},"phase":"active","turnIds":["turn-1"],"nextCursor":3}`)
+
+	if err := validateCoordinatorAgentdSessionStatus(result, workspace, "binding", lease); err != nil {
+		t.Fatalf("registered cancel result rejected: %v", err)
+	}
+}

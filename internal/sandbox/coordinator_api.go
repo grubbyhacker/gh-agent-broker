@@ -118,15 +118,22 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 		}
 		return CoordinatorSessionResponse{}, &CoordinatorAgentdError{Status: status, Code: safeAgentdErrorCode(denied.Error)}
 	}
-	if operation == "status" || operation == "checkpoint" || operation == "resume" {
-		decoded, err := decodeAgentdSessionStatus(strings.NewReader(string(result)))
-		if err != nil || !exactAgentdSessionStatus(decoded, workspace.AgentdSessionID, request.SessionBinding, lease.Profile, lease.SessionLineageID, agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID, BranchRef: decoded.Workspace.BranchRef, CheckpointRef: decoded.Workspace.CheckpointRef}, agentdWorkerBinding{WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch}) {
-			return CoordinatorSessionResponse{}, fmt.Errorf("agentd returned mismatched session status")
+	if operation == "status" || operation == "checkpoint" || operation == "resume" || (isRegistered && operation == "cancel") {
+		if err := validateCoordinatorAgentdSessionStatus(result, workspace, request.SessionBinding, lease); err != nil {
+			return CoordinatorSessionResponse{}, err
 		}
 	} else if err := validateCoordinatorAgentdResult(operation, workspace.AgentdSessionID, request.After, result); err != nil {
 		return CoordinatorSessionResponse{}, err
 	}
 	return CoordinatorSessionResponse{Version: coordinatorProtocolVersion, Lease: lease, Result: result}, nil
+}
+
+func validateCoordinatorAgentdSessionStatus(result json.RawMessage, workspace SessionWorkspace, sessionBinding string, lease AuthorityLease) error {
+	decoded, err := decodeAgentdSessionStatus(strings.NewReader(string(result)))
+	if err != nil || !exactAgentdSessionStatus(decoded, workspace.AgentdSessionID, sessionBinding, lease.Profile, lease.SessionLineageID, agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID, BranchRef: decoded.Workspace.BranchRef, CheckpointRef: decoded.Workspace.CheckpointRef}, agentdWorkerBinding{WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch}) {
+		return fmt.Errorf("agentd returned mismatched session status")
+	}
+	return nil
 }
 
 func coordinatorRegisteredAgentdRequest(operation, sessionID string, request CoordinatorSessionRequest, task RegisteredTask) (string, string, json.RawMessage) {

@@ -23,6 +23,10 @@ and turn payloads use only the stored snapshot and broker lineage/workspace
 identities. Registered coordinator commands use the exact versioned
 registered-lifecycle routes and refuse resume; registered reassignment uses
 `/adopt`, while legacy reassignment retains `/rebind`.
+Registered submit validates its turn-status response, while registered cancel,
+checkpoint, and status validate the exact canonical session status against the
+binding, workspace, and worker fence; legacy cancel retains its turn-status
+contract.
 
 ### Settled 2a/2b repository transport journal
 
