@@ -15,7 +15,12 @@ import (
 	"time"
 )
 
-const agentdBrokerValidationURL = "http://sandbox-broker:8091/v1/authority-workers/agentd/session-validation"
+const (
+	agentdBrokerValidationURL  = "http://sandbox-broker:8091/v1/authority-workers/agentd/session-validation"
+	agentdBrokerObservationURL = "http://broker:8080/v1/registered/github-green-pr/observe"
+	//nolint:gosec // This fixed internal route is not a credential and cannot be caller-selected.
+	agentdBrokerCredentialMintURL = "http://sandbox-broker:8091/v1/authority-workers/git-credential/mint"
+)
 
 // DockerAuthorityRuntime is purpose-built for immutable authority workers. It
 // does not accept caller runtime inputs; AuthorityWorkerSpec is constructed
@@ -33,7 +38,7 @@ type AuthorityAgentdSessionTransport interface {
 func (r *DockerAuthorityRuntime) AgentdSessionRequest(ctx context.Context, worker AuthorityWorker, method, path string, payload json.RawMessage) (int, json.RawMessage, error) {
 	profile, ok := r.profiles[worker.Profile]
 	readiness := configuredAgentdReadiness(profile)
-	if !ok || readiness.ContractVersion != "agentd/control/v1" || (method != http.MethodGet && method != http.MethodPost) || !strings.HasPrefix(path, "/v1/sessions/") {
+	if !ok || readiness.ContractVersion != "agentd/control/v1" || (method != http.MethodGet && method != http.MethodPost) || (!strings.HasPrefix(path, "/v1/sessions/") && !strings.HasPrefix(path, "/v1/registered-sessions/")) {
 		return 0, nil, fmt.Errorf("agentd session transport request is invalid")
 	}
 	token := strings.TrimSpace(os.Getenv(profile.CoordinatorTokenEnv))
@@ -112,18 +117,24 @@ func authorityWorkerRuntimeSpec(spec AuthorityWorkerSpec, secret, coordinatorTok
 	// source relative to that directory. State is durable within the worker's
 	// engine-enforced storage-lineage subpath.
 	env := map[string]string{
-		spec.BrokerSecretEnv:             secret,
-		"AGENTD_BROKER_VALIDATION_URL":   agentdBrokerValidationURL,
-		"AGENTD_BROKER_VALIDATION_TOKEN": deriveAgentdValidationToken(secret, spec.WorkerID, spec.WorkerStorageLineageID, spec.WorkerFenceEpoch),
-		"AGENTD_COORDINATOR_TOKEN":       coordinatorToken,
-		"AGENTD_STATE_PATH":              filepath.Join(spec.SessionIsolation.WorkspaceRoot, agentdControlV1StateDirectory, agentdControlV1StateFile),
-		"AGENTD_WORKER_ID":               spec.WorkerID,
-		"AGENTD_STORAGE_LINEAGE_ID":      spec.WorkerStorageLineageID,
-		"AGENTD_FENCE_EPOCH":             strconv.FormatInt(spec.WorkerFenceEpoch, 10),
-		"AGENTD_AUTHORITY_BINDING":       spec.Profile,
-		"AGENTD_SESSION_ROOT":            spec.SessionIsolation.WorkspaceRoot,
-		"AGENTD_SESSION_UID_MIN":         strconv.Itoa(spec.SessionIsolation.UIDStart),
-		"AGENTD_SESSION_CAPACITY":        strconv.Itoa(spec.SessionCapacity),
+		"AGENTD_BROKER_VALIDATION_URL":      agentdBrokerValidationURL,
+		"AGENTD_BROKER_VALIDATION_TOKEN":    deriveAgentdValidationToken(secret, spec.WorkerID, spec.WorkerStorageLineageID, spec.WorkerFenceEpoch),
+		"AGENTD_BROKER_OBSERVATION_URL":     agentdBrokerObservationURL,
+		"AGENTD_BROKER_OBSERVATION_TOKEN":   deriveAgentdValidationToken(secret, spec.WorkerID, spec.WorkerStorageLineageID, spec.WorkerFenceEpoch),
+		"AGENTD_BROKER_CREDENTIAL_MINT_URL": agentdBrokerCredentialMintURL,
+		"AGENTD_BROKER_CONTROL_TOKEN":       deriveAgentdValidationToken(secret, spec.WorkerID, spec.WorkerStorageLineageID, spec.WorkerFenceEpoch),
+		"AGENTD_COORDINATOR_TOKEN":          coordinatorToken,
+		"AGENTD_STATE_PATH":                 filepath.Join(spec.SessionIsolation.WorkspaceRoot, agentdControlV1StateDirectory, agentdControlV1StateFile),
+		"AGENTD_WORKER_ID":                  spec.WorkerID,
+		"AGENTD_STORAGE_LINEAGE_ID":         spec.WorkerStorageLineageID,
+		"AGENTD_FENCE_EPOCH":                strconv.FormatInt(spec.WorkerFenceEpoch, 10),
+		"AGENTD_AUTHORITY_PROFILE":          spec.Profile,
+		"AGENTD_AUTHORITY_PROFILE_VERSION":  spec.ProfileVersion,
+		"AGENTD_POLICY_DIGEST":              spec.PolicyDigest,
+		"AGENTD_AUTHORITY_BINDING":          spec.Profile,
+		"AGENTD_SESSION_ROOT":               spec.SessionIsolation.WorkspaceRoot,
+		"AGENTD_SESSION_UID_MIN":            strconv.Itoa(spec.SessionIsolation.UIDStart),
+		"AGENTD_SESSION_CAPACITY":           strconv.Itoa(spec.SessionCapacity),
 	}
 	labels := map[string]string{
 		"gh-agent-broker.run_id":                 "authority-" + spec.WorkerID,
@@ -263,8 +274,34 @@ func (r *DockerAuthorityRuntime) RebindAgentdSession(ctx context.Context, worker
 	return postAgentdRebind(ctx, r.httpClient, endpoint, token, rebind)
 }
 
+func (r *DockerAuthorityRuntime) AdoptRegisteredAgentdSession(ctx context.Context, worker AuthorityWorker, sessionID string, adoption agentdRegisteredAdoptRequest) (agentdSessionStatus, error) {
+	profile, ok := r.profiles[worker.Profile]
+	readiness := configuredAgentdReadiness(profile)
+	if !ok || readiness.ContractVersion != "agentd/control/v1" || !validAgentdID(sessionID) {
+		return agentdSessionStatus{}, &agentdRebindError{}
+	}
+	token := strings.TrimSpace(os.Getenv(profile.CoordinatorTokenEnv))
+	if token == "" {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	address, err := r.docker.InternalAddress(ctx, worker.ContainerID)
+	if err != nil || address == "" {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	endpoint := "http://" + address + ":" + strconv.Itoa(readiness.Port) + "/v1/registered-sessions/" + url.PathEscape(sessionID) + "/adopt"
+	return postAgentdRegisteredAdoption(ctx, r.httpClient, endpoint, token, adoption)
+}
+
 func postAgentdRebind(ctx context.Context, client *http.Client, endpoint, token string, rebind agentdRebindRequest) (agentdSessionStatus, error) {
-	payload, err := json.Marshal(rebind)
+	return postAgentdSessionTransition(ctx, client, endpoint, token, rebind)
+}
+
+func postAgentdRegisteredAdoption(ctx context.Context, client *http.Client, endpoint, token string, adoption agentdRegisteredAdoptRequest) (agentdSessionStatus, error) {
+	return postAgentdSessionTransition(ctx, client, endpoint, token, adoption)
+}
+
+func postAgentdSessionTransition(ctx context.Context, client *http.Client, endpoint, token string, transition any) (agentdSessionStatus, error) {
+	payload, err := json.Marshal(transition)
 	if err != nil {
 		return agentdSessionStatus{}, &agentdRebindError{}
 	}

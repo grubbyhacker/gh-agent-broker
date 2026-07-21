@@ -2,6 +2,207 @@
 
 ## Current State
 
+### Agentd canonical Git credential receipt
+
+The sandbox authority endpoint now accepts only
+`agentd-broker-git-credential-receipt/v1` at
+`POST /v1/authority-workers/git-credential/mint`, authenticated with the
+generation-bound parent control token. Schema v12 stores the exact canonical
+receipt bytes, receipt digest, effect binding, expiry, and only an HMAC-derived
+secret fingerprint. A child secret is deterministically derived from the
+broker-private authority-store salt, so a lost response and identical retry
+return the original value without persisting plaintext. Receipt conflicts,
+expired/released sessions, worker/storage/fence/profile/task mismatches, and
+cross-effect replays are denied. The response is the strict
+`agentd-broker-git-credential/v1` shape with `Cache-Control: no-store` and a
+nonrenewing `min(authorized_at + 30m, deadline_at)` expiry.
+
+Authority worker containers no longer receive the reusable configured broker
+agent secret or its observation identity. They receive only the existing
+generation-bound control derivation plus agentd's fixed credential-mint seam.
+The main broker opens the same custody database and recognizes a minted Basic
+credential only while its fingerprint, expiry, and exact registered repository
+match; it projects the parent policy only for that fixed repository.
+
+Follow-up custody hardening extends schema v13: `secret_fingerprint` is now an
+HMAC under a domain-separated authority-store key, never plain SHA-256. The
+durable credential also records its immutable profile/version, admission task,
+journal, authorization, and deadline coordinates. Every Git authentication
+joins those coordinates to the current unreleased lease, ready worker,
+storage/fence, session workspace, and admission; caller-selected substitutions
+are not accepted. Active effect-token fingerprints are registered with the
+broker scanner on store open and mint, including through revocation/expiry.
+An exact scanner match fences the bound session/worker and revokes the
+credential before the bounded receive-pack stream can be forwarded; scanner
+events carry only the reason and fingerprint identifier.
+
+The independent broker follow-up preserves both identities for dynamic Git
+credentials: Basic authentication and audit retain the effect agent ID, while
+transport authority validation uses the immutable parent principal. Receive-pack
+inspection now parses pkt-lines and complete SHA-1 pack streams before
+forwarding, inflates bounded objects, resolves bounded OFS/REF deltas, and
+scans resolved commit/blob contents. Malformed, thin, checksum-invalid, or
+limit-exceeding packs fail closed. Exact scanner matches retain only the safe
+fingerprint/reason and trigger the existing revoke/release/fence path. An
+identical stored mint retry now refuses an already-expired receipt rather than
+returning or extending its derived secret. This intentionally does not alter
+the separate agentd registered-response/event wire.
+
+### Custody implementation handoff — blocked at the agentd effect-authority seam
+
+`vps-ops` main at `435411d148cf756abc0f3ea9ee859db3ee8cb0be` settles Option A:
+agentd must submit a source-closed, reducer-validated canonical effect receipt
+to `POST /v1/authority-workers/git-credential/mint`. The current broker has
+durable registered admission, lease, worker/storage/fence, and transport state,
+but it does not persist or receive canonical model-effect authorization, journal
+cursor/record digest, effect ID, authorized-at, or absolute effect deadline.
+It therefore cannot validate the mandated receipt or implement per-request
+effect-token binding without fabricating a second authority ledger. Preserve
+this failure state until the matching agentd receipt contract is available.
+
+The broker-to-agentd registered turn seam now matches agentd ready PR #19 head
+`9801e4182ee4435885c7e195b4720f48a68e4f89`. Registered submit sends only the
+strict `agentd/registered-lifecycle/v1` body: `idempotencyKey`, `taskKind`,
+`admissionTaskDigest`, `taskEvidenceDigest`, and `parameters`. It accepts only
+HTTP 202 with strict `agentd/registered-turn/v2` queued acknowledgement and
+requires `modelEffectId == model:<idempotencyKey>`. The broker persists that
+mapping and its events cursor, so replay returns the recorded acknowledgement
+without another submission. Events use only strict
+`agentd/registered-events/v2` typed projections and advance the durable cursor
+only after source-schema validation. The verifier projection is the exact
+session-supervisor 2.2.0 result plus its transport phase: bounded opaque head
+and evidence references, 1--64 evidence references, 0--32 strict reasons, and
+the exact phase/outcome mapping. Local deadline/refusal escalation remains an
+opaque source-owned fact and is not normalized into a GitHub SHA. Replayed
+cursors are rejected before forwarding, and a stored submit is never submitted
+again. The source fixture is vendored byte-for-byte at
+`testdata/agentd/registered-turn-v2.golden.json`.
+
+Agentd may emit the typed optional `runtime_outcome_uncertain` failure for a
+persisted running effect recovered after restart. Event acceptance binds phase,
+failure, and verifier as one source-closed tuple: empty failure permits only
+verifier-free `queued`/`authorized`/`running`/`completed` or a valid matching
+verifier phase; `credential_mint_failed` is only verifier-free `authorized`;
+`runtime_failed` only verifier-free `failed`; `credential_expired` only
+verifier-free `escalated`; and `runtime_outcome_uncertain` only `escalated`
+with a valid `escalated` verifier. Unknowns and all mismatches are denied while
+the verifier contract and task-evidence digest checks remain strict.
+
+Schema v16 projects every active model effect into `authority_effect_custody`
+with its exact admitted principal/binding/task, session, worker/storage/fence,
+and profile/version/policy coordinates. The original effect keeps its own row:
+after it is terminal, agentd may project a distinct continuation only through
+that continuation's `authorized` event. Projection validates the durable task,
+turn, binding, and worker fence and inserts the custody row in the same SQLite
+transaction as cursor advancement; wrong task/fence/binding leaves neither a
+row nor a cursor advance. Terminal events latch only their named effect, never
+reopen or reuse a terminal root row. Credential mint requires all projected
+coordinates, denies terminal/missing effects before receipt replay handling,
+and permits one immutable receipt per active continuation effect.
+
+### Authority agentd green-PR observation seam
+
+The bodyless green-PR endpoints resolve an opaque `atc1` transport context
+under broker-only authority-store HMAC material. It binds the registered
+principal, profile, worker ID, storage-lineage ID, fence epoch, session lineage,
+and active lease binding. A released, stale, forged, or cross-session context
+cannot select an admission or push. Green-PR admission queries those exact
+coordinates, so two active leases no longer cause profile-global ambiguity.
+Agentd's corrected PR #18 uses the exact URL through its
+`AGENTD_BROKER_OBSERVATION_TOKEN` bearer contract; no GitHub credential is
+projected. The authority worker network is
+`gh-agent-broker_default`, whose reviewed compose topology contains the
+`broker` service at port 8080.
+
+### GitHub branch-rules API seam
+
+Green-PR observation decodes GitHub's active branch-rules response as its
+documented top-level JSON array and requests every page with
+`per_page=100&page=N`. Required-status-check rules are aggregated across pages
+before the existing incomplete, duplicate, source, sorting, and digest checks.
+The focused mock and pagination test use the real array response shape.
+
+### GitHub green-PR completion observation
+
+The registered v2 admission now accepts only the settled
+`github_green_pr_v1` task values for
+`grubbyhacker/repository-worker-lifecycle-test`, `main`, and the anchored
+`agent/fleiglabs-repo-agent/...` branch namespace. The broker's
+`POST /v1/registered/github-green-pr/create` and
+`POST /v1/registered/github-green-pr/observe` accept no request body or caller
+completion facts. Both derive the immutable task digest and exact pushed head
+from the active durable lease and completed broker smart-HTTP operation. Create
+uses the configured App installation and fixed broker-owned title/head/base/body
+and ready state, returning an existing exact ready PR idempotently while
+refusing ambiguous or mismatched rows; it does not use the generic caller-shaped
+`pull.create` route. Create requires the registered principal to authorize
+`pull.create`; observe fails closed unless it authorizes each of `pull.read`,
+`checks.read`, and `status.read`. Observe emits `github-green-pr-observation/v1` using authenticated App reads of
+the immutable target repository, ready PR, active branch rules, and complete
+paginated evaluation-SHA checks/statuses. It records the target repository
+database ID, node ID, and full name even for missing or draft PRs; a positive
+verdict requires the PR head repository to match all three identities exactly.
+Where GitHub exposes a test-merge SHA, the broker uses it only when required
+contexts are applicable there; otherwise it evaluates the PR head. Copied,
+forked, mismatched, stale, duplicate, or wrong-App-source observations refuse;
+absent rows remain pending, legacy pending statuses are pollable, and only
+GitHub-accepted success/skipped/neutral conclusions satisfy. The endpoint stays
+staging-configured through the existing transport observation mapping; it does
+not activate production.
+
+### Durable registered-task admission (candidate A)
+
+The configured registered coordinator principal is refused at the legacy
+`POST /v1/authority-workers/coordinator/v1/leases` boundary before request
+decoding or admission effects; it must use the durable registered v2
+acquisition path. Separately authorized non-registered principals retain the
+legacy v1 behavior.
+
+The authority store schema v11 atomically migrates the released v10 schema to
+a registered-admission table with a principal-plus-binding composite foreign
+key to the lease. It enables SQLite foreign-key enforcement on every store open.
+Registered durable reads fetch and verify the stored protocol version, strict
+canonical JSON, source columns, canonical bytes, and digest, failing closed on
+any mismatch. `POST /v1/authority-workers/coordinator/v2/leases` requires the
+exact top-level `broker/coordinator/v2` version and rejects unknown or trailing
+JSON. The authority store adds a fail-closed registered-admission snapshot
+table. `POST /v1/authority-workers/coordinator/v2/leases` accepts only the
+settled `broker/coordinator/v2` registered task/source shape, verifies its
+lowercase SHA-256 JCS digest, requires `session:<work_item_id>`, and atomically
+persists the snapshot alongside the lease admission. Registered admission is
+gated by the configured `registered_coordinator_principal`; production remains
+unconfigured and inactive. Existing v1 leases have no snapshot and registered
+create/turn paths refuse before agentd routing. Broker-derived registered open
+and turn payloads use only the stored snapshot and broker lineage/workspace
+identities. Registered coordinator commands use the exact versioned
+registered-lifecycle routes and refuse resume; registered reassignment uses
+`/adopt`, while legacy reassignment retains `/rebind`. The registered lifecycle
+open payload forwards the required `admissionTaskDigest` only from the validated
+durable admission, alongside the existing `taskEvidenceDigest`; observation
+continues to use that same persisted admission digest as
+`registered_task_digest` and does not add another observation digest.
+Registered submit validates its turn-status response, while registered cancel,
+checkpoint, and status validate the exact canonical session status against the
+binding, workspace, and worker fence; legacy cancel retains its turn-status
+contract.
+
+### Settled 2a/2b repository transport journal
+
+The authority SQLite store schema v10 adds the broker-owned append-only
+`repository_transport_events` table with the settled 2b reader columns. The
+main broker can enable the staging-only `transport_observation` configuration,
+which opens the existing authority store, resolves exactly one unreleased lease
+through a reviewed profile-to-agent mapping, and persists `received`,
+`forwarded`, and terminal `denied`/`completed`/`failed` phases before the
+corresponding policy, backend, or client response. It stores only normalized
+metadata and digests; credential values and Git pack bodies are excluded.
+
+This path is disabled by default and configuration rejects it in production.
+The evidence runner has no broker write API; its settled database mount/query
+remains read-only work owned by the topology. Focused tests cover no-op state,
+internal authority resolution, append failure, incomplete/denied/failed/success
+phase chains, replay, digest linkage, and ambiguous leases.
+
 ### Repository-route-policy/v1 and local smart HTTP backend
 
 The broker and sandbox now load the same optional
@@ -47,7 +248,11 @@ operations without returning installation credentials to workers.
 The private `broker/coordinator/v1` REST surface now mediates the complete
 authority session command set: acquire, create, submit, events, checkpoint,
 resume, cancel, status, reassign, and reassignment status. Signal Plane supplies
-only a logical binding and operation-specific typed data. The broker resolves
+only a logical binding and operation-specific typed data. Legacy v1 lease
+bindings remain mediated through the legacy `/v1/sessions` agentd routes and
+continue to require a prompt for submit. Only bindings with the durable v2
+admission snapshot use `/v1/registered-sessions`; their submit derives task
+data from the snapshot and rejects caller prompts. The broker resolves
 the immutable profile version, policy digest, worker/session/storage lineages,
 fence epoch, agentd identity, and fixed Docker endpoint; callers cannot address
 agentd or select runtime authority.

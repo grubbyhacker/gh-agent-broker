@@ -31,6 +31,7 @@ type fakeAuthorityRuntime struct {
 	unhealthy   bool
 	afterCreate func()
 	rebind      func(context.Context, AuthorityWorker, string, agentdRebindRequest) (agentdSessionStatus, error)
+	adopt       func(context.Context, AuthorityWorker, string, agentdRegisteredAdoptRequest) (agentdSessionStatus, error)
 }
 
 type fakeAuthenticatedReadinessRuntime struct {
@@ -329,6 +330,13 @@ func (f *fakeAuthorityRuntime) RebindAgentdSession(ctx context.Context, worker A
 		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
 	}
 	return f.rebind(ctx, worker, sessionID, request)
+}
+
+func (f *fakeAuthorityRuntime) AdoptRegisteredAgentdSession(ctx context.Context, worker AuthorityWorker, sessionID string, request agentdRegisteredAdoptRequest) (agentdSessionStatus, error) {
+	if f.adopt == nil {
+		return agentdSessionStatus{}, &agentdRebindError{retryable: true}
+	}
+	return f.adopt(ctx, worker, sessionID, request)
 }
 
 func TestAuthorityReconcileAppliesAuthenticatedReadinessOnlyToConfiguredProfiles(t *testing.T) {
@@ -631,7 +639,7 @@ func cloneCredentialBundles(in map[string]CredentialBundle) map[string]Credentia
 }
 
 func TestAuthorityWorkerRequestRejectsAuthorityOverrides(t *testing.T) {
-	for _, field := range []string{"image", "platform", "command", "credentials", "credential_bundle", "source_volume", "mount_path", "mounts", "network", "repo", "operations", "user", "isolation", "cap_add"} {
+	for _, field := range []string{"image", "platform", "command", "credentials", "credential_bundle", "source_volume", "mount_path", "mounts", "network", "repo", "operations", "user", "isolation", "cap_add", "broker_observation_url", "broker_observation_token"} {
 		body := `{"profile":"writer","idempotency_key":"one","session_binding":"session-1","` + field + `":"forbidden"}`
 		var request AuthorityWorkerRequest
 		if err := json.Unmarshal([]byte(body), &request); err == nil || !strings.Contains(err.Error(), "unknown field") {
@@ -661,10 +669,27 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	if got, want := runtime.Env["AGENTD_BROKER_VALIDATION_URL"], "http://sandbox-broker:8091/v1/authority-workers/agentd/session-validation"; got != want {
 		t.Fatalf("AGENTD_BROKER_VALIDATION_URL=%q, want %q", got, want)
 	}
+	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_URL"], "http://broker:8080/v1/registered/github-green-pr/observe"; got != want {
+		t.Fatalf("AGENTD_BROKER_OBSERVATION_URL=%q, want %q", got, want)
+	}
+	if _, ok := runtime.Env[profile.BrokerSecretEnv]; ok {
+		t.Fatal("runtime projected the reusable broker principal secret")
+	}
+	if got := runtime.Env["AGENTD_BROKER_CREDENTIAL_MINT_URL"]; got != agentdBrokerCredentialMintURL {
+		t.Fatalf("credential mint URL=%q", got)
+	}
+	for _, credential := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
+		if value, ok := runtime.Env[credential]; ok || value != "" {
+			t.Fatalf("runtime injected GitHub credential %s=%q", credential, value)
+		}
+	}
 	validationToken := runtime.Env["AGENTD_BROKER_VALIDATION_TOKEN"]
 	wantValidationToken := deriveAgentdValidationToken("secret", worker.WorkerID, worker.WorkerStorageLineageID, worker.WorkerFenceEpoch)
 	if validationToken != wantValidationToken || validationToken == "secret" || validationToken == runtime.Env[profile.BrokerSecretEnv] {
 		t.Fatal("agentd broker validation token is not an opaque generation-bound derivation")
+	}
+	if runtime.Env["AGENTD_BROKER_CONTROL_TOKEN"] != validationToken {
+		t.Fatal("control token is not the exact generation-bound control identity")
 	}
 	for _, other := range []string{
 		deriveAgentdValidationToken("secret", "other-worker", worker.WorkerStorageLineageID, worker.WorkerFenceEpoch),
@@ -2034,6 +2059,7 @@ func authorityTestConfig(t *testing.T) Config {
 		"coordinator":  {Token: "coordinator-test-token", AllowedProfiles: []string{"writer"}, AllowedActions: []string{"provision", "health", "acquire", "release", "drain", "replace", "reassign"}},
 		"session-only": {Token: "session-test-token", AllowedProfiles: []string{"writer"}, AllowedActions: []string{"acquire", "release"}},
 	}
+	cfg.RegisteredCoordinatorPrincipal = "coordinator"
 	return cfg
 }
 

@@ -10,8 +10,11 @@ import (
 	"strings"
 	"testing"
 
+	"gh-agent-broker/internal/auth"
 	"gh-agent-broker/internal/config"
+	"gh-agent-broker/internal/policy"
 	"gh-agent-broker/internal/pushtripwire"
+	"gh-agent-broker/internal/sandbox"
 )
 
 func TestParseGitPath(t *testing.T) {
@@ -249,6 +252,94 @@ func TestUnauthorizedResponsesIncludeBasicChallenge(t *testing.T) {
 		if got := resp.Header().Get("WWW-Authenticate"); got != `Basic realm="gh-agent-broker"` {
 			t.Fatalf("%s %s WWW-Authenticate = %q", tc.method, tc.path, got)
 		}
+	}
+}
+
+func TestRegisteredGreenPRCreateRejectsCallerFacts(t *testing.T) {
+	for _, body := range []string{`{"title":"caller title"}`, `{"head":"agent/caller"}`, `{"base":"caller-base"}`, `{"body":"caller body"}`, `{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`} {
+		t.Run(body, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/registered/github-green-pr/create", strings.NewReader(body))
+			resp := httptest.NewRecorder()
+			(&Server{}).ServeHTTP(resp, req)
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+			}
+		})
+	}
+}
+
+func TestGreenPRRequestUsesOnlyDurableAdmissionAndBrokerPush(t *testing.T) {
+	admission := sandbox.GreenPRTransportAdmission{
+		TaskDigest:  "sha256:durable-task",
+		OperationID: "broker-push-operation",
+		PushedSHA:   strings.Repeat("a", 40),
+		Task: sandbox.RegisteredTask{Parameters: sandbox.RegisteredTaskParameters{
+			Repository: "owner/durable-repository",
+			BaseBranch: "durable-base",
+			BranchRef:  "agent/fleiglabs-repo-agent/durable-work",
+		}},
+	}
+	got := greenPRRequest(admission, "configured-app", 77)
+	if got.Repository != admission.Task.Parameters.Repository || got.BaseRef != admission.Task.Parameters.BaseBranch || got.WorkerRef != "refs/heads/"+admission.Task.Parameters.BranchRef || got.PushedHeadSHA != admission.PushedSHA || got.BrokerOperationID != admission.OperationID || got.RegisteredTaskDigest != admission.TaskDigest || got.AppSlug != "configured-app" || got.InstallationID != 77 {
+		t.Fatalf("green PR request was not fully broker-derived: %#v", got)
+	}
+}
+
+func TestRegisteredGreenPRPolicyCheckRequiresExactEndpointOperations(t *testing.T) {
+	admission := sandbox.GreenPRTransportAdmission{Task: sandbox.RegisteredTask{Parameters: sandbox.RegisteredTaskParameters{
+		Repository: "owner/repo",
+		BaseBranch: "main",
+		BranchRef:  "agent/writer/work",
+	}}}
+	principal := func(operations ...string) auth.Principal {
+		agent := config.Agent{
+			ID:             "writer",
+			Enabled:        true,
+			Repositories:   []string{"owner/repo"},
+			Operations:     operations,
+			BaseBranches:   []string{"main"},
+			BranchPatterns: []string{"^agent/writer/.+$"},
+		}
+		return auth.Principal{ID: agent.ID, Agent: agent}
+	}
+
+	if result := registeredGreenPRPolicyCheck(principal("repo.probe", "pull.read", "pull.create"), admission, "creation"); !result.Allowed {
+		t.Fatalf("creation unexpectedly denied: %#v", result)
+	}
+	if result := registeredGreenPRPolicyCheck(principal("repo.probe", "pull.read", "checks.read", "status.read"), admission, "observation"); !result.Allowed {
+		t.Fatalf("observation unexpectedly denied: %#v", result)
+	}
+	for _, missing := range []string{"repo.probe", "pull.read", "checks.read", "status.read"} {
+		t.Run("missing_"+missing, func(t *testing.T) {
+			operations := []string{"repo.probe", "pull.read", "checks.read", "status.read"}
+			for i, operation := range operations {
+				if operation == missing {
+					operations = append(operations[:i], operations[i+1:]...)
+					break
+				}
+			}
+			result := registeredGreenPRPolicyCheck(principal(operations...), admission, "observation")
+			if result.Allowed || result.Decision != policy.DecisionDeny {
+				t.Fatalf("observation allowed without %q: %#v", missing, result)
+			}
+			if len(result.FailedChecks) != 1 || result.FailedChecks[0].Dimension != "operation" || result.FailedChecks[0].Actual != missing {
+				t.Fatalf("denial did not identify missing %q authorization: %#v", missing, result)
+			}
+		})
+	}
+	for _, missing := range []string{"repo.probe", "pull.read", "pull.create"} {
+		t.Run("creation_missing_"+missing, func(t *testing.T) {
+			operations := []string{"repo.probe", "pull.read", "pull.create"}
+			for i, operation := range operations {
+				if operation == missing {
+					operations = append(operations[:i], operations[i+1:]...)
+					break
+				}
+			}
+			if result := registeredGreenPRPolicyCheck(principal(operations...), admission, "creation"); result.Allowed {
+				t.Fatalf("creation allowed without %q", missing)
+			}
+		})
 	}
 }
 

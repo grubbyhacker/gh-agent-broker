@@ -29,12 +29,30 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			writeJSON(w, http.StatusOK, out)
 			return
 		}
+		if r.Method == http.MethodPost && path == "git-credential/mint" {
+			var in GitCredentialReceipt
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.MintGitCredential(r.Context(), bearerToken(r), in)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusForbidden, "credential_denied", "credential receipt denied")
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
 		principal, ok := authorityRESTPrincipal(service.cfg, bearerToken(r))
 		if !ok {
 			writeRESTError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		if r.Method == http.MethodPost && path == "coordinator/v1/leases" {
+			if principal == service.cfg.RegisteredCoordinatorPrincipal && principal != "" {
+				writeRESTCodeError(w, http.StatusConflict, "lease_denied", "policy denial: registered coordinator principal must use coordinator/v2 leases")
+				return
+			}
 			var in AuthorityWorkerRequest
 			if !decodeAuthorityJSON(w, r, &in) {
 				return
@@ -45,6 +63,23 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 				return
 			}
 			writeJSON(w, http.StatusOK, CoordinatorLeaseAdmission{Version: coordinatorProtocolVersion, Admission: out})
+			return
+		}
+		if r.Method == http.MethodPost && path == "coordinator/v2/leases" {
+			var in RegisteredAdmissionRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			if _, err := validateRegisteredAdmission(in); err != nil {
+				writeRESTCodeError(w, http.StatusBadRequest, "invalid_registered_admission", err.Error())
+				return
+			}
+			out, err := service.AcquireRegisteredSession(r.Context(), principal, in)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusConflict, "registered_lease_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, CoordinatorLeaseAdmission{Version: coordinatorRegisteredProtocolVersion, Admission: out})
 			return
 		}
 		if r.Method == http.MethodPost && strings.HasPrefix(path, "coordinator/v1/sessions/") {

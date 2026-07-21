@@ -109,6 +109,30 @@ func TestAgentdCreateSessionPayloadMatchesCurrentSchema(t *testing.T) {
 	}
 }
 
+func TestAgentdRegisteredSessionOpenPayloadBindsDurableAdmission(t *testing.T) {
+	const admissionDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	payload, err := json.Marshal(agentdRegisteredSessionOpenRequest{
+		Version: "agentd/registered-lifecycle/v1", SessionID: "agentd-session", CoordinatorBinding: "session:work",
+		SessionLineageID: "lineage", AuthorityProfile: "writer", AuthorityProfileVersion: "profile-v1", PolicyDigest: "sha256:policy",
+		TaskKind: "github_green_pr_v1", TaskEvidenceDigest: "sha256:evidence", AdmissionTaskDigest: admissionDigest,
+		Parameters: RegisteredTaskParameters{Repository: "grubbyhacker/repository-worker-lifecycle-test", BaseBranch: "main", BranchRef: "agent/fleiglabs-repo-agent/work"},
+		Workspace:  agentdSessionWorkspace{WorkspaceRef: "/workspace", UID: 20000, GID: 20000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if digest, ok := got["admissionTaskDigest"].(string); !ok || digest != admissionDigest {
+		t.Fatalf("admissionTaskDigest=%#v, want %q", got["admissionTaskDigest"], admissionDigest)
+	}
+	if _, ok := got["registeredTaskDigest"]; ok {
+		t.Fatalf("registeredTaskDigest must not be emitted: %s", payload)
+	}
+}
+
 func TestAgentdRebindUsesCoordinatorChannelAndExactBody(t *testing.T) {
 	request := agentdRebindRequest{
 		IdempotencyKey: "broker-derived-key",
@@ -145,6 +169,27 @@ func TestAgentdRebindUsesCoordinatorChannelAndExactBody(t *testing.T) {
 	t.Cleanup(server.Close)
 	status, err := postAgentdRebind(context.Background(), server.Client(), server.URL+"/v1/sessions/agentd-session/rebind", "coordinator-secret", request)
 	if err != nil || status.WorkerID != "new" || status.SessionID != "agentd-session" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
+func TestRegisteredAgentdAdoptionUsesExactRouteAndBody(t *testing.T) {
+	request := agentdRegisteredAdoptRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: "broker-derived-key", PredecessorWorker: "old", PredecessorEpoch: 1}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/registered-sessions/agentd-session/adopt" {
+			t.Fatalf("request method=%s path=%s", r.Method, r.URL.Path)
+		}
+		var got agentdRegisteredAdoptRequest
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&got); err != nil || got != request {
+			t.Fatalf("body decoded=%+v err=%v", got, err)
+		}
+		writeJSON(w, http.StatusOK, agentdSessionStatus{Version: agentdSessionProtocolVersion, SessionID: "agentd-session", CoordinatorBinding: "binding", AuthorityBinding: "writer", WorkerID: "new", StorageLineageID: "storage", FenceEpoch: 2, SessionLineageID: "session-lineage", Workspace: agentdSessionWorkspace{WorkspaceRef: "/workspace", UID: 20000, GID: 20000}, Phase: "active", TurnIDs: []string{}, NextCursor: 2})
+	}))
+	t.Cleanup(server.Close)
+	status, err := postAgentdRegisteredAdoption(context.Background(), server.Client(), server.URL+"/v1/registered-sessions/agentd-session/adopt", "coordinator-secret", request)
+	if err != nil || status.WorkerID != "new" {
 		t.Fatalf("status=%+v err=%v", status, err)
 	}
 }

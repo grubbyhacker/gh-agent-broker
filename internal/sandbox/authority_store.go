@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 9
+const authorityStoreSchemaVersion = 16
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -92,6 +92,7 @@ type AuthoritySessionReassignment struct {
 // Every value needed to reproduce and verify the agentd command is captured in
 // the same transaction as the lease/workspace CAS.
 type authorityAgentdAdoption struct {
+	Principal            string
 	BindingDigest        string
 	CoordinatorBinding   string
 	AuthorityBinding     string
@@ -176,6 +177,7 @@ func OpenAuthorityWorkerStore(ctx context.Context, path string) (*AuthorityWorke
 
 func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	for _, statement := range []string{
+		"PRAGMA foreign_keys=ON",
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=FULL",
 		"PRAGMA busy_timeout=5000",
@@ -247,6 +249,48 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		if err := s.migrateV9(ctx); err != nil {
 			return err
 		}
+		version = 9
+	}
+	if version == 9 {
+		if err := s.migrateV10(ctx); err != nil {
+			return err
+		}
+		version = 10
+	}
+	if version == 10 {
+		if err := s.migrateV11(ctx); err != nil {
+			return err
+		}
+		version = 11
+	}
+	if version == 11 {
+		if err := s.migrateV12(ctx); err != nil {
+			return err
+		}
+		version = 12
+	}
+	if version == 12 {
+		if err := s.migrateV13(ctx); err != nil {
+			return err
+		}
+		version = 13
+	}
+	if version == 13 {
+		if err := s.migrateV14(ctx); err != nil {
+			return err
+		}
+		version = 14
+	}
+	if version == 14 {
+		if err := s.migrateV15(ctx); err != nil {
+			return err
+		}
+		version = 15
+	}
+	if version == 15 {
+		if err := s.migrateV16(ctx); err != nil {
+			return err
+		}
 	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
@@ -265,7 +309,127 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		return fmt.Errorf("authority worker request salt is malformed")
 	}
 	s.salt = append([]byte(nil), salt...)
+	if err := s.registerEffectTokenFingerprints(ctx); err != nil {
+		return err
+	}
 	return nil
+}
+
+// V16 binds every effect custody row to the immutable admission and active
+// worker coordinates selected by the broker. Continuation effects are added
+// only by the transaction that validates their authorized agentd event.
+func (s *AuthorityWorkerStore) migrateV16(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE authority_effect_custody ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN worker_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN worker_storage_lineage_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN worker_fence_epoch INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE authority_effect_custody ADD COLUMN authority_profile TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN authority_profile_version TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN policy_digest TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN registered_task_digest TEXT NOT NULL DEFAULT '';
+	UPDATE authority_effect_custody AS e SET
+		session_id=(SELECT rt.session_id FROM authority_registered_turns rt WHERE rt.principal=e.principal AND rt.binding_digest=e.binding_digest),
+		worker_id=(SELECT l.worker_id FROM authority_session_leases l WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		worker_storage_lineage_id=(SELECT w.worker_storage_lineage_id FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		worker_fence_epoch=(SELECT w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		authority_profile=(SELECT l.profile FROM authority_session_leases l WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		authority_profile_version=(SELECT w.profile_version FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		policy_digest=(SELECT w.policy_digest FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		registered_task_digest=(SELECT a.admission_task_digest FROM authority_registered_admissions a WHERE a.principal=e.principal AND a.binding_digest=e.binding_digest);
+	PRAGMA user_version=16`)
+	return err
+}
+
+// V15 is the broker's authoritative custody projection for a registered
+// effect. Terminal state arrives only from a validated agentd event stream;
+// credential authentication reads this row in the same SQLite snapshot as the
+// remaining lease and worker custody checks.
+func (s *AuthorityWorkerStore) migrateV15(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE authority_effect_custody (
+		principal TEXT NOT NULL, binding_digest TEXT NOT NULL, model_effect_id TEXT NOT NULL,
+		terminal_phase TEXT NOT NULL DEFAULT '', terminal_cursor INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(principal,binding_digest,model_effect_id),
+		FOREIGN KEY(principal,binding_digest) REFERENCES authority_registered_turns(principal,binding_digest)
+	) STRICT;
+	INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id)
+		SELECT principal,binding_digest,model_effect_id FROM authority_registered_turns;
+	PRAGMA user_version=15`)
+	return err
+}
+
+// V14 persists the source-closed registered turn identity and its event
+// cursor. It prevents a recovered coordinator from resubmitting accepted work
+// and makes each event poll resume from the last broker-acknowledged cursor.
+func (s *AuthorityWorkerStore) migrateV14(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE authority_registered_turns (
+		principal TEXT NOT NULL, binding_digest TEXT NOT NULL,
+		idempotency_digest TEXT NOT NULL, session_id TEXT NOT NULL,
+		turn_id TEXT NOT NULL, model_effect_id TEXT NOT NULL,
+		submit_cursor INTEGER NOT NULL, events_after INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(principal,binding_digest),
+		FOREIGN KEY(principal,binding_digest) REFERENCES authority_registered_admissions(principal,binding_digest)
+	) STRICT; PRAGMA user_version=14`)
+	return err
+}
+
+// V13 records every immutable coordinate selected by an effect receipt.  It
+// lets the Git reader prove the credential still names the current lease,
+// worker, workspace, admission and effect rather than accepting request data.
+func (s *AuthorityWorkerStore) migrateV13(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE authority_git_credentials ADD COLUMN authority_profile TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_git_credentials ADD COLUMN authority_profile_version TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_git_credentials ADD COLUMN registered_task_digest TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_git_credentials ADD COLUMN journal_cursor INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE authority_git_credentials ADD COLUMN journal_record_digest TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_git_credentials ADD COLUMN authorized_at_ms INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE authority_git_credentials ADD COLUMN deadline_at_ms INTEGER NOT NULL DEFAULT 0;
+	CREATE UNIQUE INDEX authority_git_credentials_effect_journal ON authority_git_credentials(principal,binding_digest,model_effect_id,journal_cursor,journal_record_digest);
+	PRAGMA user_version=13`)
+	return err
+}
+
+// V12 is the custody record for agentd's reducer-produced credential receipt.
+// It stores only a verifier for the child secret, never the secret itself.
+func (s *AuthorityWorkerStore) migrateV12(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE authority_git_credentials (
+		receipt_digest TEXT PRIMARY KEY, receipt_json TEXT NOT NULL,
+		principal TEXT NOT NULL, binding_digest TEXT NOT NULL, session_id TEXT NOT NULL,
+		effect_id TEXT NOT NULL, model_effect_id TEXT NOT NULL, repository TEXT NOT NULL,
+		worker_id TEXT NOT NULL, worker_storage_lineage_id TEXT NOT NULL, worker_fence_epoch INTEGER NOT NULL,
+		agent_id TEXT NOT NULL UNIQUE, secret_fingerprint TEXT NOT NULL UNIQUE,
+		expires_at_ms INTEGER NOT NULL, revoked_at TEXT NOT NULL DEFAULT '',
+		UNIQUE(principal,binding_digest,model_effect_id),
+		FOREIGN KEY(principal,binding_digest) REFERENCES authority_registered_admissions(principal,binding_digest)
+	) STRICT; CREATE INDEX authority_git_credentials_active ON authority_git_credentials(agent_id,expires_at_ms,revoked_at); PRAGMA user_version=12`)
+	return err
+}
+
+// V11 atomically records immutable registered-task input with its owning lease.
+// V10 is the last released schema, so there is no intermediate schema to repair.
+func (s *AuthorityWorkerStore) migrateV11(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollbackAuthorityTx(tx)
+	if _, err = tx.ExecContext(ctx, `CREATE UNIQUE INDEX authority_session_leases_principal_binding ON authority_session_leases(principal,binding_digest);
+	CREATE TABLE authority_registered_admissions (
+		principal TEXT NOT NULL, binding_digest TEXT NOT NULL,
+		protocol_version TEXT NOT NULL, work_item_id TEXT NOT NULL, route_snapshot_id TEXT NOT NULL,
+		canonical_task_json TEXT NOT NULL, admission_task_digest TEXT NOT NULL,
+		PRIMARY KEY(principal,binding_digest),
+		FOREIGN KEY(principal,binding_digest) REFERENCES authority_session_leases(principal,binding_digest)
+	) STRICT`); err != nil {
+		return err
+	}
+	var violations int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
+		return fmt.Errorf("registered admission migration foreign key check failed: %d: %w", violations, err)
+	}
+	if _, err = tx.ExecContext(ctx, `PRAGMA user_version=11`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *AuthorityWorkerStore) migrateV1(ctx context.Context) error {
@@ -452,6 +616,47 @@ func (s *AuthorityWorkerStore) migrateV9(ctx context.Context) error {
 		profile_version=coalesce((SELECT profile_version FROM authority_workers worker WHERE worker.worker_id=authority_session_reassignments.replacement_worker_id),''),
 		policy_digest=coalesce((SELECT policy_digest FROM authority_workers worker WHERE worker.worker_id=authority_session_reassignments.replacement_worker_id),'');
 	PRAGMA user_version=9`)
+	return err
+}
+
+// V10 adds the broker-owned, append-only smart-HTTP transport journal. The
+// table is deliberately in the authority database so one durable boundary
+// binds the active lease and the observed operation.
+func (s *AuthorityWorkerStore) migrateV10(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE repository_transport_events (
+		cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+		operation_id TEXT NOT NULL,
+		phase_ordinal INTEGER NOT NULL,
+		phase TEXT NOT NULL,
+		principal TEXT NOT NULL,
+		worker_id TEXT NOT NULL,
+		session_lineage_id TEXT NOT NULL,
+		worker_storage_lineage_id TEXT NOT NULL,
+		worker_fence_epoch INTEGER NOT NULL,
+		profile_version TEXT NOT NULL,
+		policy_digest TEXT NOT NULL,
+		method TEXT NOT NULL,
+		service TEXT NOT NULL,
+		repository TEXT NOT NULL,
+		request_path TEXT NOT NULL,
+		requested_refs_json TEXT NOT NULL,
+		ref_updates_json TEXT NOT NULL,
+		credential_header_present INTEGER NOT NULL,
+		decision TEXT NOT NULL,
+		outcome_code TEXT NOT NULL,
+		http_status INTEGER NOT NULL,
+		backend_status INTEGER NOT NULL,
+		before_refs_digest TEXT NOT NULL,
+		after_refs_digest TEXT NOT NULL,
+		previous_event_digest TEXT NOT NULL,
+		event_digest TEXT NOT NULL UNIQUE,
+		UNIQUE(operation_id, phase_ordinal),
+		CHECK(phase_ordinal >= 1),
+		CHECK(phase IN ('received','forwarded','denied','completed','failed')),
+		CHECK(credential_header_present IN (0,1))
+	) STRICT;
+	CREATE INDEX repository_transport_events_operation ON repository_transport_events(operation_id,phase_ordinal);
+	PRAGMA user_version=10`)
 	return err
 }
 
@@ -1039,7 +1244,7 @@ func getLeaseByDigest(ctx context.Context, queryer interface {
 	return lease, err
 }
 
-const authorityAdoptionSelect = `SELECT binding_digest,coordinator_binding,authority_binding,profile_version,policy_digest,session_lineage_id,agentd_session_id,
+const authorityAdoptionSelect = `SELECT principal,binding_digest,coordinator_binding,authority_binding,profile_version,policy_digest,session_lineage_id,agentd_session_id,
 	predecessor_worker_id,predecessor_storage_lineage_id,predecessor_fence_epoch,
 	replacement_worker_id,replacement_storage_lineage_id,replacement_fence_epoch,
 	rebind_idempotency_key,workspace_ref,workspace_uid,workspace_gid,adoption_state,adoption_error_code
@@ -1048,7 +1253,7 @@ const authorityAdoptionSelect = `SELECT binding_digest,coordinator_binding,autho
 func scanAuthorityAgentdAdoption(scanner interface{ Scan(...any) error }) (authorityAgentdAdoption, error) {
 	var adoption authorityAgentdAdoption
 	err := scanner.Scan(
-		&adoption.BindingDigest, &adoption.CoordinatorBinding, &adoption.AuthorityBinding, &adoption.ProfileVersion, &adoption.PolicyDigest, &adoption.SessionLineageID, &adoption.AgentdSessionID,
+		&adoption.Principal, &adoption.BindingDigest, &adoption.CoordinatorBinding, &adoption.AuthorityBinding, &adoption.ProfileVersion, &adoption.PolicyDigest, &adoption.SessionLineageID, &adoption.AgentdSessionID,
 		&adoption.Predecessor.WorkerID, &adoption.Predecessor.StorageLineageID, &adoption.Predecessor.FenceEpoch,
 		&adoption.Successor.WorkerID, &adoption.Successor.StorageLineageID, &adoption.Successor.FenceEpoch,
 		&adoption.RebindIdempotencyKey, &adoption.Workspace.WorkspaceRef, &adoption.Workspace.UID, &adoption.Workspace.GID,

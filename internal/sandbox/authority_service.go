@@ -47,6 +47,21 @@ type agentdCreateSessionRequest struct {
 	Workspace          agentdSessionWorkspace `json:"workspace"`
 }
 
+type agentdRegisteredSessionOpenRequest struct {
+	Version                 string                   `json:"version"`
+	SessionID               string                   `json:"sessionId"`
+	CoordinatorBinding      string                   `json:"coordinatorBinding"`
+	SessionLineageID        string                   `json:"sessionLineageId"`
+	AuthorityProfile        string                   `json:"authorityProfile"`
+	AuthorityProfileVersion string                   `json:"authorityProfileVersion"`
+	PolicyDigest            string                   `json:"policyDigest"`
+	TaskKind                string                   `json:"taskKind"`
+	TaskEvidenceDigest      string                   `json:"taskEvidenceDigest"`
+	AdmissionTaskDigest     string                   `json:"admissionTaskDigest"`
+	Parameters              RegisteredTaskParameters `json:"parameters"`
+	Workspace               agentdSessionWorkspace   `json:"workspace"`
+}
+
 type agentdSessionWorkspace struct {
 	WorkspaceRef  string `json:"workspaceRef"`
 	UID           int    `json:"uid"`
@@ -70,6 +85,11 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if err := s.store.RequireConfirmedCoordinatorRouting(ctx, binding, lease); err != nil {
 		return nil, err
 	}
+	registered, admissionErr := s.store.RegisteredAdmission(ctx, principal, binding)
+	isRegistered := admissionErr == nil
+	if admissionErr != nil && !errors.Is(admissionErr, sql.ErrNoRows) {
+		return nil, admissionErr
+	}
 	workspace, err := s.store.SessionWorkspace(ctx, binding)
 	if err != nil {
 		return nil, err
@@ -78,20 +98,20 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if token == "" {
 		return nil, fmt.Errorf("authority worker coordinator credential is unavailable")
 	}
-	payload, err := json.Marshal(agentdCreateSessionRequest{
-		Version:            "agentd/v1",
-		CoordinatorBinding: binding,
-		AuthorityBinding:   lease.Profile,
-		WorkerID:           lease.WorkerID,
-		StorageLineageID:   lease.WorkerStorageLineageID,
-		FenceEpoch:         lease.WorkerFenceEpoch,
-		SessionLineageID:   lease.SessionLineageID,
-		Workspace:          agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID},
-	})
+	derivedSessionID := "agentd-" + lease.SessionLineageID
+	var createPayload any = agentdCreateSessionRequest{Version: "agentd/v1", CoordinatorBinding: binding, AuthorityBinding: lease.Profile, WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}}
+	if isRegistered {
+		createPayload = agentdRegisteredSessionOpenRequest{Version: "agentd/registered-lifecycle/v1", SessionID: derivedSessionID, CoordinatorBinding: binding, SessionLineageID: lease.SessionLineageID, AuthorityProfile: lease.Profile, AuthorityProfileVersion: lease.ProfileVersion, PolicyDigest: lease.PolicyDigest, TaskKind: registered.Task.TaskKind, TaskEvidenceDigest: registered.Task.TaskEvidenceDigest, AdmissionTaskDigest: registered.Digest, Parameters: registered.Task.Parameters, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}}
+	}
+	payload, err := json.Marshal(createPayload)
 	if err != nil {
 		return nil, err
 	}
-	url := "http://sandbox-authority-" + lease.WorkerID + ":8080/v1/sessions"
+	path := "/v1/sessions"
+	if isRegistered {
+		path = "/v1/registered-sessions"
+	}
+	url := "http://sandbox-authority-" + lease.WorkerID + ":8080" + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -115,7 +135,11 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 		}
 		expectedBinding := agentdWorkerBinding{WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch}
 		expectedWorkspace := agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}
-		if !exactAgentdSessionStatus(status, status.SessionID, binding, lease.Profile, lease.SessionLineageID, expectedWorkspace, expectedBinding) {
+		expectedSessionID := status.SessionID
+		if isRegistered {
+			expectedSessionID = derivedSessionID
+		}
+		if !exactAgentdSessionStatus(status, expectedSessionID, binding, lease.Profile, lease.SessionLineageID, expectedWorkspace, expectedBinding) {
 			return "", fmt.Errorf("agentd session create returned a mismatched status")
 		}
 		encoded, err = marshalAgentdSessionStatus(status)
@@ -211,6 +235,12 @@ type AuthorityAgentdRebinder interface {
 	RebindAgentdSession(context.Context, AuthorityWorker, string, agentdRebindRequest) (agentdSessionStatus, error)
 }
 
+// AuthorityAgentdRegisteredAdopter is the registered-lifecycle counterpart to
+// legacy rebind. The successor remains entirely broker-derived.
+type AuthorityAgentdRegisteredAdopter interface {
+	AdoptRegisteredAgentdSession(context.Context, AuthorityWorker, string, agentdRegisteredAdoptRequest) (agentdSessionStatus, error)
+}
+
 type AgentdSessionValidationRequest struct {
 	WorkerID               string `json:"worker_id"`
 	WorkerStorageLineageID string `json:"worker_storage_lineage_id"`
@@ -253,6 +283,27 @@ func (s *AuthorityWorkerService) AcquireSession(ctx context.Context, principal s
 		return AuthoritySessionAdmission{}, err
 	}
 	lease, err := s.store.Acquire(ctx, principal, request, profile.IssuanceGeneration)
+	if err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
+	workspace, err := s.store.AllocateSessionWorkspace(ctx, lease, profile.SessionIsolation)
+	if err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
+	return AuthoritySessionAdmission{Lease: lease, Workspace: workspace}, nil
+}
+
+// AcquireRegisteredSession is the sole registered-task admission seam.  It is
+// intentionally unavailable unless configuration names the Signal principal.
+func (s *AuthorityWorkerService) AcquireRegisteredSession(ctx context.Context, principal string, request RegisteredAdmissionRequest) (AuthoritySessionAdmission, error) {
+	if s.cfg.RegisteredCoordinatorPrincipal == "" || principal != s.cfg.RegisteredCoordinatorPrincipal {
+		return AuthoritySessionAdmission{}, fmt.Errorf("policy denial: registered admission principal is not configured")
+	}
+	profile, err := s.authorize(principal, request.Profile, "acquire")
+	if err != nil {
+		return AuthoritySessionAdmission{}, err
+	}
+	lease, err := s.store.AcquireRegistered(ctx, principal, request, profile.IssuanceGeneration)
 	if err != nil {
 		return AuthoritySessionAdmission{}, err
 	}
@@ -536,7 +587,16 @@ func (s *AuthorityWorkerService) ReassignSession(ctx context.Context, principal 
 	if err != nil || !validAgentdID(workspace.AgentdSessionID) {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentConflictingReplacement, "session has no durable agentd identity")
 	}
-	if _, ok := s.runtime.(AuthorityAgentdRebinder); !ok {
+	_, admissionErr := s.store.RegisteredAdmission(ctx, principal, request.SessionBinding)
+	isRegistered := admissionErr == nil
+	if admissionErr != nil && !errors.Is(admissionErr, sql.ErrNoRows) {
+		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentRebindConflict, "registered admission state is unavailable")
+	}
+	if isRegistered {
+		if _, ok := s.runtime.(AuthorityAgentdRegisteredAdopter); !ok {
+			return AuthoritySessionReassignment{}, reassignmentError(ReassignmentRebindRetryable, "agentd registered adoption transport is unavailable")
+		}
+	} else if _, ok := s.runtime.(AuthorityAgentdRebinder); !ok {
 		return AuthoritySessionReassignment{}, reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
 	}
 	reassignment, err := s.store.Reassign(ctx, principal, request.SessionBinding, request.SessionLineageID, request.PredecessorWorkerID, request.PredecessorWorkerFenceEpoch, request.IdempotencyKey, workspace, profile.IssuanceGeneration)
@@ -593,12 +653,28 @@ func (s *AuthorityWorkerService) confirmAgentdAdoption(ctx context.Context, adop
 	if err != nil || replacement.Profile != adoption.AuthorityBinding || replacement.WorkerStorageLineageID != adoption.Successor.StorageLineageID || replacement.WorkerFenceEpoch != adoption.Successor.FenceEpoch {
 		return reassignmentError(ReassignmentRebindRetryable, "broker-recorded adoption successor is temporarily unavailable")
 	}
-	rebinder, ok := s.runtime.(AuthorityAgentdRebinder)
-	if !ok {
-		return reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
+	_, admissionErr := s.store.RegisteredAdmission(ctx, adoption.Principal, adoption.CoordinatorBinding)
+	isRegistered := admissionErr == nil
+	if admissionErr != nil && !errors.Is(admissionErr, sql.ErrNoRows) {
+		return reassignmentError(ReassignmentRebindRetryable, "registered admission state is unavailable")
 	}
-	request := agentdRebindRequest{IdempotencyKey: adoption.RebindIdempotencyKey, Predecessor: adoption.Predecessor, Successor: adoption.Successor}
-	status, rebindErr := rebinder.RebindAgentdSession(ctx, replacement, adoption.AgentdSessionID, request)
+	var status agentdSessionStatus
+	var rebindErr error
+	if isRegistered {
+		adopter, ok := s.runtime.(AuthorityAgentdRegisteredAdopter)
+		if !ok {
+			return reassignmentError(ReassignmentRebindRetryable, "agentd registered adoption transport is unavailable")
+		}
+		request := agentdRegisteredAdoptRequest{Version: "agentd/registered-lifecycle/v1", IdempotencyKey: adoption.RebindIdempotencyKey, PredecessorWorker: adoption.Predecessor.WorkerID, PredecessorEpoch: adoption.Predecessor.FenceEpoch}
+		status, rebindErr = adopter.AdoptRegisteredAgentdSession(ctx, replacement, adoption.AgentdSessionID, request)
+	} else {
+		rebinder, ok := s.runtime.(AuthorityAgentdRebinder)
+		if !ok {
+			return reassignmentError(ReassignmentRebindRetryable, "agentd rebind transport is unavailable")
+		}
+		request := agentdRebindRequest{IdempotencyKey: adoption.RebindIdempotencyKey, Predecessor: adoption.Predecessor, Successor: adoption.Successor}
+		status, rebindErr = rebinder.RebindAgentdSession(ctx, replacement, adoption.AgentdSessionID, request)
+	}
 	if rebindErr != nil {
 		var typed *agentdRebindError
 		if errors.As(rebindErr, &typed) && !typed.retryable {

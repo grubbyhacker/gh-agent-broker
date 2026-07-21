@@ -289,6 +289,21 @@ func TestValidateRejectsInvalidBranchLifecycleGuardMode(t *testing.T) {
 	}
 }
 
+func TestTransportObservationRejectsProduction(t *testing.T) {
+	cfg := Config{
+		Server: ServerConfig{Production: true},
+		GitHub: GitHubConfig{AppID: 1, PrivateKeyPath: "key.pem", Installations: map[string]int64{"owner/repo": 2}},
+		TransportObservation: TransportObservationConfig{
+			Enabled:            true,
+			AuthorityStorePath: "/var/lib/gh-agent-broker-tripwire/authority-workers.sqlite",
+			ProfileAgentIDs:    map[string]string{"writer": "agent-1"},
+		},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cannot be enabled in production") {
+		t.Fatalf("production transport observation validation error = %v", err)
+	}
+}
+
 func writeFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {

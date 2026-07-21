@@ -3,6 +3,8 @@
 package securityscan
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
 const (
@@ -22,8 +25,9 @@ const (
 )
 
 type Finding struct {
-	Code  string
-	Field string
+	Code        string
+	Field       string
+	Fingerprint string
 }
 
 type DetectionError struct {
@@ -53,9 +57,36 @@ var detectors = []detector{
 }
 
 var (
-	base64Run = regexp.MustCompile(`[A-Za-z0-9+/_-]{16,}={0,2}`)
-	hexRun    = regexp.MustCompile(`(?i)(?:[0-9a-f]{2}){12,}`)
+	base64Run      = regexp.MustCompile(`[A-Za-z0-9+/_-]{16,}={0,2}`)
+	hexRun         = regexp.MustCompile(`(?i)(?:[0-9a-f]{2}){12,}`)
+	effectTokenRun = regexp.MustCompile(`(?i)\b[0-9a-f]{64}\b`)
+	effectTokensMu sync.RWMutex
+	effectTokens   = map[string][]byte{}
+	effectHandlers []func(string)
 )
+
+// RegisterEffectTokenFingerprint installs an HMAC verifier for a broker-owned
+// effect token.  Callers retain only the fingerprint; the plaintext token is
+// never registered or persisted by this package.
+func RegisterEffectTokenFingerprint(fingerprint string, key []byte) {
+	if fingerprint == "" || len(key) == 0 {
+		return
+	}
+	effectTokensMu.Lock()
+	effectTokens[fingerprint] = append([]byte(nil), key...)
+	effectTokensMu.Unlock()
+}
+
+// RegisterEffectTokenLeakHandler installs a broker-controlled response for an
+// exact effect-token match. The handler receives only the opaque fingerprint.
+func RegisterEffectTokenLeakHandler(handler func(string)) {
+	if handler == nil {
+		return
+	}
+	effectTokensMu.Lock()
+	effectHandlers = append(effectHandlers, handler)
+	effectTokensMu.Unlock()
+}
 
 // Fields scans deterministic named text fields. It returns only a reason code
 // and field name; matched credential-shaped material is never returned.
@@ -125,6 +156,9 @@ func scanValue(field, value string, rawLimit int) *Finding {
 				return &Finding{Code: candidate.code, Field: field}
 			}
 		}
+		if fingerprint := matchingEffectToken(current.value); fingerprint != "" {
+			return &Finding{Code: "effect_token_fingerprint", Field: field, Fingerprint: fingerprint}
+		}
 		if current.depth >= maxCanonicalDepth {
 			continue
 		}
@@ -148,6 +182,24 @@ func scanValue(field, value string, rawLimit int) *Finding {
 		}
 	}
 	return nil
+}
+
+func matchingEffectToken(value string) string {
+	effectTokensMu.RLock()
+	defer effectTokensMu.RUnlock()
+	for _, candidate := range effectTokenRun.FindAllString(value, -1) {
+		for fingerprint, key := range effectTokens {
+			h := hmac.New(sha256.New, key)
+			_, _ = h.Write([]byte(candidate))
+			if hmac.Equal([]byte(fingerprint), []byte(hex.EncodeToString(h.Sum(nil)))) {
+				for _, handler := range effectHandlers {
+					handler(fingerprint)
+				}
+				return fingerprint
+			}
+		}
+	}
+	return ""
 }
 
 func canonicalDecodings(value string) ([]string, bool) {

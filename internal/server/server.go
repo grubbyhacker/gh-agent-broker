@@ -33,18 +33,22 @@ import (
 	"gh-agent-broker/internal/policy"
 	"gh-agent-broker/internal/pushtripwire"
 	"gh-agent-broker/internal/repositoryroutepolicy"
+	"gh-agent-broker/internal/sandbox"
 	"gh-agent-broker/internal/securityscan"
 )
 
 type Server struct {
-	configPath string
-	mu         sync.RWMutex
-	cfg        *config.Config
-	gh         *githubapp.Client
-	audit      *audit.Logger
-	http       *http.Client
-	tripwire   *pushtripwire.Store
-	fence      pushtripwire.FenceAdapter
+	configPath        string
+	mu                sync.RWMutex
+	cfg               *config.Config
+	gh                *githubapp.Client
+	audit             *audit.Logger
+	http              *http.Client
+	tripwire          *pushtripwire.Store
+	fence             pushtripwire.FenceAdapter
+	transport         *sandbox.TransportObserver
+	transportProfiles map[string]string
+	credentialStore   *sandbox.AuthorityWorkerStore
 }
 
 func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *audit.Logger) (*Server, error) {
@@ -56,14 +60,53 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 			return nil, err
 		}
 	}
+	var transport *sandbox.TransportObserver
+	if cfg.TransportObservation.Enabled {
+		transport, err = sandbox.OpenTransportObserver(context.Background(), cfg.TransportObservation.AuthorityStorePath)
+		if err != nil {
+			return nil, fmt.Errorf("open transport observer: %w", err)
+		}
+	}
+	var credentialStore *sandbox.AuthorityWorkerStore
+	if cfg.TransportObservation.AuthorityStorePath != "" {
+		credentialStore, err = sandbox.OpenAuthorityWorkerStore(context.Background(), cfg.TransportObservation.AuthorityStorePath)
+		if err != nil {
+			return nil, fmt.Errorf("open credential custody store: %w", err)
+		}
+	}
 	return &Server{
-		configPath: configPath,
-		cfg:        cfg,
-		gh:         gh,
-		audit:      auditLog,
-		http:       &http.Client{Timeout: 10 * time.Minute},
-		tripwire:   tripwire,
+		configPath:        configPath,
+		cfg:               cfg,
+		gh:                gh,
+		audit:             auditLog,
+		http:              &http.Client{Timeout: 10 * time.Minute},
+		tripwire:          tripwire,
+		transport:         transport,
+		transportProfiles: cfg.TransportObservation.ProfileAgentIDs,
+		credentialStore:   credentialStore,
 	}, nil
+}
+
+func (s *Server) beginTransport(ctx context.Context, principal auth.Principal, transportContext, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
+	authority, err := s.transport.ResolveAuthority(ctx, transportContext)
+	if err != nil {
+		return nil, err
+	}
+	if authority.Principal != principal.TransportPrincipal {
+		return nil, errors.New("transport authority context principal mismatch")
+	}
+	op := &sandbox.TransportOperation{OperationID: ids.NewOperationID(), Method: method, Service: service, Repository: repo, RequestPath: path, RequestedRefs: []string{}, RefUpdates: []any{}, CredentialHeaderPresent: credentialHeader, Authority: authority}
+	if err := s.transport.Received(ctx, op); err != nil {
+		return nil, err
+	}
+	return op, nil
+}
+
+func (s *Server) denyTransport(ctx context.Context, op *sandbox.TransportOperation, code string, status int) bool {
+	if op == nil {
+		return true
+	}
+	return s.transport.Terminal(ctx, op, "denied", "denied", code, status, 0) == nil
 }
 
 func (s *Server) InstallSignalReload() {
@@ -268,6 +311,11 @@ func (s *Server) blockUnsafeEgress(w http.ResponseWriter, operationID, agentID, 
 	if finding == nil {
 		return false
 	}
+	if finding.Fingerprint != "" && s.credentialStore != nil {
+		if err := s.credentialStore.HandleEffectTokenLeak(context.Background(), finding.Fingerprint); err != nil {
+			s.audit.Log(audit.Event{OperationID: operationID, AgentID: agentID, Operation: "security.fence_failed", Repo: repo, Decision: policy.DecisionDeny, Result: "effect_token_fingerprint"})
+		}
+	}
 	s.audit.Log(audit.Event{
 		OperationID: operationID,
 		AgentID:     agentID,
@@ -312,6 +360,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handlePushTripwireMaterial(w, r)
 	case r.URL.Path == "/v1/security/push-tripwire/respond":
 		s.handlePushTripwireResponse(w, r)
+	case r.URL.Path == "/v1/registered/github-green-pr/observe":
+		s.handleRegisteredGreenPRObservation(w, r)
+	case r.URL.Path == "/v1/registered/github-green-pr/create":
+		s.handleRegisteredGreenPRCreate(w, r)
 	case r.URL.Path == "/v1/policy/dry-run":
 		s.handleDryRun(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/repos/"):
@@ -321,6 +373,137 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
+}
+
+// handleRegisteredGreenPRObservation has an intentionally empty request
+// surface: every completion fact is derived from durable admission, the
+// broker's recorded smart-HTTP push, and authenticated GitHub reads.
+func (s *Server) handleRegisteredGreenPRObservation(w http.ResponseWriter, r *http.Request) {
+	principal, appName, admission, installation, gh, ok := s.registeredGreenPRAdmission(w, r, "observation")
+	if !ok {
+		return
+	}
+	observation, err := gh.ObserveGreenPR(appName, greenPRRequest(admission, appName, installation))
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "GitHub green PR observation failed"})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: admission.OperationID, AgentID: principal.ID, Operation: "github_green_pr.observe", Repo: admission.Task.Parameters.Repository, Branch: admission.Task.Parameters.BranchRef, Decision: policy.DecisionAllow, Result: observation.Verdict})
+	writeJSON(w, http.StatusOK, observation)
+}
+
+// handleRegisteredGreenPRCreate has the same empty request surface and
+// durable admission source as observation. The fixed App installation creates
+// the ready PR; callers cannot select its title, refs, body, or draft state.
+func (s *Server) handleRegisteredGreenPRCreate(w http.ResponseWriter, r *http.Request) {
+	principal, appName, admission, installation, gh, ok := s.registeredGreenPRAdmission(w, r, "creation")
+	if !ok {
+		return
+	}
+	pull, err := gh.CreateReadyGreenPR(appName, greenPRRequest(admission, appName, installation))
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "GitHub green PR creation was refused"})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: admission.OperationID, AgentID: principal.ID, Operation: "github_green_pr.create", Repo: admission.Task.Parameters.Repository, Branch: admission.Task.Parameters.BranchRef, Decision: policy.DecisionAllow, GitHubURL: pull.URL, Result: "ok"})
+	writeJSON(w, http.StatusCreated, pull)
+}
+
+func greenPRRequest(admission sandbox.GreenPRTransportAdmission, appName string, installation int64) githubapp.GreenPRRequest {
+	return githubapp.GreenPRRequest{RegisteredTaskDigest: admission.TaskDigest, BrokerOperationID: admission.OperationID, AppSlug: appName, InstallationID: installation, Repository: admission.Task.Parameters.Repository, BaseRef: admission.Task.Parameters.BaseBranch, WorkerRef: "refs/heads/" + admission.Task.Parameters.BranchRef, PushedHeadSHA: admission.PushedSHA}
+}
+
+// registeredGreenPRAdmission authenticates the registered principal, rejects
+// every caller-supplied completion fact, and derives all mutable PR inputs
+// from the one durable task and completed broker push.
+func (s *Server) registeredGreenPRAdmission(w http.ResponseWriter, r *http.Request, action string) (auth.Principal, string, sandbox.GreenPRTransportAdmission, int64, *githubapp.Client, bool) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
+	}
+	if body, err := io.ReadAll(io.LimitReader(r.Body, 2)); err != nil || len(bytes.TrimSpace(body)) != 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "github green PR " + action + " accepts no caller facts"})
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
+	}
+	cfg, gh := s.snapshot()
+	if s.transport == nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "registered transport authority is unavailable"})
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
+	}
+	transportContext := bearerTransportContext(r)
+	authority, err := s.transport.ResolveAuthority(r.Context(), transportContext)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "registered transport authority is unavailable"})
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
+	}
+	agent, found := configuredAgent(cfg, authority.Principal)
+	if !found || s.transportProfiles[authority.Profile] != authority.Principal {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "registered transport authority is unavailable"})
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
+	}
+	principal := auth.Principal{ID: authority.Principal, Agent: agent}
+	admission, err := s.transport.GreenPRAdmission(r.Context(), transportContext)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "registered green PR " + action + " is unavailable"})
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
+	}
+	appName := config.GitHubAppName(principal.Agent)
+	installation, ok := cfg.InstallationIDForApp(appName, admission.Task.Parameters.Repository)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "repository installation is not configured"})
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
+	}
+	result := registeredGreenPRPolicyCheck(principal, admission, action)
+	if !result.Allowed {
+		writeJSON(w, http.StatusForbidden, s.errorResponse(admission.OperationID, "policy_denied", "registered green PR "+action+" denied by policy", &result))
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
+	}
+	return principal, appName, admission, installation, gh, true
+}
+
+func bearerTransportContext(r *http.Request) string {
+	value := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(value), "bearer ") {
+		return strings.TrimSpace(value[len("bearer "):])
+	}
+	return ""
+}
+
+func configuredAgent(cfg *config.Config, id string) (config.Agent, bool) {
+	for _, agent := range cfg.Agents {
+		if agent.ID == id && agent.Enabled {
+			return agent, true
+		}
+	}
+	return config.Agent{}, false
+}
+
+// registeredGreenPRPolicyCheck requires the registered principal to authorize
+// every broker operation performed by the selected fixed endpoint.
+func registeredGreenPRPolicyCheck(principal auth.Principal, admission sandbox.GreenPRTransportAdmission, action string) policy.Result {
+	var operations []string
+	switch action {
+	case "creation":
+		operations = []string{"repo.probe", "pull.read", "pull.create"}
+	case "observation":
+		operations = []string{"repo.probe", "pull.read", "checks.read", "status.read"}
+	default:
+		return policy.Result{Allowed: false, Decision: policy.DecisionDeny}
+	}
+	for _, operation := range operations {
+		result := policy.Check(policy.Request{
+			Agent:      principal.Agent,
+			AgentID:    principal.ID,
+			Repo:       admission.Task.Parameters.Repository,
+			Operation:  operation,
+			Branch:     admission.Task.Parameters.BranchRef,
+			BaseBranch: admission.Task.Parameters.BaseBranch,
+		})
+		if !result.Allowed {
+			return result
+		}
+	}
+	return policy.Result{Allowed: true, Decision: policy.DecisionAllow}
 }
 
 func handleDiscovery(w http.ResponseWriter, r *http.Request) {
@@ -351,6 +534,20 @@ func handleOperations(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"version": "v1",
 		"operations": []map[string]interface{}{
+			{
+				"name":        "registered.github-green-pr.create",
+				"method":      http.MethodPost,
+				"path":        "/v1/registered/github-green-pr/create",
+				"auth":        "registered agent",
+				"description": "Create or return the exact ready PR derived from the registered task and completed broker push. This endpoint accepts no request body.",
+			},
+			{
+				"name":        "registered.github-green-pr.observe",
+				"method":      http.MethodPost,
+				"path":        "/v1/registered/github-green-pr/observe",
+				"auth":        "registered agent",
+				"description": "Observe the exact ready PR derived from the registered task and completed broker push. This endpoint accepts no request body.",
+			},
 			{
 				"name":        "repo.probe",
 				"method":      http.MethodGet,
@@ -507,6 +704,8 @@ Discovery:
 - GET /whoami
 
 Operations:
+- POST /v1/registered/github-green-pr/create
+- POST /v1/registered/github-green-pr/observe
 - GET  /v1/repos/{owner}/{repo}/probe
 - POST /v1/policy/dry-run
 - GET  /v1/repos/{owner}/{repo}/pulls
@@ -1856,20 +2055,45 @@ func (s *Server) handleIssueLabelRemove(w http.ResponseWriter, r *http.Request, 
 func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	opID := ids.NewOperationID()
 	cfg, gh := s.snapshot()
-	principal, ok := auth.AuthenticateAgent(r, cfg)
-	if !ok {
-		writeAuthText(w, "agent authentication failed")
-		return
-	}
 	repo, suffix, ok := parseGitPath(r.URL.Path)
 	if !ok {
 		http.Error(w, "invalid git path", http.StatusNotFound)
+		return
+	}
+	principal, ok := auth.AuthenticateAgent(r, cfg)
+	if !ok && s.credentialStore != nil {
+		id, secret, basic := r.BasicAuth()
+		if basic {
+			if custody, valid, err := s.credentialStore.AuthenticateGitCredential(r.Context(), id, secret, repo); err == nil && valid {
+				if parent, found := cfg.AgentByID(custody.Principal); found {
+					parent.ID = custody.AgentID
+					parent.Secret = ""
+					parent.Repositories = []string{custody.Repository}
+					// The effect identity is retained for Basic authentication and audit,
+					// while the immutable parent principal remains the only identity that
+					// can satisfy a leased transport context.
+					principal, ok = auth.Principal{Agent: parent, ID: custody.AgentID, TransportPrincipal: custody.Principal}, true
+				}
+			}
+		}
+	}
+	if !ok {
+		writeAuthText(w, "agent authentication failed")
 		return
 	}
 	operation := gitOperation(r, suffix)
 	if operation == "" {
 		http.Error(w, "unsupported git operation", http.StatusBadRequest)
 		return
+	}
+	var transport *sandbox.TransportOperation
+	if s.transport != nil {
+		var err error
+		transport, err = s.beginTransport(r.Context(), principal, r.Header.Get("X-GH-Agent-Broker-Transport-Context"), r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, r.Header.Get("Authorization") != "")
+		if err != nil {
+			http.Error(w, "transport authority observation unavailable", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	var bodyReader io.Reader = r.Body
 	branch := ""
@@ -1882,10 +2106,17 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 				status = http.StatusRequestEntityTooLarge
 			}
 			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Decision: policy.DecisionDeny, Result: "receive_pack_command_prefix_rejected"})
+			if !s.denyTransport(r.Context(), transport, "receive_pack_command_prefix_rejected", status) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
 			http.Error(w, "invalid receive-pack command prefix", status)
 			return
 		}
 		updates = parsedUpdates
+		if transport != nil {
+			transport.RefUpdates = parsedUpdates
+		}
 		bodyReader = io.MultiReader(bytes.NewReader(prefix), r.Body)
 		if len(parsedUpdates) > 0 {
 			branch = parsedUpdates[0].Ref
@@ -1907,6 +2138,10 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 				Action:   "push a named branch ref that the broker can parse and policy allows",
 			}},
 		}
+		if !s.denyTransport(r.Context(), transport, "branch_unparseable", http.StatusForbidden) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Decision: result.Decision})
 		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
@@ -1919,6 +2154,10 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		Branch:    branch,
 	})
 	if !result.Allowed {
+		if !s.denyTransport(r.Context(), transport, "policy_denied", http.StatusForbidden) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision})
 		writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", &result))
 		return
@@ -1958,33 +2197,89 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			Result:      "semantic_pack_inspection_unavailable",
 			Extra:       map[string]interface{}{"attempted_operation": operation, "surface": "git_receive_pack"},
 		})
+		if !s.denyTransport(r.Context(), transport, "security_egress_blocked", http.StatusForbidden) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		writeGitPolicyError(w, r, s.errorResponse(opID, "security_egress_blocked", "opaque Git push denied by security policy", &result))
 		return
+	}
+	if operation == "git.receive-pack" && r.Method == http.MethodPost && s.credentialStore != nil {
+		// Effect credentials are exact, broker-known values. Inspect the bounded
+		// pack object graph before forwarding; compressed bytes are not text.
+		pack, err := io.ReadAll(io.LimitReader(bodyReader, securityscan.MaxStreamBytes+1))
+		if err != nil || len(pack) > securityscan.MaxStreamBytes {
+			if !s.denyTransport(r.Context(), transport, "security_scan_limit", http.StatusRequestEntityTooLarge) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, "receive-pack exceeds security scan bound", http.StatusRequestEntityTooLarge)
+			return
+		}
+		bodyReader = bytes.NewReader(pack)
+		finding, scanErr := scanReceivePack(pack)
+		if scanErr != nil {
+			if !s.denyTransport(r.Context(), transport, "security_pack_scan_rejected", http.StatusForbidden) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, "receive-pack blocked by security policy", http.StatusForbidden)
+			return
+		}
+		if finding != nil {
+			if finding.Fingerprint != "" && s.credentialStore.HandleEffectTokenLeak(r.Context(), finding.Fingerprint) != nil {
+				http.Error(w, "credential fence unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "security.egress_blocked", Repo: repo, Decision: policy.DecisionDeny, Result: finding.Code, Extra: map[string]interface{}{"fingerprint": finding.Fingerprint, "surface": "git_receive_pack"}})
+			if !s.denyTransport(r.Context(), transport, "security_egress_blocked", http.StatusForbidden) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, "receive-pack blocked by security policy", http.StatusForbidden)
+			return
+		}
 	}
 	if strings.HasPrefix(repo, "local/") {
 		route, found := localRepositoryRoute(cfg, repo)
 		if !found {
+			if !s.denyTransport(r.Context(), transport, "local_repository_not_configured", http.StatusForbidden) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
 			http.Error(w, "local repository is not configured", http.StatusForbidden)
 			return
 		}
 		if operation == "git.receive-pack" && r.Method == http.MethodPost {
 			for _, update := range updates {
 				if update.After == strings.Repeat("0", 40) || !route.AllowsWrite(update.Ref) {
+					if !s.denyTransport(r.Context(), transport, "local_ref_policy_denied", http.StatusForbidden) {
+						http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+						return
+					}
 					s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, update.Ref, "local_ref_policy_denied", "local pushes must be non-deleting updates in the configured writable namespace")
 					return
 				}
 			}
 			if !s.localReceivePackBeforeMatches(r.Context(), route, repo, updates) {
+				if !s.denyTransport(r.Context(), transport, "ref_before_mismatch", http.StatusForbidden) {
+					http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+					return
+				}
 				s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, branch, "ref_before_mismatch", "advertised ref state no longer matches the repository backend")
 				return
 			}
 		}
-		s.forwardLocalGit(w, r, opID, principal.ID, repo, branch, operation, result, route, suffix, bodyReader)
+		s.forwardLocalGit(w, r, opID, principal.ID, repo, branch, operation, result, route, suffix, bodyReader, transport)
 		return
 	}
 	appName := config.GitHubAppName(principal.Agent)
 	inst, ok := cfg.InstallationIDForApp(appName, repo)
 	if !ok {
+		if !s.denyTransport(r.Context(), transport, "installation_not_configured", http.StatusForbidden) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "repository has no configured GitHub App installation", http.StatusForbidden)
 		return
 	}
@@ -1992,6 +2287,10 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	if guardResult != nil {
 		result.Warnings = append(result.Warnings, guardResult.Warnings...)
 		if !guardResult.Allowed {
+			if !s.denyTransport(r.Context(), transport, "policy_denied", http.StatusForbidden) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
 			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: guardResult.Decision})
 			writeGitPolicyError(w, r, s.errorResponse(opID, "policy_denied", "git operation denied by policy", guardResult))
 			return
@@ -2004,17 +2303,29 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	if operation == "git.receive-pack" && r.Method == http.MethodPost {
 		for _, update := range updates {
 			if update.After == strings.Repeat("0", 40) {
+				if !s.denyTransport(r.Context(), transport, "ref_deletion_rejected", http.StatusForbidden) {
+					http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+					return
+				}
 				s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, update.Ref, "ref_deletion_rejected", "ref deletion is not allowed through opaque receive-pack")
 				return
 			}
 			current, found, err := gh.GetRef(appName, repo, update.Ref, inst)
 			if err != nil {
+				if !s.denyTransport(r.Context(), transport, "ref_preflight_unavailable", http.StatusBadGateway) {
+					http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+					return
+				}
 				s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: update.Ref, Decision: policy.DecisionDeny, Result: "ref_preflight_unavailable", Error: err.Error()})
 				http.Error(w, "GitHub ref preflight failed", http.StatusBadGateway)
 				return
 			}
 			zeroBefore := update.Before == strings.Repeat("0", 40)
 			if (zeroBefore && found) || (!zeroBefore && (!found || current != update.Before)) {
+				if !s.denyTransport(r.Context(), transport, "ref_before_mismatch", http.StatusForbidden) {
+					http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+					return
+				}
 				s.writeGitPreflightDenial(w, r, opID, principal.ID, repo, update.Ref, "ref_before_mismatch", "advertised ref state no longer matches GitHub")
 				return
 			}
@@ -2022,32 +2333,58 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	}
 	token, err := gh.InstallationToken(appName, inst)
 	if err != nil {
+		if !s.denyTransport(r.Context(), transport, "token_exchange_failed", http.StatusBadGateway) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
 		http.Error(w, "github token exchange failed", http.StatusBadGateway)
 		return
 	}
 	upstream, err := gitUpstreamURL(cfg.GitHub.GitBaseURL, repo, suffix, r.URL.RawQuery)
 	if err != nil {
+		if !s.denyTransport(r.Context(), transport, "upstream_url_invalid", http.StatusBadRequest) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	//nolint:gosec // upstream is constructed from validated repo path and configured Git base URL.
 	req, err := http.NewRequest(r.Method, upstream, bodyReader)
 	if err != nil {
+		if !s.denyTransport(r.Context(), transport, "upstream_request_invalid", http.StatusBadRequest) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	req.ContentLength = r.ContentLength
 	copyGitHeaders(req.Header, r.Header)
 	req.SetBasicAuth("x-access-token", token)
+	if transport != nil && s.transport.Forwarded(r.Context(), transport) != nil {
+		http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+		return
+	}
 	// #nosec G704 -- outbound Git proxy target is constrained by broker config and repo policy.
 	resp, err := s.http.Do(req)
 	if err != nil {
+		if transport != nil {
+			if terminalErr := s.transport.Terminal(r.Context(), transport, "failed", "failed", "github_git_upstream_failed", http.StatusBadGateway, 0); terminalErr != nil {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
+		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
 		http.Error(w, "github git upstream failed", http.StatusBadGateway)
 		return
 	}
 	defer closeBody(resp.Body)
+	if transport != nil && s.transport.Terminal(r.Context(), transport, "completed", "allowed", "", resp.StatusCode, resp.StatusCode) != nil {
+		http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+		return
+	}
 	if operation != "git.receive-pack" {
 		copyGitHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
@@ -2387,27 +2724,49 @@ func advertisedRefs(body []byte) map[string]string {
 	return refs
 }
 
-func (s *Server) forwardLocalGit(w http.ResponseWriter, r *http.Request, opID, agentID, repo, branch, operation string, result policy.Result, route repositoryroutepolicy.Route, suffix string, body io.Reader) {
+func (s *Server) forwardLocalGit(w http.ResponseWriter, r *http.Request, opID, agentID, repo, branch, operation string, result policy.Result, route repositoryroutepolicy.Route, suffix string, body io.Reader, transport *sandbox.TransportOperation) {
 	u, err := localGitURL(route, repo, suffix, r.URL.RawQuery)
 	if err != nil {
+		if !s.denyTransport(r.Context(), transport, "local_backend_url_invalid", http.StatusBadGateway) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "invalid local backend URL", http.StatusBadGateway)
 		return
 	}
 	//nolint:gosec // URL is constructed solely from the reviewed route manifest.
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, u, body)
 	if err != nil {
+		if !s.denyTransport(r.Context(), transport, "local_backend_request_invalid", http.StatusBadGateway) {
+			http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "invalid local backend request", http.StatusBadGateway)
 		return
 	}
 	req.ContentLength = r.ContentLength
 	copyGitHeaders(req.Header, r.Header)
+	if transport != nil && s.transport.Forwarded(r.Context(), transport) != nil {
+		http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+		return
+	}
 	//nolint:gosec // request target is constrained by the reviewed route manifest.
 	resp, err := s.http.Do(req)
 	if err != nil {
+		if transport != nil {
+			if terminalErr := s.transport.Terminal(r.Context(), transport, "failed", "failed", "backend_unavailable", http.StatusBadGateway, 0); terminalErr != nil {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
+		}
 		http.Error(w, "repository backend unavailable", http.StatusBadGateway)
 		return
 	}
 	defer closeBody(resp.Body)
+	if transport != nil && s.transport.Terminal(r.Context(), transport, "completed", "allowed", "", resp.StatusCode, resp.StatusCode) != nil {
+		http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+		return
+	}
 	copyGitHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {

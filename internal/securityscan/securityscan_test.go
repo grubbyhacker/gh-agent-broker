@@ -1,6 +1,8 @@
 package securityscan
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"io"
@@ -8,6 +10,22 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestEffectTokenFingerprintDetectsOnlyRegisteredExactToken(t *testing.T) {
+	key := []byte("scanner-test-key")
+	token := strings.Repeat("a", 64)
+	h := hmac.New(sha256.New, key)
+	_, _ = h.Write([]byte(token))
+	fingerprint := hex.EncodeToString(h.Sum(nil))
+	RegisterEffectTokenFingerprint(fingerprint, key)
+	finding := Fields(map[string]string{"output": "prefix " + token + " suffix"})
+	if finding == nil || finding.Code != "effect_token_fingerprint" || finding.Fingerprint != fingerprint {
+		t.Fatalf("effect token finding = %+v", finding)
+	}
+	if finding := Fields(map[string]string{"output": strings.Repeat("b", 64)}); finding != nil {
+		t.Fatalf("unregistered token finding = %+v", finding)
+	}
+}
 
 func TestFieldsDetectsCredentialShapesWithoutReturningMaterial(t *testing.T) {
 	//nolint:gosec // G101: intentionally synthetic credential shapes exercise the detector.
