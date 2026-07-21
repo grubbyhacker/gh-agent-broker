@@ -2,6 +2,22 @@
 
 ## Current State
 
+### GitHub green-PR completion observation
+
+The registered v2 admission now accepts only the settled
+`github_green_pr_v1` task values for
+`grubbyhacker/repository-worker-lifecycle-test`, `main`, and the anchored
+`agent/fleiglabs-repo-agent/...` branch namespace. The broker's
+`POST /v1/registered/github-green-pr/observe` accepts no request body or
+caller completion facts. It derives the immutable task digest and exact pushed
+head from the active durable lease and completed broker smart-HTTP operation,
+then emits `github-green-pr-observation/v1` using authenticated App reads of
+the ready PR, active branch rules, and exact evaluation-SHA checks/statuses.
+Copied, forked, mismatched, stale, duplicate, or wrong-App-source observations
+refuse; absent rows remain pending, and only GitHub-accepted success/skipped/
+neutral conclusions satisfy. The endpoint stays staging-configured through the
+existing transport observation mapping; it does not activate production.
+
 ### Durable registered-task admission (candidate A)
 
 The configured registered coordinator principal is refused at the legacy

@@ -16,7 +16,7 @@ import (
 
 const (
 	coordinatorRegisteredProtocolVersion = "broker/coordinator/v2"
-	repositoryContractDigest             = "sha256:df72462d2bde6674349b2265d8768c6bba0b3368114cd015195ce66a697fc102"
+	githubGreenPRContractDigest          = "sha256:df72462d2bde6674349b2265d8768c6bba0b3368114cd015195ce66a697fc102"
 )
 
 type RegisteredTaskSource struct {
@@ -70,10 +70,10 @@ type registeredAdmission struct {
 }
 
 var (
-	registeredOpaqueID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
-	sha256Digest       = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	sha40              = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	repositoryBranch   = regexp.MustCompile(`^agent/repository-proof/[a-z0-9][a-z0-9-]{0,62}$`)
+	registeredOpaqueID  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+	sha256Digest        = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	sha40               = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	githubGreenPRBranch = regexp.MustCompile(`^agent/fleiglabs-repo-agent/[a-z0-9][a-z0-9-]{0,62}$`)
 )
 
 func validateRegisteredAdmission(r RegisteredAdmissionRequest) (registeredAdmission, error) {
@@ -87,7 +87,7 @@ func validateRegisteredAdmission(r RegisteredAdmissionRequest) (registeredAdmiss
 		return registeredAdmission{}, fmt.Errorf("registered task source and session binding are invalid")
 	}
 	t := r.Task
-	if t.TaskKind != "repository_change_v1" || t.TaskVersion != "1.0.0" || t.CompletionContract != "repository_state_v1" || t.VerifierID != "repository_state_v1" || t.ContractDigest != repositoryContractDigest || !sha256Digest.MatchString(t.TaskEvidenceDigest) || t.Parameters.RepositoryID != "neutral/repository-proof" || !sha40.MatchString(t.Parameters.BaseRevision) || !repositoryBranch.MatchString(t.Parameters.BranchRef) || t.Parameters.ValidationSelection != "required" {
+	if t.TaskKind != "repository_change_v1" || t.TaskVersion != "1.0.0" || t.CompletionContract != "github_green_pr_v1" || t.VerifierID != "github_green_pr_v1" || t.ContractDigest != githubGreenPRContractDigest || !sha256Digest.MatchString(t.TaskEvidenceDigest) || t.Parameters.RepositoryID != "grubbyhacker/repository-worker-lifecycle-test" || !sha40.MatchString(t.Parameters.BaseRevision) || !githubGreenPRBranch.MatchString(t.Parameters.BranchRef) || t.Parameters.ValidationSelection != "required" {
 		return registeredAdmission{}, fmt.Errorf("registered task is invalid")
 	}
 	// All accepted strings are ASCII-safe identifiers, so this literal is also

@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -82,6 +83,49 @@ func TestTransportEventsFailClosedAndAppendOnly(t *testing.T) {
 	seedTransportLease(t, observer.store, "writer", "worker-2", "binding-2")
 	if _, err := observer.ResolveAuthority(ctx, "writer"); err == nil {
 		t.Fatal("ambiguous active authority was accepted")
+	}
+}
+
+func TestGreenPRAdmissionUsesOnlyRegisteredTaskAndCompletedPush(t *testing.T) {
+	ctx := context.Background()
+	observer, err := OpenTransportObserver(ctx, filepath.Join(t.TempDir(), "authority-workers.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeTransportObserver(observer) })
+	seedTransportLease(t, observer.store, "writer", "worker-1", "session:transport-work")
+	request := registeredRequest(t, "transport-work", "transport-route")
+	admission, err := validateRegisteredAdmission(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := observer.store.db.ExecContext(ctx, `INSERT INTO authority_registered_admissions(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest) VALUES(?,?,?,?,?,?,?)`, "broker-principal", "session:transport-work", coordinatorRegisteredProtocolVersion, request.Source.WorkItemID, request.Source.RouteSnapshotID, admission.CanonicalJSON, admission.Digest); err != nil {
+		t.Fatal(err)
+	}
+	authority, err := observer.ResolveAuthority(ctx, "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updates, err := json.Marshal([]struct {
+		After string `json:"After"`
+		Ref   string `json:"Ref"`
+	}{{After: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Ref: "refs/heads/agent/fleiglabs-repo-agent/settled"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := TransportOperation{OperationID: "push-1", Method: "POST", Service: "git-receive-pack", Repository: request.Task.Parameters.RepositoryID, RequestPath: "/git/repo.git/git-receive-pack", RequestedRefs: []string{}, RefUpdates: json.RawMessage(updates), Authority: authority}
+	if err := observer.Received(ctx, &op); err != nil {
+		t.Fatal(err)
+	}
+	if err := observer.Forwarded(ctx, &op); err != nil {
+		t.Fatal(err)
+	}
+	if err := observer.Terminal(ctx, &op, "completed", "allowed", "", 200, 200); err != nil {
+		t.Fatal(err)
+	}
+	got, err := observer.GreenPRAdmission(ctx, "writer")
+	if err != nil || got.OperationID != "push-1" || got.PushedSHA != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || got.TaskDigest != admission.Digest {
+		t.Fatalf("admission=%+v err=%v", got, err)
 	}
 }
 

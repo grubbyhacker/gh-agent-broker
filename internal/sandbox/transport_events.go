@@ -28,6 +28,15 @@ type TransportOperation struct {
 	phaseOrdinal                                          int
 }
 
+// GreenPRTransportAdmission is derived exclusively from the active durable
+// lease, its immutable registered task, and a completed broker Git operation.
+type GreenPRTransportAdmission struct {
+	Task        RegisteredTask
+	TaskDigest  string
+	OperationID string
+	PushedSHA   string
+}
+
 // OpenTransportObserver opens the existing authority boundary and applies its
 // migration. The path is operator configuration, never request input.
 func OpenTransportObserver(ctx context.Context, path string) (*TransportObserver, error) {
@@ -68,6 +77,58 @@ func (o *TransportObserver) ResolveAuthority(ctx context.Context, profile string
 		return TransportAuthority{}, fmt.Errorf("transport authority profile %q has %d active leases", profile, count)
 	}
 	return out, nil
+}
+
+// GreenPRAdmission returns the one current registered task and exact pushed
+// head for a profile. It accepts no caller identity, SHA, or PR data.
+func (o *TransportObserver) GreenPRAdmission(ctx context.Context, profile string) (GreenPRTransportAdmission, error) {
+	authority, err := o.ResolveAuthority(ctx, profile)
+	if err != nil {
+		return GreenPRTransportAdmission{}, err
+	}
+	var canonical, digest string
+	err = o.store.db.QueryRowContext(ctx, `SELECT a.canonical_task_json,a.admission_task_digest FROM authority_registered_admissions a JOIN authority_session_leases l ON l.principal=a.principal AND l.binding_digest=a.binding_digest WHERE l.principal=? AND l.profile=? AND l.released_at=''`, authority.Principal, profile).Scan(&canonical, &digest)
+	if err != nil {
+		return GreenPRTransportAdmission{}, fmt.Errorf("read registered transport admission: %w", err)
+	}
+	var wire struct {
+		Source RegisteredTaskSource `json:"registered_task_source"`
+		Task   RegisteredTask       `json:"registered_task"`
+	}
+	if err := json.Unmarshal([]byte(canonical), &wire); err != nil {
+		return GreenPRTransportAdmission{}, fmt.Errorf("registered transport admission is corrupt")
+	}
+	validated, err := validateRegisteredAdmission(RegisteredAdmissionRequest{Version: coordinatorRegisteredProtocolVersion, Profile: profile, IdempotencyKey: "green-pr-observe", SessionBinding: "session:" + wire.Source.WorkItemID, Source: wire.Source, Task: wire.Task, AdmissionTaskDigest: digest})
+	if err != nil || validated.CanonicalJSON != canonical {
+		return GreenPRTransportAdmission{}, fmt.Errorf("registered transport admission is invalid")
+	}
+	rows, err := o.store.db.QueryContext(ctx, `SELECT operation_id,ref_updates_json FROM repository_transport_events WHERE principal=? AND worker_id=? AND worker_storage_lineage_id=? AND worker_fence_epoch=? AND repository=? AND service='git-receive-pack' AND phase='completed' ORDER BY cursor DESC`, authority.Principal, authority.WorkerID, authority.WorkerStorageLineageID, authority.WorkerFenceEpoch, wire.Task.Parameters.RepositoryID)
+	if err != nil {
+		return GreenPRTransportAdmission{}, fmt.Errorf("read broker push operation: %w", err)
+	}
+	defer closeTransportRows(rows)
+	for rows.Next() {
+		var operationID, encoded string
+		if err := rows.Scan(&operationID, &encoded); err != nil {
+			return GreenPRTransportAdmission{}, err
+		}
+		var updates []struct {
+			After string `json:"After"`
+			Ref   string `json:"Ref"`
+		}
+		if json.Unmarshal([]byte(encoded), &updates) != nil {
+			continue
+		}
+		for _, update := range updates {
+			if update.Ref == "refs/heads/"+wire.Task.Parameters.BranchRef && sha40.MatchString(update.After) {
+				return GreenPRTransportAdmission{Task: validated.Task, TaskDigest: digest, OperationID: operationID, PushedSHA: update.After}, nil
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return GreenPRTransportAdmission{}, err
+	}
+	return GreenPRTransportAdmission{}, fmt.Errorf("registered task has no completed broker push")
 }
 
 func (o *TransportObserver) Received(ctx context.Context, op *TransportOperation) error {

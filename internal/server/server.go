@@ -352,6 +352,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handlePushTripwireMaterial(w, r)
 	case r.URL.Path == "/v1/security/push-tripwire/respond":
 		s.handlePushTripwireResponse(w, r)
+	case r.URL.Path == "/v1/registered/github-green-pr/observe":
+		s.handleRegisteredGreenPRObservation(w, r)
 	case r.URL.Path == "/v1/policy/dry-run":
 		s.handleDryRun(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/repos/"):
@@ -361,6 +363,54 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
+}
+
+// handleRegisteredGreenPRObservation has an intentionally empty request
+// surface: every completion fact is derived from durable admission, the
+// broker's recorded smart-HTTP push, and authenticated GitHub reads.
+func (s *Server) handleRegisteredGreenPRObservation(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if body, err := io.ReadAll(io.LimitReader(r.Body, 2)); err != nil || len(bytes.TrimSpace(body)) != 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "github green PR observation accepts no caller facts"})
+		return
+	}
+	cfg, gh := s.snapshot()
+	principal, ok := auth.AuthenticateAgent(r, cfg)
+	if !ok {
+		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", Decision: policy.DecisionDeny})
+		return
+	}
+	profiles := make([]string, 0, 1)
+	for profile, agentID := range s.transportProfiles {
+		if agentID == principal.ID {
+			profiles = append(profiles, profile)
+		}
+	}
+	if s.transport == nil || len(profiles) != 1 {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "registered transport authority is unavailable"})
+		return
+	}
+	admission, err := s.transport.GreenPRAdmission(r.Context(), profiles[0])
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "registered green PR observation is unavailable"})
+		return
+	}
+	appName := config.GitHubAppName(principal.Agent)
+	installation, ok := cfg.InstallationIDForApp(appName, admission.Task.Parameters.RepositoryID)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "repository installation is not configured"})
+		return
+	}
+	observation, err := gh.ObserveGreenPR(appName, githubapp.GreenPRRequest{RegisteredTaskDigest: admission.TaskDigest, BrokerOperationID: admission.OperationID, AppSlug: appName, InstallationID: installation, Repository: admission.Task.Parameters.RepositoryID, BaseRef: "main", WorkerRef: "refs/heads/" + admission.Task.Parameters.BranchRef, PushedHeadSHA: admission.PushedSHA})
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "GitHub green PR observation failed"})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: admission.OperationID, AgentID: principal.ID, Operation: "github_green_pr.observe", Repo: admission.Task.Parameters.RepositoryID, Branch: admission.Task.Parameters.BranchRef, Decision: policy.DecisionAllow, Result: observation.Verdict})
+	writeJSON(w, http.StatusOK, observation)
 }
 
 func handleDiscovery(w http.ResponseWriter, r *http.Request) {
