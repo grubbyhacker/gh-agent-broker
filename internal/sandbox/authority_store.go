@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -136,6 +137,7 @@ func reassignmentError(code ReassignmentErrorCode, format string, args ...any) e
 
 type AuthorityWorkerStore struct {
 	db                         *sql.DB
+	validationDB               *sql.DB
 	salt                       []byte
 	sessionMu                  sync.Mutex
 	afterIssuanceCheckForTest  func()
@@ -169,8 +171,23 @@ func OpenAuthorityWorkerStore(ctx context.Context, path string) (*AuthorityWorke
 	if err := store.initialize(ctx); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
+	validationURL := url.URL{Scheme: "file", Path: path}
+	query := validationURL.Query()
+	query.Set("mode", "ro")
+	query.Add("_pragma", "busy_timeout(5000)")
+	validationURL.RawQuery = query.Encode()
+	validationDB, err := sql.Open("sqlite", validationURL.String())
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("open authority validation store: %w", err), db.Close())
+	}
+	validationDB.SetMaxOpenConns(1)
+	validationDB.SetMaxIdleConns(1)
+	if err := validationDB.PingContext(ctx); err != nil {
+		return nil, errors.Join(fmt.Errorf("open authority validation store: %w", err), validationDB.Close(), db.Close())
+	}
+	store.validationDB = validationDB
 	if err := os.Chmod(path, 0o600); err != nil {
-		return nil, errors.Join(fmt.Errorf("secure authority worker store: %w", err), db.Close())
+		return nil, errors.Join(fmt.Errorf("secure authority worker store: %w", err), validationDB.Close(), db.Close())
 	}
 	return store, nil
 }
@@ -664,7 +681,7 @@ func (s *AuthorityWorkerStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	return errors.Join(s.validationDB.Close(), s.db.Close())
 }
 
 func (s *AuthorityWorkerStore) requestDigest(raw string) string {
@@ -1026,8 +1043,28 @@ func (s *AuthorityWorkerStore) GetLease(ctx context.Context, principal, sessionB
 }
 
 func (s *AuthorityWorkerStore) ValidateSessionFence(ctx context.Context, workerID, sessionLineageID string, workerFenceEpoch int64) (bool, error) {
+	return validateSessionFence(ctx, s.db, workerID, sessionLineageID, workerFenceEpoch)
+}
+
+func (s *AuthorityWorkerStore) agentdValidationWorker(ctx context.Context, workerID string) (AuthorityWorker, error) {
+	var worker AuthorityWorker
+	err := s.validationDB.QueryRowContext(ctx, `SELECT profile,worker_storage_lineage_id,worker_fence_epoch FROM authority_workers WHERE worker_id=?`, workerID).
+		Scan(&worker.Profile, &worker.WorkerStorageLineageID, &worker.WorkerFenceEpoch)
+	worker.WorkerID = workerID
+	return worker, err
+}
+
+func (s *AuthorityWorkerStore) validateAgentdSessionFence(ctx context.Context, workerID, sessionLineageID string, workerFenceEpoch int64) (bool, error) {
+	return validateSessionFence(ctx, s.validationDB, workerID, sessionLineageID, workerFenceEpoch)
+}
+
+type authorityQueryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func validateSessionFence(ctx context.Context, db authorityQueryRower, workerID, sessionLineageID string, workerFenceEpoch int64) (bool, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM authority_session_leases l
+	err := db.QueryRowContext(ctx, `SELECT count(*) FROM authority_session_leases l
 		JOIN authority_session_workspaces sw ON sw.session_lineage_id=l.session_lineage_id
 		JOIN authority_workers aw ON aw.worker_id=l.worker_id
 		WHERE l.worker_id=? AND l.session_lineage_id=? AND aw.worker_fence_epoch=? AND l.released_at='' AND sw.worker_id=?`, workerID, sessionLineageID, workerFenceEpoch, workerID).Scan(&count)

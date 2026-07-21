@@ -2,6 +2,26 @@
 
 ## Current State
 
+### Synchronous agentd fence validation during transactional session issuance
+
+`IssueAgentdSession` still holds its `BEGIN IMMEDIATE` transaction from the
+push-tripwire enforcement read through the durable agentd session binding, so
+issuance remains atomic and linearizable with a halt. Agentd session creation
+can now synchronously call the broker fence validator without contending for
+that transaction's sole pooled connection: authenticated validation reads use
+a separate read-only SQLite pool against the same WAL database. Worker
+identity/storage/fence checks and the active lease/workspace join both stay
+fail closed on that path; no timeout was widened and no external mutation can
+be accepted without the existing durable binding commit.
+
+`TestIssueAgentdSessionAllowsSynchronousFenceValidationCallback` drives the
+real `CreateSession` transport callback with agentd's 250 ms validation
+deadline. On the previous store path it deterministically returned
+`503 broker_validator_unavailable`; on the read-only validation path it returns
+the exact session status and verifies the same identity was durably bound.
+The pre-existing bounded agentd rejection status/body diagnostic remains in
+place for focused staging evidence.
+
 ### Agentd canonical Git credential receipt
 
 The sandbox authority endpoint now accepts only
