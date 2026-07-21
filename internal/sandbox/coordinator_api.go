@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -85,7 +86,33 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 		return CoordinatorSessionResponse{}, fmt.Errorf("agentd session transport is unavailable")
 	}
 	method, path, payload := coordinatorAgentdRequest(operation, workspace.AgentdSessionID, request)
+	var registeredTurn registeredTurnState
 	if isRegistered {
+		if operation == "submit" {
+			registeredTurn, err = s.store.RegisteredTurn(ctx, principal, request.SessionBinding)
+			if err == nil {
+				if registeredTurn.IdempotencyDigest != s.store.requestDigest(request.IdempotencyKey) {
+					return CoordinatorSessionResponse{}, fmt.Errorf("registered turn idempotency key conflicts with durable turn")
+				}
+				result, marshalErr := json.Marshal(registeredTurnResponse{Version: registeredTurnResponseVersion, SessionID: registeredTurn.SessionID, TurnID: registeredTurn.TurnID, ModelEffectID: registeredTurn.ModelEffectID, Phase: "queued", Cursor: registeredTurn.SubmitCursor})
+				if marshalErr != nil {
+					return CoordinatorSessionResponse{}, marshalErr
+				}
+				return CoordinatorSessionResponse{Version: coordinatorProtocolVersion, Lease: lease, Result: result}, nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return CoordinatorSessionResponse{}, err
+			}
+		}
+		if operation == "events" {
+			registeredTurn, err = s.store.RegisteredTurn(ctx, principal, request.SessionBinding)
+			if err != nil {
+				return CoordinatorSessionResponse{}, fmt.Errorf("registered turn is not durably accepted")
+			}
+			if request.After != registeredTurn.EventsAfter {
+				return CoordinatorSessionResponse{}, fmt.Errorf("registered event cursor does not match durable cursor")
+			}
+		}
 		method, path, payload = coordinatorRegisteredAgentdRequest(operation, workspace.AgentdSessionID, request, registered)
 	}
 	status, result, err := transport.AgentdSessionRequest(ctx, worker, method, path, payload)
@@ -118,12 +145,35 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 		}
 		return CoordinatorSessionResponse{}, &CoordinatorAgentdError{Status: status, Code: safeAgentdErrorCode(denied.Error)}
 	}
+	if isRegistered && ((operation == "submit" && status != http.StatusAccepted) || (operation == "events" && status != http.StatusOK)) {
+		return CoordinatorSessionResponse{}, &CoordinatorAgentdError{Status: status, Code: "agentd_session_rejected"}
+	}
+	if isRegistered && operation == "submit" {
+		turn, validateErr := validateRegisteredTurnResponse(result, workspace.AgentdSessionID, request.IdempotencyKey)
+		if validateErr != nil {
+			return CoordinatorSessionResponse{}, validateErr
+		}
+		if err := s.store.RecordRegisteredTurn(ctx, principal, request.SessionBinding, request.IdempotencyKey, registeredTurnState{SessionID: turn.SessionID, TurnID: turn.TurnID, ModelEffectID: turn.ModelEffectID, SubmitCursor: turn.Cursor}); err != nil {
+			return CoordinatorSessionResponse{}, err
+		}
+	}
+	if isRegistered && operation == "events" {
+		events, validateErr := validateRegisteredEventsResponse(result, registeredTurn, request.After, registered.Digest, registered.Task.TaskEvidenceDigest)
+		if validateErr != nil {
+			return CoordinatorSessionResponse{}, validateErr
+		}
+		if err := s.store.AdvanceRegisteredTurnCursor(ctx, principal, request.SessionBinding, request.After, events.NextCursor); err != nil {
+			return CoordinatorSessionResponse{}, err
+		}
+	}
 	if operation == "status" || operation == "checkpoint" || operation == "resume" || (isRegistered && operation == "cancel") {
 		if err := validateCoordinatorAgentdSessionStatus(result, workspace, request.SessionBinding, lease); err != nil {
 			return CoordinatorSessionResponse{}, err
 		}
-	} else if err := validateCoordinatorAgentdResult(operation, workspace.AgentdSessionID, request.After, result); err != nil {
-		return CoordinatorSessionResponse{}, err
+	} else if !isRegistered {
+		if err := validateCoordinatorAgentdResult(operation, workspace.AgentdSessionID, request.After, result); err != nil {
+			return CoordinatorSessionResponse{}, err
+		}
 	}
 	return CoordinatorSessionResponse{Version: coordinatorProtocolVersion, Lease: lease, Result: result}, nil
 }
@@ -144,7 +194,7 @@ func coordinatorRegisteredAgentdRequest(operation, sessionID string, request Coo
 		payload := map[string]any{}
 		switch operation {
 		case "events":
-			method, payload, path = http.MethodGet, nil, path+"/events"+versionQuery+"&after="+strconv.FormatInt(request.After, 10)
+			method, payload, path = http.MethodGet, nil, path+"/events?version=agentd%2Fregistered-events%2Fv2&after="+strconv.FormatInt(request.After, 10)
 		case "status":
 			method, payload, path = http.MethodGet, nil, path+"/status"+versionQuery
 		case "cancel":
@@ -162,15 +212,145 @@ func coordinatorRegisteredAgentdRequest(operation, sessionID string, request Coo
 		Version             string                   `json:"version"`
 		IdempotencyKey      string                   `json:"idempotencyKey"`
 		TaskKind            string                   `json:"taskKind"`
-		TaskEvidenceDigest  string                   `json:"taskEvidenceDigest"`
 		AdmissionTaskDigest string                   `json:"admissionTaskDigest"`
-		Source              RegisteredTaskSource     `json:"registeredTaskSource"`
+		TaskEvidenceDigest  string                   `json:"taskEvidenceDigest"`
 		Parameters          RegisteredTaskParameters `json:"parameters"`
-	}{"agentd/registered-lifecycle/v1", request.IdempotencyKey, admission.Task.TaskKind, admission.Task.TaskEvidenceDigest, admission.Digest, admission.Source, admission.Task.Parameters})
+	}{"agentd/registered-lifecycle/v1", request.IdempotencyKey, admission.Task.TaskKind, admission.Digest, admission.Task.TaskEvidenceDigest, admission.Task.Parameters})
 	if err != nil {
 		return http.MethodPost, "/v1/registered-sessions/" + url.PathEscape(sessionID) + "/turns", nil
 	}
 	return http.MethodPost, "/v1/registered-sessions/" + url.PathEscape(sessionID) + "/turns", payload
+}
+
+const (
+	registeredTurnResponseVersion   = "agentd/registered-turn/v2"
+	registeredEventsResponseVersion = "agentd/registered-events/v2"
+)
+
+type registeredTurnResponse struct {
+	Version       string `json:"version"`
+	SessionID     string `json:"sessionId"`
+	TurnID        string `json:"turnId"`
+	ModelEffectID string `json:"modelEffectId"`
+	Phase         string `json:"phase"`
+	Cursor        int64  `json:"cursor"`
+}
+
+type registeredVerifierProjection struct {
+	Phase              string `json:"phase"`
+	Outcome            string `json:"outcome"`
+	ContractDigest     string `json:"contractDigest"`
+	TaskEvidenceDigest string `json:"taskEvidenceDigest"`
+	Reasons            []struct {
+		Code string `json:"code"`
+	} `json:"reasons"`
+}
+
+type registeredEventProjection struct {
+	Cursor              int64                         `json:"cursor"`
+	SessionID           string                        `json:"sessionId"`
+	TurnID              string                        `json:"turnId"`
+	ModelEffectID       string                        `json:"modelEffectId"`
+	Attempt             int64                         `json:"attempt"`
+	Phase               string                        `json:"phase"`
+	WorkerID            string                        `json:"workerId"`
+	StorageLineageID    string                        `json:"storageLineageId"`
+	FenceEpoch          int64                         `json:"fenceEpoch"`
+	AdmissionTaskDigest string                        `json:"admissionTaskDigest"`
+	TaskEvidenceDigest  string                        `json:"taskEvidenceDigest"`
+	Verifier            *registeredVerifierProjection `json:"verifier,omitempty"`
+	Failure             string                        `json:"failure,omitempty"`
+}
+
+func (e *registeredEventProjection) UnmarshalJSON(data []byte) error {
+	type projection registeredEventProjection
+	var decoded projection
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("trailing JSON value")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range []string{"verifier", "failure"} {
+		if value, ok := fields[name]; ok && string(value) == "null" {
+			return fmt.Errorf("%s cannot be null", name)
+		}
+	}
+	*e = registeredEventProjection(decoded)
+	return nil
+}
+
+type registeredEventsResponse struct {
+	Version    string                      `json:"version"`
+	Events     []registeredEventProjection `json:"events"`
+	NextCursor int64                       `json:"nextCursor"`
+}
+
+func decodeRegisteredResponse(data json.RawMessage, target any) error {
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("trailing JSON value")
+	}
+	return nil
+}
+
+func validateRegisteredTurnResponse(result json.RawMessage, sessionID, idempotencyKey string) (registeredTurnResponse, error) {
+	var turn registeredTurnResponse
+	if err := decodeRegisteredResponse(result, &turn); err != nil || turn.Version != registeredTurnResponseVersion || turn.SessionID != sessionID || !registeredOpaqueID.MatchString(turn.TurnID) || turn.TurnID != "turn:"+idempotencyKey || !registeredOpaqueID.MatchString(turn.ModelEffectID) || turn.ModelEffectID != "model:"+idempotencyKey || turn.Phase != "queued" || turn.Cursor < 1 {
+		return registeredTurnResponse{}, fmt.Errorf("agentd returned invalid registered turn acknowledgement")
+	}
+	return turn, nil
+}
+
+func validateRegisteredEventsResponse(result json.RawMessage, turn registeredTurnState, after int64, admissionDigest, taskEvidenceDigest string) (registeredEventsResponse, error) {
+	var response registeredEventsResponse
+	if err := decodeRegisteredResponse(result, &response); err != nil || response.Version != registeredEventsResponseVersion || response.Events == nil || response.NextCursor < after {
+		return registeredEventsResponse{}, fmt.Errorf("agentd returned invalid registered event stream")
+	}
+	previous := after
+	for _, event := range response.Events {
+		if event.Cursor <= previous || event.SessionID != turn.SessionID || event.TurnID != turn.TurnID || event.ModelEffectID != turn.ModelEffectID || event.Attempt < 0 || !registeredOpaqueID.MatchString(event.WorkerID) || event.StorageLineageID == "" || len(event.StorageLineageID) > 128 || event.FenceEpoch < 0 || event.AdmissionTaskDigest != admissionDigest || event.TaskEvidenceDigest != taskEvidenceDigest || !registeredEventPhase(event.Phase) || (event.Failure != "" && event.Failure != "credential_expired" && event.Failure != "credential_mint_failed" && event.Failure != "runtime_failed") || !validRegisteredVerifier(event.Verifier) {
+			return registeredEventsResponse{}, fmt.Errorf("agentd returned invalid registered event stream")
+		}
+		previous = event.Cursor
+	}
+	if response.NextCursor != previous {
+		return registeredEventsResponse{}, fmt.Errorf("agentd returned invalid registered event cursor")
+	}
+	return response, nil
+}
+
+func registeredEventPhase(phase string) bool {
+	switch phase {
+	case "queued", "authorized", "running", "completed", "failed", "pending", "green", "red", "refused", "escalated":
+		return true
+	}
+	return false
+}
+
+func validRegisteredVerifier(verifier *registeredVerifierProjection) bool {
+	if verifier == nil {
+		return true
+	}
+	if (verifier.Phase != "pending" && verifier.Phase != "green" && verifier.Phase != "red" && verifier.Phase != "refused" && verifier.Phase != "escalated") || (verifier.Outcome != "waiting" && verifier.Outcome != "satisfied" && verifier.Outcome != "missing_or_stale" && verifier.Outcome != "continuation" && verifier.Outcome != "refused") || !sha256Digest.MatchString(verifier.ContractDigest) || !sha256Digest.MatchString(verifier.TaskEvidenceDigest) || verifier.Reasons == nil {
+		return false
+	}
+	for _, reason := range verifier.Reasons {
+		if reason.Code == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func validateCoordinatorAgentdResult(operation, sessionID string, after int64, result json.RawMessage) error {

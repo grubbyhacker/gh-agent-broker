@@ -16,16 +16,23 @@ import (
 
 type coordinatorTestRuntime struct {
 	*fakeAuthorityRuntime
-	worker AuthorityWorker
-	method string
-	path   string
-	body   json.RawMessage
-	result json.RawMessage
-	status int
+	worker    AuthorityWorker
+	method    string
+	path      string
+	body      json.RawMessage
+	result    json.RawMessage
+	status    int
+	calls     int
+	responses []json.RawMessage
+	statuses  []int
 }
 
 func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker AuthorityWorker, method, path string, body json.RawMessage) (int, json.RawMessage, error) {
 	r.worker, r.method, r.path, r.body = worker, method, path, bytes.Clone(body)
+	r.calls++
+	if len(r.responses) >= r.calls {
+		return r.statuses[r.calls-1], bytes.Clone(r.responses[r.calls-1]), nil
+	}
 	parts := strings.Split(path, "/")
 	sessionID := "agentd-session"
 	if len(parts) > 3 && parts[1] == "v1" && parts[2] == "sessions" {
@@ -101,6 +108,102 @@ func TestCoordinatorV1BlocksCommandsUntilReassignmentAdoptionIsConfirmed(t *test
 
 	if _, err := service.CoordinatorSessionCommand(context.Background(), "coordinator", "submit", request); err == nil || !strings.Contains(err.Error(), "not confirmed") {
 		t.Fatalf("pending adoption routed command: %v", err)
+	}
+}
+
+func TestRegisteredCoordinatorAgentdV2Contract(t *testing.T) {
+	ctx := context.Background()
+	fixture, err := os.ReadFile("../../testdata/agentd/registered-turn-v2.golden.json") //nolint:gosec // Fixed checked-in contract fixture.
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden struct {
+		Request  json.RawMessage `json:"request"`
+		Response json.RawMessage `json:"response"`
+		Events   json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal(fixture, &golden); err != nil {
+		t.Fatal(err)
+	}
+	var exactRequest struct {
+		Version             string                   `json:"version"`
+		IdempotencyKey      string                   `json:"idempotencyKey"`
+		TaskKind            string                   `json:"taskKind"`
+		AdmissionTaskDigest string                   `json:"admissionTaskDigest"`
+		TaskEvidenceDigest  string                   `json:"taskEvidenceDigest"`
+		Parameters          RegisteredTaskParameters `json:"parameters"`
+	}
+	if err := json.Unmarshal(golden.Request, &exactRequest); err != nil {
+		t.Fatal(err)
+	}
+	bodyMethod, _, body := coordinatorRegisteredAgentdRequest("submit", "session-42", CoordinatorSessionRequest{IdempotencyKey: exactRequest.IdempotencyKey}, registeredAdmission{Task: RegisteredTask{TaskKind: exactRequest.TaskKind, TaskEvidenceDigest: exactRequest.TaskEvidenceDigest, Parameters: exactRequest.Parameters}, Digest: exactRequest.AdmissionTaskDigest})
+	var gotRequest, wantRequest any
+	if json.Unmarshal(body, &gotRequest) != nil || json.Unmarshal(golden.Request, &wantRequest) != nil || bodyMethod != http.MethodPost || !reflect.DeepEqual(gotRequest, wantRequest) {
+		t.Fatalf("registered request drifted\nwant=%s\ngot=%s", golden.Request, body)
+	}
+	if _, err := validateRegisteredTurnResponse(golden.Response, "session-42", "turn-42"); err != nil {
+		t.Fatalf("golden acknowledgement rejected: %v", err)
+	}
+
+	cfg := authorityTestConfig(t)
+	profile := cfg.AuthorityProfiles["writer"]
+	profile.SessionIsolation.WorkspaceRoot = t.TempDir()
+	profile.SessionIsolation.UIDStart, profile.SessionIsolation.GIDStart = os.Getuid(), os.Getgid()
+	cfg.AuthorityProfiles["writer"] = profile
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &coordinatorTestRuntime{fakeAuthorityRuntime: &fakeAuthorityRuntime{}}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
+	service.newID = func() (string, error) { return "registered-contract-worker", nil }
+	worker, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", worker.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	admissionRequest := registeredRequest(t, "turn-42", "route-42")
+	admissionRequest.IdempotencyKey = "turn-42"
+	_, err = service.AcquireRegisteredSession(ctx, "coordinator", admissionRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindAgentdSession(ctx, admissionRequest.SessionBinding, "session-42"); err != nil {
+		t.Fatal(err)
+	}
+	queued := `{"version":"agentd/registered-events/v2","events":[{"cursor":1,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":0,"phase":"queued","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + admissionRequest.AdmissionTaskDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `"},{"cursor":2,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":0,"phase":"green","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + admissionRequest.AdmissionTaskDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `","verifier":{"phase":"green","outcome":"satisfied","contractDigest":"` + githubGreenPRContractDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `","reasons":[]}}],"nextCursor":2}`
+	runtime.statuses = []int{http.StatusAccepted, http.StatusOK, http.StatusOK}
+	runtime.responses = []json.RawMessage{
+		[]byte(`{"version":"agentd/registered-turn/v2","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued","cursor":1}`),
+		[]byte(queued),
+		[]byte(`{"version":"agentd/registered-events/v2","events":[],"nextCursor":2}`),
+	}
+	submit := CoordinatorSessionRequest{SessionBinding: admissionRequest.SessionBinding, IdempotencyKey: "turn-42"}
+	if _, err := service.CoordinatorSessionCommand(ctx, "coordinator", "submit", submit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CoordinatorSessionCommand(ctx, "coordinator", "submit", submit); err != nil || runtime.calls != 1 {
+		t.Fatalf("duplicate submit calls=%d err=%v", runtime.calls, err)
+	}
+	if _, err := service.CoordinatorSessionCommand(ctx, "coordinator", "events", CoordinatorSessionRequest{SessionBinding: admissionRequest.SessionBinding}); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.path != "/v1/registered-sessions/session-42/events?version=agentd%2Fregistered-events%2Fv2&after=0" {
+		t.Fatalf("first events path=%q", runtime.path)
+	}
+	if _, err := service.CoordinatorSessionCommand(ctx, "coordinator", "events", CoordinatorSessionRequest{SessionBinding: admissionRequest.SessionBinding, After: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.path != "/v1/registered-sessions/session-42/events?version=agentd%2Fregistered-events%2Fv2&after=2" || runtime.calls != 3 {
+		t.Fatalf("cursor did not advance: path=%q calls=%d", runtime.path, runtime.calls)
+	}
+	if _, err := validateRegisteredTurnResponse([]byte(`{"version":"agentd/registered-turn/v1","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued","cursor":1}`), "session-42", "turn-42"); err == nil {
+		t.Fatal("wrong response version accepted")
+	}
+	if _, err := validateRegisteredTurnResponse([]byte(`{"version":"agentd/registered-turn/v2","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued","cursor":1,"extra":true}`), "session-42", "turn-42"); err == nil {
+		t.Fatal("extra turn response field accepted")
+	}
+	if _, err := validateRegisteredEventsResponse([]byte(`{"version":"agentd/registered-events/v2","events":[],"nextCursor":2,"extra":true}`), registeredTurnState{SessionID: "session-42", TurnID: "turn:turn-42", ModelEffectID: "model:turn-42"}, 2, admissionRequest.AdmissionTaskDigest, admissionRequest.Task.TaskEvidenceDigest); err == nil {
+		t.Fatal("extra event response field accepted")
 	}
 }
 

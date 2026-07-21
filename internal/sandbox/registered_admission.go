@@ -68,6 +68,15 @@ type registeredAdmission struct {
 	CanonicalJSON, Digest string
 }
 
+type registeredTurnState struct {
+	IdempotencyDigest string
+	SessionID         string
+	TurnID            string
+	ModelEffectID     string
+	SubmitCursor      int64
+	EventsAfter       int64
+}
+
 var (
 	registeredOpaqueID  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 	sha256Digest        = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -98,6 +107,38 @@ func validateRegisteredAdmission(r RegisteredAdmissionRequest) (registeredAdmiss
 		return registeredAdmission{}, fmt.Errorf("admission_task_digest mismatch")
 	}
 	return registeredAdmission{Source: r.Source, Task: t, CanonicalJSON: c, Digest: digest}, nil
+}
+
+func (s *AuthorityWorkerStore) RegisteredTurn(ctx context.Context, principal, binding string) (registeredTurnState, error) {
+	state := registeredTurnState{}
+	err := s.db.QueryRowContext(ctx, `SELECT idempotency_digest,session_id,turn_id,model_effect_id,submit_cursor,events_after
+		FROM authority_registered_turns WHERE principal=? AND binding_digest=?`, principal, s.requestDigest(binding)).Scan(
+		&state.IdempotencyDigest, &state.SessionID, &state.TurnID, &state.ModelEffectID, &state.SubmitCursor, &state.EventsAfter)
+	return state, err
+}
+
+func (s *AuthorityWorkerStore) RecordRegisteredTurn(ctx context.Context, principal, binding, idempotencyKey string, state registeredTurnState) error {
+	bindingDigest := s.requestDigest(binding)
+	idempotencyDigest := s.requestDigest(idempotencyKey)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO authority_registered_turns(principal,binding_digest,idempotency_digest,session_id,turn_id,model_effect_id,submit_cursor)
+		VALUES(?,?,?,?,?,?,?)`, principal, bindingDigest, idempotencyDigest, state.SessionID, state.TurnID, state.ModelEffectID, state.SubmitCursor)
+	if err != nil {
+		return fmt.Errorf("record registered turn: %w", err)
+	}
+	return nil
+}
+
+func (s *AuthorityWorkerStore) AdvanceRegisteredTurnCursor(ctx context.Context, principal, binding string, after, next int64) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE authority_registered_turns SET events_after=?
+		WHERE principal=? AND binding_digest=? AND events_after=?`, next, principal, s.requestDigest(binding), after)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return fmt.Errorf("registered event cursor changed concurrently")
+	}
+	return nil
 }
 
 func (s *AuthorityWorkerStore) AcquireRegistered(ctx context.Context, principal string, r RegisteredAdmissionRequest, generation int64) (AuthorityLease, error) {
