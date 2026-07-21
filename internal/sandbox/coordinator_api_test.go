@@ -33,7 +33,11 @@ func TestCoordinatorAgentdRequestUsesOnlyFixedOperations(t *testing.T) {
 }
 
 func TestRegisteredCoordinatorAgentdRequestUsesRegisteredRoutes(t *testing.T) {
-	task := registeredRequest(t, "route-work", "route-snapshot").Task
+	request := registeredRequest(t, "route-work", "route-snapshot")
+	admission, err := validateRegisteredAdmission(request)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, test := range []struct {
 		operation, path string
 		request         CoordinatorSessionRequest
@@ -48,11 +52,11 @@ func TestRegisteredCoordinatorAgentdRequestUsesRegisteredRoutes(t *testing.T) {
 			if err := validateCoordinatorSessionRequestForBinding(test.operation, test.request, true); err != nil {
 				t.Fatal(err)
 			}
-			method, path, body := coordinatorRegisteredAgentdRequest(test.operation, "session-1", test.request, task)
+			method, path, body := coordinatorRegisteredAgentdRequest(test.operation, "session-1", test.request, admission)
 			if path != test.path {
 				t.Fatalf("path=%s", path)
 			}
-			if test.operation == "submit" && (method != http.MethodPost || bytes.Contains(body, []byte("prompt")) || !bytes.Contains(body, []byte(task.Parameters.BranchRef))) {
+			if test.operation == "submit" && (method != http.MethodPost || bytes.Contains(body, []byte("prompt")) || !bytes.Contains(body, []byte(admission.Task.Parameters.BranchRef)) || !bytes.Contains(body, []byte(admission.Digest)) || !bytes.Contains(body, []byte(admission.Source.WorkItemID)) || !bytes.Contains(body, []byte(admission.Source.RouteSnapshotID))) {
 				t.Fatalf("body=%s", body)
 			}
 			if test.operation == "checkpoint" || test.operation == "cancel" {

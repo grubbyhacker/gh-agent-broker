@@ -2,6 +2,27 @@
 
 ## Current State
 
+### Custody implementation handoff — blocked at the agentd effect-authority seam
+
+`vps-ops` main at `435411d148cf756abc0f3ea9ee859db3ee8cb0be` settles Option A:
+agentd must submit a source-closed, reducer-validated canonical effect receipt
+to `POST /v1/authority-workers/git-credential/mint`. The current broker has
+durable registered admission, lease, worker/storage/fence, and transport state,
+but it does not persist or receive canonical model-effect authorization, journal
+cursor/record digest, effect ID, authorized-at, or absolute effect deadline.
+It therefore cannot validate the mandated receipt or implement per-request
+effect-token binding without fabricating a second authority ledger. Preserve
+this failure state until the matching agentd receipt contract is available.
+
+The broker-to-agentd registered submit payload now includes only durable,
+broker-derived values: `admissionTaskDigest` and `registeredTaskSource` are
+sent alongside the existing task kind/evidence digest/parameters. Registered
+create remains on its existing body contract. The required agentd submit wire is
+`agentd/registered-lifecycle/v1` with `idempotencyKey`, `taskKind`,
+`taskEvidenceDigest`, `admissionTaskDigest`, `registeredTaskSource`, and
+`parameters`; it must return promptly after durable acceptance rather than wait
+for model completion.
+
 ### Authority agentd green-PR observation seam
 
 The bodyless green-PR endpoints resolve an opaque `atc1` transport context

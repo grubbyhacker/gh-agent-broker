@@ -86,7 +86,7 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 	}
 	method, path, payload := coordinatorAgentdRequest(operation, workspace.AgentdSessionID, request)
 	if isRegistered {
-		method, path, payload = coordinatorRegisteredAgentdRequest(operation, workspace.AgentdSessionID, request, registered.Task)
+		method, path, payload = coordinatorRegisteredAgentdRequest(operation, workspace.AgentdSessionID, request, registered)
 	}
 	status, result, err := transport.AgentdSessionRequest(ctx, worker, method, path, payload)
 	if err != nil {
@@ -136,7 +136,7 @@ func validateCoordinatorAgentdSessionStatus(result json.RawMessage, workspace Se
 	return nil
 }
 
-func coordinatorRegisteredAgentdRequest(operation, sessionID string, request CoordinatorSessionRequest, task RegisteredTask) (string, string, json.RawMessage) {
+func coordinatorRegisteredAgentdRequest(operation, sessionID string, request CoordinatorSessionRequest, admission registeredAdmission) (string, string, json.RawMessage) {
 	path := "/v1/registered-sessions/" + url.PathEscape(sessionID)
 	versionQuery := "?version=agentd%2Fregistered-lifecycle%2Fv1"
 	if operation != "submit" {
@@ -159,12 +159,14 @@ func coordinatorRegisteredAgentdRequest(operation, sessionID string, request Coo
 		return method, path, encoded
 	}
 	payload, err := json.Marshal(struct {
-		Version            string                   `json:"version"`
-		IdempotencyKey     string                   `json:"idempotencyKey"`
-		TaskKind           string                   `json:"taskKind"`
-		TaskEvidenceDigest string                   `json:"taskEvidenceDigest"`
-		Parameters         RegisteredTaskParameters `json:"parameters"`
-	}{"agentd/registered-lifecycle/v1", request.IdempotencyKey, task.TaskKind, task.TaskEvidenceDigest, task.Parameters})
+		Version             string                   `json:"version"`
+		IdempotencyKey      string                   `json:"idempotencyKey"`
+		TaskKind            string                   `json:"taskKind"`
+		TaskEvidenceDigest  string                   `json:"taskEvidenceDigest"`
+		AdmissionTaskDigest string                   `json:"admissionTaskDigest"`
+		Source              RegisteredTaskSource     `json:"registeredTaskSource"`
+		Parameters          RegisteredTaskParameters `json:"parameters"`
+	}{"agentd/registered-lifecycle/v1", request.IdempotencyKey, admission.Task.TaskKind, admission.Task.TaskEvidenceDigest, admission.Digest, admission.Source, admission.Task.Parameters})
 	if err != nil {
 		return http.MethodPost, "/v1/registered-sessions/" + url.PathEscape(sessionID) + "/turns", nil
 	}
