@@ -19,8 +19,10 @@ real `CreateSession` transport callback with agentd's 250 ms validation
 deadline. On the previous store path it deterministically returned
 `503 broker_validator_unavailable`; on the read-only validation path it returns
 the exact session status and verifies the same identity was durably bound.
-The pre-existing bounded agentd rejection status/body diagnostic remains in
-place for focused staging evidence.
+Agentd rejection diagnostics expose only the HTTP status plus a fixed
+allowlisted error code. Arbitrary JSON fields, credential-shaped values,
+malformed bodies, and oversized error values cannot be reflected through the
+coordinator REST response.
 
 ### Agentd canonical Git credential receipt
 

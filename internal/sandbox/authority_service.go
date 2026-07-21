@@ -123,7 +123,7 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 			return "", fmt.Errorf("agentd session create: %w", err)
 		}
 		if statusCode != http.StatusCreated {
-			return "", fmt.Errorf("agentd session create rejected: status=%d body=%s", statusCode, string(result))
+			return "", agentdSessionCreateRejection(statusCode, result)
 		}
 		status, err := decodeAgentdSessionStatus(bytes.NewReader(result))
 		if err != nil {
@@ -166,6 +166,25 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 		return nil, fmt.Errorf("agentd session replay returned a mismatched status")
 	}
 	return marshalAgentdSessionStatus(status)
+}
+
+func agentdSessionCreateRejection(status int, body json.RawMessage) error {
+	var detail struct {
+		Error      string `json:"error"`
+		BrokerCode string `json:"brokerCode"`
+		Code       string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &detail); err != nil {
+		return fmt.Errorf("agentd session create rejected: status=%d code=agentd_session_rejected", status)
+	}
+	code := safeAgentdErrorCode(detail.Error)
+	if code == "agentd_session_rejected" {
+		code = safeAgentdErrorCode(detail.BrokerCode)
+	}
+	if code == "agentd_session_rejected" {
+		code = safeAgentdErrorCode(detail.Code)
+	}
+	return fmt.Errorf("agentd session create rejected: status=%d code=%s", status, code)
 }
 
 func (r *AuthorityWorkerRequest) UnmarshalJSON(data []byte) error {

@@ -60,7 +60,7 @@ func (r *synchronousFenceValidationRuntime) AgentdSessionRequest(ctx context.Con
 		deriveAgentdValidationToken(r.secret, request.WorkerID, request.StorageLineageID, request.FenceEpoch),
 		AgentdSessionValidationRequest{WorkerID: request.WorkerID, WorkerStorageLineageID: request.StorageLineageID, WorkerFenceEpoch: request.FenceEpoch, SessionLineageID: request.SessionLineageID})
 	if err != nil {
-		return http.StatusServiceUnavailable, json.RawMessage(`{"code":"broker_validator_unavailable"}`), nil
+		return http.StatusServiceUnavailable, json.RawMessage(`{"error":"broker_validator_unavailable"}`), nil
 	}
 	if !validation.Authorized {
 		return http.StatusForbidden, json.RawMessage(`{"code":"` + validation.Code + `"}`), nil
@@ -222,6 +222,29 @@ func TestIssueAgentdSessionAllowsSynchronousFenceValidationCallback(t *testing.T
 	durable, err := store.SessionWorkspace(ctx, request.SessionBinding)
 	if err != nil || durable.AgentdSessionID != status.SessionID {
 		t.Fatalf("durable workspace=%+v err=%v", durable, err)
+	}
+}
+
+func TestAgentdSessionCreateRejectionExposesOnlyAllowlistedBoundedDetail(t *testing.T) {
+	//nolint:gosec // This credential-shaped sentinel proves untrusted agentd JSON is never reflected.
+	const credential = "ghs_credential-shaped-secret-value"
+	for name, body := range map[string]json.RawMessage{
+		"credential shaped extra fields": json.RawMessage(`{"error":"broker_validator_unavailable","authorization":"Bearer ` + credential + `","detail":"` + credential + `"}`),
+		"oversized error":                json.RawMessage(`{"error":"` + strings.Repeat("x", 1024*1024) + `","brokerCode":"also-not-allowlisted"}`),
+		"malformed":                      json.RawMessage(`{"error":`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := agentdSessionCreateRejection(http.StatusServiceUnavailable, body).Error()
+			if strings.Contains(got, credential) || len(got) > 128 {
+				t.Fatalf("unbounded agentd rejection detail: len=%d error=%q", len(got), got)
+			}
+			if name == "credential shaped extra fields" && got != "agentd session create rejected: status=503 code=broker_validator_unavailable" {
+				t.Fatalf("allowlisted diagnostic=%q", got)
+			}
+			if name != "credential shaped extra fields" && got != "agentd session create rejected: status=503 code=agentd_session_rejected" {
+				t.Fatalf("generic diagnostic=%q", got)
+			}
+		})
 	}
 }
 
