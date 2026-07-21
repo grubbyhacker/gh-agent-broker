@@ -256,22 +256,61 @@ func TestRegisteredVerifierProjectionIsStrictAndAcceptsLocalEscalation(t *testin
 	}
 }
 
-func TestRegisteredEventsFailureUnionAcceptsRuntimeOutcomeUncertain(t *testing.T) {
+func TestRegisteredEventsPhaseFailureVerifierCoupling(t *testing.T) {
 	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	turn := registeredTurnState{SessionID: "session-42", TurnID: "turn:turn-42", ModelEffectID: "model:turn-42"}
-	event := `{"version":"agentd/registered-events/v2","events":[{"cursor":1,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":1,"phase":"failed","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + digest + `","taskEvidenceDigest":"` + digest + `","failure":"runtime_outcome_uncertain"}],"nextCursor":1}`
-
-	response, err := validateRegisteredEventsResponse([]byte(event), turn, 0, digest, digest, digest)
-	if err != nil {
-		t.Fatalf("runtime_outcome_uncertain event rejected: %v", err)
+	verifier := func(phase, outcome string) *registeredVerifierProjection {
+		reasons := []registeredVerifierReason{}
+		if outcome != "satisfied" {
+			reasons = append(reasons, registeredVerifierReason{Code: outcome, EvidenceRef: "broker:observation:turn-42"})
+		}
+		return &registeredVerifierProjection{Phase: phase, Outcome: outcome, ContractDigest: digest, TaskEvidenceDigest: digest, HeadRevision: "broker:head:turn-42", Reasons: reasons, EvidenceRefs: []string{"broker:observation:turn-42"}}
 	}
-	if got := response.Events[0].Failure; got != "runtime_outcome_uncertain" {
-		t.Fatalf("failure = %q, want runtime_outcome_uncertain", got)
-	}
-
-	unknown := strings.Replace(event, `"runtime_outcome_uncertain"`, `"runtime_outcome_unknown"`, 1)
-	if _, err := validateRegisteredEventsResponse([]byte(unknown), turn, 0, digest, digest, digest); err == nil {
-		t.Fatal("unknown registered event failure accepted")
+	wrongContractDigest := verifier("green", "satisfied")
+	wrongContractDigest.ContractDigest = "sha256:" + strings.Repeat("b", 64)
+	wrongEvidenceDigest := verifier("green", "satisfied")
+	wrongEvidenceDigest.TaskEvidenceDigest = "sha256:" + strings.Repeat("c", 64)
+	for _, tc := range []struct {
+		name, phase, failure string
+		verifier             *registeredVerifierProjection
+		valid                bool
+	}{
+		{"queued without failure", "queued", "", nil, true},
+		{"authorized without failure", "authorized", "", nil, true},
+		{"running without failure", "running", "", nil, true},
+		{"completed without failure", "completed", "", nil, true},
+		{"pending verifier", "pending", "", verifier("pending", "waiting"), true},
+		{"green verifier", "green", "", verifier("green", "satisfied"), true},
+		{"red verifier", "red", "", verifier("red", "missing_or_stale"), true},
+		{"refused verifier", "refused", "", verifier("refused", "escalated"), true},
+		{"escalated verifier", "escalated", "", verifier("escalated", "escalated"), true},
+		{"credential mint failure", "authorized", "credential_mint_failed", nil, true},
+		{"runtime failure", "failed", "runtime_failed", nil, true},
+		{"credential expired", "escalated", "credential_expired", nil, true},
+		{"runtime outcome uncertain", "escalated", "runtime_outcome_uncertain", verifier("escalated", "escalated"), true},
+		{"failed without failure", "failed", "", nil, false},
+		{"verifier phase mismatch", "queued", "", verifier("green", "satisfied"), false},
+		{"verifier wrong contract digest", "green", "", wrongContractDigest, false},
+		{"verifier wrong evidence digest", "green", "", wrongEvidenceDigest, false},
+		{"credential mint wrong phase", "queued", "credential_mint_failed", nil, false},
+		{"credential mint with verifier", "authorized", "credential_mint_failed", verifier("green", "satisfied"), false},
+		{"runtime failure wrong phase", "escalated", "runtime_failed", nil, false},
+		{"credential expired with verifier", "escalated", "credential_expired", verifier("escalated", "escalated"), false},
+		{"uncertain without verifier", "escalated", "runtime_outcome_uncertain", nil, false},
+		{"uncertain wrong phase", "failed", "runtime_outcome_uncertain", verifier("escalated", "escalated"), false},
+		{"uncertain wrong verifier", "escalated", "runtime_outcome_uncertain", verifier("refused", "escalated"), false},
+		{"unknown failure", "failed", "runtime_outcome_unknown", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(registeredEventsResponse{Version: registeredEventsResponseVersion, Events: []registeredEventProjection{{Cursor: 1, SessionID: turn.SessionID, TurnID: turn.TurnID, ModelEffectID: turn.ModelEffectID, Attempt: 1, Phase: tc.phase, WorkerID: "worker-42", StorageLineageID: "lineage-42", FenceEpoch: 7, AdmissionTaskDigest: digest, TaskEvidenceDigest: digest, Verifier: tc.verifier, Failure: tc.failure}}, NextCursor: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = validateRegisteredEventsResponse(payload, turn, 0, digest, digest, digest)
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%t, err=%v", tc.valid, err)
+			}
+		})
 	}
 }
 

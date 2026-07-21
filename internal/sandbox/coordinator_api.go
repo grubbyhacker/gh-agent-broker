@@ -385,7 +385,7 @@ func validateRegisteredEventsResponse(result json.RawMessage, turn registeredTur
 	}
 	previous := after
 	for _, event := range response.Events {
-		if event.Cursor <= previous || event.SessionID != turn.SessionID || event.TurnID != turn.TurnID || event.ModelEffectID != turn.ModelEffectID || event.Attempt < 0 || !registeredOpaqueID.MatchString(event.WorkerID) || event.StorageLineageID == "" || len(event.StorageLineageID) > 128 || event.FenceEpoch < 0 || event.AdmissionTaskDigest != admissionDigest || event.TaskEvidenceDigest != taskEvidenceDigest || !registeredEventPhase(event.Phase) || !registeredEventFailure(event.Failure) || !validRegisteredVerifier(event.Verifier, contractDigest, taskEvidenceDigest) {
+		if event.Cursor <= previous || event.SessionID != turn.SessionID || event.TurnID != turn.TurnID || event.ModelEffectID != turn.ModelEffectID || event.Attempt < 0 || !registeredOpaqueID.MatchString(event.WorkerID) || event.StorageLineageID == "" || len(event.StorageLineageID) > 128 || event.FenceEpoch < 0 || event.AdmissionTaskDigest != admissionDigest || event.TaskEvidenceDigest != taskEvidenceDigest || !validRegisteredEventPhaseFailureVerifier(event, contractDigest, taskEvidenceDigest) {
 			return registeredEventsResponse{}, fmt.Errorf("agentd returned invalid registered event stream")
 		}
 		previous = event.Cursor
@@ -396,20 +396,32 @@ func validateRegisteredEventsResponse(result json.RawMessage, turn registeredTur
 	return response, nil
 }
 
-func registeredEventFailure(failure string) bool {
-	switch failure {
-	case "", "credential_expired", "credential_mint_failed", "runtime_failed", "runtime_outcome_uncertain":
-		return true
+func validRegisteredEventPhaseFailureVerifier(event registeredEventProjection, contractDigest, taskEvidenceDigest string) bool {
+	if !validRegisteredVerifier(event.Verifier, contractDigest, taskEvidenceDigest) {
+		return false
 	}
-	return false
-}
 
-func registeredEventPhase(phase string) bool {
-	switch phase {
-	case "queued", "authorized", "running", "completed", "failed", "pending", "green", "red", "refused", "escalated":
-		return true
+	switch event.Failure {
+	case "":
+		if event.Verifier == nil {
+			switch event.Phase {
+			case "queued", "authorized", "running", "completed":
+				return true
+			}
+			return false
+		}
+		return event.Phase == event.Verifier.Phase
+	case "credential_mint_failed":
+		return event.Phase == "authorized" && event.Verifier == nil
+	case "runtime_failed":
+		return event.Phase == "failed" && event.Verifier == nil
+	case "credential_expired":
+		return event.Phase == "escalated" && event.Verifier == nil
+	case "runtime_outcome_uncertain":
+		return event.Phase == "escalated" && event.Verifier != nil && event.Verifier.Phase == "escalated"
+	default:
+		return false
 	}
-	return false
 }
 
 var registeredVerifierReasonCode = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)

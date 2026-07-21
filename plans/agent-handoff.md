@@ -79,9 +79,14 @@ again. The source fixture is vendored byte-for-byte at
 `testdata/agentd/registered-turn-v2.golden.json`.
 
 Agentd may emit the typed optional `runtime_outcome_uncertain` failure for a
-persisted running effect recovered after restart. The broker's strict
-source-closed failure union accepts that value alongside only the existing
-credential and runtime failures; unknown failure values remain denied.
+persisted running effect recovered after restart. Event acceptance binds phase,
+failure, and verifier as one source-closed tuple: empty failure permits only
+verifier-free `queued`/`authorized`/`running`/`completed` or a valid matching
+verifier phase; `credential_mint_failed` is only verifier-free `authorized`;
+`runtime_failed` only verifier-free `failed`; `credential_expired` only
+verifier-free `escalated`; and `runtime_outcome_uncertain` only `escalated`
+with a valid `escalated` verifier. Unknowns and all mismatches are denied while
+the verifier contract and task-evidence digest checks remain strict.
 
 ### Authority agentd green-PR observation seam
 
