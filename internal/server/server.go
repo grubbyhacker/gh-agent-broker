@@ -92,7 +92,7 @@ func (s *Server) beginTransport(ctx context.Context, principal auth.Principal, t
 	if err != nil {
 		return nil, err
 	}
-	if authority.Principal != principal.ID {
+	if authority.Principal != principal.TransportPrincipal {
 		return nil, errors.New("transport authority context principal mismatch")
 	}
 	op := &sandbox.TransportOperation{OperationID: ids.NewOperationID(), Method: method, Service: service, Repository: repo, RequestPath: path, RequestedRefs: []string{}, RefUpdates: []any{}, CredentialHeaderPresent: credentialHeader, Authority: authority}
@@ -2069,7 +2069,10 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 					parent.ID = custody.AgentID
 					parent.Secret = ""
 					parent.Repositories = []string{custody.Repository}
-					principal, ok = auth.Principal{Agent: parent, ID: custody.AgentID}, true
+					// The effect identity is retained for Basic authentication and audit,
+					// while the immutable parent principal remains the only identity that
+					// can satisfy a leased transport context.
+					principal, ok = auth.Principal{Agent: parent, ID: custody.AgentID, TransportPrincipal: custody.Principal}, true
 				}
 			}
 		}
@@ -2202,9 +2205,8 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if operation == "git.receive-pack" && r.Method == http.MethodPost && s.credentialStore != nil {
-		// Effect credentials are exact, broker-known values.  Scan the bounded
-		// receive-pack stream before forwarding so a matching token cannot be
-		// committed through the opaque transport path.
+		// Effect credentials are exact, broker-known values. Inspect the bounded
+		// pack object graph before forwarding; compressed bytes are not text.
 		pack, err := io.ReadAll(io.LimitReader(bodyReader, securityscan.MaxStreamBytes+1))
 		if err != nil || len(pack) > securityscan.MaxStreamBytes {
 			if !s.denyTransport(r.Context(), transport, "security_scan_limit", http.StatusRequestEntityTooLarge) {
@@ -2215,7 +2217,16 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		bodyReader = bytes.NewReader(pack)
-		if finding := securityscan.Reader("receive_pack", bytes.NewReader(pack), securityscan.MaxStreamBytes); finding != nil {
+		finding, scanErr := scanReceivePack(pack)
+		if scanErr != nil {
+			if !s.denyTransport(r.Context(), transport, "security_pack_scan_rejected", http.StatusForbidden) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, "receive-pack blocked by security policy", http.StatusForbidden)
+			return
+		}
+		if finding != nil {
 			if finding.Fingerprint != "" && s.credentialStore.HandleEffectTokenLeak(r.Context(), finding.Fingerprint) != nil {
 				http.Error(w, "credential fence unavailable", http.StatusServiceUnavailable)
 				return

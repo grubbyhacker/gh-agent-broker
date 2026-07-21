@@ -36,6 +36,18 @@ An exact scanner match fences the bound session/worker and revokes the
 credential before the bounded receive-pack stream can be forwarded; scanner
 events carry only the reason and fingerprint identifier.
 
+The independent broker follow-up preserves both identities for dynamic Git
+credentials: Basic authentication and audit retain the effect agent ID, while
+transport authority validation uses the immutable parent principal. Receive-pack
+inspection now parses pkt-lines and complete SHA-1 pack streams before
+forwarding, inflates bounded objects, resolves bounded OFS/REF deltas, and
+scans resolved commit/blob contents. Malformed, thin, checksum-invalid, or
+limit-exceeding packs fail closed. Exact scanner matches retain only the safe
+fingerprint/reason and trigger the existing revoke/release/fence path. An
+identical stored mint retry now refuses an already-expired receipt rather than
+returning or extending its derived secret. This intentionally does not alter
+the separate agentd registered-response/event wire.
+
 ### Custody implementation handoff — blocked at the agentd effect-authority seam
 
 `vps-ops` main at `435411d148cf756abc0f3ea9ee859db3ee8cb0be` settles Option A:

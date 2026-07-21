@@ -10,8 +10,9 @@ import (
 )
 
 type Principal struct {
-	Agent config.Agent
-	ID    string
+	Agent              config.Agent
+	ID                 string
+	TransportPrincipal string
 }
 
 func AuthenticateAgent(r *http.Request, cfg *config.Config) (Principal, bool) {
@@ -34,7 +35,7 @@ func AuthenticateAgent(r *http.Request, cfg *config.Config) (Principal, bool) {
 	if subtle.ConstantTimeCompare([]byte(secret), []byte(agent.Secret)) != 1 {
 		return Principal{}, false
 	}
-	return Principal{Agent: agent, ID: id}, true
+	return Principal{Agent: agent, ID: id, TransportPrincipal: id}, true
 }
 
 func AuthenticateAdmin(r *http.Request, cfg *config.Config) bool {

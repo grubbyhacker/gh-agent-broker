@@ -133,6 +133,9 @@ func (s *AuthorityWorkerService) MintGitCredential(ctx context.Context, control 
 		if existingRaw != string(raw) {
 			return GitCredential{}, fmt.Errorf("credential receipt replay conflict")
 		}
+		if expiry <= time.Now().UnixMilli() {
+			return GitCredential{}, fmt.Errorf("credential receipt expired")
+		}
 		securityscan.RegisterEffectTokenFingerprint(fp, s.store.effectTokenFingerprintKey())
 		return GitCredential{gitCredentialVersion, digest, agentID, s.credentialSecret(digest), expiry}, nil
 	}
