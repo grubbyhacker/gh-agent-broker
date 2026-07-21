@@ -303,15 +303,15 @@ func TestRegisteredGreenPRPolicyCheckRequiresExactEndpointOperations(t *testing.
 		return auth.Principal{ID: agent.ID, Agent: agent}
 	}
 
-	if result := registeredGreenPRPolicyCheck(principal("pull.create"), admission, "creation"); !result.Allowed {
+	if result := registeredGreenPRPolicyCheck(principal("repo.probe", "pull.read", "pull.create"), admission, "creation"); !result.Allowed {
 		t.Fatalf("creation unexpectedly denied: %#v", result)
 	}
-	if result := registeredGreenPRPolicyCheck(principal("pull.read", "checks.read", "status.read"), admission, "observation"); !result.Allowed {
+	if result := registeredGreenPRPolicyCheck(principal("repo.probe", "pull.read", "checks.read", "status.read"), admission, "observation"); !result.Allowed {
 		t.Fatalf("observation unexpectedly denied: %#v", result)
 	}
-	for _, missing := range []string{"pull.read", "checks.read", "status.read"} {
+	for _, missing := range []string{"repo.probe", "pull.read", "checks.read", "status.read"} {
 		t.Run("missing_"+missing, func(t *testing.T) {
-			operations := []string{"pull.read", "checks.read", "status.read"}
+			operations := []string{"repo.probe", "pull.read", "checks.read", "status.read"}
 			for i, operation := range operations {
 				if operation == missing {
 					operations = append(operations[:i], operations[i+1:]...)
@@ -324,6 +324,20 @@ func TestRegisteredGreenPRPolicyCheckRequiresExactEndpointOperations(t *testing.
 			}
 			if len(result.FailedChecks) != 1 || result.FailedChecks[0].Dimension != "operation" || result.FailedChecks[0].Actual != missing {
 				t.Fatalf("denial did not identify missing %q authorization: %#v", missing, result)
+			}
+		})
+	}
+	for _, missing := range []string{"repo.probe", "pull.read", "pull.create"} {
+		t.Run("creation_missing_"+missing, func(t *testing.T) {
+			operations := []string{"repo.probe", "pull.read", "pull.create"}
+			for i, operation := range operations {
+				if operation == missing {
+					operations = append(operations[:i], operations[i+1:]...)
+					break
+				}
+			}
+			if result := registeredGreenPRPolicyCheck(principal(operations...), admission, "creation"); result.Allowed {
+				t.Fatalf("creation allowed without %q", missing)
 			}
 		})
 	}

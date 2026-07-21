@@ -2,8 +2,10 @@ package sandbox
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,9 +17,9 @@ import (
 type TransportObserver struct{ store *AuthorityWorkerStore }
 
 type TransportAuthority struct {
-	Principal, WorkerID, SessionLineageID, WorkerStorageLineageID string
-	WorkerFenceEpoch                                              int64
-	ProfileVersion, PolicyDigest                                  string
+	Principal, Profile, WorkerID, SessionLineageID, SessionBindingDigest, WorkerStorageLineageID string
+	WorkerFenceEpoch                                                                             int64
+	ProfileVersion, PolicyDigest                                                                 string
 }
 
 type TransportOperation struct {
@@ -54,40 +56,72 @@ func (o *TransportObserver) Close() error { return o.store.Close() }
 
 // ResolveAuthority derives the sole active lease for the reviewed profile. A
 // caller can name neither the profile nor any authority coordinate.
-func (o *TransportObserver) ResolveAuthority(ctx context.Context, profile string) (TransportAuthority, error) {
-	rows, err := o.store.db.QueryContext(ctx, `SELECT l.principal,l.worker_id,l.session_lineage_id,w.worker_storage_lineage_id,w.worker_fence_epoch,w.profile_version,w.policy_digest
+// ResolveAuthority resolves only the active lease authenticated by the fixed
+// broker-issued transport context. The context is an HMAC under store-private
+// material; it is neither an agent credential nor derivable by another worker.
+func (o *TransportObserver) ResolveAuthority(ctx context.Context, transportContext string) (TransportAuthority, error) {
+	rows, err := o.store.db.QueryContext(ctx, `SELECT l.principal,l.profile,l.worker_id,l.session_lineage_id,l.binding_digest,w.worker_storage_lineage_id,w.worker_fence_epoch,w.profile_version,w.policy_digest
 		FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id
-		WHERE l.profile=? AND l.released_at=''`, profile)
+		WHERE l.released_at=''`)
 	if err != nil {
 		return TransportAuthority{}, fmt.Errorf("query active transport authority: %w", err)
 	}
 	defer closeTransportRows(rows)
 	var out TransportAuthority
-	count := 0
+	matches := 0
 	for rows.Next() {
-		count++
-		if err := rows.Scan(&out.Principal, &out.WorkerID, &out.SessionLineageID, &out.WorkerStorageLineageID, &out.WorkerFenceEpoch, &out.ProfileVersion, &out.PolicyDigest); err != nil {
+		var candidate TransportAuthority
+		if err := rows.Scan(&candidate.Principal, &candidate.Profile, &candidate.WorkerID, &candidate.SessionLineageID, &candidate.SessionBindingDigest, &candidate.WorkerStorageLineageID, &candidate.WorkerFenceEpoch, &candidate.ProfileVersion, &candidate.PolicyDigest); err != nil {
 			return TransportAuthority{}, fmt.Errorf("scan active transport authority: %w", err)
+		}
+		if secureTokenEqual(transportContext, o.transportContext(candidate)) {
+			out = candidate
+			matches++
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return TransportAuthority{}, fmt.Errorf("read active transport authority: %w", err)
 	}
-	if count != 1 {
-		return TransportAuthority{}, fmt.Errorf("transport authority profile %q has %d active leases", profile, count)
+	if matches != 1 {
+		return TransportAuthority{}, fmt.Errorf("transport authority context is unavailable")
 	}
 	return out, nil
 }
 
+// TransportContext returns the fixed capability delivered to the exact active
+// agentd session by the broker-owned session supervisor. It is intentionally
+// opaque and cannot name a profile, task, push, or completion fact.
+func (o *TransportObserver) TransportContext(authority TransportAuthority) string {
+	return o.transportContext(authority)
+}
+
+// LeaseTransportContext is called only by the broker's session handoff path to
+// deliver the fixed context to the selected agentd session.
+func (o *TransportObserver) LeaseTransportContext(ctx context.Context, principal, bindingDigest string) (string, error) {
+	var authority TransportAuthority
+	err := o.store.db.QueryRowContext(ctx, `SELECT l.principal,l.profile,l.worker_id,l.session_lineage_id,l.binding_digest,w.worker_storage_lineage_id,w.worker_fence_epoch,w.profile_version,w.policy_digest FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=? AND l.binding_digest=? AND l.released_at=''`, principal, bindingDigest).Scan(&authority.Principal, &authority.Profile, &authority.WorkerID, &authority.SessionLineageID, &authority.SessionBindingDigest, &authority.WorkerStorageLineageID, &authority.WorkerFenceEpoch, &authority.ProfileVersion, &authority.PolicyDigest)
+	if err != nil {
+		return "", fmt.Errorf("read active transport authority: %w", err)
+	}
+	return o.transportContext(authority), nil
+}
+
+func (o *TransportObserver) transportContext(authority TransportAuthority) string {
+	payload := authority.Principal + "\x00" + authority.Profile + "\x00" + authority.WorkerID + "\x00" + authority.WorkerStorageLineageID + "\x00" + fmt.Sprint(authority.WorkerFenceEpoch) + "\x00" + authority.SessionLineageID + "\x00" + authority.SessionBindingDigest
+	mac := hmac.New(sha256.New, o.store.salt)
+	_, _ = mac.Write([]byte("gh-agent-broker/transport-context/v1\x00" + payload))
+	return "atc1." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
 // GreenPRAdmission returns the one current registered task and exact pushed
 // head for a profile. It accepts no caller identity, SHA, or PR data.
-func (o *TransportObserver) GreenPRAdmission(ctx context.Context, profile string) (GreenPRTransportAdmission, error) {
-	authority, err := o.ResolveAuthority(ctx, profile)
+func (o *TransportObserver) GreenPRAdmission(ctx context.Context, transportContext string) (GreenPRTransportAdmission, error) {
+	authority, err := o.ResolveAuthority(ctx, transportContext)
 	if err != nil {
 		return GreenPRTransportAdmission{}, err
 	}
 	var canonical, digest string
-	err = o.store.db.QueryRowContext(ctx, `SELECT a.canonical_task_json,a.admission_task_digest FROM authority_registered_admissions a JOIN authority_session_leases l ON l.principal=a.principal AND l.binding_digest=a.binding_digest WHERE l.principal=? AND l.profile=? AND l.released_at=''`, authority.Principal, profile).Scan(&canonical, &digest)
+	err = o.store.db.QueryRowContext(ctx, `SELECT a.canonical_task_json,a.admission_task_digest FROM authority_registered_admissions a JOIN authority_session_leases l ON l.principal=a.principal AND l.binding_digest=a.binding_digest WHERE l.principal=? AND l.binding_digest=? AND l.worker_id=? AND l.session_lineage_id=? AND l.released_at=''`, authority.Principal, authority.SessionBindingDigest, authority.WorkerID, authority.SessionLineageID).Scan(&canonical, &digest)
 	if err != nil {
 		return GreenPRTransportAdmission{}, fmt.Errorf("read registered transport admission: %w", err)
 	}
@@ -98,7 +132,7 @@ func (o *TransportObserver) GreenPRAdmission(ctx context.Context, profile string
 	if err := json.Unmarshal([]byte(canonical), &wire); err != nil {
 		return GreenPRTransportAdmission{}, fmt.Errorf("registered transport admission is corrupt")
 	}
-	validated, err := validateRegisteredAdmission(RegisteredAdmissionRequest{Version: coordinatorRegisteredProtocolVersion, Profile: profile, IdempotencyKey: "green-pr-observe", SessionBinding: "session:" + wire.Source.WorkItemID, Source: wire.Source, Task: wire.Task, AdmissionTaskDigest: digest})
+	validated, err := validateRegisteredAdmission(RegisteredAdmissionRequest{Version: coordinatorRegisteredProtocolVersion, Profile: authority.Profile, IdempotencyKey: "green-pr-observe", SessionBinding: "session:" + wire.Source.WorkItemID, Source: wire.Source, Task: wire.Task, AdmissionTaskDigest: digest})
 	if err != nil || validated.CanonicalJSON != canonical {
 		return GreenPRTransportAdmission{}, fmt.Errorf("registered transport admission is invalid")
 	}

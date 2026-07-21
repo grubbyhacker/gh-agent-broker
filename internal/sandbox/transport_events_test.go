@@ -20,7 +20,7 @@ func TestTransportEventsFailClosedAndAppendOnly(t *testing.T) {
 	if count, err := observer.transportEventCount(ctx); err != nil || count != 0 {
 		t.Fatalf("no-op count=%d err=%v", count, err)
 	}
-	authority, err := observer.ResolveAuthority(ctx, "writer")
+	authority, err := resolveSeededTransportAuthority(ctx, observer, "binding-1")
 	if err != nil || authority.WorkerID != "worker-1" {
 		t.Fatalf("internally resolved authority=%+v err=%v", authority, err)
 	}
@@ -81,8 +81,25 @@ func TestTransportEventsFailClosedAndAppendOnly(t *testing.T) {
 	}
 
 	seedTransportLease(t, observer.store, "writer", "worker-2", "binding-2")
-	if _, err := observer.ResolveAuthority(ctx, "writer"); err == nil {
-		t.Fatal("ambiguous active authority was accepted")
+	if _, err := resolveSeededTransportAuthority(ctx, observer, "binding-1"); err != nil {
+		t.Fatalf("first active lease context was refused: %v", err)
+	}
+	first, err := observer.LeaseTransportContext(ctx, "broker-principal", "binding-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := observer.LeaseTransportContext(ctx, "broker-principal", "binding-2")
+	if err != nil || first == second {
+		t.Fatalf("active lease contexts=%q,%q err=%v", first, second, err)
+	}
+	if got, err := observer.ResolveAuthority(ctx, second); err != nil || got.WorkerID != "worker-2" || got.SessionBindingDigest != "binding-2" {
+		t.Fatalf("second lease crossed or was refused: %+v %v", got, err)
+	}
+	if _, err := observer.store.db.ExecContext(ctx, `UPDATE authority_session_leases SET released_at=? WHERE binding_digest=?`, time.Now().UTC().Format(time.RFC3339Nano), "binding-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := observer.ResolveAuthority(ctx, first); err == nil {
+		t.Fatal("released lease context was accepted")
 	}
 }
 
@@ -102,7 +119,7 @@ func TestGreenPRAdmissionUsesOnlyRegisteredTaskAndCompletedPush(t *testing.T) {
 	if _, err := observer.store.db.ExecContext(ctx, `INSERT INTO authority_registered_admissions(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest) VALUES(?,?,?,?,?,?,?)`, "broker-principal", "session:transport-work", coordinatorRegisteredProtocolVersion, request.Source.WorkItemID, request.Source.RouteSnapshotID, admission.CanonicalJSON, admission.Digest); err != nil {
 		t.Fatal(err)
 	}
-	authority, err := observer.ResolveAuthority(ctx, "writer")
+	authority, err := resolveSeededTransportAuthority(ctx, observer, "session:transport-work")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +140,11 @@ func TestGreenPRAdmissionUsesOnlyRegisteredTaskAndCompletedPush(t *testing.T) {
 	if err := observer.Terminal(ctx, &op, "completed", "allowed", "", 200, 200); err != nil {
 		t.Fatal(err)
 	}
-	got, err := observer.GreenPRAdmission(ctx, "writer")
+	context, err := observer.LeaseTransportContext(ctx, "broker-principal", "session:transport-work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := observer.GreenPRAdmission(ctx, context)
 	if err != nil || got.OperationID != "push-1" || got.PushedSHA != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || got.TaskDigest != admission.Digest {
 		t.Fatalf("admission=%+v err=%v", got, err)
 	}
@@ -142,7 +163,7 @@ func TestTransportAppendFailureDoesNotSucceed(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedTransportLease(t, observer.store, "writer", "worker-1", "binding-1")
-	authority, err := observer.ResolveAuthority(ctx, "writer")
+	authority, err := resolveSeededTransportAuthority(ctx, observer, "binding-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,6 +174,14 @@ func TestTransportAppendFailureDoesNotSucceed(t *testing.T) {
 	if err := observer.Received(ctx, &op); err == nil {
 		t.Fatal("append failure was accepted")
 	}
+}
+
+func resolveSeededTransportAuthority(ctx context.Context, observer *TransportObserver, binding string) (TransportAuthority, error) {
+	context, err := observer.LeaseTransportContext(ctx, "broker-principal", binding)
+	if err != nil {
+		return TransportAuthority{}, err
+	}
+	return observer.ResolveAuthority(ctx, context)
 }
 
 func seedTransportLease(t *testing.T, store *AuthorityWorkerStore, profile, worker, binding string) {

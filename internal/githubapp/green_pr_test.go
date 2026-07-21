@@ -50,6 +50,27 @@ func TestGreenPRChecksPendingLegacyStatusRemainsPollable(t *testing.T) {
 	}
 }
 
+func TestGreenPRChecksRejectsMissingOrWrongCheckRunHeadSHA(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	for name, headSHA := range map[string]string{"missing": "", "wrong": strings.Repeat("b", 40)} {
+		t.Run(name, func(t *testing.T) {
+			c := greenPRTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/check-runs"):
+					writeGreenPRTestJSON(t, w, map[string]any{"check_runs": []any{map[string]any{"name": "required", "head_sha": headSHA, "status": "completed", "conclusion": "success", "app": map[string]any{"id": 1}}}})
+				case strings.HasSuffix(r.URL.Path, "/status"):
+					writeGreenPRTestJSON(t, w, map[string]any{"sha": sha, "statuses": []any{}})
+				default:
+					t.Fatalf("unexpected %s", r.URL.String())
+				}
+			})
+			if _, err := c.greenPRChecks("default", 1, "owner/repo", sha, []greenPRRule{{Context: "required"}}); err == nil {
+				t.Fatal("check run without the exact head SHA was accepted")
+			}
+		})
+	}
+}
+
 func TestObserveGreenPRSelectsApplicableEvaluationSHA(t *testing.T) {
 	head, merge := strings.Repeat("a", 40), strings.Repeat("b", 40)
 	for name, tc := range map[string]struct{ mergeStatus, wantBasis, wantVerdict string }{
@@ -171,12 +192,12 @@ func TestGreenPRChecksReadsLaterPagesForDuplicates(t *testing.T) {
 		if r.URL.Query().Get("page") == "1" {
 			rows := make([]any, 100)
 			for i := range rows {
-				rows[i] = map[string]any{"name": "other", "status": "completed", "conclusion": "success", "app": map[string]any{"id": 1}}
+				rows[i] = map[string]any{"name": "other", "head_sha": sha, "status": "completed", "conclusion": "success", "app": map[string]any{"id": 1}}
 			}
 			writeGreenPRTestJSON(t, w, map[string]any{"check_runs": rows})
 			return
 		}
-		writeGreenPRTestJSON(t, w, map[string]any{"check_runs": []any{map[string]any{"name": "required", "status": "completed", "conclusion": "success", "app": map[string]any{"id": 1}}, map[string]any{"name": "required", "status": "completed", "conclusion": "success", "app": map[string]any{"id": 1}}}})
+		writeGreenPRTestJSON(t, w, map[string]any{"check_runs": []any{map[string]any{"name": "required", "head_sha": sha, "status": "completed", "conclusion": "success", "app": map[string]any{"id": 1}}, map[string]any{"name": "required", "head_sha": sha, "status": "completed", "conclusion": "success", "app": map[string]any{"id": 1}}}})
 	})
 	if _, err := c.greenPRChecks("default", 1, "owner/repo", sha, []greenPRRule{{Context: "required"}}); err == nil {
 		t.Fatal("later-page duplicate was hidden")

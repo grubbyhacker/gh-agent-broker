@@ -4,15 +4,15 @@
 
 ### Authority agentd green-PR observation seam
 
-Active authority `agentd` workers receive the fixed, broker-owned
-`AGENTD_BROKER_OBSERVATION_URL` value
-`http://broker:8080/v1/registered/github-green-pr/observe` and
-`AGENTD_BROKER_OBSERVATION_AGENT_ID` from `broker_agent_id` and
-`AGENTD_BROKER_OBSERVATION_SECRET` from the resolved
-`broker_agent_secret_env`. Agentd uses those fixed values as HTTP Basic
-credentials for the exact URL. The URL is fixed in service code: neither caller
-input nor an authority profile may select it. No token/Bearer observation seam
-or GitHub credential is injected. The authority worker network is
+The bodyless green-PR endpoints resolve an opaque `atc1` transport context
+under broker-only authority-store HMAC material. It binds the registered
+principal, profile, worker ID, storage-lineage ID, fence epoch, session lineage,
+and active lease binding. A released, stale, forged, or cross-session context
+cannot select an admission or push. Green-PR admission queries those exact
+coordinates, so two active leases no longer cause profile-global ambiguity.
+Agentd's corrected PR #18 uses the exact URL through its
+`AGENTD_BROKER_OBSERVATION_TOKEN` bearer contract; no GitHub credential is
+projected. The authority worker network is
 `gh-agent-broker_default`, whose reviewed compose topology contains the
 `broker` service at port 8080.
 

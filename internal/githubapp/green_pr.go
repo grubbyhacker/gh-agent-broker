@@ -317,6 +317,7 @@ func (c *Client) greenPRRules(app string, installation int64, repo, base string)
 
 func (c *Client) greenPRChecks(app string, installation int64, repo, sha string, rules []greenPRRule) ([]GreenPRRequiredCheck, error) {
 	type checkRun struct {
+		HeadSHA    string `json:"head_sha"`
 		Name       string `json:"name"`
 		Status     string `json:"status"`
 		Conclusion string `json:"conclusion"`
@@ -361,9 +362,14 @@ func (c *Client) greenPRChecks(app string, installation int64, repo, sha string,
 			break
 		}
 	}
+	for _, run := range checkRuns {
+		if len(run.HeadSHA) != 40 || strings.Trim(run.HeadSHA, "0123456789abcdef") != "" || run.HeadSHA != sha {
+			return nil, fmt.Errorf("check run returned missing or wrong evaluation SHA")
+		}
+	}
 	out := make([]GreenPRRequiredCheck, 0, len(rules))
 	for _, rule := range rules {
-		row := GreenPRRequiredCheck{Context: rule.Context, ExpectedAppSource: rule.IntegrationID, Presence: "absent", Status: "", Conclusion: "", ObservedSHA: sha}
+		row := GreenPRRequiredCheck{Context: rule.Context, ExpectedAppSource: rule.IntegrationID, Presence: "absent", Status: "", Conclusion: ""}
 		matches := 0
 		for _, run := range checkRuns {
 			if run.Name == rule.Context {
@@ -371,7 +377,7 @@ func (c *Client) greenPRChecks(app string, installation int64, repo, sha string,
 					return nil, fmt.Errorf("required check context %q has wrong App source", rule.Context)
 				}
 				matches++
-				row.Presence, row.Status, row.Conclusion = "present", run.Status, run.Conclusion
+				row.Presence, row.Status, row.Conclusion, row.ObservedSHA = "present", run.Status, run.Conclusion, run.HeadSHA
 			}
 		}
 		for _, context := range statuses {
@@ -381,6 +387,7 @@ func (c *Client) greenPRChecks(app string, installation int64, repo, sha string,
 				}
 				matches++
 				row.Presence = "present"
+				row.ObservedSHA = sha
 				switch strings.ToLower(context.State) {
 				case "success", "error", "failure":
 					row.Status, row.Conclusion = "completed", context.State

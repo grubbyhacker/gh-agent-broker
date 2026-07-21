@@ -78,19 +78,13 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 	}, nil
 }
 
-func (s *Server) beginTransport(ctx context.Context, principal auth.Principal, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
-	profiles := make([]string, 0, 1)
-	for profile, agentID := range s.transportProfiles {
-		if agentID == principal.ID {
-			profiles = append(profiles, profile)
-		}
-	}
-	if len(profiles) != 1 {
-		return nil, errors.New("transport authority correlation is ambiguous or unavailable")
-	}
-	authority, err := s.transport.ResolveAuthority(ctx, profiles[0])
+func (s *Server) beginTransport(ctx context.Context, principal auth.Principal, transportContext, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
+	authority, err := s.transport.ResolveAuthority(ctx, transportContext)
 	if err != nil {
 		return nil, err
+	}
+	if authority.Principal != principal.ID {
+		return nil, errors.New("transport authority context principal mismatch")
 	}
 	op := &sandbox.TransportOperation{OperationID: ids.NewOperationID(), Method: method, Service: service, Repository: repo, RequestPath: path, RequestedRefs: []string{}, RefUpdates: []any{}, CredentialHeaderPresent: credentialHeader, Authority: authority}
 	if err := s.transport.Received(ctx, op); err != nil {
@@ -418,22 +412,23 @@ func (s *Server) registeredGreenPRAdmission(w http.ResponseWriter, r *http.Reque
 		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
 	cfg, gh := s.snapshot()
-	principal, authenticated := auth.AuthenticateAgent(r, cfg)
-	if !authenticated {
-		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", Decision: policy.DecisionDeny})
-		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
-	}
-	profiles := make([]string, 0, 1)
-	for profile, agentID := range s.transportProfiles {
-		if agentID == principal.ID {
-			profiles = append(profiles, profile)
-		}
-	}
-	if s.transport == nil || len(profiles) != 1 {
+	if s.transport == nil {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "registered transport authority is unavailable"})
 		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
-	admission, err := s.transport.GreenPRAdmission(r.Context(), profiles[0])
+	transportContext := bearerTransportContext(r)
+	authority, err := s.transport.ResolveAuthority(r.Context(), transportContext)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "registered transport authority is unavailable"})
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
+	}
+	agent, found := configuredAgent(cfg, authority.Principal)
+	if !found || s.transportProfiles[authority.Profile] != authority.Principal {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "registered transport authority is unavailable"})
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
+	}
+	principal := auth.Principal{ID: authority.Principal, Agent: agent}
+	admission, err := s.transport.GreenPRAdmission(r.Context(), transportContext)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "registered green PR " + action + " is unavailable"})
 		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
@@ -452,15 +447,32 @@ func (s *Server) registeredGreenPRAdmission(w http.ResponseWriter, r *http.Reque
 	return principal, appName, admission, installation, gh, true
 }
 
+func bearerTransportContext(r *http.Request) string {
+	value := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(value), "bearer ") {
+		return strings.TrimSpace(value[len("bearer "):])
+	}
+	return ""
+}
+
+func configuredAgent(cfg *config.Config, id string) (config.Agent, bool) {
+	for _, agent := range cfg.Agents {
+		if agent.ID == id && agent.Enabled {
+			return agent, true
+		}
+	}
+	return config.Agent{}, false
+}
+
 // registeredGreenPRPolicyCheck requires the registered principal to authorize
 // every broker operation performed by the selected fixed endpoint.
 func registeredGreenPRPolicyCheck(principal auth.Principal, admission sandbox.GreenPRTransportAdmission, action string) policy.Result {
 	var operations []string
 	switch action {
 	case "creation":
-		operations = []string{"pull.create"}
+		operations = []string{"repo.probe", "pull.read", "pull.create"}
 	case "observation":
-		operations = []string{"pull.read", "checks.read", "status.read"}
+		operations = []string{"repo.probe", "pull.read", "checks.read", "status.read"}
 	default:
 		return policy.Result{Allowed: false, Decision: policy.DecisionDeny}
 	}
@@ -2047,7 +2059,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	var transport *sandbox.TransportOperation
 	if s.transport != nil {
 		var err error
-		transport, err = s.beginTransport(r.Context(), principal, r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, r.Header.Get("Authorization") != "")
+		transport, err = s.beginTransport(r.Context(), principal, r.Header.Get("X-GH-Agent-Broker-Transport-Context"), r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, r.Header.Get("Authorization") != "")
 		if err != nil {
 			http.Error(w, "transport authority observation unavailable", http.StatusServiceUnavailable)
 			return
