@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,47 @@ type fakeAuthorityRuntime struct {
 type fakeAuthenticatedReadinessRuntime struct {
 	*fakeAuthorityRuntime
 	probed []string
+}
+
+type synchronousFenceValidationRuntime struct {
+	*fakeAuthorityRuntime
+	service *AuthorityWorkerService
+	secret  string
+}
+
+func (r *synchronousFenceValidationRuntime) AgentdSessionRequest(ctx context.Context, worker AuthorityWorker, method, path string, body json.RawMessage) (int, json.RawMessage, error) {
+	if method != http.MethodPost || path != "/v1/sessions" {
+		return 0, nil, fmt.Errorf("unexpected agentd session request: %s %s", method, path)
+	}
+	var request agentdCreateSessionRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		return 0, nil, err
+	}
+	validationCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	validation, err := r.service.ValidateAgentdSession(validationCtx,
+		deriveAgentdValidationToken(r.secret, request.WorkerID, request.StorageLineageID, request.FenceEpoch),
+		AgentdSessionValidationRequest{WorkerID: request.WorkerID, WorkerStorageLineageID: request.StorageLineageID, WorkerFenceEpoch: request.FenceEpoch, SessionLineageID: request.SessionLineageID})
+	if err != nil {
+		return http.StatusServiceUnavailable, json.RawMessage(`{"error":"broker_validator_unavailable"}`), nil
+	}
+	if !validation.Authorized {
+		return http.StatusForbidden, json.RawMessage(`{"code":"` + validation.Code + `"}`), nil
+	}
+	return http.StatusCreated, mustMarshalAgentdSessionStatus(agentdSessionStatus{
+		Version: agentdSessionProtocolVersion, SessionID: "agentd-synchronous-callback", CoordinatorBinding: request.CoordinatorBinding,
+		AuthorityBinding: request.AuthorityBinding, WorkerID: request.WorkerID, StorageLineageID: request.StorageLineageID,
+		FenceEpoch: request.FenceEpoch, SessionLineageID: request.SessionLineageID, Workspace: request.Workspace,
+		Phase: "active", TurnIDs: []string{}, NextCursor: 1,
+	}), nil
+}
+
+func mustMarshalAgentdSessionStatus(status agentdSessionStatus) json.RawMessage {
+	payload, err := json.Marshal(status)
+	if err != nil {
+		panic(err)
+	}
+	return payload
 }
 
 func (f *fakeAuthenticatedReadinessRuntime) AgentdReady(_ context.Context, worker AuthorityWorker) (bool, string, error) {
@@ -136,6 +178,73 @@ func TestSharedTripwireHaltDeniesAuthorityIssuanceAcrossStores(t *testing.T) {
 	}
 	if issuedAgentdSession {
 		t.Fatal("halted agentd session creation reached the external issuance mutation")
+	}
+}
+
+func TestIssueAgentdSessionAllowsSynchronousFenceValidationCallback(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	//nolint:gosec // This synthetic HMAC test input never authorizes a real broker or agentd process.
+	const validationSecret = "synchronous-validator-test-secret"
+	t.Setenv(cfg.AuthorityProfiles["writer"].BrokerSecretEnv, validationSecret)
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &synchronousFenceValidationRuntime{fakeAuthorityRuntime: &fakeAuthorityRuntime{}, secret: validationSecret}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
+	runtime.service = service
+	service.newID = func() (string, error) { return "synchronous-callback-worker", nil }
+	worker, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", worker.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	request := AuthorityWorkerRequest{Profile: "writer", IdempotencyKey: "synchronous-callback-key", SessionBinding: "synchronous-callback-binding"}
+	lease, err := store.Acquire(ctx, "coordinator", request, cfg.AuthorityProfiles["writer"].IssuanceGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := SessionWorkspace{UID: 20000, GID: 20000, Path: "/durable/synchronous-callback", SessionLineageID: lease.SessionLineageID}
+	if _, err = store.db.ExecContext(ctx, `INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?)`, lease.BindingDigest, worker.WorkerID, workspace.UID, workspace.GID, workspace.Path, formatAuthorityTime(time.Now().UTC()), workspace.SessionLineageID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.CreateSession(ctx, "coordinator", request.SessionBinding)
+	if err != nil {
+		t.Fatalf("synchronous agentd fence callback failed: %v", err)
+	}
+	var status agentdSessionStatus
+	if err := json.Unmarshal(created, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.SessionID != "agentd-synchronous-callback" {
+		t.Fatalf("session=%+v", status)
+	}
+	durable, err := store.SessionWorkspace(ctx, request.SessionBinding)
+	if err != nil || durable.AgentdSessionID != status.SessionID {
+		t.Fatalf("durable workspace=%+v err=%v", durable, err)
+	}
+}
+
+func TestAgentdSessionCreateRejectionExposesOnlyAllowlistedBoundedDetail(t *testing.T) {
+	//nolint:gosec // This credential-shaped sentinel proves untrusted agentd JSON is never reflected.
+	const credential = "ghs_credential-shaped-secret-value"
+	for name, body := range map[string]json.RawMessage{
+		"credential shaped extra fields": json.RawMessage(`{"error":"broker_validator_unavailable","authorization":"Bearer ` + credential + `","detail":"` + credential + `"}`),
+		"oversized error":                json.RawMessage(`{"error":"` + strings.Repeat("x", 1024*1024) + `","brokerCode":"also-not-allowlisted"}`),
+		"malformed":                      json.RawMessage(`{"error":`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := agentdSessionCreateRejection(http.StatusServiceUnavailable, body).Error()
+			if strings.Contains(got, credential) || len(got) > 128 {
+				t.Fatalf("unbounded agentd rejection detail: len=%d error=%q", len(got), got)
+			}
+			if name == "credential shaped extra fields" && got != "agentd session create rejected: status=503 code=broker_validator_unavailable" {
+				t.Fatalf("allowlisted diagnostic=%q", got)
+			}
+			if name != "credential shaped extra fields" && got != "agentd session create rejected: status=503 code=agentd_session_rejected" {
+				t.Fatalf("generic diagnostic=%q", got)
+			}
+		})
 	}
 }
 

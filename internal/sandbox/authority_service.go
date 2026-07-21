@@ -123,7 +123,7 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 			return "", fmt.Errorf("agentd session create: %w", err)
 		}
 		if statusCode != http.StatusCreated {
-			return "", fmt.Errorf("agentd session create rejected")
+			return "", agentdSessionCreateRejection(statusCode, result)
 		}
 		status, err := decodeAgentdSessionStatus(bytes.NewReader(result))
 		if err != nil {
@@ -166,6 +166,25 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 		return nil, fmt.Errorf("agentd session replay returned a mismatched status")
 	}
 	return marshalAgentdSessionStatus(status)
+}
+
+func agentdSessionCreateRejection(status int, body json.RawMessage) error {
+	var detail struct {
+		Error      string `json:"error"`
+		BrokerCode string `json:"brokerCode"`
+		Code       string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &detail); err != nil {
+		return fmt.Errorf("agentd session create rejected: status=%d code=agentd_session_rejected", status)
+	}
+	code := safeAgentdErrorCode(detail.Error)
+	if code == "agentd_session_rejected" {
+		code = safeAgentdErrorCode(detail.BrokerCode)
+	}
+	if code == "agentd_session_rejected" {
+		code = safeAgentdErrorCode(detail.Code)
+	}
+	return fmt.Errorf("agentd session create rejected: status=%d code=%s", status, code)
 }
 
 func (r *AuthorityWorkerRequest) UnmarshalJSON(data []byte) error {
@@ -441,7 +460,7 @@ func (s *AuthorityWorkerService) Reconcile(ctx context.Context, principal string
 // ValidateAgentdSession is the authenticated, fail-closed fencing contract
 // agentd calls before accessing any lineage-scoped journal or workspace state.
 func (s *AuthorityWorkerService) ValidateAgentdSession(ctx context.Context, credential string, request AgentdSessionValidationRequest) (AgentdSessionValidation, error) {
-	worker, err := s.store.GetWorker(ctx, request.WorkerID)
+	worker, err := s.store.agentdValidationWorker(ctx, request.WorkerID)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return AgentdSessionValidation{}, err
@@ -467,7 +486,7 @@ func (s *AuthorityWorkerService) ValidateAgentdSession(ctx context.Context, cred
 	if worker.WorkerStorageLineageID != request.WorkerStorageLineageID || worker.WorkerFenceEpoch != request.WorkerFenceEpoch {
 		return AgentdSessionValidation{Code: "fenced"}, nil
 	}
-	valid, err := s.store.ValidateSessionFence(ctx, request.WorkerID, request.SessionLineageID, request.WorkerFenceEpoch)
+	valid, err := s.store.validateAgentdSessionFence(ctx, request.WorkerID, request.SessionLineageID, request.WorkerFenceEpoch)
 	if err != nil {
 		return AgentdSessionValidation{}, err
 	}
