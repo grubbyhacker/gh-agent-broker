@@ -444,12 +444,40 @@ func (s *Server) registeredGreenPRAdmission(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "repository installation is not configured"})
 		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
-	result := policy.Check(policy.Request{Agent: principal.Agent, AgentID: principal.ID, Repo: admission.Task.Parameters.Repository, Operation: "pull.create", Branch: admission.Task.Parameters.BranchRef, BaseBranch: admission.Task.Parameters.BaseBranch})
+	result := registeredGreenPRPolicyCheck(principal, admission, action)
 	if !result.Allowed {
-		writeJSON(w, http.StatusForbidden, s.errorResponse(admission.OperationID, "policy_denied", "registered green PR creation denied by policy", &result))
+		writeJSON(w, http.StatusForbidden, s.errorResponse(admission.OperationID, "policy_denied", "registered green PR "+action+" denied by policy", &result))
 		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
 	return principal, appName, admission, installation, gh, true
+}
+
+// registeredGreenPRPolicyCheck requires the registered principal to authorize
+// every broker operation performed by the selected fixed endpoint.
+func registeredGreenPRPolicyCheck(principal auth.Principal, admission sandbox.GreenPRTransportAdmission, action string) policy.Result {
+	var operations []string
+	switch action {
+	case "creation":
+		operations = []string{"pull.create"}
+	case "observation":
+		operations = []string{"pull.read", "checks.read", "status.read"}
+	default:
+		return policy.Result{Allowed: false, Decision: policy.DecisionDeny}
+	}
+	for _, operation := range operations {
+		result := policy.Check(policy.Request{
+			Agent:      principal.Agent,
+			AgentID:    principal.ID,
+			Repo:       admission.Task.Parameters.Repository,
+			Operation:  operation,
+			Branch:     admission.Task.Parameters.BranchRef,
+			BaseBranch: admission.Task.Parameters.BaseBranch,
+		})
+		if !result.Allowed {
+			return result
+		}
+	}
+	return policy.Result{Allowed: true, Decision: policy.DecisionAllow}
 }
 
 func handleDiscovery(w http.ResponseWriter, r *http.Request) {

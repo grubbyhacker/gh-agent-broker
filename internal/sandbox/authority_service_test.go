@@ -672,8 +672,21 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_URL"], "http://broker:8080/v1/registered/github-green-pr/observe"; got != want {
 		t.Fatalf("AGENTD_BROKER_OBSERVATION_URL=%q, want %q", got, want)
 	}
-	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_TOKEN"], "secret"; got != want || got != runtime.Env[profile.BrokerSecretEnv] {
-		t.Fatalf("AGENTD_BROKER_OBSERVATION_TOKEN is not the registered broker principal credential")
+	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_AGENT_ID"], profile.BrokerAgentID; got != want {
+		t.Fatalf("AGENTD_BROKER_OBSERVATION_AGENT_ID=%q, want %q", got, want)
+	}
+	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_SECRET"], "secret"; got != want || got != runtime.Env[profile.BrokerSecretEnv] {
+		t.Fatalf("AGENTD_BROKER_OBSERVATION_SECRET is not the registered broker principal credential")
+	}
+	for key, value := range runtime.Env {
+		if strings.HasPrefix(key, "AGENTD_BROKER_OBSERVATION_") && (strings.Contains(key, "TOKEN") || strings.Contains(key, "BEARER")) {
+			t.Fatalf("runtime injected ambiguous observation credential %s=%q", key, value)
+		}
+	}
+	for _, credential := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
+		if value, ok := runtime.Env[credential]; ok || value != "" {
+			t.Fatalf("runtime injected GitHub credential %s=%q", credential, value)
+		}
 	}
 	validationToken := runtime.Env["AGENTD_BROKER_VALIDATION_TOKEN"]
 	wantValidationToken := deriveAgentdValidationToken("secret", worker.WorkerID, worker.WorkerStorageLineageID, worker.WorkerFenceEpoch)

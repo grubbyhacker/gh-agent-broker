@@ -7,11 +7,14 @@
 Active authority `agentd` workers receive the fixed, broker-owned
 `AGENTD_BROKER_OBSERVATION_URL` value
 `http://broker:8080/v1/registered/github-green-pr/observe` and
-`AGENTD_BROKER_OBSERVATION_TOKEN` from the same configured registered broker
-principal secret as `broker_agent_secret_env`. The URL is fixed in service code:
-neither caller input nor an authority profile may select it. The authority
-worker network is `gh-agent-broker_default`, whose reviewed compose topology
-contains the `broker` service at port 8080; no GitHub credential is injected.
+`AGENTD_BROKER_OBSERVATION_AGENT_ID` from `broker_agent_id` and
+`AGENTD_BROKER_OBSERVATION_SECRET` from the resolved
+`broker_agent_secret_env`. Agentd uses those fixed values as HTTP Basic
+credentials for the exact URL. The URL is fixed in service code: neither caller
+input nor an authority profile may select it. No token/Bearer observation seam
+or GitHub credential is injected. The authority worker network is
+`gh-agent-broker_default`, whose reviewed compose topology contains the
+`broker` service at port 8080.
 
 ### GitHub branch-rules API seam
 
@@ -34,7 +37,9 @@ from the active durable lease and completed broker smart-HTTP operation. Create
 uses the configured App installation and fixed broker-owned title/head/base/body
 and ready state, returning an existing exact ready PR idempotently while
 refusing ambiguous or mismatched rows; it does not use the generic caller-shaped
-`pull.create` route. Observe emits `github-green-pr-observation/v1` using authenticated App reads of
+`pull.create` route. Create requires the registered principal to authorize
+`pull.create`; observe fails closed unless it authorizes each of `pull.read`,
+`checks.read`, and `status.read`. Observe emits `github-green-pr-observation/v1` using authenticated App reads of
 the immutable target repository, ready PR, active branch rules, and complete
 paginated evaluation-SHA checks/statuses. It records the target repository
 database ID, node ID, and full name even for missing or draft PRs; a positive
