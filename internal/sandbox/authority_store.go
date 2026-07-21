@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 12
+const authorityStoreSchemaVersion = 13
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -267,6 +267,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		if err := s.migrateV12(ctx); err != nil {
 			return err
 		}
+		version = 12
+	}
+	if version == 12 {
+		if err := s.migrateV13(ctx); err != nil {
+			return err
+		}
 	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
@@ -285,7 +291,26 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		return fmt.Errorf("authority worker request salt is malformed")
 	}
 	s.salt = append([]byte(nil), salt...)
+	if err := s.registerEffectTokenFingerprints(ctx); err != nil {
+		return err
+	}
 	return nil
+}
+
+// V13 records every immutable coordinate selected by an effect receipt.  It
+// lets the Git reader prove the credential still names the current lease,
+// worker, workspace, admission and effect rather than accepting request data.
+func (s *AuthorityWorkerStore) migrateV13(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE authority_git_credentials ADD COLUMN authority_profile TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_git_credentials ADD COLUMN authority_profile_version TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_git_credentials ADD COLUMN registered_task_digest TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_git_credentials ADD COLUMN journal_cursor INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE authority_git_credentials ADD COLUMN journal_record_digest TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_git_credentials ADD COLUMN authorized_at_ms INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE authority_git_credentials ADD COLUMN deadline_at_ms INTEGER NOT NULL DEFAULT 0;
+	CREATE UNIQUE INDEX authority_git_credentials_effect_journal ON authority_git_credentials(principal,binding_digest,model_effect_id,journal_cursor,journal_record_digest);
+	PRAGMA user_version=13`)
+	return err
 }
 
 // V12 is the custody record for agentd's reducer-produced credential receipt.

@@ -311,6 +311,11 @@ func (s *Server) blockUnsafeEgress(w http.ResponseWriter, operationID, agentID, 
 	if finding == nil {
 		return false
 	}
+	if finding.Fingerprint != "" && s.credentialStore != nil {
+		if err := s.credentialStore.HandleEffectTokenLeak(context.Background(), finding.Fingerprint); err != nil {
+			s.audit.Log(audit.Event{OperationID: operationID, AgentID: agentID, Operation: "security.fence_failed", Repo: repo, Decision: policy.DecisionDeny, Result: "effect_token_fingerprint"})
+		}
+	}
 	s.audit.Log(audit.Event{
 		OperationID: operationID,
 		AgentID:     agentID,
@@ -2195,6 +2200,34 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		}
 		writeGitPolicyError(w, r, s.errorResponse(opID, "security_egress_blocked", "opaque Git push denied by security policy", &result))
 		return
+	}
+	if operation == "git.receive-pack" && r.Method == http.MethodPost && s.credentialStore != nil {
+		// Effect credentials are exact, broker-known values.  Scan the bounded
+		// receive-pack stream before forwarding so a matching token cannot be
+		// committed through the opaque transport path.
+		pack, err := io.ReadAll(io.LimitReader(bodyReader, securityscan.MaxStreamBytes+1))
+		if err != nil || len(pack) > securityscan.MaxStreamBytes {
+			if !s.denyTransport(r.Context(), transport, "security_scan_limit", http.StatusRequestEntityTooLarge) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, "receive-pack exceeds security scan bound", http.StatusRequestEntityTooLarge)
+			return
+		}
+		bodyReader = bytes.NewReader(pack)
+		if finding := securityscan.Reader("receive_pack", bytes.NewReader(pack), securityscan.MaxStreamBytes); finding != nil {
+			if finding.Fingerprint != "" && s.credentialStore.HandleEffectTokenLeak(r.Context(), finding.Fingerprint) != nil {
+				http.Error(w, "credential fence unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "security.egress_blocked", Repo: repo, Decision: policy.DecisionDeny, Result: finding.Code, Extra: map[string]interface{}{"fingerprint": finding.Fingerprint, "surface": "git_receive_pack"}})
+			if !s.denyTransport(r.Context(), transport, "security_egress_blocked", http.StatusForbidden) {
+				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, "receive-pack blocked by security policy", http.StatusForbidden)
+			return
+		}
 	}
 	if strings.HasPrefix(repo, "local/") {
 		route, found := localRepositoryRoute(cfg, repo)

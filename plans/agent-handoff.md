@@ -24,6 +24,18 @@ The main broker opens the same custody database and recognizes a minted Basic
 credential only while its fingerprint, expiry, and exact registered repository
 match; it projects the parent policy only for that fixed repository.
 
+Follow-up custody hardening extends schema v13: `secret_fingerprint` is now an
+HMAC under a domain-separated authority-store key, never plain SHA-256. The
+durable credential also records its immutable profile/version, admission task,
+journal, authorization, and deadline coordinates. Every Git authentication
+joins those coordinates to the current unreleased lease, ready worker,
+storage/fence, session workspace, and admission; caller-selected substitutions
+are not accepted. Active effect-token fingerprints are registered with the
+broker scanner on store open and mint, including through revocation/expiry.
+An exact scanner match fences the bound session/worker and revokes the
+credential before the bounded receive-pack stream can be forwarded; scanner
+events carry only the reason and fingerprint identifier.
+
 ### Custody implementation handoff — blocked at the agentd effect-authority seam
 
 `vps-ops` main at `435411d148cf756abc0f3ea9ee859db3ee8cb0be` settles Option A:
