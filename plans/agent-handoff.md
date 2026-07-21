@@ -88,6 +88,18 @@ verifier-free `escalated`; and `runtime_outcome_uncertain` only `escalated`
 with a valid `escalated` verifier. Unknowns and all mismatches are denied while
 the verifier contract and task-evidence digest checks remain strict.
 
+Schema v16 projects every active model effect into `authority_effect_custody`
+with its exact admitted principal/binding/task, session, worker/storage/fence,
+and profile/version/policy coordinates. The original effect keeps its own row:
+after it is terminal, agentd may project a distinct continuation only through
+that continuation's `authorized` event. Projection validates the durable task,
+turn, binding, and worker fence and inserts the custody row in the same SQLite
+transaction as cursor advancement; wrong task/fence/binding leaves neither a
+row nor a cursor advance. Terminal events latch only their named effect, never
+reopen or reuse a terminal root row. Credential mint requires all projected
+coordinates, denies terminal/missing effects before receipt replay handling,
+and permits one immutable receipt per active continuation effect.
+
 ### Authority agentd green-PR observation seam
 
 The bodyless green-PR endpoints resolve an opaque `atc1` transport context

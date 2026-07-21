@@ -106,13 +106,9 @@ func (s *AuthorityWorkerService) MintGitCredential(ctx context.Context, control 
 	if err != nil || released != "" || agentdID != r.SessionID || taskDigest != r.RegisteredTaskDigest || leaseProfile != r.AuthorityProfile || profileVersion != r.AuthorityProfileVersion || workerStorage != r.WorkerStorageLineageID || fence != r.FenceEpoch || workerState != string(AuthorityWorkerReady) {
 		return GitCredential{}, fmt.Errorf("credential receipt context denied")
 	}
-	worker, err := s.store.GetWorker(ctx, r.WorkerID)
-	if err != nil {
-		return GitCredential{}, err
-	}
 	profile, ok := s.cfg.AuthorityProfiles[r.AuthorityProfile]
 	configuredVersion, configuredPolicy, profileErr := authorityProfileDigest(r.AuthorityProfile, profile)
-	if !ok || profileErr != nil || worker.Profile != r.AuthorityProfile || configuredVersion != r.AuthorityProfileVersion || configuredVersion != profileVersion || configuredPolicy != policyDigest {
+	if !ok || profileErr != nil || leaseProfile != r.AuthorityProfile || configuredVersion != r.AuthorityProfileVersion || configuredVersion != profileVersion || configuredPolicy != policyDigest {
 		return GitCredential{}, fmt.Errorf("credential receipt profile denied")
 	}
 	secret := profile.BrokerSecretEnv
@@ -127,7 +123,10 @@ func (s *AuthorityWorkerService) MintGitCredential(ctx context.Context, control 
 		return GitCredential{}, fmt.Errorf("credential admission corrupt")
 	}
 	var terminalPhase string
-	if err = conn.QueryRowContext(ctx, `SELECT terminal_phase FROM authority_effect_custody WHERE principal=? AND binding_digest=? AND model_effect_id=?`, principal, binding, r.ModelEffectID).Scan(&terminalPhase); err != nil || terminalPhase != "" {
+	if err = conn.QueryRowContext(ctx, `SELECT terminal_phase FROM authority_effect_custody WHERE principal=? AND binding_digest=? AND model_effect_id=?
+		AND session_id=? AND worker_id=? AND worker_storage_lineage_id=? AND worker_fence_epoch=?
+		AND authority_profile=? AND authority_profile_version=? AND policy_digest=? AND registered_task_digest=?`, principal, binding, r.ModelEffectID,
+		r.SessionID, r.WorkerID, r.WorkerStorageLineageID, r.FenceEpoch, r.AuthorityProfile, r.AuthorityProfileVersion, policyDigest, r.RegisteredTaskDigest).Scan(&terminalPhase); err != nil || terminalPhase != "" {
 		return GitCredential{}, fmt.Errorf("credential effect is terminal or missing")
 	}
 	var existingRaw, agentID, fp string

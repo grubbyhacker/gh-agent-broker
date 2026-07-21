@@ -129,25 +129,23 @@ func (s *AuthorityWorkerStore) RecordRegisteredTurn(ctx context.Context, princip
 		VALUES(?,?,?,?,?,?,?)`, principal, bindingDigest, idempotencyDigest, state.SessionID, state.TurnID, state.ModelEffectID, state.SubmitCursor); err != nil {
 		return fmt.Errorf("record registered turn: %w", err)
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id) VALUES(?,?,?)`, principal, bindingDigest, state.ModelEffectID); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id,session_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,authority_profile,authority_profile_version,policy_digest,registered_task_digest)
+		SELECT l.principal,l.binding_digest,?,rt.session_id,l.worker_id,w.worker_storage_lineage_id,w.worker_fence_epoch,l.profile,w.profile_version,w.policy_digest,a.admission_task_digest
+		FROM authority_session_leases l
+		JOIN authority_registered_turns rt ON rt.principal=l.principal AND rt.binding_digest=l.binding_digest
+		JOIN authority_registered_admissions a ON a.principal=l.principal AND a.binding_digest=l.binding_digest
+		JOIN authority_workers w ON w.worker_id=l.worker_id
+		WHERE l.principal=? AND l.binding_digest=? AND l.released_at=''`, state.ModelEffectID, principal, bindingDigest); err != nil {
 		return fmt.Errorf("record registered effect custody: %w", err)
 	}
 	return tx.Commit()
 }
 
-func registeredTerminalPhase(events []registeredEventProjection) (string, int64) {
-	for _, event := range events {
-		switch event.Phase {
-		case "completed", "failed", "green", "refused", "escalated":
-			return event.Phase, event.Cursor
-		}
-	}
-	return "", 0
-}
-
 // RecordRegisteredEvents advances the source-closed event cursor and latches
-// the first terminal effect event in one transaction.  Callers supply only an
-// already-validated agentd projection, never a terminal state of their own.
+// terminal effect events in one transaction. A distinct effect can enter the
+// projection only through its own active, authorized event. Callers supply
+// only an already-validated agentd projection, never a terminal state of their
+// own.
 func (s *AuthorityWorkerStore) RecordRegisteredEvents(ctx context.Context, principal, binding string, after, next int64, events []registeredEventProjection) error {
 	bindingDigest := s.requestDigest(binding)
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -155,6 +153,23 @@ func (s *AuthorityWorkerStore) RecordRegisteredEvents(ctx context.Context, princ
 		return err
 	}
 	defer rollbackAuthorityTx(tx)
+	var sessionID, turnID, admissionDigest, canonical string
+	if err = tx.QueryRowContext(ctx, `SELECT rt.session_id,rt.turn_id,a.admission_task_digest,a.canonical_task_json
+		FROM authority_registered_turns rt JOIN authority_registered_admissions a ON a.principal=rt.principal AND a.binding_digest=rt.binding_digest
+		WHERE rt.principal=? AND rt.binding_digest=?`, principal, bindingDigest).Scan(&sessionID, &turnID, &admissionDigest, &canonical); err != nil {
+		return fmt.Errorf("registered event custody is missing: %w", err)
+	}
+	var admissionWire struct {
+		Task RegisteredTask `json:"registered_task"`
+	}
+	if err = json.Unmarshal([]byte(canonical), &admissionWire); err != nil {
+		return fmt.Errorf("registered event admission is corrupt: %w", err)
+	}
+	for _, event := range events {
+		if event.SessionID != sessionID || event.TurnID != turnID || event.AdmissionTaskDigest != admissionDigest || event.TaskEvidenceDigest != admissionWire.Task.TaskEvidenceDigest {
+			return fmt.Errorf("registered event admission mismatch")
+		}
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE authority_registered_turns SET events_after=?
 		WHERE principal=? AND binding_digest=? AND events_after=?`, next, principal, s.requestDigest(binding), after)
 	if err != nil {
@@ -164,14 +179,60 @@ func (s *AuthorityWorkerStore) RecordRegisteredEvents(ctx context.Context, princ
 	if err != nil || rows != 1 {
 		return fmt.Errorf("registered event cursor changed concurrently")
 	}
-	phase, cursor := registeredTerminalPhase(events)
-	if phase != "" {
-		if _, err = tx.ExecContext(ctx, `UPDATE authority_effect_custody SET terminal_phase=?,terminal_cursor=?
-			WHERE principal=? AND binding_digest=? AND model_effect_id=(SELECT model_effect_id FROM authority_registered_turns WHERE principal=? AND binding_digest=?) AND terminal_phase=''`, phase, cursor, principal, bindingDigest, principal, bindingDigest); err != nil {
+	for _, event := range events {
+		var known int
+		var custodySession, custodyWorker, custodyStorage string
+		var custodyFence int64
+		err = tx.QueryRowContext(ctx, `SELECT 1,session_id,worker_id,worker_storage_lineage_id,worker_fence_epoch FROM authority_effect_custody WHERE principal=? AND binding_digest=? AND model_effect_id=?`, principal, bindingDigest, event.ModelEffectID).Scan(&known, &custodySession, &custodyWorker, &custodyStorage, &custodyFence)
+		if errors.Is(err, sql.ErrNoRows) {
+			// agentd creates continuations with a new model effect identity. Bind
+			// that identity to the exact durable admission and active worker
+			// custody before allowing any receipt for it to be minted.
+			if event.Phase != "authorized" {
+				return fmt.Errorf("registered continuation effect is not authorized")
+			}
+			result, insertErr := tx.ExecContext(ctx, `INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id,session_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,authority_profile,authority_profile_version,policy_digest,registered_task_digest)
+				SELECT l.principal,l.binding_digest,?,rt.session_id,l.worker_id,w.worker_storage_lineage_id,w.worker_fence_epoch,l.profile,w.profile_version,w.policy_digest,a.admission_task_digest
+				FROM authority_session_leases l
+				JOIN authority_registered_turns rt ON rt.principal=l.principal AND rt.binding_digest=l.binding_digest
+				JOIN authority_registered_admissions a ON a.principal=l.principal AND a.binding_digest=l.binding_digest
+				JOIN authority_workers w ON w.worker_id=l.worker_id
+				WHERE l.principal=? AND l.binding_digest=? AND l.released_at='' AND rt.session_id=?
+				AND l.worker_id=? AND w.worker_storage_lineage_id=? AND w.worker_fence_epoch=?`, event.ModelEffectID, principal, bindingDigest, event.SessionID, event.WorkerID, event.StorageLineageID, event.FenceEpoch)
+			if insertErr != nil {
+				return insertErr
+			}
+			rows, rowsErr := result.RowsAffected()
+			if rowsErr != nil || rows != 1 {
+				return fmt.Errorf("registered continuation effect custody mismatch")
+			}
+		} else if err != nil {
 			return err
+		} else if custodySession != event.SessionID || custodyWorker != event.WorkerID || custodyStorage != event.StorageLineageID || custodyFence != event.FenceEpoch {
+			return fmt.Errorf("registered effect custody mismatch")
+		}
+		if registeredTerminalPhase(event.Phase) {
+			result, updateErr := tx.ExecContext(ctx, `UPDATE authority_effect_custody SET terminal_phase=?,terminal_cursor=?
+				WHERE principal=? AND binding_digest=? AND model_effect_id=? AND terminal_phase=''`, event.Phase, event.Cursor, principal, bindingDigest, event.ModelEffectID)
+			if updateErr != nil {
+				return updateErr
+			}
+			rows, rowsErr := result.RowsAffected()
+			if rowsErr != nil || rows != 1 {
+				return fmt.Errorf("registered effect is already terminal")
+			}
 		}
 	}
 	return tx.Commit()
+}
+
+func registeredTerminalPhase(phase string) bool {
+	switch phase {
+	case "completed", "failed", "green", "refused", "escalated":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *AuthorityWorkerStore) AcquireRegistered(ctx context.Context, principal string, r RegisteredAdmissionRequest, generation int64) (AuthorityLease, error) {

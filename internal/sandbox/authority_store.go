@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 15
+const authorityStoreSchemaVersion = 16
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -285,6 +285,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		if err := s.migrateV15(ctx); err != nil {
 			return err
 		}
+		version = 15
+	}
+	if version == 15 {
+		if err := s.migrateV16(ctx); err != nil {
+			return err
+		}
 	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
@@ -307,6 +313,31 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// V16 binds every effect custody row to the immutable admission and active
+// worker coordinates selected by the broker. Continuation effects are added
+// only by the transaction that validates their authorized agentd event.
+func (s *AuthorityWorkerStore) migrateV16(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE authority_effect_custody ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN worker_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN worker_storage_lineage_id TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN worker_fence_epoch INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE authority_effect_custody ADD COLUMN authority_profile TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN authority_profile_version TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN policy_digest TEXT NOT NULL DEFAULT '';
+	ALTER TABLE authority_effect_custody ADD COLUMN registered_task_digest TEXT NOT NULL DEFAULT '';
+	UPDATE authority_effect_custody AS e SET
+		session_id=(SELECT rt.session_id FROM authority_registered_turns rt WHERE rt.principal=e.principal AND rt.binding_digest=e.binding_digest),
+		worker_id=(SELECT l.worker_id FROM authority_session_leases l WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		worker_storage_lineage_id=(SELECT w.worker_storage_lineage_id FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		worker_fence_epoch=(SELECT w.worker_fence_epoch FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		authority_profile=(SELECT l.profile FROM authority_session_leases l WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		authority_profile_version=(SELECT w.profile_version FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		policy_digest=(SELECT w.policy_digest FROM authority_session_leases l JOIN authority_workers w ON w.worker_id=l.worker_id WHERE l.principal=e.principal AND l.binding_digest=e.binding_digest),
+		registered_task_digest=(SELECT a.admission_task_digest FROM authority_registered_admissions a WHERE a.principal=e.principal AND a.binding_digest=e.binding_digest);
+	PRAGMA user_version=16`)
+	return err
 }
 
 // V15 is the broker's authoritative custody projection for a registered

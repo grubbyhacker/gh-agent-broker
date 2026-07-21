@@ -385,7 +385,10 @@ func validateRegisteredEventsResponse(result json.RawMessage, turn registeredTur
 	}
 	previous := after
 	for _, event := range response.Events {
-		if event.Cursor <= previous || event.SessionID != turn.SessionID || event.TurnID != turn.TurnID || event.ModelEffectID != turn.ModelEffectID || event.Attempt < 0 || !registeredOpaqueID.MatchString(event.WorkerID) || event.StorageLineageID == "" || len(event.StorageLineageID) > 128 || event.FenceEpoch < 0 || event.AdmissionTaskDigest != admissionDigest || event.TaskEvidenceDigest != taskEvidenceDigest || !validRegisteredEventPhaseFailureVerifier(event, contractDigest, taskEvidenceDigest) {
+		// The root turn identity never changes, but agentd gives each authorized
+		// continuation a distinct model effect identity. Durable projection
+		// verifies that identity and its worker custody atomically.
+		if event.Cursor <= previous || event.SessionID != turn.SessionID || event.TurnID != turn.TurnID || !registeredOpaqueID.MatchString(event.ModelEffectID) || event.Attempt < 0 || !registeredOpaqueID.MatchString(event.WorkerID) || event.StorageLineageID == "" || len(event.StorageLineageID) > 128 || event.FenceEpoch < 0 || event.AdmissionTaskDigest != admissionDigest || event.TaskEvidenceDigest != taskEvidenceDigest || !validRegisteredEventPhaseFailureVerifier(event, contractDigest, taskEvidenceDigest) {
 			return registeredEventsResponse{}, fmt.Errorf("agentd returned invalid registered event stream")
 		}
 		previous = event.Cursor

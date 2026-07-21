@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -174,6 +175,9 @@ func TestRegisteredCoordinatorAgentdV2Contract(t *testing.T) {
 		t.Fatal(err)
 	}
 	queued := `{"version":"agentd/registered-events/v2","events":[{"cursor":1,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":0,"phase":"queued","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + admissionRequest.AdmissionTaskDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `"},{"cursor":2,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":0,"phase":"green","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + admissionRequest.AdmissionTaskDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `","verifier":{"phase":"green","outcome":"satisfied","contractDigest":"` + githubGreenPRContractDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `","headRevision":"broker:head:turn-42","reasons":[],"evidenceRefs":["broker:observation:turn-42"]}}],"nextCursor":2}`
+	queued = strings.ReplaceAll(queued, "worker-42", worker.WorkerID)
+	queued = strings.ReplaceAll(queued, "lineage-42", worker.WorkerStorageLineageID)
+	queued = strings.ReplaceAll(queued, `"fenceEpoch":7`, `"fenceEpoch":`+strconv.FormatInt(worker.WorkerFenceEpoch, 10))
 	runtime.statuses = []int{http.StatusAccepted, http.StatusOK, http.StatusOK, http.StatusOK}
 	runtime.responses = []json.RawMessage{
 		[]byte(`{"version":"agentd/registered-turn/v2","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued","cursor":1}`),
