@@ -1,0 +1,41 @@
+{
+  "request": {
+    "version": "agentd/registered-lifecycle/v1",
+    "idempotencyKey": "turn-42",
+    "taskKind": "github_green_pr_v1",
+    "admissionTaskDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "taskEvidenceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "parameters": {
+      "repository": "grubbyhacker/repository-worker-lifecycle-test",
+      "baseBranch": "main",
+      "branchRef": "agent/fleiglabs-repo-agent/turn-42"
+    }
+  },
+  "response": {
+    "version": "agentd/registered-turn/v2",
+    "sessionId": "session-42",
+    "turnId": "turn:turn-42",
+    "modelEffectId": "model:turn-42",
+    "phase": "queued",
+    "cursor": 1
+  },
+  "events": {
+    "version": "agentd/registered-events/v2",
+    "events": [
+      {
+        "cursor": 1,
+        "sessionId": "session-42",
+        "turnId": "turn:turn-42",
+        "modelEffectId": "model:turn-42",
+        "attempt": 0,
+        "phase": "queued",
+        "workerId": "worker-42",
+        "storageLineageId": "lineage-42",
+        "fenceEpoch": 7,
+        "admissionTaskDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "taskEvidenceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ],
+    "nextCursor": 1
+  }
+}

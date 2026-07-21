@@ -60,14 +60,18 @@ It therefore cannot validate the mandated receipt or implement per-request
 effect-token binding without fabricating a second authority ledger. Preserve
 this failure state until the matching agentd receipt contract is available.
 
-The broker-to-agentd registered submit payload now includes only durable,
-broker-derived values: `admissionTaskDigest` and `registeredTaskSource` are
-sent alongside the existing task kind/evidence digest/parameters. Registered
-create remains on its existing body contract. The required agentd submit wire is
-`agentd/registered-lifecycle/v1` with `idempotencyKey`, `taskKind`,
-`taskEvidenceDigest`, `admissionTaskDigest`, `registeredTaskSource`, and
-`parameters`; it must return promptly after durable acceptance rather than wait
-for model completion.
+The broker-to-agentd registered turn seam now matches agentd PR #18 head
+`c64cf3efee1ebe3b439a7211f235a0458b8ab446`. Registered submit sends only the
+strict `agentd/registered-lifecycle/v1` body: `idempotencyKey`, `taskKind`,
+`admissionTaskDigest`, `taskEvidenceDigest`, and `parameters`. It accepts only
+HTTP 202 with strict `agentd/registered-turn/v2` queued acknowledgement and
+requires `modelEffectId == model:<idempotencyKey>`. The broker persists that
+mapping and its events cursor, so replay returns the recorded acknowledgement
+without another submission. Events use only strict
+`agentd/registered-events/v2` typed projections and advance the durable cursor
+only after source-schema validation; verifier projections are source facts from
+agentd's background flow, never broker-invented facts. The source fixture is
+vendored unchanged at `testdata/agentd/registered-turn-v2.golden.json`.
 
 ### Authority agentd green-PR observation seam
 

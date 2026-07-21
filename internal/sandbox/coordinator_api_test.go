@@ -43,7 +43,7 @@ func TestRegisteredCoordinatorAgentdRequestUsesRegisteredRoutes(t *testing.T) {
 		request         CoordinatorSessionRequest
 	}{
 		{"submit", "/v1/registered-sessions/session-1/turns", CoordinatorSessionRequest{SessionBinding: "binding", IdempotencyKey: "key"}},
-		{"events", "/v1/registered-sessions/session-1/events?version=agentd%2Fregistered-lifecycle%2Fv1&after=7", CoordinatorSessionRequest{SessionBinding: "binding", After: 7}},
+		{"events", "/v1/registered-sessions/session-1/events?version=agentd%2Fregistered-events%2Fv2&after=7", CoordinatorSessionRequest{SessionBinding: "binding", After: 7}},
 		{"checkpoint", "/v1/registered-sessions/session-1/checkpoint", CoordinatorSessionRequest{SessionBinding: "binding", CheckpointRef: "checkpoint-1"}},
 		{"cancel", "/v1/registered-sessions/session-1/cancel", CoordinatorSessionRequest{SessionBinding: "binding", IdempotencyKey: "key"}},
 		{"status", "/v1/registered-sessions/session-1/status?version=agentd%2Fregistered-lifecycle%2Fv1", CoordinatorSessionRequest{SessionBinding: "binding"}},
@@ -56,7 +56,7 @@ func TestRegisteredCoordinatorAgentdRequestUsesRegisteredRoutes(t *testing.T) {
 			if path != test.path {
 				t.Fatalf("path=%s", path)
 			}
-			if test.operation == "submit" && (method != http.MethodPost || bytes.Contains(body, []byte("prompt")) || !bytes.Contains(body, []byte(admission.Task.Parameters.BranchRef)) || !bytes.Contains(body, []byte(admission.Digest)) || !bytes.Contains(body, []byte(admission.Source.WorkItemID)) || !bytes.Contains(body, []byte(admission.Source.RouteSnapshotID))) {
+			if test.operation == "submit" && (method != http.MethodPost || bytes.Contains(body, []byte("prompt")) || bytes.Contains(body, []byte("registeredTaskSource")) || !bytes.Contains(body, []byte(admission.Task.Parameters.BranchRef)) || !bytes.Contains(body, []byte(admission.Digest))) {
 				t.Fatalf("body=%s", body)
 			}
 			if test.operation == "checkpoint" || test.operation == "cancel" {

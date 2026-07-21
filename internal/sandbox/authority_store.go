@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 13
+const authorityStoreSchemaVersion = 14
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -273,6 +273,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		if err := s.migrateV13(ctx); err != nil {
 			return err
 		}
+		version = 13
+	}
+	if version == 13 {
+		if err := s.migrateV14(ctx); err != nil {
+			return err
+		}
 	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
@@ -295,6 +301,21 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// V14 persists the source-closed registered turn identity and its event
+// cursor. It prevents a recovered coordinator from resubmitting accepted work
+// and makes each event poll resume from the last broker-acknowledged cursor.
+func (s *AuthorityWorkerStore) migrateV14(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE authority_registered_turns (
+		principal TEXT NOT NULL, binding_digest TEXT NOT NULL,
+		idempotency_digest TEXT NOT NULL, session_id TEXT NOT NULL,
+		turn_id TEXT NOT NULL, model_effect_id TEXT NOT NULL,
+		submit_cursor INTEGER NOT NULL, events_after INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(principal,binding_digest),
+		FOREIGN KEY(principal,binding_digest) REFERENCES authority_registered_admissions(principal,binding_digest)
+	) STRICT; PRAGMA user_version=14`)
+	return err
 }
 
 // V13 records every immutable coordinate selected by an effect receipt.  It
