@@ -163,7 +163,7 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 		if validateErr != nil {
 			return CoordinatorSessionResponse{}, validateErr
 		}
-		if err := s.store.AdvanceRegisteredTurnCursor(ctx, principal, request.SessionBinding, request.After, events.NextCursor); err != nil {
+		if err := s.store.RecordRegisteredEvents(ctx, principal, request.SessionBinding, request.After, events.NextCursor, events.Events); err != nil {
 			return CoordinatorSessionResponse{}, err
 		}
 	}

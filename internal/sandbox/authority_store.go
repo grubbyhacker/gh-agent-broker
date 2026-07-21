@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 14
+const authorityStoreSchemaVersion = 15
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -279,6 +279,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		if err := s.migrateV14(ctx); err != nil {
 			return err
 		}
+		version = 14
+	}
+	if version == 14 {
+		if err := s.migrateV15(ctx); err != nil {
+			return err
+		}
 	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
@@ -301,6 +307,23 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// V15 is the broker's authoritative custody projection for a registered
+// effect. Terminal state arrives only from a validated agentd event stream;
+// credential authentication reads this row in the same SQLite snapshot as the
+// remaining lease and worker custody checks.
+func (s *AuthorityWorkerStore) migrateV15(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE authority_effect_custody (
+		principal TEXT NOT NULL, binding_digest TEXT NOT NULL, model_effect_id TEXT NOT NULL,
+		terminal_phase TEXT NOT NULL DEFAULT '', terminal_cursor INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(principal,binding_digest,model_effect_id),
+		FOREIGN KEY(principal,binding_digest) REFERENCES authority_registered_turns(principal,binding_digest)
+	) STRICT;
+	INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id)
+		SELECT principal,binding_digest,model_effect_id FROM authority_registered_turns;
+	PRAGMA user_version=15`)
+	return err
 }
 
 // V14 persists the source-closed registered turn identity and its event

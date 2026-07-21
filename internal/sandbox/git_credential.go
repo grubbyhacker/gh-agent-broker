@@ -126,6 +126,10 @@ func (s *AuthorityWorkerService) MintGitCredential(ctx context.Context, control 
 	if json.Unmarshal([]byte(canonical), &wire) != nil || wire.Task.Parameters.Repository == "" {
 		return GitCredential{}, fmt.Errorf("credential admission corrupt")
 	}
+	var terminalPhase string
+	if err = conn.QueryRowContext(ctx, `SELECT terminal_phase FROM authority_effect_custody WHERE principal=? AND binding_digest=? AND model_effect_id=?`, principal, binding, r.ModelEffectID).Scan(&terminalPhase); err != nil || terminalPhase != "" {
+		return GitCredential{}, fmt.Errorf("credential effect is terminal or missing")
+	}
 	var existingRaw, agentID, fp string
 	var expiry int64
 	err = conn.QueryRowContext(ctx, `SELECT receipt_json,agent_id,secret_fingerprint,expires_at_ms FROM authority_git_credentials WHERE principal=? AND binding_digest=? AND model_effect_id=?`, principal, binding, r.ModelEffectID).Scan(&existingRaw, &agentID, &fp, &expiry)
@@ -266,7 +270,7 @@ func (s *AuthorityWorkerStore) AuthenticateGitCredential(ctx context.Context, ag
 	}
 	var out GitCredentialAuthority
 	var fp, revoked string
-	err := s.db.QueryRowContext(ctx, `SELECT c.agent_id,c.repository,c.principal,c.expires_at_ms,c.secret_fingerprint,c.revoked_at FROM authority_git_credentials c JOIN authority_session_leases l ON l.principal=c.principal AND l.binding_digest=c.binding_digest AND l.worker_id=c.worker_id AND l.profile=c.authority_profile AND l.released_at='' JOIN authority_workers w ON w.worker_id=c.worker_id AND w.worker_storage_lineage_id=c.worker_storage_lineage_id AND w.worker_fence_epoch=c.worker_fence_epoch AND w.profile_version=c.authority_profile_version AND w.state=? JOIN authority_session_workspaces ws ON ws.binding_digest=c.binding_digest AND ws.worker_id=c.worker_id AND ws.agentd_session_id=c.session_id JOIN authority_registered_admissions a ON a.principal=c.principal AND a.binding_digest=c.binding_digest AND a.admission_task_digest=c.registered_task_digest WHERE c.agent_id=?`, AuthorityWorkerReady, agentID).Scan(&out.AgentID, &out.Repository, &out.Principal, &out.ExpiresAt, &fp, &revoked)
+	err := s.db.QueryRowContext(ctx, `SELECT c.agent_id,c.repository,c.principal,c.expires_at_ms,c.secret_fingerprint,c.revoked_at FROM authority_git_credentials c JOIN authority_effect_custody e ON e.principal=c.principal AND e.binding_digest=c.binding_digest AND e.model_effect_id=c.model_effect_id AND e.terminal_phase='' JOIN authority_session_leases l ON l.principal=c.principal AND l.binding_digest=c.binding_digest AND l.worker_id=c.worker_id AND l.profile=c.authority_profile AND l.released_at='' JOIN authority_workers w ON w.worker_id=c.worker_id AND w.worker_storage_lineage_id=c.worker_storage_lineage_id AND w.worker_fence_epoch=c.worker_fence_epoch AND w.profile_version=c.authority_profile_version AND w.state=? JOIN authority_session_workspaces ws ON ws.binding_digest=c.binding_digest AND ws.worker_id=c.worker_id AND ws.agentd_session_id=c.session_id JOIN authority_registered_admissions a ON a.principal=c.principal AND a.binding_digest=c.binding_digest AND a.admission_task_digest=c.registered_task_digest WHERE c.agent_id=?`, AuthorityWorkerReady, agentID).Scan(&out.AgentID, &out.Repository, &out.Principal, &out.ExpiresAt, &fp, &revoked)
 	if err == sql.ErrNoRows {
 		return GitCredentialAuthority{}, false, nil
 	}

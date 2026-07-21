@@ -120,16 +120,42 @@ func (s *AuthorityWorkerStore) RegisteredTurn(ctx context.Context, principal, bi
 func (s *AuthorityWorkerStore) RecordRegisteredTurn(ctx context.Context, principal, binding, idempotencyKey string, state registeredTurnState) error {
 	bindingDigest := s.requestDigest(binding)
 	idempotencyDigest := s.requestDigest(idempotencyKey)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO authority_registered_turns(principal,binding_digest,idempotency_digest,session_id,turn_id,model_effect_id,submit_cursor)
-		VALUES(?,?,?,?,?,?,?)`, principal, bindingDigest, idempotencyDigest, state.SessionID, state.TurnID, state.ModelEffectID, state.SubmitCursor)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return err
+	}
+	defer rollbackAuthorityTx(tx)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO authority_registered_turns(principal,binding_digest,idempotency_digest,session_id,turn_id,model_effect_id,submit_cursor)
+		VALUES(?,?,?,?,?,?,?)`, principal, bindingDigest, idempotencyDigest, state.SessionID, state.TurnID, state.ModelEffectID, state.SubmitCursor); err != nil {
 		return fmt.Errorf("record registered turn: %w", err)
 	}
-	return nil
+	if _, err = tx.ExecContext(ctx, `INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id) VALUES(?,?,?)`, principal, bindingDigest, state.ModelEffectID); err != nil {
+		return fmt.Errorf("record registered effect custody: %w", err)
+	}
+	return tx.Commit()
 }
 
-func (s *AuthorityWorkerStore) AdvanceRegisteredTurnCursor(ctx context.Context, principal, binding string, after, next int64) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE authority_registered_turns SET events_after=?
+func registeredTerminalPhase(events []registeredEventProjection) (string, int64) {
+	for _, event := range events {
+		switch event.Phase {
+		case "completed", "failed", "green", "refused", "escalated":
+			return event.Phase, event.Cursor
+		}
+	}
+	return "", 0
+}
+
+// RecordRegisteredEvents advances the source-closed event cursor and latches
+// the first terminal effect event in one transaction.  Callers supply only an
+// already-validated agentd projection, never a terminal state of their own.
+func (s *AuthorityWorkerStore) RecordRegisteredEvents(ctx context.Context, principal, binding string, after, next int64, events []registeredEventProjection) error {
+	bindingDigest := s.requestDigest(binding)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollbackAuthorityTx(tx)
+	result, err := tx.ExecContext(ctx, `UPDATE authority_registered_turns SET events_after=?
 		WHERE principal=? AND binding_digest=? AND events_after=?`, next, principal, s.requestDigest(binding), after)
 	if err != nil {
 		return err
@@ -138,7 +164,14 @@ func (s *AuthorityWorkerStore) AdvanceRegisteredTurnCursor(ctx context.Context, 
 	if err != nil || rows != 1 {
 		return fmt.Errorf("registered event cursor changed concurrently")
 	}
-	return nil
+	phase, cursor := registeredTerminalPhase(events)
+	if phase != "" {
+		if _, err = tx.ExecContext(ctx, `UPDATE authority_effect_custody SET terminal_phase=?,terminal_cursor=?
+			WHERE principal=? AND binding_digest=? AND model_effect_id=(SELECT model_effect_id FROM authority_registered_turns WHERE principal=? AND binding_digest=?) AND terminal_phase=''`, phase, cursor, principal, bindingDigest, principal, bindingDigest); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *AuthorityWorkerStore) AcquireRegistered(ctx context.Context, principal string, r RegisteredAdmissionRequest, generation int64) (AuthorityLease, error) {

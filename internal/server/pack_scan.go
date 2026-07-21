@@ -32,8 +32,8 @@ type packedObject struct {
 }
 
 // scanReceivePack parses the pkt-line command prefix and a complete SHA-1 pack
-// stream. It scans only resolved commit and blob payloads, never compressed
-// transport bytes. Unsupported/thin/corrupt packs are rejected by returning an
+// stream. It scans resolved semantic payloads (commits, blobs, annotated tags,
+// and tree entry names), never compressed transport bytes. Unsupported/thin/corrupt packs are rejected by returning an
 // error so callers fail closed before forwarding.
 func scanReceivePack(body []byte) (*securityscan.Finding, error) {
 	prefix, _, err := readReceivePackCommandPrefix(bytes.NewReader(body))
@@ -111,17 +111,98 @@ func scanReceivePack(body []byte) (*securityscan.Finding, error) {
 		if e != nil {
 			return nil, e
 		}
-		if typ == 1 || typ == 3 {
-			field := "pack_commit"
-			if typ == 3 {
-				field = "pack_blob"
-			}
-			if finding := securityscan.Reader(field, bytes.NewReader(data), int64(maxPackObjectSize)); finding != nil {
-				return finding, nil
-			}
+		if finding, scanErr := scanPackSemanticObject(typ, data); scanErr != nil {
+			return nil, scanErr
+		} else if finding != nil {
+			return finding, nil
 		}
 	}
 	return nil, nil //nolint:nilnil // A nil finding is the successful scan result.
+}
+
+func scanPackSemanticObject(typ byte, data []byte) (*securityscan.Finding, error) {
+	switch typ {
+	case 1:
+		return securityscan.Reader("pack_commit", bytes.NewReader(data), int64(maxPackObjectSize)), nil
+	case 2:
+		return scanPackTree(data)
+	case 3:
+		return securityscan.Reader("pack_blob", bytes.NewReader(data), int64(maxPackObjectSize)), nil
+	case 4:
+		if err := validateAnnotatedTag(data); err != nil {
+			return nil, err
+		}
+		return securityscan.Reader("pack_tag", bytes.NewReader(data), int64(maxPackObjectSize)), nil
+	default:
+		return nil, errors.New("unsupported resolved pack object type")
+	}
+}
+
+func scanPackTree(data []byte) (*securityscan.Finding, error) {
+	for pos := 0; pos < len(data); {
+		space := bytes.IndexByte(data[pos:], ' ')
+		if space <= 0 {
+			return nil, errors.New("malformed tree mode")
+		}
+		mode := data[pos : pos+space]
+		if !validTreeMode(mode) {
+			return nil, errors.New("malformed tree mode")
+		}
+		pos += space + 1
+		nul := bytes.IndexByte(data[pos:], 0)
+		if nul <= 0 {
+			return nil, errors.New("malformed tree name")
+		}
+		name := data[pos : pos+nul]
+		if bytes.IndexByte(name, '/') >= 0 {
+			return nil, errors.New("malformed tree name")
+		}
+		if finding := securityscan.Reader("pack_tree_entry_name", bytes.NewReader(name), int64(len(name))); finding != nil {
+			return finding, nil
+		}
+		pos += nul + 1
+		if len(data)-pos < sha1.Size {
+			return nil, errors.New("truncated tree object id")
+		}
+		pos += sha1.Size
+	}
+	return nil, nil //nolint:nilnil // A nil finding is the successful scan result.
+}
+
+func validTreeMode(mode []byte) bool {
+	switch string(mode) {
+	case "40000", "100644", "100755", "120000", "160000":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateAnnotatedTag(data []byte) error {
+	separator := bytes.Index(data, []byte("\n\n"))
+	if separator < 0 {
+		return errors.New("malformed annotated tag")
+	}
+	headers := bytes.Split(data[:separator], []byte("\n"))
+	if len(headers) != 4 || !bytes.HasPrefix(headers[0], []byte("object ")) {
+		return errors.New("malformed annotated tag")
+	}
+	if len(headers[0]) != len("object ")+40 || !bytes.HasPrefix(headers[1], []byte("type ")) || !bytes.HasPrefix(headers[2], []byte("tag ")) || !bytes.HasPrefix(headers[3], []byte("tagger ")) {
+		return errors.New("malformed annotated tag")
+	}
+	for _, b := range headers[0][len("object "):] {
+		if (b < '0' || b > '9') && (b < 'a' || b > 'f') {
+			return errors.New("malformed annotated tag")
+		}
+	}
+	if len(headers[1]) == len("type ") || !validTagTargetType(headers[1][len("type "):]) || len(headers[2]) == len("tag ") || len(headers[3]) == len("tagger ") {
+		return errors.New("malformed annotated tag")
+	}
+	return nil
+}
+
+func validTagTargetType(value []byte) bool {
+	return bytes.Equal(value, []byte("commit")) || bytes.Equal(value, []byte("tree")) || bytes.Equal(value, []byte("blob")) || bytes.Equal(value, []byte("tag"))
 }
 
 func readPackObjectHeader(b []byte) (byte, int64, int, error) {
