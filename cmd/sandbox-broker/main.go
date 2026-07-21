@@ -86,18 +86,28 @@ func runServerCommand(args []string) {
 			log.Printf("close audit log: %v", err)
 		}
 	}()
-	intentStore, err := sandbox.OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
-	if err != nil {
-		log.Fatalf("open durable launch intent store: %v", err)
-	}
-	defer func() {
-		if err := intentStore.Close(); err != nil {
-			log.Printf("close durable launch intent store: %v", err)
+	var legacyMCPHandler http.Handler
+	var legacyRESTHandler http.Handler
+	if !cfg.AuthorityOnly {
+		intentStore, openErr := sandbox.OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+		if openErr != nil {
+			log.Fatalf("open durable launch intent store: %v", openErr)
 		}
-	}()
-	service := sandbox.NewServiceWithLaunchIntents(cfg, sandbox.NewDockerBackend(*dockerSocket), auditLog, intentStore)
-	if err := service.Reconcile(context.Background()); err != nil {
-		log.Fatalf("reconcile runs: %v", err)
+		defer func() {
+			if closeErr := intentStore.Close(); closeErr != nil {
+				log.Printf("close durable launch intent store: %v", closeErr)
+			}
+		}()
+		service := sandbox.NewServiceWithLaunchIntents(cfg, sandbox.NewDockerBackend(*dockerSocket), auditLog, intentStore)
+		if reconcileErr := service.Reconcile(context.Background()); reconcileErr != nil {
+			log.Fatalf("reconcile runs: %v", reconcileErr)
+		}
+		mcpServer := mcp.NewServer(&mcp.Implementation{Name: "gh-agent-sandbox-broker", Version: "v1"}, nil)
+		registerTools(mcpServer, service)
+		legacyMCPHandler = tokenAuth(cfg.AuthToken, mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
+			return mcpServer
+		}, &mcp.StreamableHTTPOptions{Stateless: true}))
+		legacyRESTHandler = sandbox.NewRESTHandler(service)
 	}
 	var authorityHandler http.Handler
 	var authorityStore *sandbox.AuthorityWorkerStore
@@ -131,35 +141,13 @@ func runServerCommand(args []string) {
 		authorityHandler = sandbox.NewAuthorityRESTHandler(authorityService)
 	}
 
-	mcpServer := mcp.NewServer(&mcp.Implementation{Name: "gh-agent-sandbox-broker", Version: "v1"}, nil)
-	registerTools(mcpServer, service)
+	mux := newServerMux(cfg, legacyMCPHandler, legacyRESTHandler, authorityHandler)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(map[string]any{
-			"status":           "ok",
-			"config_loaded_at": cfg.ConfigLoadedAt,
-			"config_version":   cfg.ConfigVersion,
-		}); err != nil {
-			return
-		}
-	})
-	mux.Handle(cfg.MCPPath, tokenAuth(cfg.AuthToken, mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
-		return mcpServer
-	}, &mcp.StreamableHTTPOptions{Stateless: true})))
-	mux.Handle("/v1/", sandbox.NewRESTHandler(service))
-	if authorityHandler != nil {
-		mux.Handle("/v1/authority-workers", authorityHandler)
-		mux.Handle("/v1/authority-workers/", authorityHandler)
+	mode := "legacy-and-authority"
+	if cfg.AuthorityOnly {
+		mode = "authority-only"
 	}
-
-	log.Printf("sandbox broker listening on %s, mcp path %s", cfg.Listen, cfg.MCPPath)
+	log.Printf("sandbox broker listening on %s in %s mode", cfg.Listen, mode)
 	httpServer := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           mux,
@@ -171,6 +159,35 @@ func runServerCommand(args []string) {
 	if err := httpServer.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func newServerMux(cfg sandbox.Config, legacyMCPHandler, legacyRESTHandler, authorityHandler http.Handler) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"status":           "ok",
+			"authority_only":   cfg.AuthorityOnly,
+			"config_loaded_at": cfg.ConfigLoadedAt,
+			"config_version":   cfg.ConfigVersion,
+		}); err != nil {
+			return
+		}
+	})
+	if !cfg.AuthorityOnly {
+		mux.Handle(cfg.MCPPath, legacyMCPHandler)
+		mux.Handle("/v1/", legacyRESTHandler)
+	}
+	if authorityHandler != nil {
+		mux.Handle("/v1/authority-workers", authorityHandler)
+		mux.Handle("/v1/authority-workers/", authorityHandler)
+	}
+	return mux
 }
 
 type pruneCommand struct {

@@ -44,6 +44,62 @@ func TestConfigVersionIncludesOnlyNonemptySourceVolume(t *testing.T) {
 	}
 }
 
+func TestAuthorityOnlyConfigAcceptsOnlyAuthoritySurface(t *testing.T) {
+	cfg := authorityTestConfig(t)
+	cfg.AuthorityOnly = true
+	cfg.AuthToken = ""
+	cfg.AuthTokenEnv = ""
+	cfg.Bundles = nil
+	cfg.Templates = nil
+	cfg.LaunchProfiles = nil
+	cfg.OperatorPrincipals = nil
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestAuthorityOnlyConfigRejectsLegacyInputs(t *testing.T) {
+	tests := map[string]func(*Config){
+		"auth token":         func(cfg *Config) { cfg.AuthToken = "legacy" },
+		"auth token env":     func(cfg *Config) { cfg.AuthTokenEnv = "LEGACY_TOKEN" },
+		"credential bundles": func(cfg *Config) { cfg.Bundles = map[string]CredentialBundle{"legacy": {}} },
+		"templates":          func(cfg *Config) { cfg.Templates = map[string]Template{"legacy": {}} },
+		"launch profiles":    func(cfg *Config) { cfg.LaunchProfiles = map[string]LaunchProfile{"legacy": {}} },
+		"operator principals": func(cfg *Config) {
+			cfg.OperatorPrincipals = map[string]OperatorPrincipal{"legacy": {}}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := authorityTestConfig(t)
+			cfg.AuthorityOnly = true
+			cfg.AuthToken = ""
+			cfg.AuthTokenEnv = ""
+			cfg.Bundles = nil
+			cfg.Templates = nil
+			cfg.LaunchProfiles = nil
+			cfg.OperatorPrincipals = nil
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "authority_only forbids") {
+				t.Fatalf("Validate() error = %v, want authority_only rejection", err)
+			}
+		})
+	}
+}
+
+func TestAuthorityOnlyConfigRequiresRegisteredAuthority(t *testing.T) {
+	cfg := authorityTestConfig(t)
+	cfg.AuthorityOnly = true
+	cfg.AuthToken = ""
+	cfg.Bundles = nil
+	cfg.Templates = nil
+	cfg.RegisteredCoordinatorPrincipal = "missing"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must name an authority_principal") {
+		t.Fatalf("Validate() error = %v, want registered principal rejection", err)
+	}
+}
+
 func TestConfigValidateRejectsUnsafeSettings(t *testing.T) {
 	cfg := baseTestConfig(t)
 	cfg.Production = true
