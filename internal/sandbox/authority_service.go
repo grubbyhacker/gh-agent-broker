@@ -94,9 +94,13 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if err != nil {
 		return nil, err
 	}
-	token := strings.TrimSpace(os.Getenv(profile.CoordinatorTokenEnv))
-	if token == "" {
-		return nil, fmt.Errorf("authority worker coordinator credential is unavailable")
+	worker, err := s.store.GetWorker(ctx, lease.WorkerID)
+	if err != nil {
+		return nil, err
+	}
+	transport, ok := s.runtime.(AuthorityAgentdSessionTransport)
+	if !ok {
+		return nil, fmt.Errorf("agentd session transport is unavailable")
 	}
 	derivedSessionID := "agentd-" + lease.SessionLineageID
 	var createPayload any = agentdCreateSessionRequest{Version: "agentd/v1", CoordinatorBinding: binding, AuthorityBinding: lease.Profile, WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}}
@@ -111,25 +115,16 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	if isRegistered {
 		path = "/v1/registered-sessions"
 	}
-	url := "http://sandbox-authority-" + lease.WorkerID + ":8080" + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
 	var encoded json.RawMessage
 	err = s.store.IssueAgentdSession(ctx, binding, lease.Profile, profile.IssuanceGeneration, func() (string, error) {
-		resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+		statusCode, result, err := transport.AgentdSessionRequest(ctx, worker, http.MethodPost, path, payload)
 		if err != nil {
 			return "", fmt.Errorf("agentd session create: %w", err)
 		}
-		//nolint:errcheck // The response is decoded before return; a close error cannot alter admission state.
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusCreated {
+		if statusCode != http.StatusCreated {
 			return "", fmt.Errorf("agentd session create rejected")
 		}
-		status, err := decodeAgentdSessionStatus(resp.Body)
+		status, err := decodeAgentdSessionStatus(bytes.NewReader(result))
 		if err != nil {
 			return "", fmt.Errorf("agentd session create returned an invalid status")
 		}
@@ -254,15 +249,16 @@ type AgentdSessionValidation struct {
 }
 
 type AuthorityWorkerService struct {
-	cfg          Config
-	store        *AuthorityWorkerStore
-	runtime      AuthorityWorkerRuntime
-	audit        *AuditLogger
-	now          func() time.Time
-	newID        func() (string, error)
-	checkpoints  *CheckpointStore
-	issuance     AuthorityIssuanceGuard
-	retirementMu sync.Mutex
+	cfg              Config
+	store            *AuthorityWorkerStore
+	runtime          AuthorityWorkerRuntime
+	audit            *AuditLogger
+	now              func() time.Time
+	newID            func() (string, error)
+	checkpoints      *CheckpointStore
+	issuance         AuthorityIssuanceGuard
+	retirementMu     sync.Mutex
+	registeredTurnMu sync.Mutex
 }
 
 type AuthorityIssuanceGuard interface {

@@ -11,12 +11,14 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 type coordinatorTestRuntime struct {
 	*fakeAuthorityRuntime
+	mu        sync.Mutex
 	worker    AuthorityWorker
 	method    string
 	path      string
@@ -29,6 +31,8 @@ type coordinatorTestRuntime struct {
 }
 
 func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker AuthorityWorker, method, path string, body json.RawMessage) (int, json.RawMessage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.worker, r.method, r.path, r.body = worker, method, path, bytes.Clone(body)
 	r.calls++
 	if len(r.responses) >= r.calls {
@@ -47,6 +51,88 @@ func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker 
 		return status, bytes.Clone(r.result), nil
 	}
 	return http.StatusAccepted, json.RawMessage(`{"sessionId":"` + sessionID + `","turnId":"turn-1","phase":"queued"}`), nil
+}
+
+func TestRegisteredTurnEndpointCreatesOnceAndConvergesConcurrentReplay(t *testing.T) {
+	ctx := context.Background()
+	cfg := authorityTestConfig(t)
+	profile := cfg.AuthorityProfiles["writer"]
+	profile.SessionIsolation.WorkspaceRoot = t.TempDir()
+	profile.SessionIsolation.UIDStart, profile.SessionIsolation.GIDStart = os.Getuid(), os.Getgid()
+	cfg.AuthorityProfiles["writer"] = profile
+	store := openAuthorityTestStore(t, cfg.AuthorityStore)
+	runtime := &coordinatorTestRuntime{fakeAuthorityRuntime: &fakeAuthorityRuntime{}}
+	service := NewAuthorityWorkerService(cfg, store, runtime, nil, allowTestAuthorityIssuance{})
+	service.newID = func() (string, error) { return "registered-endpoint-worker", nil }
+	worker, err := service.Provision(ctx, "coordinator", "writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.SetHealth(ctx, "coordinator", worker.WorkerID, "ready", true); err != nil {
+		t.Fatal(err)
+	}
+	admission := registeredRequest(t, "endpoint-work", "endpoint-route")
+	admitted, err := service.AcquireRegisteredSession(ctx, "coordinator", admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := admitted.Lease
+	workspace, err := store.SessionWorkspace(ctx, admission.SessionBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := "agentd-" + lease.SessionLineageID
+	submitKey := "agentd:registered-turn:v1:" + admission.Source.WorkItemID
+	created, err := marshalAgentdSessionStatus(agentdSessionStatus{
+		Version: agentdSessionProtocolVersion, SessionID: sessionID, CoordinatorBinding: admission.SessionBinding,
+		AuthorityBinding: lease.Profile, WorkerID: worker.WorkerID, StorageLineageID: worker.WorkerStorageLineageID,
+		FenceEpoch: worker.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID,
+		Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID},
+		Phase:     "active", TurnIDs: []string{}, NextCursor: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.statuses = []int{http.StatusCreated, http.StatusAccepted}
+	runtime.responses = []json.RawMessage{
+		created,
+		[]byte(`{"version":"agentd/registered-turn/v2","sessionId":"` + sessionID + `","turnId":"turn:` + submitKey + `","modelEffectId":"model:` + submitKey + `","phase":"queued","cursor":1}`),
+	}
+	body, err := json.Marshal(CoordinatorRegisteredTurnRequest{
+		Version: "agentd/registered-lifecycle/v1", SessionBinding: admission.SessionBinding,
+		IdempotencyKey: submitKey, TaskKind: admission.Task.TaskKind,
+		AdmissionTaskDigest: admission.AdmissionTaskDigest, TaskEvidenceDigest: admission.Task.TaskEvidenceDigest,
+		Parameters: admission.Task.Parameters,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewAuthorityRESTHandler(service)
+	responses := make([]*httptest.ResponseRecorder, 2)
+	var wg sync.WaitGroup
+	for i := range responses {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v1/registered-turn", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer coordinator-test-token")
+			responses[index] = httptest.NewRecorder()
+			handler.ServeHTTP(responses[index], req)
+		}(i)
+	}
+	wg.Wait()
+	for _, response := range responses {
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		var got CoordinatorRegisteredTurnResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil || got.SessionID != sessionID || got.TurnID != "turn:"+submitKey {
+			t.Fatalf("response=%+v err=%v", got, err)
+		}
+	}
+	if runtime.calls != 2 {
+		t.Fatalf("concurrent replay performed %d agentd calls, want one create and one submit", runtime.calls)
+	}
 }
 
 func TestCoordinatorV1SubmitIsBrokerMediated(t *testing.T) {

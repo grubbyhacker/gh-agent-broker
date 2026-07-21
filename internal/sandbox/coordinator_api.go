@@ -187,6 +187,10 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 		return CoordinatorSessionResponse{}, fmt.Errorf("agentd session transport is unavailable")
 	}
 	method, path, payload := coordinatorAgentdRequest(operation, workspace.AgentdSessionID, request)
+	if isRegistered && operation == "submit" {
+		s.registeredTurnMu.Lock()
+		defer s.registeredTurnMu.Unlock()
+	}
 	var registeredTurn registeredTurnState
 	if isRegistered {
 		if operation == "submit" {
