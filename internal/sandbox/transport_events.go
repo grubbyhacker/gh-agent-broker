@@ -102,7 +102,7 @@ func (o *TransportObserver) GreenPRAdmission(ctx context.Context, profile string
 	if err != nil || validated.CanonicalJSON != canonical {
 		return GreenPRTransportAdmission{}, fmt.Errorf("registered transport admission is invalid")
 	}
-	rows, err := o.store.db.QueryContext(ctx, `SELECT operation_id,ref_updates_json FROM repository_transport_events WHERE principal=? AND worker_id=? AND worker_storage_lineage_id=? AND worker_fence_epoch=? AND repository=? AND service='git-receive-pack' AND phase='completed' ORDER BY cursor DESC`, authority.Principal, authority.WorkerID, authority.WorkerStorageLineageID, authority.WorkerFenceEpoch, wire.Task.Parameters.RepositoryID)
+	rows, err := o.store.db.QueryContext(ctx, `SELECT operation_id,ref_updates_json FROM repository_transport_events WHERE principal=? AND worker_id=? AND worker_storage_lineage_id=? AND worker_fence_epoch=? AND repository=? AND service='git-receive-pack' AND phase='completed' ORDER BY cursor DESC`, authority.Principal, authority.WorkerID, authority.WorkerStorageLineageID, authority.WorkerFenceEpoch, wire.Task.Parameters.Repository)
 	if err != nil {
 		return GreenPRTransportAdmission{}, fmt.Errorf("read broker push operation: %w", err)
 	}

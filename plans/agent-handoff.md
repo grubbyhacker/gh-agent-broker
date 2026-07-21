@@ -12,11 +12,17 @@ The registered v2 admission now accepts only the settled
 caller completion facts. It derives the immutable task digest and exact pushed
 head from the active durable lease and completed broker smart-HTTP operation,
 then emits `github-green-pr-observation/v1` using authenticated App reads of
-the ready PR, active branch rules, and exact evaluation-SHA checks/statuses.
-Copied, forked, mismatched, stale, duplicate, or wrong-App-source observations
-refuse; absent rows remain pending, and only GitHub-accepted success/skipped/
-neutral conclusions satisfy. The endpoint stays staging-configured through the
-existing transport observation mapping; it does not activate production.
+the immutable target repository, ready PR, active branch rules, and complete
+paginated evaluation-SHA checks/statuses. It records the target repository
+database ID, node ID, and full name even for missing or draft PRs; a positive
+verdict requires the PR head repository to match all three identities exactly.
+Where GitHub exposes a test-merge SHA, the broker uses it only when required
+contexts are applicable there; otherwise it evaluates the PR head. Copied,
+forked, mismatched, stale, duplicate, or wrong-App-source observations refuse;
+absent rows remain pending, legacy pending statuses are pollable, and only
+GitHub-accepted success/skipped/neutral conclusions satisfy. The endpoint stays
+staging-configured through the existing transport observation mapping; it does
+not activate production.
 
 ### Durable registered-task admission (candidate A)
 

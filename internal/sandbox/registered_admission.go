@@ -16,7 +16,7 @@ import (
 
 const (
 	coordinatorRegisteredProtocolVersion = "broker/coordinator/v2"
-	githubGreenPRContractDigest          = "sha256:df72462d2bde6674349b2265d8768c6bba0b3368114cd015195ce66a697fc102"
+	githubGreenPRContractDigest          = "sha256:40963efb60fd00563bd6a33f1325b45008a917ebf17c110f9d3c86f7dd77d1fb"
 )
 
 type RegisteredTaskSource struct {
@@ -24,10 +24,9 @@ type RegisteredTaskSource struct {
 	RouteSnapshotID string `json:"route_snapshot_id"`
 }
 type RegisteredTaskParameters struct {
-	RepositoryID        string `json:"repositoryId"`
-	BaseRevision        string `json:"baseRevision"`
-	BranchRef           string `json:"branchRef"`
-	ValidationSelection string `json:"validationSelection"`
+	Repository string `json:"repository"`
+	BaseBranch string `json:"baseBranch"`
+	BranchRef  string `json:"branchRef"`
 }
 type RegisteredTask struct {
 	TaskKind           string                   `json:"taskKind"`
@@ -87,12 +86,12 @@ func validateRegisteredAdmission(r RegisteredAdmissionRequest) (registeredAdmiss
 		return registeredAdmission{}, fmt.Errorf("registered task source and session binding are invalid")
 	}
 	t := r.Task
-	if t.TaskKind != "repository_change_v1" || t.TaskVersion != "1.0.0" || t.CompletionContract != "github_green_pr_v1" || t.VerifierID != "github_green_pr_v1" || t.ContractDigest != githubGreenPRContractDigest || !sha256Digest.MatchString(t.TaskEvidenceDigest) || t.Parameters.RepositoryID != "grubbyhacker/repository-worker-lifecycle-test" || !sha40.MatchString(t.Parameters.BaseRevision) || !githubGreenPRBranch.MatchString(t.Parameters.BranchRef) || t.Parameters.ValidationSelection != "required" {
+	if t.TaskKind != "github_green_pr_v1" || t.TaskVersion != "1.0.0" || t.CompletionContract != "github_green_pr_v1" || t.VerifierID != "github_green_pr_v1" || t.ContractDigest != githubGreenPRContractDigest || !sha256Digest.MatchString(t.TaskEvidenceDigest) || t.Parameters.Repository != "grubbyhacker/repository-worker-lifecycle-test" || t.Parameters.BaseBranch != "main" || !githubGreenPRBranch.MatchString(t.Parameters.BranchRef) {
 		return registeredAdmission{}, fmt.Errorf("registered task is invalid")
 	}
 	// All accepted strings are ASCII-safe identifiers, so this literal is also
 	// RFC 8785/JCS canonical JSON (lexicographic keys, no insignificant space).
-	c := `{"registered_task":{"completionContract":"` + t.CompletionContract + `","contractDigest":"` + t.ContractDigest + `","parameters":{"baseRevision":"` + t.Parameters.BaseRevision + `","branchRef":"` + t.Parameters.BranchRef + `","repositoryId":"` + t.Parameters.RepositoryID + `","validationSelection":"required"},"taskEvidenceDigest":"` + t.TaskEvidenceDigest + `","taskKind":"` + t.TaskKind + `","taskVersion":"` + t.TaskVersion + `","verifierId":"` + t.VerifierID + `"},"registered_task_source":{"route_snapshot_id":"` + r.Source.RouteSnapshotID + `","work_item_id":"` + r.Source.WorkItemID + `"}}`
+	c := `{"registered_task":{"completionContract":"` + t.CompletionContract + `","contractDigest":"` + t.ContractDigest + `","parameters":{"baseBranch":"` + t.Parameters.BaseBranch + `","branchRef":"` + t.Parameters.BranchRef + `","repository":"` + t.Parameters.Repository + `"},"taskEvidenceDigest":"` + t.TaskEvidenceDigest + `","taskKind":"` + t.TaskKind + `","taskVersion":"` + t.TaskVersion + `","verifierId":"` + t.VerifierID + `"},"registered_task_source":{"route_snapshot_id":"` + r.Source.RouteSnapshotID + `","work_item_id":"` + r.Source.WorkItemID + `"}}`
 	s := sha256.Sum256([]byte(c))
 	digest := "sha256:" + hex.EncodeToString(s[:])
 	if r.AdmissionTaskDigest != digest {

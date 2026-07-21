@@ -18,12 +18,28 @@ import (
 
 func registeredRequest(t *testing.T, work, route string) RegisteredAdmissionRequest {
 	t.Helper()
-	r := RegisteredAdmissionRequest{Version: coordinatorRegisteredProtocolVersion, Profile: "writer", IdempotencyKey: "registered-key", SessionBinding: "session:" + work, Source: RegisteredTaskSource{WorkItemID: work, RouteSnapshotID: route}, Task: RegisteredTask{TaskKind: "repository_change_v1", TaskVersion: "1.0.0", CompletionContract: "github_green_pr_v1", VerifierID: "github_green_pr_v1", ContractDigest: githubGreenPRContractDigest, TaskEvidenceDigest: "sha256:" + strings.Repeat("a", 64), Parameters: RegisteredTaskParameters{RepositoryID: "grubbyhacker/repository-worker-lifecycle-test", BaseRevision: strings.Repeat("b", 40), BranchRef: "agent/fleiglabs-repo-agent/settled", ValidationSelection: "required"}}}
+	r := RegisteredAdmissionRequest{Version: coordinatorRegisteredProtocolVersion, Profile: "writer", IdempotencyKey: "registered-key", SessionBinding: "session:" + work, Source: RegisteredTaskSource{WorkItemID: work, RouteSnapshotID: route}, Task: RegisteredTask{TaskKind: "github_green_pr_v1", TaskVersion: "1.0.0", CompletionContract: "github_green_pr_v1", VerifierID: "github_green_pr_v1", ContractDigest: githubGreenPRContractDigest, TaskEvidenceDigest: "sha256:" + strings.Repeat("a", 64), Parameters: RegisteredTaskParameters{Repository: "grubbyhacker/repository-worker-lifecycle-test", BaseBranch: "main", BranchRef: "agent/fleiglabs-repo-agent/settled"}}}
 	task := r.Task
-	canonical := `{"registered_task":{"completionContract":"` + task.CompletionContract + `","contractDigest":"` + task.ContractDigest + `","parameters":{"baseRevision":"` + task.Parameters.BaseRevision + `","branchRef":"` + task.Parameters.BranchRef + `","repositoryId":"` + task.Parameters.RepositoryID + `","validationSelection":"required"},"taskEvidenceDigest":"` + task.TaskEvidenceDigest + `","taskKind":"` + task.TaskKind + `","taskVersion":"` + task.TaskVersion + `","verifierId":"` + task.VerifierID + `"},"registered_task_source":{"route_snapshot_id":"` + r.Source.RouteSnapshotID + `","work_item_id":"` + r.Source.WorkItemID + `"}}`
+	canonical := `{"registered_task":{"completionContract":"` + task.CompletionContract + `","contractDigest":"` + task.ContractDigest + `","parameters":{"baseBranch":"` + task.Parameters.BaseBranch + `","branchRef":"` + task.Parameters.BranchRef + `","repository":"` + task.Parameters.Repository + `"},"taskEvidenceDigest":"` + task.TaskEvidenceDigest + `","taskKind":"` + task.TaskKind + `","taskVersion":"` + task.TaskVersion + `","verifierId":"` + task.VerifierID + `"},"registered_task_source":{"route_snapshot_id":"` + r.Source.RouteSnapshotID + `","work_item_id":"` + r.Source.WorkItemID + `"}}`
 	s := sha256.Sum256([]byte(canonical))
 	r.AdmissionTaskDigest = "sha256:" + hex.EncodeToString(s[:])
 	return r
+}
+
+func TestRegisteredAdmissionAcceptsExactSignalWireFixture(t *testing.T) {
+	const wire = `{"version":"broker/coordinator/v2","profile":"writer","idempotency_key":"registered-key","session_binding":"session:signal-work","registered_task_source":{"work_item_id":"signal-work","route_snapshot_id":"signal-route"},"registered_task":{"taskKind":"github_green_pr_v1","taskVersion":"1.0.0","completionContract":"github_green_pr_v1","verifierId":"github_green_pr_v1","contractDigest":"sha256:40963efb60fd00563bd6a33f1325b45008a917ebf17c110f9d3c86f7dd77d1fb","taskEvidenceDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parameters":{"repository":"grubbyhacker/repository-worker-lifecycle-test","baseBranch":"main","branchRef":"agent/fleiglabs-repo-agent/settled"}},"admission_task_digest":"sha256:d680878b19936df93549a0745264720c502e8fc8cd64dbfa0589d225b0d79be0"}`
+	var got RegisteredAdmissionRequest
+	if err := json.Unmarshal([]byte(wire), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateRegisteredAdmission(got); err != nil {
+		t.Fatalf("exact Signal wire fixture was refused: %v", err)
+	}
+
+	var superseded RegisteredAdmissionRequest
+	if err := json.Unmarshal([]byte(`{"version":"broker/coordinator/v2","profile":"writer","idempotency_key":"registered-key","session_binding":"session:signal-work","registered_task_source":{"work_item_id":"signal-work","route_snapshot_id":"signal-route"},"registered_task":{"taskKind":"repository_change_v1","taskVersion":"1.0.0","completionContract":"github_green_pr_v1","verifierId":"github_green_pr_v1","contractDigest":"sha256:df72462d2bde6674349b2265d8768c6bba0b3368114cd015195ce66a697fc102","taskEvidenceDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parameters":{"repositoryId":"grubbyhacker/repository-worker-lifecycle-test","baseRevision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","branchRef":"agent/fleiglabs-repo-agent/settled","validationSelection":"required"}},"admission_task_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`), &superseded); err == nil {
+		t.Fatal("superseded Signal shape decoded")
+	}
 }
 
 func TestRegisteredAdmissionRESTRequiresExactVersionAndStrictJSON(t *testing.T) {

@@ -113,7 +113,7 @@ func TestGreenPRAdmissionUsesOnlyRegisteredTaskAndCompletedPush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	op := TransportOperation{OperationID: "push-1", Method: "POST", Service: "git-receive-pack", Repository: request.Task.Parameters.RepositoryID, RequestPath: "/git/repo.git/git-receive-pack", RequestedRefs: []string{}, RefUpdates: json.RawMessage(updates), Authority: authority}
+	op := TransportOperation{OperationID: "push-1", Method: "POST", Service: "git-receive-pack", Repository: request.Task.Parameters.Repository, RequestPath: "/git/repo.git/git-receive-pack", RequestedRefs: []string{}, RefUpdates: json.RawMessage(updates), Authority: authority}
 	if err := observer.Received(ctx, &op); err != nil {
 		t.Fatal(err)
 	}

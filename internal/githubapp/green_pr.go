@@ -60,23 +60,24 @@ type GreenPRRequiredCheck struct {
 // GreenPRObservation is the only positive completion fact the broker emits.
 // IntegrityDigest is over every other serialized member.
 type GreenPRObservation struct {
-	Version              string                 `json:"version"`
-	RegisteredTaskDigest string                 `json:"registered_task_digest"`
-	BrokerOperationID    string                 `json:"broker_operation_id"`
-	AppSlug              string                 `json:"app_slug"`
-	InstallationID       int64                  `json:"installation_id"`
-	Repository           string                 `json:"repository"`
-	BaseRef              string                 `json:"base_ref"`
-	WorkerRef            string                 `json:"worker_ref"`
-	PushedHeadSHA        string                 `json:"pushed_head_sha"`
-	PullRequest          *GreenPRPullRequest    `json:"pull_request"`
-	RequiredRulesDigest  string                 `json:"required_rules_digest"`
-	EvaluationBasis      string                 `json:"evaluation_basis"`
-	EvaluationSHA        string                 `json:"evaluation_sha"`
-	RequiredChecks       []GreenPRRequiredCheck `json:"required_checks"`
-	Verdict              string                 `json:"verdict"`
-	ObservedAt           string                 `json:"observed_at"`
-	IntegrityDigest      string                 `json:"integrity_digest"`
+	Version              string                    `json:"version"`
+	RegisteredTaskDigest string                    `json:"registered_task_digest"`
+	BrokerOperationID    string                    `json:"broker_operation_id"`
+	AppSlug              string                    `json:"app_slug"`
+	InstallationID       int64                     `json:"installation_id"`
+	Repository           string                    `json:"repository"`
+	TargetRepository     GreenPRRepositoryIdentity `json:"target_repository"`
+	BaseRef              string                    `json:"base_ref"`
+	WorkerRef            string                    `json:"worker_ref"`
+	PushedHeadSHA        string                    `json:"pushed_head_sha"`
+	PullRequest          *GreenPRPullRequest       `json:"pull_request"`
+	RequiredRulesDigest  string                    `json:"required_rules_digest"`
+	EvaluationBasis      string                    `json:"evaluation_basis"`
+	EvaluationSHA        string                    `json:"evaluation_sha"`
+	RequiredChecks       []GreenPRRequiredCheck    `json:"required_checks"`
+	Verdict              string                    `json:"verdict"`
+	ObservedAt           string                    `json:"observed_at"`
+	IntegrityDigest      string                    `json:"integrity_digest"`
 }
 
 type greenPRRule struct {
@@ -98,7 +99,7 @@ func (c *Client) CreateReadyGreenPR(appName string, in GreenPRRequest) (GreenPRP
 	}, &created); err != nil {
 		return GreenPRPullRequest{}, err
 	}
-	if !sameGreenPRIdentity(created.Head.Repo, in.Repository) || created.Base.Ref != in.BaseRef || created.Head.Ref != branch || created.Head.SHA != in.PushedHeadSHA || created.State != "open" || created.Draft {
+	if !validGreenPRRepository(derefGreenPRRepository(created.Head.Repo), in.Repository) || created.Base.Ref != in.BaseRef || created.Head.Ref != branch || created.Head.SHA != in.PushedHeadSHA || created.State != "open" || created.Draft {
 		return GreenPRPullRequest{}, fmt.Errorf("created pull request does not match broker-owned branch operation")
 	}
 	return GreenPRPullRequest{DatabaseID: created.ID, NodeID: created.NodeID, Number: created.Number, URL: created.HTMLURL, State: created.State, Draft: created.Draft, BaseRef: created.Base.Ref, HeadRef: created.Head.Ref, HeadRepository: derefGreenPRRepository(created.Head.Repo), HeadSHA: created.Head.SHA}, nil
@@ -111,6 +112,10 @@ func (c *Client) ObserveGreenPR(appName string, in GreenPRRequest) (GreenPRObser
 	if err := validGreenPRRequest(in); err != nil {
 		return GreenPRObservation{}, err
 	}
+	target, err := c.greenPRRepository(appName, in.InstallationID, in.Repository)
+	if err != nil {
+		return GreenPRObservation{}, err
+	}
 	owner, _, _ := strings.Cut(in.Repository, "/")
 	branch := strings.TrimPrefix(in.WorkerRef, "refs/heads/")
 	pull, found, err := c.greenPRPull(appName, in.InstallationID, in.Repository, owner+":"+branch)
@@ -118,16 +123,17 @@ func (c *Client) ObserveGreenPR(appName string, in GreenPRRequest) (GreenPRObser
 		return GreenPRObservation{}, err
 	}
 	if !found {
-		obs := GreenPRObservation{Version: GreenPRObservationVersion, RegisteredTaskDigest: in.RegisteredTaskDigest, BrokerOperationID: in.BrokerOperationID, AppSlug: in.AppSlug, InstallationID: in.InstallationID, Repository: in.Repository, BaseRef: in.BaseRef, WorkerRef: in.WorkerRef, PushedHeadSHA: in.PushedHeadSHA, RequiredChecks: []GreenPRRequiredCheck{}, Verdict: "missing", ObservedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+		obs := newGreenPRObservation(in, target)
+		obs.Verdict = "missing"
 		return sealGreenPRObservation(obs)
 	}
-	obs := GreenPRObservation{Version: GreenPRObservationVersion, RegisteredTaskDigest: in.RegisteredTaskDigest, BrokerOperationID: in.BrokerOperationID, AppSlug: in.AppSlug, InstallationID: in.InstallationID, Repository: in.Repository, BaseRef: in.BaseRef, WorkerRef: in.WorkerRef, PushedHeadSHA: in.PushedHeadSHA, RequiredChecks: []GreenPRRequiredCheck{}, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	obs := newGreenPRObservation(in, target)
 	if pull.Draft {
 		obs.PullRequest = &GreenPRPullRequest{DatabaseID: pull.ID, NodeID: pull.NodeID, Number: pull.Number, URL: pull.HTMLURL, State: pull.State, Draft: pull.Draft, BaseRef: pull.Base.Ref, HeadRef: pull.Head.Ref, HeadRepository: derefGreenPRRepository(pull.Head.Repo), HeadSHA: pull.Head.SHA}
 		obs.Verdict = "draft"
 		return sealGreenPRObservation(obs)
 	}
-	if !sameGreenPRIdentity(pull.Head.Repo, in.Repository) || pull.Base.Ref != in.BaseRef || pull.Head.Ref != branch || pull.Head.SHA != in.PushedHeadSHA || pull.State != "open" {
+	if !sameGreenPRIdentity(target, derefGreenPRRepository(pull.Head.Repo)) || pull.Base.Ref != in.BaseRef || pull.Head.Ref != branch || pull.Head.SHA != in.PushedHeadSHA || pull.State != "open" {
 		obs.Verdict = "refused"
 		return sealGreenPRObservation(obs)
 	}
@@ -139,19 +145,31 @@ func (c *Client) ObserveGreenPR(appName string, in GreenPRRequest) (GreenPRObser
 	obs.RequiredRulesDigest = greenPRRulesDigest(rules)
 	obs.EvaluationBasis, obs.EvaluationSHA = "head", pull.Head.SHA
 	if githubSHAPattern.MatchString(pull.MergeCommitSHA) && pull.MergeCommitSHA != pull.Head.SHA {
-		obs.EvaluationBasis, obs.EvaluationSHA = "test_merge", pull.MergeCommitSHA
+		mergeChecks, err := c.greenPRChecks(appName, in.InstallationID, in.Repository, pull.MergeCommitSHA, rules)
+		if err != nil {
+			return GreenPRObservation{}, err
+		}
+		if greenPRChecksApplicable(mergeChecks) {
+			obs.EvaluationBasis, obs.EvaluationSHA, obs.RequiredChecks = "test_merge", pull.MergeCommitSHA, mergeChecks
+		}
 	}
 	if !githubSHAPattern.MatchString(obs.EvaluationSHA) {
 		obs.Verdict = "refused"
 		return sealGreenPRObservation(obs)
 	}
-	checks, err := c.greenPRChecks(appName, in.InstallationID, in.Repository, obs.EvaluationSHA, rules)
-	if err != nil {
-		return GreenPRObservation{}, err
+	if obs.RequiredChecks == nil {
+		checks, err := c.greenPRChecks(appName, in.InstallationID, in.Repository, obs.EvaluationSHA, rules)
+		if err != nil {
+			return GreenPRObservation{}, err
+		}
+		obs.RequiredChecks = checks
 	}
-	obs.RequiredChecks = checks
-	obs.Verdict = greenPRVerdict(checks)
+	obs.Verdict = greenPRVerdict(obs.RequiredChecks)
 	return sealGreenPRObservation(obs)
+}
+
+func newGreenPRObservation(in GreenPRRequest, target GreenPRRepositoryIdentity) GreenPRObservation {
+	return GreenPRObservation{Version: GreenPRObservationVersion, RegisteredTaskDigest: in.RegisteredTaskDigest, BrokerOperationID: in.BrokerOperationID, AppSlug: in.AppSlug, InstallationID: in.InstallationID, Repository: in.Repository, TargetRepository: target, BaseRef: in.BaseRef, WorkerRef: in.WorkerRef, PushedHeadSHA: in.PushedHeadSHA, RequiredChecks: []GreenPRRequiredCheck{}, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 }
 
 func derefGreenPRRepository(repo *GreenPRRepositoryIdentity) GreenPRRepositoryIdentity {
@@ -203,6 +221,17 @@ func (c *Client) greenPRPull(app string, installation int64, repo, head string) 
 	return pulls[0], true, nil
 }
 
+func (c *Client) greenPRRepository(app string, installation int64, fullName string) (GreenPRRepositoryIdentity, error) {
+	var target GreenPRRepositoryIdentity
+	if err := c.doJSON(app, http.MethodGet, "/repos/"+fullName, installation, nil, &target); err != nil {
+		return GreenPRRepositoryIdentity{}, err
+	}
+	if !validGreenPRRepository(target, fullName) {
+		return GreenPRRepositoryIdentity{}, fmt.Errorf("GitHub target repository identity is invalid")
+	}
+	return target, nil
+}
+
 func (c *Client) greenPRRules(app string, installation int64, repo, base string) ([]greenPRRule, error) {
 	var response struct {
 		Rules []struct {
@@ -239,40 +268,56 @@ func (c *Client) greenPRRules(app string, installation int64, repo, base string)
 }
 
 func (c *Client) greenPRChecks(app string, installation int64, repo, sha string, rules []greenPRRule) ([]GreenPRRequiredCheck, error) {
-	var checkRuns struct {
-		CheckRuns []struct {
-			Name       string `json:"name"`
-			Status     string `json:"status"`
-			Conclusion string `json:"conclusion"`
-			App        struct {
-				ID int64 `json:"id"`
-			} `json:"app"`
-		} `json:"check_runs"`
+	type checkRun struct {
+		Name       string `json:"name"`
+		Status     string `json:"status"`
+		Conclusion string `json:"conclusion"`
+		App        struct {
+			ID int64 `json:"id"`
+		} `json:"app"`
 	}
-	if err := c.doJSON(app, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/check-runs?per_page=100", installation, nil, &checkRuns); err != nil {
-		return nil, err
+	type statusContext struct {
+		Context string `json:"context"`
+		State   string `json:"state"`
+		Creator struct {
+			ID int64 `json:"id"`
+		} `json:"creator"`
 	}
-	var status struct {
-		SHA      string `json:"sha"`
-		Statuses []struct {
-			Context string `json:"context"`
-			State   string `json:"state"`
-			Creator struct {
-				ID int64 `json:"id"`
-			} `json:"creator"`
-		} `json:"statuses"`
+	checkRuns := []checkRun{}
+	statuses := []statusContext{}
+	for page := 1; ; page++ {
+		var response struct {
+			CheckRuns []checkRun `json:"check_runs"`
+		}
+		if err := c.doJSON(app, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/check-runs?per_page=100&page="+strconv.Itoa(page), installation, nil, &response); err != nil {
+			return nil, err
+		}
+		checkRuns = append(checkRuns, response.CheckRuns...)
+		if len(response.CheckRuns) < 100 {
+			break
+		}
 	}
-	if err := c.doJSON(app, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/status", installation, nil, &status); err != nil {
-		return nil, err
-	}
-	if status.SHA != "" && status.SHA != sha {
-		return nil, fmt.Errorf("commit status returned wrong evaluation SHA")
+	for page := 1; ; page++ {
+		var status struct {
+			SHA      string          `json:"sha"`
+			Statuses []statusContext `json:"statuses"`
+		}
+		if err := c.doJSON(app, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/status?per_page=100&page="+strconv.Itoa(page), installation, nil, &status); err != nil {
+			return nil, err
+		}
+		if status.SHA != "" && status.SHA != sha {
+			return nil, fmt.Errorf("commit status returned wrong evaluation SHA")
+		}
+		statuses = append(statuses, status.Statuses...)
+		if len(status.Statuses) < 100 {
+			break
+		}
 	}
 	out := make([]GreenPRRequiredCheck, 0, len(rules))
 	for _, rule := range rules {
 		row := GreenPRRequiredCheck{Context: rule.Context, ExpectedAppSource: rule.IntegrationID, Presence: "absent", Status: "", Conclusion: "", ObservedSHA: sha}
 		matches := 0
-		for _, run := range checkRuns.CheckRuns {
+		for _, run := range checkRuns {
 			if run.Name == rule.Context {
 				if rule.IntegrationID != nil && run.App.ID != *rule.IntegrationID {
 					return nil, fmt.Errorf("required check context %q has wrong App source", rule.Context)
@@ -281,13 +326,19 @@ func (c *Client) greenPRChecks(app string, installation int64, repo, sha string,
 				row.Presence, row.Status, row.Conclusion = "present", run.Status, run.Conclusion
 			}
 		}
-		for _, context := range status.Statuses {
+		for _, context := range statuses {
 			if context.Context == rule.Context {
 				if rule.IntegrationID != nil && context.Creator.ID != *rule.IntegrationID {
 					return nil, fmt.Errorf("required status context %q has wrong App source", rule.Context)
 				}
 				matches++
-				row.Presence, row.Status, row.Conclusion = "present", "completed", context.State
+				row.Presence = "present"
+				switch strings.ToLower(context.State) {
+				case "success", "error", "failure":
+					row.Status, row.Conclusion = "completed", context.State
+				default:
+					row.Status, row.Conclusion = "pending", ""
+				}
 			}
 		}
 		if matches > 1 {
@@ -296,6 +347,15 @@ func (c *Client) greenPRChecks(app string, installation int64, repo, sha string,
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+func greenPRChecksApplicable(rows []GreenPRRequiredCheck) bool {
+	for _, row := range rows {
+		if row.Presence == "present" {
+			return true
+		}
+	}
+	return false
 }
 
 func greenPRVerdict(rows []GreenPRRequiredCheck) string {
@@ -314,8 +374,12 @@ func greenPRVerdict(rows []GreenPRRequiredCheck) string {
 	return "satisfied"
 }
 
-func sameGreenPRIdentity(repo *GreenPRRepositoryIdentity, fullName string) bool {
-	return repo != nil && repo.DatabaseID > 0 && repo.NodeID != "" && repo.FullName == fullName
+func sameGreenPRIdentity(left, right GreenPRRepositoryIdentity) bool {
+	return left.DatabaseID > 0 && left.NodeID != "" && left.FullName != "" && left.DatabaseID == right.DatabaseID && left.NodeID == right.NodeID && left.FullName == right.FullName
+}
+
+func validGreenPRRepository(repo GreenPRRepositoryIdentity, fullName string) bool {
+	return repo.DatabaseID > 0 && repo.NodeID != "" && repo.FullName == fullName
 }
 
 func greenPRRulesDigest(rules []greenPRRule) string {

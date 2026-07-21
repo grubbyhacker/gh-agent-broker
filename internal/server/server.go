@@ -399,17 +399,17 @@ func (s *Server) handleRegisteredGreenPRObservation(w http.ResponseWriter, r *ht
 		return
 	}
 	appName := config.GitHubAppName(principal.Agent)
-	installation, ok := cfg.InstallationIDForApp(appName, admission.Task.Parameters.RepositoryID)
+	installation, ok := cfg.InstallationIDForApp(appName, admission.Task.Parameters.Repository)
 	if !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "repository installation is not configured"})
 		return
 	}
-	observation, err := gh.ObserveGreenPR(appName, githubapp.GreenPRRequest{RegisteredTaskDigest: admission.TaskDigest, BrokerOperationID: admission.OperationID, AppSlug: appName, InstallationID: installation, Repository: admission.Task.Parameters.RepositoryID, BaseRef: "main", WorkerRef: "refs/heads/" + admission.Task.Parameters.BranchRef, PushedHeadSHA: admission.PushedSHA})
+	observation, err := gh.ObserveGreenPR(appName, githubapp.GreenPRRequest{RegisteredTaskDigest: admission.TaskDigest, BrokerOperationID: admission.OperationID, AppSlug: appName, InstallationID: installation, Repository: admission.Task.Parameters.Repository, BaseRef: admission.Task.Parameters.BaseBranch, WorkerRef: "refs/heads/" + admission.Task.Parameters.BranchRef, PushedHeadSHA: admission.PushedSHA})
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "GitHub green PR observation failed"})
 		return
 	}
-	s.audit.Log(audit.Event{OperationID: admission.OperationID, AgentID: principal.ID, Operation: "github_green_pr.observe", Repo: admission.Task.Parameters.RepositoryID, Branch: admission.Task.Parameters.BranchRef, Decision: policy.DecisionAllow, Result: observation.Verdict})
+	s.audit.Log(audit.Event{OperationID: admission.OperationID, AgentID: principal.ID, Operation: "github_green_pr.observe", Repo: admission.Task.Parameters.Repository, Branch: admission.Task.Parameters.BranchRef, Decision: policy.DecisionAllow, Result: observation.Verdict})
 	writeJSON(w, http.StatusOK, observation)
 }
 
