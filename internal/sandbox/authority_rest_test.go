@@ -144,6 +144,9 @@ func TestRegisteredCoordinatorAgentdV2Contract(t *testing.T) {
 	if _, err := validateRegisteredTurnResponse(golden.Response, "session-42", "turn-42"); err != nil {
 		t.Fatalf("golden acknowledgement rejected: %v", err)
 	}
+	if _, err := validateRegisteredEventsResponse(golden.Events, registeredTurnState{SessionID: "session-42", TurnID: "turn:turn-42", ModelEffectID: "model:turn-42"}, 0, "sha256:"+strings.Repeat("a", 64), githubGreenPRContractDigest, "sha256:"+strings.Repeat("b", 64)); err != nil {
+		t.Fatalf("golden events rejected: %v", err)
+	}
 
 	cfg := authorityTestConfig(t)
 	profile := cfg.AuthorityProfiles["writer"]
@@ -170,12 +173,13 @@ func TestRegisteredCoordinatorAgentdV2Contract(t *testing.T) {
 	if err := store.BindAgentdSession(ctx, admissionRequest.SessionBinding, "session-42"); err != nil {
 		t.Fatal(err)
 	}
-	queued := `{"version":"agentd/registered-events/v2","events":[{"cursor":1,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":0,"phase":"queued","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + admissionRequest.AdmissionTaskDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `"},{"cursor":2,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":0,"phase":"green","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + admissionRequest.AdmissionTaskDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `","verifier":{"phase":"green","outcome":"satisfied","contractDigest":"` + githubGreenPRContractDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `","reasons":[]}}],"nextCursor":2}`
-	runtime.statuses = []int{http.StatusAccepted, http.StatusOK, http.StatusOK}
+	queued := `{"version":"agentd/registered-events/v2","events":[{"cursor":1,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":0,"phase":"queued","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + admissionRequest.AdmissionTaskDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `"},{"cursor":2,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":0,"phase":"green","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + admissionRequest.AdmissionTaskDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `","verifier":{"phase":"green","outcome":"satisfied","contractDigest":"` + githubGreenPRContractDigest + `","taskEvidenceDigest":"` + admissionRequest.Task.TaskEvidenceDigest + `","headRevision":"broker:head:turn-42","reasons":[],"evidenceRefs":["broker:observation:turn-42"]}}],"nextCursor":2}`
+	runtime.statuses = []int{http.StatusAccepted, http.StatusOK, http.StatusOK, http.StatusOK}
 	runtime.responses = []json.RawMessage{
 		[]byte(`{"version":"agentd/registered-turn/v2","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued","cursor":1}`),
 		[]byte(queued),
 		[]byte(`{"version":"agentd/registered-events/v2","events":[],"nextCursor":2}`),
+		[]byte(queued),
 	}
 	submit := CoordinatorSessionRequest{SessionBinding: admissionRequest.SessionBinding, IdempotencyKey: "turn-42"}
 	if _, err := service.CoordinatorSessionCommand(ctx, "coordinator", "submit", submit); err != nil {
@@ -196,14 +200,59 @@ func TestRegisteredCoordinatorAgentdV2Contract(t *testing.T) {
 	if runtime.path != "/v1/registered-sessions/session-42/events?version=agentd%2Fregistered-events%2Fv2&after=2" || runtime.calls != 3 {
 		t.Fatalf("cursor did not advance: path=%q calls=%d", runtime.path, runtime.calls)
 	}
+	if _, err := service.CoordinatorSessionCommand(ctx, "coordinator", "events", CoordinatorSessionRequest{SessionBinding: admissionRequest.SessionBinding}); err == nil || !strings.Contains(err.Error(), "cursor") {
+		t.Fatalf("replayed cursor was accepted: %v", err)
+	}
+	if runtime.calls != 3 || strings.Contains(runtime.path, "/verify") {
+		t.Fatalf("registered forwarding drifted: path=%q calls=%d", runtime.path, runtime.calls)
+	}
 	if _, err := validateRegisteredTurnResponse([]byte(`{"version":"agentd/registered-turn/v1","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued","cursor":1}`), "session-42", "turn-42"); err == nil {
 		t.Fatal("wrong response version accepted")
 	}
 	if _, err := validateRegisteredTurnResponse([]byte(`{"version":"agentd/registered-turn/v2","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued","cursor":1,"extra":true}`), "session-42", "turn-42"); err == nil {
 		t.Fatal("extra turn response field accepted")
 	}
-	if _, err := validateRegisteredEventsResponse([]byte(`{"version":"agentd/registered-events/v2","events":[],"nextCursor":2,"extra":true}`), registeredTurnState{SessionID: "session-42", TurnID: "turn:turn-42", ModelEffectID: "model:turn-42"}, 2, admissionRequest.AdmissionTaskDigest, admissionRequest.Task.TaskEvidenceDigest); err == nil {
+	if _, err := validateRegisteredTurnResponse([]byte(`{"version":"agentd/registered-turn/v2","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued"}`), "session-42", "turn-42"); err == nil {
+		t.Fatal("missing turn cursor accepted")
+	}
+	if _, err := validateRegisteredTurnResponse([]byte(`{"version":"agentd/registered-turn/v2","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued","cursor":1} {}`), "session-42", "turn-42"); err == nil {
+		t.Fatal("trailing turn JSON accepted")
+	}
+	if _, err := validateRegisteredEventsResponse([]byte(`{"version":"agentd/registered-events/v2","events":[],"nextCursor":2,"extra":true}`), registeredTurnState{SessionID: "session-42", TurnID: "turn:turn-42", ModelEffectID: "model:turn-42"}, 2, admissionRequest.AdmissionTaskDigest, admissionRequest.Task.ContractDigest, admissionRequest.Task.TaskEvidenceDigest); err == nil {
 		t.Fatal("extra event response field accepted")
+	}
+}
+
+func TestRegisteredVerifierProjectionIsStrictAndAcceptsLocalEscalation(t *testing.T) {
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	turn := registeredTurnState{SessionID: "session-42", TurnID: "turn:turn-42", ModelEffectID: "model:turn-42"}
+	localEscalated := `{"version":"agentd/registered-events/v2","events":[{"cursor":1,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":0,"phase":"escalated","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + digest + `","taskEvidenceDigest":"` + digest + `","verifier":{"phase":"escalated","outcome":"escalated","contractDigest":"` + digest + `","taskEvidenceDigest":"` + digest + `","headRevision":"local:unavailable:verifier:turn-42:observation:1","reasons":[{"code":"deadline","evidenceRef":"local:deadline:` + digest + `:verifier:turn-42:observation:1"}],"evidenceRefs":["local:deadline:` + digest + `:verifier:turn-42:observation:1"]}}],"nextCursor":1}`
+	if _, err := validateRegisteredEventsResponse([]byte(localEscalated), turn, 0, digest, digest, digest); err != nil {
+		t.Fatalf("local escalation rejected: %v", err)
+	}
+	for _, name := range []string{"missing_attempt", "null_cursor", "missing_head", "null_reason_ref", "extra_reason", "refused_outcome", "phase_mismatch", "empty_evidence"} {
+		payload := localEscalated
+		switch name {
+		case "missing_attempt":
+			payload = strings.Replace(payload, `,"attempt":0`, "", 1)
+		case "null_cursor":
+			payload = strings.Replace(payload, `"cursor":1`, `"cursor":null`, 1)
+		case "missing_head":
+			payload = strings.Replace(payload, `,"headRevision":"local:unavailable:verifier:turn-42:observation:1"`, "", 1)
+		case "null_reason_ref":
+			payload = strings.Replace(payload, `"evidenceRef":"local:deadline:`, `"evidenceRef":null,"discard":"local:deadline:`, 1)
+		case "extra_reason":
+			payload = strings.Replace(payload, `{"code":"deadline"`, `{"extra":true,"code":"deadline"`, 1)
+		case "refused_outcome":
+			payload = strings.Replace(payload, `"outcome":"escalated"`, `"outcome":"refused"`, 1)
+		case "phase_mismatch":
+			payload = strings.Replace(payload, `"phase":"escalated","outcome":"escalated"`, `"phase":"red","outcome":"escalated"`, 1)
+		case "empty_evidence":
+			payload = strings.Replace(payload, `"evidenceRefs":["local:deadline:`, `"evidenceRefs":[],"discard":["local:deadline:`, 1)
+		}
+		if _, err := validateRegisteredEventsResponse([]byte(payload), turn, 0, digest, digest, digest); err == nil {
+			t.Fatalf("%s verifier projection accepted", name)
+		}
 	}
 }
 

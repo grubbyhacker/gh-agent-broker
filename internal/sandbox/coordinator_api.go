@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -158,7 +159,7 @@ func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, 
 		}
 	}
 	if isRegistered && operation == "events" {
-		events, validateErr := validateRegisteredEventsResponse(result, registeredTurn, request.After, registered.Digest, registered.Task.TaskEvidenceDigest)
+		events, validateErr := validateRegisteredEventsResponse(result, registeredTurn, request.After, registered.Digest, registered.Task.ContractDigest, registered.Task.TaskEvidenceDigest)
 		if validateErr != nil {
 			return CoordinatorSessionResponse{}, validateErr
 		}
@@ -236,14 +237,49 @@ type registeredTurnResponse struct {
 	Cursor        int64  `json:"cursor"`
 }
 
+func (r *registeredTurnResponse) UnmarshalJSON(data []byte) error {
+	type response registeredTurnResponse
+	var decoded response
+	if err := decodeRegisteredResponse(data, &decoded); err != nil {
+		return err
+	}
+	if _, err := requireRegisteredFields(data, "version", "sessionId", "turnId", "modelEffectId", "phase", "cursor"); err != nil {
+		return err
+	}
+	*r = registeredTurnResponse(decoded)
+	return nil
+}
+
 type registeredVerifierProjection struct {
-	Phase              string `json:"phase"`
-	Outcome            string `json:"outcome"`
-	ContractDigest     string `json:"contractDigest"`
-	TaskEvidenceDigest string `json:"taskEvidenceDigest"`
-	Reasons            []struct {
-		Code string `json:"code"`
-	} `json:"reasons"`
+	Phase              string                     `json:"phase"`
+	Outcome            string                     `json:"outcome"`
+	ContractDigest     string                     `json:"contractDigest"`
+	TaskEvidenceDigest string                     `json:"taskEvidenceDigest"`
+	HeadRevision       string                     `json:"headRevision"`
+	Reasons            []registeredVerifierReason `json:"reasons"`
+	EvidenceRefs       []string                   `json:"evidenceRefs"`
+}
+
+// registeredVerifierReason is the exact session-supervisor v2.2.0 reason
+// projection. It intentionally keeps evidence references opaque.
+type registeredVerifierReason struct {
+	Code        string `json:"code"`
+	EvidenceRef string `json:"evidenceRef,omitempty"`
+}
+
+func (r *registeredVerifierReason) UnmarshalJSON(data []byte) error {
+	type reason registeredVerifierReason
+	var decoded reason
+	if err := decodeRegisteredResponse(data, &decoded); err != nil {
+		return err
+	}
+	if fields, err := requireRegisteredFields(data, "code"); err != nil {
+		return err
+	} else if value, ok := fields["evidenceRef"]; ok && string(value) == "null" {
+		return fmt.Errorf("evidenceRef cannot be null")
+	}
+	*r = registeredVerifierReason(decoded)
+	return nil
 }
 
 type registeredEventProjection struct {
@@ -273,8 +309,8 @@ func (e *registeredEventProjection) UnmarshalJSON(data []byte) error {
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return fmt.Errorf("trailing JSON value")
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
+	fields, err := requireRegisteredFields(data, "cursor", "sessionId", "turnId", "modelEffectId", "attempt", "phase", "workerId", "storageLineageId", "fenceEpoch", "admissionTaskDigest", "taskEvidenceDigest")
+	if err != nil {
 		return err
 	}
 	for _, name := range []string{"verifier", "failure"} {
@@ -292,6 +328,19 @@ type registeredEventsResponse struct {
 	NextCursor int64                       `json:"nextCursor"`
 }
 
+func (r *registeredEventsResponse) UnmarshalJSON(data []byte) error {
+	type response registeredEventsResponse
+	var decoded response
+	if err := decodeRegisteredResponse(data, &decoded); err != nil {
+		return err
+	}
+	if _, err := requireRegisteredFields(data, "version", "events", "nextCursor"); err != nil {
+		return err
+	}
+	*r = registeredEventsResponse(decoded)
+	return nil
+}
+
 func decodeRegisteredResponse(data json.RawMessage, target any) error {
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
@@ -304,6 +353,23 @@ func decodeRegisteredResponse(data json.RawMessage, target any) error {
 	return nil
 }
 
+func requireRegisteredFields(data []byte, required ...string) (map[string]json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	for _, name := range required {
+		value, ok := fields[name]
+		if !ok {
+			return nil, fmt.Errorf("%s is required", name)
+		}
+		if string(value) == "null" {
+			return nil, fmt.Errorf("%s cannot be null", name)
+		}
+	}
+	return fields, nil
+}
+
 func validateRegisteredTurnResponse(result json.RawMessage, sessionID, idempotencyKey string) (registeredTurnResponse, error) {
 	var turn registeredTurnResponse
 	if err := decodeRegisteredResponse(result, &turn); err != nil || turn.Version != registeredTurnResponseVersion || turn.SessionID != sessionID || !registeredOpaqueID.MatchString(turn.TurnID) || turn.TurnID != "turn:"+idempotencyKey || !registeredOpaqueID.MatchString(turn.ModelEffectID) || turn.ModelEffectID != "model:"+idempotencyKey || turn.Phase != "queued" || turn.Cursor < 1 {
@@ -312,14 +378,14 @@ func validateRegisteredTurnResponse(result json.RawMessage, sessionID, idempoten
 	return turn, nil
 }
 
-func validateRegisteredEventsResponse(result json.RawMessage, turn registeredTurnState, after int64, admissionDigest, taskEvidenceDigest string) (registeredEventsResponse, error) {
+func validateRegisteredEventsResponse(result json.RawMessage, turn registeredTurnState, after int64, admissionDigest, contractDigest, taskEvidenceDigest string) (registeredEventsResponse, error) {
 	var response registeredEventsResponse
 	if err := decodeRegisteredResponse(result, &response); err != nil || response.Version != registeredEventsResponseVersion || response.Events == nil || response.NextCursor < after {
 		return registeredEventsResponse{}, fmt.Errorf("agentd returned invalid registered event stream")
 	}
 	previous := after
 	for _, event := range response.Events {
-		if event.Cursor <= previous || event.SessionID != turn.SessionID || event.TurnID != turn.TurnID || event.ModelEffectID != turn.ModelEffectID || event.Attempt < 0 || !registeredOpaqueID.MatchString(event.WorkerID) || event.StorageLineageID == "" || len(event.StorageLineageID) > 128 || event.FenceEpoch < 0 || event.AdmissionTaskDigest != admissionDigest || event.TaskEvidenceDigest != taskEvidenceDigest || !registeredEventPhase(event.Phase) || (event.Failure != "" && event.Failure != "credential_expired" && event.Failure != "credential_mint_failed" && event.Failure != "runtime_failed") || !validRegisteredVerifier(event.Verifier) {
+		if event.Cursor <= previous || event.SessionID != turn.SessionID || event.TurnID != turn.TurnID || event.ModelEffectID != turn.ModelEffectID || event.Attempt < 0 || !registeredOpaqueID.MatchString(event.WorkerID) || event.StorageLineageID == "" || len(event.StorageLineageID) > 128 || event.FenceEpoch < 0 || event.AdmissionTaskDigest != admissionDigest || event.TaskEvidenceDigest != taskEvidenceDigest || !registeredEventPhase(event.Phase) || (event.Failure != "" && event.Failure != "credential_expired" && event.Failure != "credential_mint_failed" && event.Failure != "runtime_failed") || !validRegisteredVerifier(event.Verifier, contractDigest, taskEvidenceDigest) {
 			return registeredEventsResponse{}, fmt.Errorf("agentd returned invalid registered event stream")
 		}
 		previous = event.Cursor
@@ -338,19 +404,48 @@ func registeredEventPhase(phase string) bool {
 	return false
 }
 
-func validRegisteredVerifier(verifier *registeredVerifierProjection) bool {
+var registeredVerifierReasonCode = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$`)
+
+func validRegisteredVerifier(verifier *registeredVerifierProjection, contractDigest, taskEvidenceDigest string) bool {
 	if verifier == nil {
 		return true
 	}
-	if (verifier.Phase != "pending" && verifier.Phase != "green" && verifier.Phase != "red" && verifier.Phase != "refused" && verifier.Phase != "escalated") || (verifier.Outcome != "waiting" && verifier.Outcome != "satisfied" && verifier.Outcome != "missing_or_stale" && verifier.Outcome != "continuation" && verifier.Outcome != "refused") || !sha256Digest.MatchString(verifier.ContractDigest) || !sha256Digest.MatchString(verifier.TaskEvidenceDigest) || verifier.Reasons == nil {
+	if !registeredVerifierPhaseOutcome(verifier.Phase, verifier.Outcome) || verifier.ContractDigest != contractDigest || verifier.TaskEvidenceDigest != taskEvidenceDigest || !sha256Digest.MatchString(verifier.ContractDigest) || !sha256Digest.MatchString(verifier.TaskEvidenceDigest) || !registeredOpaqueReference(verifier.HeadRevision) || verifier.Reasons == nil || len(verifier.Reasons) > 32 || len(verifier.EvidenceRefs) < 1 || len(verifier.EvidenceRefs) > 64 {
+		return false
+	}
+	if (verifier.Outcome == "satisfied" && len(verifier.Reasons) != 0) || (verifier.Outcome != "satisfied" && len(verifier.Reasons) == 0) {
 		return false
 	}
 	for _, reason := range verifier.Reasons {
-		if reason.Code == "" {
+		if !registeredVerifierReasonCode.MatchString(reason.Code) || (reason.EvidenceRef != "" && !registeredOpaqueReference(reason.EvidenceRef)) {
+			return false
+		}
+	}
+	for _, evidenceRef := range verifier.EvidenceRefs {
+		if !registeredOpaqueReference(evidenceRef) {
 			return false
 		}
 	}
 	return true
+}
+
+func registeredVerifierPhaseOutcome(phase, outcome string) bool {
+	switch outcome {
+	case "waiting":
+		return phase == "pending"
+	case "satisfied":
+		return phase == "green"
+	case "missing_or_stale", "continuation":
+		return phase == "red"
+	case "escalated":
+		return phase == "refused" || phase == "escalated"
+	default:
+		return false
+	}
+}
+
+func registeredOpaqueReference(value string) bool {
+	return len(value) >= 1 && len(value) <= 512
 }
 
 func validateCoordinatorAgentdResult(operation, sessionID string, after int64, result json.RawMessage) error {

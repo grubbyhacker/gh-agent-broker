@@ -34,8 +34,38 @@
         "fenceEpoch": 7,
         "admissionTaskDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "taskEvidenceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      {
+        "cursor": 2,
+        "sessionId": "session-42",
+        "turnId": "turn:turn-42",
+        "modelEffectId": "model:turn-42",
+        "attempt": 1,
+        "phase": "pending",
+        "workerId": "worker-42",
+        "storageLineageId": "lineage-42",
+        "fenceEpoch": 7,
+        "admissionTaskDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "taskEvidenceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "verifier": {
+          "phase": "pending",
+          "outcome": "waiting",
+          "contractDigest": "sha256:40963efb60fd00563bd6a33f1325b45008a917ebf17c110f9d3c86f7dd77d1fb",
+          "taskEvidenceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "headRevision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "reasons": [
+            {
+              "code": "pending",
+              "evidenceRef": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          ],
+          "evidenceRefs": [
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ]
+        }
       }
     ],
-    "nextCursor": 1
+    "nextCursor": 2
   }
 }

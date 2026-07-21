@@ -60,8 +60,8 @@ It therefore cannot validate the mandated receipt or implement per-request
 effect-token binding without fabricating a second authority ledger. Preserve
 this failure state until the matching agentd receipt contract is available.
 
-The broker-to-agentd registered turn seam now matches agentd PR #18 head
-`c64cf3efee1ebe3b439a7211f235a0458b8ab446`. Registered submit sends only the
+The broker-to-agentd registered turn seam now matches agentd ready PR #19 head
+`09bc4afaf9fe1bb62c8f2905fb49b52e56eb80aa`. Registered submit sends only the
 strict `agentd/registered-lifecycle/v1` body: `idempotencyKey`, `taskKind`,
 `admissionTaskDigest`, `taskEvidenceDigest`, and `parameters`. It accepts only
 HTTP 202 with strict `agentd/registered-turn/v2` queued acknowledgement and
@@ -69,9 +69,14 @@ requires `modelEffectId == model:<idempotencyKey>`. The broker persists that
 mapping and its events cursor, so replay returns the recorded acknowledgement
 without another submission. Events use only strict
 `agentd/registered-events/v2` typed projections and advance the durable cursor
-only after source-schema validation; verifier projections are source facts from
-agentd's background flow, never broker-invented facts. The source fixture is
-vendored unchanged at `testdata/agentd/registered-turn-v2.golden.json`.
+only after source-schema validation. The verifier projection is the exact
+session-supervisor 2.2.0 result plus its transport phase: bounded opaque head
+and evidence references, 1--64 evidence references, 0--32 strict reasons, and
+the exact phase/outcome mapping. Local deadline/refusal escalation remains an
+opaque source-owned fact and is not normalized into a GitHub SHA. Replayed
+cursors are rejected before forwarding, and a stored submit is never submitted
+again. The source fixture is vendored byte-for-byte at
+`testdata/agentd/registered-turn-v2.golden.json`.
 
 ### Authority agentd green-PR observation seam
 
