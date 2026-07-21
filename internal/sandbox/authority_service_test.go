@@ -639,7 +639,7 @@ func cloneCredentialBundles(in map[string]CredentialBundle) map[string]Credentia
 }
 
 func TestAuthorityWorkerRequestRejectsAuthorityOverrides(t *testing.T) {
-	for _, field := range []string{"image", "platform", "command", "credentials", "credential_bundle", "source_volume", "mount_path", "mounts", "network", "repo", "operations", "user", "isolation", "cap_add"} {
+	for _, field := range []string{"image", "platform", "command", "credentials", "credential_bundle", "source_volume", "mount_path", "mounts", "network", "repo", "operations", "user", "isolation", "cap_add", "broker_observation_url", "broker_observation_token"} {
 		body := `{"profile":"writer","idempotency_key":"one","session_binding":"session-1","` + field + `":"forbidden"}`
 		var request AuthorityWorkerRequest
 		if err := json.Unmarshal([]byte(body), &request); err == nil || !strings.Contains(err.Error(), "unknown field") {
@@ -668,6 +668,12 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	}
 	if got, want := runtime.Env["AGENTD_BROKER_VALIDATION_URL"], "http://sandbox-broker:8091/v1/authority-workers/agentd/session-validation"; got != want {
 		t.Fatalf("AGENTD_BROKER_VALIDATION_URL=%q, want %q", got, want)
+	}
+	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_URL"], "http://broker:8080/v1/registered/github-green-pr/observe"; got != want {
+		t.Fatalf("AGENTD_BROKER_OBSERVATION_URL=%q, want %q", got, want)
+	}
+	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_TOKEN"], "secret"; got != want || got != runtime.Env[profile.BrokerSecretEnv] {
+		t.Fatalf("AGENTD_BROKER_OBSERVATION_TOKEN is not the registered broker principal credential")
 	}
 	validationToken := runtime.Env["AGENTD_BROKER_VALIDATION_TOKEN"]
 	wantValidationToken := deriveAgentdValidationToken("secret", worker.WorkerID, worker.WorkerStorageLineageID, worker.WorkerFenceEpoch)

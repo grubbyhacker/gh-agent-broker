@@ -2,6 +2,17 @@
 
 ## Current State
 
+### Authority agentd green-PR observation seam
+
+Active authority `agentd` workers receive the fixed, broker-owned
+`AGENTD_BROKER_OBSERVATION_URL` value
+`http://broker:8080/v1/registered/github-green-pr/observe` and
+`AGENTD_BROKER_OBSERVATION_TOKEN` from the same configured registered broker
+principal secret as `broker_agent_secret_env`. The URL is fixed in service code:
+neither caller input nor an authority profile may select it. The authority
+worker network is `gh-agent-broker_default`, whose reviewed compose topology
+contains the `broker` service at port 8080; no GitHub credential is injected.
+
 ### GitHub branch-rules API seam
 
 Green-PR observation decodes GitHub's active branch-rules response as its
