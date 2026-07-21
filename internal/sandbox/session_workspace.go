@@ -101,6 +101,16 @@ func (s *AuthorityWorkerStore) IssueAgentdSession(ctx context.Context, binding, 
 	if err := s.checkIssuanceInTransaction(ctx, conn, profile, issuanceGeneration); err != nil {
 		return err
 	}
+	var existingSessionID string
+	if err := conn.QueryRowContext(ctx, `SELECT agentd_session_id FROM authority_session_workspaces WHERE binding_digest=?`, s.requestDigest(binding)).Scan(&existingSessionID); err != nil {
+		return err
+	}
+	if existingSessionID != "" {
+		if !validAgentdID(existingSessionID) {
+			return fmt.Errorf("durable agentd session identity is malformed")
+		}
+		return nil
+	}
 	sessionID, err := issue()
 	if err != nil {
 		return err
