@@ -672,16 +672,11 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_URL"], "http://broker:8080/v1/registered/github-green-pr/observe"; got != want {
 		t.Fatalf("AGENTD_BROKER_OBSERVATION_URL=%q, want %q", got, want)
 	}
-	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_AGENT_ID"], profile.BrokerAgentID; got != want {
-		t.Fatalf("AGENTD_BROKER_OBSERVATION_AGENT_ID=%q, want %q", got, want)
+	if _, ok := runtime.Env[profile.BrokerSecretEnv]; ok {
+		t.Fatal("runtime projected the reusable broker principal secret")
 	}
-	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_SECRET"], "secret"; got != want || got != runtime.Env[profile.BrokerSecretEnv] {
-		t.Fatalf("AGENTD_BROKER_OBSERVATION_SECRET is not the registered broker principal credential")
-	}
-	for key, value := range runtime.Env {
-		if strings.HasPrefix(key, "AGENTD_BROKER_OBSERVATION_") && (strings.Contains(key, "TOKEN") || strings.Contains(key, "BEARER")) {
-			t.Fatalf("runtime injected ambiguous observation credential %s=%q", key, value)
-		}
+	if got := runtime.Env["AGENTD_BROKER_CREDENTIAL_MINT_URL"]; got != agentdBrokerCredentialMintURL {
+		t.Fatalf("credential mint URL=%q", got)
 	}
 	for _, credential := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
 		if value, ok := runtime.Env[credential]; ok || value != "" {
@@ -692,6 +687,9 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	wantValidationToken := deriveAgentdValidationToken("secret", worker.WorkerID, worker.WorkerStorageLineageID, worker.WorkerFenceEpoch)
 	if validationToken != wantValidationToken || validationToken == "secret" || validationToken == runtime.Env[profile.BrokerSecretEnv] {
 		t.Fatal("agentd broker validation token is not an opaque generation-bound derivation")
+	}
+	if runtime.Env["AGENTD_BROKER_CONTROL_TOKEN"] != validationToken {
+		t.Fatal("control token is not the exact generation-bound control identity")
 	}
 	for _, other := range []string{
 		deriveAgentdValidationToken("secret", "other-worker", worker.WorkerStorageLineageID, worker.WorkerFenceEpoch),

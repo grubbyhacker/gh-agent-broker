@@ -19,7 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const authorityStoreSchemaVersion = 11
+const authorityStoreSchemaVersion = 12
 
 const (
 	authorityAdoptionPending          = "pending"
@@ -261,6 +261,12 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 		if err := s.migrateV11(ctx); err != nil {
 			return err
 		}
+		version = 11
+	}
+	if version == 11 {
+		if err := s.migrateV12(ctx); err != nil {
+			return err
+		}
 	}
 	var salt []byte
 	err := s.db.QueryRowContext(ctx, "SELECT value FROM authority_settings WHERE name='request_hmac_salt'").Scan(&salt)
@@ -280,6 +286,22 @@ func (s *AuthorityWorkerStore) initialize(ctx context.Context) error {
 	}
 	s.salt = append([]byte(nil), salt...)
 	return nil
+}
+
+// V12 is the custody record for agentd's reducer-produced credential receipt.
+// It stores only a verifier for the child secret, never the secret itself.
+func (s *AuthorityWorkerStore) migrateV12(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `CREATE TABLE authority_git_credentials (
+		receipt_digest TEXT PRIMARY KEY, receipt_json TEXT NOT NULL,
+		principal TEXT NOT NULL, binding_digest TEXT NOT NULL, session_id TEXT NOT NULL,
+		effect_id TEXT NOT NULL, model_effect_id TEXT NOT NULL, repository TEXT NOT NULL,
+		worker_id TEXT NOT NULL, worker_storage_lineage_id TEXT NOT NULL, worker_fence_epoch INTEGER NOT NULL,
+		agent_id TEXT NOT NULL UNIQUE, secret_fingerprint TEXT NOT NULL UNIQUE,
+		expires_at_ms INTEGER NOT NULL, revoked_at TEXT NOT NULL DEFAULT '',
+		UNIQUE(principal,binding_digest,model_effect_id),
+		FOREIGN KEY(principal,binding_digest) REFERENCES authority_registered_admissions(principal,binding_digest)
+	) STRICT; CREATE INDEX authority_git_credentials_active ON authority_git_credentials(agent_id,expires_at_ms,revoked_at); PRAGMA user_version=12`)
+	return err
 }
 
 // V11 atomically records immutable registered-task input with its owning lease.

@@ -29,6 +29,20 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			writeJSON(w, http.StatusOK, out)
 			return
 		}
+		if r.Method == http.MethodPost && path == "git-credential/mint" {
+			var in GitCredentialReceipt
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.MintGitCredential(r.Context(), bearerToken(r), in)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusForbidden, "credential_denied", "credential receipt denied")
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
 		principal, ok := authorityRESTPrincipal(service.cfg, bearerToken(r))
 		if !ok {
 			writeRESTError(w, http.StatusUnauthorized, "unauthorized")

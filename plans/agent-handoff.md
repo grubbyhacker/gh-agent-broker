@@ -2,6 +2,28 @@
 
 ## Current State
 
+### Agentd canonical Git credential receipt
+
+The sandbox authority endpoint now accepts only
+`agentd-broker-git-credential-receipt/v1` at
+`POST /v1/authority-workers/git-credential/mint`, authenticated with the
+generation-bound parent control token. Schema v12 stores the exact canonical
+receipt bytes, receipt digest, effect binding, expiry, and only an HMAC-derived
+secret fingerprint. A child secret is deterministically derived from the
+broker-private authority-store salt, so a lost response and identical retry
+return the original value without persisting plaintext. Receipt conflicts,
+expired/released sessions, worker/storage/fence/profile/task mismatches, and
+cross-effect replays are denied. The response is the strict
+`agentd-broker-git-credential/v1` shape with `Cache-Control: no-store` and a
+nonrenewing `min(authorized_at + 30m, deadline_at)` expiry.
+
+Authority worker containers no longer receive the reusable configured broker
+agent secret or its observation identity. They receive only the existing
+generation-bound control derivation plus agentd's fixed credential-mint seam.
+The main broker opens the same custody database and recognizes a minted Basic
+credential only while its fingerprint, expiry, and exact registered repository
+match; it projects the parent policy only for that fixed repository.
+
 ### Custody implementation handoff — blocked at the agentd effect-authority seam
 
 `vps-ops` main at `435411d148cf756abc0f3ea9ee859db3ee8cb0be` settles Option A:

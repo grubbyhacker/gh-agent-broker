@@ -48,6 +48,7 @@ type Server struct {
 	fence             pushtripwire.FenceAdapter
 	transport         *sandbox.TransportObserver
 	transportProfiles map[string]string
+	credentialStore   *sandbox.AuthorityWorkerStore
 }
 
 func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *audit.Logger) (*Server, error) {
@@ -66,6 +67,13 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 			return nil, fmt.Errorf("open transport observer: %w", err)
 		}
 	}
+	var credentialStore *sandbox.AuthorityWorkerStore
+	if cfg.TransportObservation.AuthorityStorePath != "" {
+		credentialStore, err = sandbox.OpenAuthorityWorkerStore(context.Background(), cfg.TransportObservation.AuthorityStorePath)
+		if err != nil {
+			return nil, fmt.Errorf("open credential custody store: %w", err)
+		}
+	}
 	return &Server{
 		configPath:        configPath,
 		cfg:               cfg,
@@ -75,6 +83,7 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 		tripwire:          tripwire,
 		transport:         transport,
 		transportProfiles: cfg.TransportObservation.ProfileAgentIDs,
+		credentialStore:   credentialStore,
 	}, nil
 }
 
@@ -2041,14 +2050,27 @@ func (s *Server) handleIssueLabelRemove(w http.ResponseWriter, r *http.Request, 
 func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	opID := ids.NewOperationID()
 	cfg, gh := s.snapshot()
-	principal, ok := auth.AuthenticateAgent(r, cfg)
-	if !ok {
-		writeAuthText(w, "agent authentication failed")
-		return
-	}
 	repo, suffix, ok := parseGitPath(r.URL.Path)
 	if !ok {
 		http.Error(w, "invalid git path", http.StatusNotFound)
+		return
+	}
+	principal, ok := auth.AuthenticateAgent(r, cfg)
+	if !ok && s.credentialStore != nil {
+		id, secret, basic := r.BasicAuth()
+		if basic {
+			if custody, valid, err := s.credentialStore.AuthenticateGitCredential(r.Context(), id, secret, repo); err == nil && valid {
+				if parent, found := cfg.AgentByID(custody.Principal); found {
+					parent.ID = custody.AgentID
+					parent.Secret = ""
+					parent.Repositories = []string{custody.Repository}
+					principal, ok = auth.Principal{Agent: parent, ID: custody.AgentID}, true
+				}
+			}
+		}
+	}
+	if !ok {
+		writeAuthText(w, "agent authentication failed")
 		return
 	}
 	operation := gitOperation(r, suffix)
