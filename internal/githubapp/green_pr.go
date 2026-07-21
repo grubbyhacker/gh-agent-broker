@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -91,18 +92,45 @@ func (c *Client) CreateReadyGreenPR(appName string, in GreenPRRequest) (GreenPRP
 	if err := validGreenPRRequest(in); err != nil {
 		return GreenPRPullRequest{}, err
 	}
-	branch := strings.TrimPrefix(in.WorkerRef, "refs/heads/")
-	var created greenPRPull
-	if err := c.doJSON(appName, http.MethodPost, "/repos/"+in.Repository+"/pulls", in.InstallationID, map[string]any{
-		"title": "Agent task " + in.RegisteredTaskDigest,
-		"head":  branch, "base": in.BaseRef, "body": "", "draft": false,
-	}, &created); err != nil {
+	target, err := c.greenPRRepository(appName, in.InstallationID, in.Repository)
+	if err != nil {
 		return GreenPRPullRequest{}, err
 	}
-	if !validGreenPRRepository(derefGreenPRRepository(created.Head.Repo), in.Repository) || created.Base.Ref != in.BaseRef || created.Head.Ref != branch || created.Head.SHA != in.PushedHeadSHA || created.State != "open" || created.Draft {
-		return GreenPRPullRequest{}, fmt.Errorf("created pull request does not match broker-owned branch operation")
+	branch := strings.TrimPrefix(in.WorkerRef, "refs/heads/")
+	if existing, found, err := c.greenPRPull(appName, in.InstallationID, in.Repository, greenPRHead(in.Repository, branch)); err != nil {
+		return GreenPRPullRequest{}, err
+	} else if found {
+		return exactReadyGreenPR(target, existing, in, branch)
 	}
-	return GreenPRPullRequest{DatabaseID: created.ID, NodeID: created.NodeID, Number: created.Number, URL: created.HTMLURL, State: created.State, Draft: created.Draft, BaseRef: created.Base.Ref, HeadRef: created.Head.Ref, HeadRepository: derefGreenPRRepository(created.Head.Repo), HeadSHA: created.Head.SHA}, nil
+	var created greenPRPull
+	err = c.doJSON(appName, http.MethodPost, "/repos/"+in.Repository+"/pulls", in.InstallationID, map[string]any{
+		"title": "Agent task " + in.RegisteredTaskDigest,
+		"head":  branch, "base": in.BaseRef, "body": "", "draft": false,
+	}, &created)
+	if err != nil {
+		var apiErr APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusUnprocessableEntity {
+			return GreenPRPullRequest{}, err
+		}
+		existing, found, observeErr := c.greenPRPull(appName, in.InstallationID, in.Repository, greenPRHead(in.Repository, branch))
+		if observeErr != nil || !found {
+			return GreenPRPullRequest{}, err
+		}
+		return exactReadyGreenPR(target, existing, in, branch)
+	}
+	return exactReadyGreenPR(target, created, in, branch)
+}
+
+func greenPRHead(repository, branch string) string {
+	owner, _, _ := strings.Cut(repository, "/")
+	return owner + ":" + branch
+}
+
+func exactReadyGreenPR(target GreenPRRepositoryIdentity, pull greenPRPull, in GreenPRRequest, branch string) (GreenPRPullRequest, error) {
+	if !sameGreenPRIdentity(target, derefGreenPRRepository(pull.Head.Repo)) || pull.Base.Ref != in.BaseRef || pull.Head.Ref != branch || pull.Head.SHA != in.PushedHeadSHA || pull.State != "open" || pull.Draft {
+		return GreenPRPullRequest{}, fmt.Errorf("existing pull request does not match broker-owned branch operation")
+	}
+	return GreenPRPullRequest{DatabaseID: pull.ID, NodeID: pull.NodeID, Number: pull.Number, URL: pull.HTMLURL, State: pull.State, Draft: pull.Draft, BaseRef: pull.Base.Ref, HeadRef: pull.Head.Ref, HeadRepository: derefGreenPRRepository(pull.Head.Repo), HeadSHA: pull.Head.SHA}, nil
 }
 
 // ObserveGreenPR uses only the installation token held by this client. It
@@ -116,9 +144,8 @@ func (c *Client) ObserveGreenPR(appName string, in GreenPRRequest) (GreenPRObser
 	if err != nil {
 		return GreenPRObservation{}, err
 	}
-	owner, _, _ := strings.Cut(in.Repository, "/")
 	branch := strings.TrimPrefix(in.WorkerRef, "refs/heads/")
-	pull, found, err := c.greenPRPull(appName, in.InstallationID, in.Repository, owner+":"+branch)
+	pull, found, err := c.greenPRPull(appName, in.InstallationID, in.Repository, greenPRHead(in.Repository, branch))
 	if err != nil {
 		return GreenPRObservation{}, err
 	}
@@ -128,16 +155,15 @@ func (c *Client) ObserveGreenPR(appName string, in GreenPRRequest) (GreenPRObser
 		return sealGreenPRObservation(obs)
 	}
 	obs := newGreenPRObservation(in, target)
-	if pull.Draft {
-		obs.PullRequest = &GreenPRPullRequest{DatabaseID: pull.ID, NodeID: pull.NodeID, Number: pull.Number, URL: pull.HTMLURL, State: pull.State, Draft: pull.Draft, BaseRef: pull.Base.Ref, HeadRef: pull.Head.Ref, HeadRepository: derefGreenPRRepository(pull.Head.Repo), HeadSHA: pull.Head.SHA}
-		obs.Verdict = "draft"
-		return sealGreenPRObservation(obs)
-	}
 	if !sameGreenPRIdentity(target, derefGreenPRRepository(pull.Head.Repo)) || pull.Base.Ref != in.BaseRef || pull.Head.Ref != branch || pull.Head.SHA != in.PushedHeadSHA || pull.State != "open" {
 		obs.Verdict = "refused"
 		return sealGreenPRObservation(obs)
 	}
 	obs.PullRequest = &GreenPRPullRequest{DatabaseID: pull.ID, NodeID: pull.NodeID, Number: pull.Number, URL: pull.HTMLURL, State: pull.State, Draft: pull.Draft, BaseRef: pull.Base.Ref, HeadRef: pull.Head.Ref, HeadRepository: *pull.Head.Repo, HeadSHA: pull.Head.SHA}
+	if pull.Draft {
+		obs.Verdict = "draft"
+		return sealGreenPRObservation(obs)
+	}
 	rules, err := c.greenPRRules(appName, in.InstallationID, in.Repository, in.BaseRef)
 	if err != nil {
 		return GreenPRObservation{}, err
@@ -207,18 +233,36 @@ type greenPRPull struct {
 }
 
 func (c *Client) greenPRPull(app string, installation int64, repo, head string) (greenPRPull, bool, error) {
-	var pulls []greenPRPull
-	q := url.Values{"state": {"open"}, "head": {head}, "per_page": {"100"}}
-	if err := c.doJSON(app, http.MethodGet, "/repos/"+repo+"/pulls?"+q.Encode(), installation, nil, &pulls); err != nil {
-		return greenPRPull{}, false, err
+	_, branch, ok := strings.Cut(head, ":")
+	if !ok || branch == "" {
+		return greenPRPull{}, false, fmt.Errorf("green PR head selector is invalid")
 	}
-	if len(pulls) == 0 {
+	// GitHub's head query only searches the named owner. Read open PRs and
+	// select the immutable branch ref ourselves so a copied/forked PR with the
+	// same branch name is refused instead of being invisible to creation.
+	candidates := make([]greenPRPull, 0, 1)
+	for page := 1; ; page++ {
+		var pulls []greenPRPull
+		q := url.Values{"state": {"open"}, "per_page": {"100"}, "page": {strconv.Itoa(page)}}
+		if err := c.doJSON(app, http.MethodGet, "/repos/"+repo+"/pulls?"+q.Encode(), installation, nil, &pulls); err != nil {
+			return greenPRPull{}, false, err
+		}
+		for _, pull := range pulls {
+			if pull.Head.Ref == branch {
+				candidates = append(candidates, pull)
+			}
+		}
+		if len(pulls) < 100 {
+			break
+		}
+	}
+	if len(candidates) == 0 {
 		return greenPRPull{}, false, nil
 	}
-	if len(pulls) != 1 {
+	if len(candidates) != 1 {
 		return greenPRPull{}, false, fmt.Errorf("multiple open pull requests for broker branch")
 	}
-	return pulls[0], true, nil
+	return candidates[0], true, nil
 }
 
 func (c *Client) greenPRRepository(app string, installation int64, fullName string) (GreenPRRepositoryIdentity, error) {

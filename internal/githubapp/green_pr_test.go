@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +82,82 @@ func TestObserveGreenPRRefusesMismatchedHeadImmutableIdentity(t *testing.T) {
 				t.Fatalf("obs=%#v err=%v", obs, err)
 			}
 		})
+	}
+}
+
+func TestObserveGreenPRRefusesCopiedOrStaleDraftBeforeDraftVerdict(t *testing.T) {
+	head := strings.Repeat("a", 40)
+	for name, pull := range map[string]map[string]any{
+		"copied draft": {"head_repo": GreenPRRepositoryIdentity{DatabaseID: 43, NodeID: "R_43", FullName: "fork/repo"}, "head_sha": head},
+		"stale draft":  {"head_repo": GreenPRRepositoryIdentity{DatabaseID: 42, NodeID: "R_42", FullName: "owner/repo"}, "head_sha": strings.Repeat("b", 40)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := greenPRTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/repos/owner/repo":
+					writeGreenPRTestJSON(t, w, GreenPRRepositoryIdentity{DatabaseID: 42, NodeID: "R_42", FullName: "owner/repo"})
+				case "/repos/owner/repo/pulls":
+					writeGreenPRTestJSON(t, w, []any{map[string]any{"id": 7, "node_id": "PR_7", "number": 7, "html_url": "https://example.test/pr/7", "state": "open", "draft": true, "base": map[string]any{"ref": "main"}, "head": map[string]any{"ref": "agent/fleiglabs-repo-agent/work", "sha": pull["head_sha"], "repo": pull["head_repo"]}}})
+				default:
+					t.Fatalf("unexpected request for refused draft: %s", r.URL.String())
+				}
+			})
+			obs, err := c.ObserveGreenPR("default", GreenPRRequest{RegisteredTaskDigest: "sha256:task", BrokerOperationID: "operation", AppSlug: "app", InstallationID: 1, Repository: "owner/repo", BaseRef: "main", WorkerRef: "refs/heads/agent/fleiglabs-repo-agent/work", PushedHeadSHA: head})
+			if err != nil || obs.Verdict != "refused" {
+				t.Fatalf("obs=%#v err=%v", obs, err)
+			}
+		})
+	}
+}
+
+func TestCreateReadyGreenPRReturnsExactExistingReadyPull(t *testing.T) {
+	head := strings.Repeat("a", 40)
+	c := greenPRTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/owner/repo":
+			writeGreenPRTestJSON(t, w, GreenPRRepositoryIdentity{DatabaseID: 42, NodeID: "R_42", FullName: "owner/repo"})
+		case "/repos/owner/repo/pulls":
+			if r.Method != http.MethodGet || r.URL.Query().Get("state") != "open" || r.URL.Query().Get("head") != "" {
+				t.Fatalf("existing ready PR lookup did not inspect all open candidates: %s %s", r.Method, r.URL.String())
+			}
+			writeGreenPRTestJSON(t, w, []any{map[string]any{"id": 7, "node_id": "PR_7", "number": 7, "html_url": "https://example.test/pr/7", "state": "open", "draft": false, "base": map[string]any{"ref": "main"}, "head": map[string]any{"ref": "agent/fleiglabs-repo-agent/work", "sha": head, "repo": map[string]any{"database_id": 42, "node_id": "R_42", "full_name": "owner/repo"}}}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.String())
+		}
+	})
+	pull, err := c.CreateReadyGreenPR("default", GreenPRRequest{RegisteredTaskDigest: "sha256:task", BrokerOperationID: "operation", AppSlug: "app", InstallationID: 1, Repository: "owner/repo", BaseRef: "main", WorkerRef: "refs/heads/agent/fleiglabs-repo-agent/work", PushedHeadSHA: head})
+	if err != nil || pull.Number != 7 || pull.HeadSHA != head {
+		t.Fatalf("pull=%#v err=%v", pull, err)
+	}
+}
+
+func TestCreateReadyGreenPRPostsOnlyBrokerDerivedReadyFields(t *testing.T) {
+	head := strings.Repeat("a", 40)
+	c := greenPRTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/owner/repo":
+			writeGreenPRTestJSON(t, w, GreenPRRepositoryIdentity{DatabaseID: 42, NodeID: "R_42", FullName: "owner/repo"})
+		case "/repos/owner/repo/pulls":
+			if r.Method == http.MethodGet {
+				writeGreenPRTestJSON(t, w, []any{})
+				return
+			}
+			var got map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]any{"title": "Agent task sha256:task", "head": "agent/fleiglabs-repo-agent/work", "base": "main", "body": "", "draft": false}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("create payload=%#v want=%#v", got, want)
+			}
+			writeGreenPRTestJSON(t, w, map[string]any{"id": 7, "node_id": "PR_7", "number": 7, "html_url": "https://example.test/pr/7", "state": "open", "draft": false, "base": map[string]any{"ref": "main"}, "head": map[string]any{"ref": "agent/fleiglabs-repo-agent/work", "sha": head, "repo": map[string]any{"database_id": 42, "node_id": "R_42", "full_name": "owner/repo"}}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.String())
+		}
+	})
+	pull, err := c.CreateReadyGreenPR("default", GreenPRRequest{RegisteredTaskDigest: "sha256:task", BrokerOperationID: "operation", AppSlug: "app", InstallationID: 1, Repository: "owner/repo", BaseRef: "main", WorkerRef: "refs/heads/agent/fleiglabs-repo-agent/work", PushedHeadSHA: head})
+	if err != nil || pull.Number != 7 {
+		t.Fatalf("pull=%#v err=%v", pull, err)
 	}
 }
 

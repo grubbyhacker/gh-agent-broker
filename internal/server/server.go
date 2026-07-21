@@ -354,6 +354,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handlePushTripwireResponse(w, r)
 	case r.URL.Path == "/v1/registered/github-green-pr/observe":
 		s.handleRegisteredGreenPRObservation(w, r)
+	case r.URL.Path == "/v1/registered/github-green-pr/create":
+		s.handleRegisteredGreenPRCreate(w, r)
 	case r.URL.Path == "/v1/policy/dry-run":
 		s.handleDryRun(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/repos/"):
@@ -369,19 +371,57 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // surface: every completion fact is derived from durable admission, the
 // broker's recorded smart-HTTP push, and authenticated GitHub reads.
 func (s *Server) handleRegisteredGreenPRObservation(w http.ResponseWriter, r *http.Request) {
+	principal, appName, admission, installation, gh, ok := s.registeredGreenPRAdmission(w, r, "observation")
+	if !ok {
+		return
+	}
+	observation, err := gh.ObserveGreenPR(appName, greenPRRequest(admission, appName, installation))
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "GitHub green PR observation failed"})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: admission.OperationID, AgentID: principal.ID, Operation: "github_green_pr.observe", Repo: admission.Task.Parameters.Repository, Branch: admission.Task.Parameters.BranchRef, Decision: policy.DecisionAllow, Result: observation.Verdict})
+	writeJSON(w, http.StatusOK, observation)
+}
+
+// handleRegisteredGreenPRCreate has the same empty request surface and
+// durable admission source as observation. The fixed App installation creates
+// the ready PR; callers cannot select its title, refs, body, or draft state.
+func (s *Server) handleRegisteredGreenPRCreate(w http.ResponseWriter, r *http.Request) {
+	principal, appName, admission, installation, gh, ok := s.registeredGreenPRAdmission(w, r, "creation")
+	if !ok {
+		return
+	}
+	pull, err := gh.CreateReadyGreenPR(appName, greenPRRequest(admission, appName, installation))
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "GitHub green PR creation was refused"})
+		return
+	}
+	s.audit.Log(audit.Event{OperationID: admission.OperationID, AgentID: principal.ID, Operation: "github_green_pr.create", Repo: admission.Task.Parameters.Repository, Branch: admission.Task.Parameters.BranchRef, Decision: policy.DecisionAllow, GitHubURL: pull.URL, Result: "ok"})
+	writeJSON(w, http.StatusCreated, pull)
+}
+
+func greenPRRequest(admission sandbox.GreenPRTransportAdmission, appName string, installation int64) githubapp.GreenPRRequest {
+	return githubapp.GreenPRRequest{RegisteredTaskDigest: admission.TaskDigest, BrokerOperationID: admission.OperationID, AppSlug: appName, InstallationID: installation, Repository: admission.Task.Parameters.Repository, BaseRef: admission.Task.Parameters.BaseBranch, WorkerRef: "refs/heads/" + admission.Task.Parameters.BranchRef, PushedHeadSHA: admission.PushedSHA}
+}
+
+// registeredGreenPRAdmission authenticates the registered principal, rejects
+// every caller-supplied completion fact, and derives all mutable PR inputs
+// from the one durable task and completed broker push.
+func (s *Server) registeredGreenPRAdmission(w http.ResponseWriter, r *http.Request, action string) (auth.Principal, string, sandbox.GreenPRTransportAdmission, int64, *githubapp.Client, bool) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
 	if body, err := io.ReadAll(io.LimitReader(r.Body, 2)); err != nil || len(bytes.TrimSpace(body)) != 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "github green PR observation accepts no caller facts"})
-		return
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "github green PR " + action + " accepts no caller facts"})
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
 	cfg, gh := s.snapshot()
-	principal, ok := auth.AuthenticateAgent(r, cfg)
-	if !ok {
+	principal, authenticated := auth.AuthenticateAgent(r, cfg)
+	if !authenticated {
 		writeAuthJSON(w, api.ErrorResponse{Code: "unauthorized", Message: "agent authentication failed", Decision: policy.DecisionDeny})
-		return
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
 	profiles := make([]string, 0, 1)
 	for profile, agentID := range s.transportProfiles {
@@ -391,26 +431,25 @@ func (s *Server) handleRegisteredGreenPRObservation(w http.ResponseWriter, r *ht
 	}
 	if s.transport == nil || len(profiles) != 1 {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "registered transport authority is unavailable"})
-		return
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
 	admission, err := s.transport.GreenPRAdmission(r.Context(), profiles[0])
 	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "registered green PR observation is unavailable"})
-		return
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "registered green PR " + action + " is unavailable"})
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
 	appName := config.GitHubAppName(principal.Agent)
 	installation, ok := cfg.InstallationIDForApp(appName, admission.Task.Parameters.Repository)
 	if !ok {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "repository installation is not configured"})
-		return
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
-	observation, err := gh.ObserveGreenPR(appName, githubapp.GreenPRRequest{RegisteredTaskDigest: admission.TaskDigest, BrokerOperationID: admission.OperationID, AppSlug: appName, InstallationID: installation, Repository: admission.Task.Parameters.Repository, BaseRef: admission.Task.Parameters.BaseBranch, WorkerRef: "refs/heads/" + admission.Task.Parameters.BranchRef, PushedHeadSHA: admission.PushedSHA})
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "GitHub green PR observation failed"})
-		return
+	result := policy.Check(policy.Request{Agent: principal.Agent, AgentID: principal.ID, Repo: admission.Task.Parameters.Repository, Operation: "pull.create", Branch: admission.Task.Parameters.BranchRef, BaseBranch: admission.Task.Parameters.BaseBranch})
+	if !result.Allowed {
+		writeJSON(w, http.StatusForbidden, s.errorResponse(admission.OperationID, "policy_denied", "registered green PR creation denied by policy", &result))
+		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
-	s.audit.Log(audit.Event{OperationID: admission.OperationID, AgentID: principal.ID, Operation: "github_green_pr.observe", Repo: admission.Task.Parameters.Repository, Branch: admission.Task.Parameters.BranchRef, Decision: policy.DecisionAllow, Result: observation.Verdict})
-	writeJSON(w, http.StatusOK, observation)
+	return principal, appName, admission, installation, gh, true
 }
 
 func handleDiscovery(w http.ResponseWriter, r *http.Request) {
@@ -441,6 +480,20 @@ func handleOperations(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"version": "v1",
 		"operations": []map[string]interface{}{
+			{
+				"name":        "registered.github-green-pr.create",
+				"method":      http.MethodPost,
+				"path":        "/v1/registered/github-green-pr/create",
+				"auth":        "registered agent",
+				"description": "Create or return the exact ready PR derived from the registered task and completed broker push. This endpoint accepts no request body.",
+			},
+			{
+				"name":        "registered.github-green-pr.observe",
+				"method":      http.MethodPost,
+				"path":        "/v1/registered/github-green-pr/observe",
+				"auth":        "registered agent",
+				"description": "Observe the exact ready PR derived from the registered task and completed broker push. This endpoint accepts no request body.",
+			},
 			{
 				"name":        "repo.probe",
 				"method":      http.MethodGet,
@@ -597,6 +650,8 @@ Discovery:
 - GET /whoami
 
 Operations:
+- POST /v1/registered/github-green-pr/create
+- POST /v1/registered/github-green-pr/observe
 - GET  /v1/repos/{owner}/{repo}/probe
 - POST /v1/policy/dry-run
 - GET  /v1/repos/{owner}/{repo}/pulls

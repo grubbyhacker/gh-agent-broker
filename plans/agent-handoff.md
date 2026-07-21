@@ -8,10 +8,14 @@ The registered v2 admission now accepts only the settled
 `github_green_pr_v1` task values for
 `grubbyhacker/repository-worker-lifecycle-test`, `main`, and the anchored
 `agent/fleiglabs-repo-agent/...` branch namespace. The broker's
-`POST /v1/registered/github-green-pr/observe` accepts no request body or
-caller completion facts. It derives the immutable task digest and exact pushed
-head from the active durable lease and completed broker smart-HTTP operation,
-then emits `github-green-pr-observation/v1` using authenticated App reads of
+`POST /v1/registered/github-green-pr/create` and
+`POST /v1/registered/github-green-pr/observe` accept no request body or caller
+completion facts. Both derive the immutable task digest and exact pushed head
+from the active durable lease and completed broker smart-HTTP operation. Create
+uses the configured App installation and fixed broker-owned title/head/base/body
+and ready state, returning an existing exact ready PR idempotently while
+refusing ambiguous or mismatched rows; it does not use the generic caller-shaped
+`pull.create` route. Observe emits `github-green-pr-observation/v1` using authenticated App reads of
 the immutable target repository, ready PR, active branch rules, and complete
 paginated evaluation-SHA checks/statuses. It records the target repository
 database ID, node ID, and full name even for missing or draft PRs; a positive
