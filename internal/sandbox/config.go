@@ -28,6 +28,7 @@ const (
 )
 
 type Config struct {
+	AuthorityOnly                  bool                          `yaml:"authority_only"`
 	Listen                         string                        `yaml:"listen"`
 	MCPPath                        string                        `yaml:"mcp_path"`
 	AuthToken                      string                        `yaml:"auth_token"`
@@ -257,7 +258,34 @@ func (c *Config) ResolveSecrets() {
 
 func (c *Config) Validate() error {
 	var errs []string
-	if strings.TrimSpace(c.AuthToken) == "" {
+	if c.AuthorityOnly {
+		if strings.TrimSpace(c.AuthToken) != "" || strings.TrimSpace(c.AuthTokenEnv) != "" {
+			errs = append(errs, "authority_only forbids auth_token and auth_token_env")
+		}
+		if len(c.Bundles) != 0 {
+			errs = append(errs, "authority_only forbids credential_bundles")
+		}
+		if len(c.Templates) != 0 {
+			errs = append(errs, "authority_only forbids templates")
+		}
+		if len(c.LaunchProfiles) != 0 {
+			errs = append(errs, "authority_only forbids launch_profiles")
+		}
+		if len(c.OperatorPrincipals) != 0 {
+			errs = append(errs, "authority_only forbids operator_principals")
+		}
+		if len(c.AuthorityProfiles) == 0 {
+			errs = append(errs, "authority_only requires authority_profiles")
+		}
+		if len(c.AuthorityPrincipals) == 0 {
+			errs = append(errs, "authority_only requires authority_principals")
+		}
+		if strings.TrimSpace(c.RegisteredCoordinatorPrincipal) == "" {
+			errs = append(errs, "authority_only requires registered_coordinator_principal")
+		} else if _, ok := c.AuthorityPrincipals[c.RegisteredCoordinatorPrincipal]; !ok {
+			errs = append(errs, "registered_coordinator_principal must name an authority_principal")
+		}
+	} else if strings.TrimSpace(c.AuthToken) == "" {
 		errs = append(errs, "auth_token or auth_token_env is required")
 	}
 	if strings.TrimSpace(c.BrokerURL) == "" {
@@ -309,7 +337,7 @@ func (c *Config) Validate() error {
 	for name, bundle := range c.Bundles {
 		errs = append(errs, c.validateBundle(name, bundle)...)
 	}
-	if len(c.Templates) == 0 {
+	if !c.AuthorityOnly && len(c.Templates) == 0 {
 		errs = append(errs, "templates must not be empty")
 	}
 	for name, tmpl := range c.Templates {
@@ -847,6 +875,10 @@ func (c Config) versionDigest() string {
 		"max_parameter_bytes":  c.MaxParameterBytes,
 		"log_byte_limit":       c.LogByteLimit,
 		"stop_grace":           c.StopGrace,
+	}
+	if c.AuthorityOnly {
+		view["authority_only"] = true
+		view["registered_coordinator_principal"] = c.RegisteredCoordinatorPrincipal
 	}
 	b, err := json.Marshal(view)
 	if err != nil {
