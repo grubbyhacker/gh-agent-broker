@@ -256,6 +256,25 @@ func TestRegisteredVerifierProjectionIsStrictAndAcceptsLocalEscalation(t *testin
 	}
 }
 
+func TestRegisteredEventsFailureUnionAcceptsRuntimeOutcomeUncertain(t *testing.T) {
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	turn := registeredTurnState{SessionID: "session-42", TurnID: "turn:turn-42", ModelEffectID: "model:turn-42"}
+	event := `{"version":"agentd/registered-events/v2","events":[{"cursor":1,"sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","attempt":1,"phase":"failed","workerId":"worker-42","storageLineageId":"lineage-42","fenceEpoch":7,"admissionTaskDigest":"` + digest + `","taskEvidenceDigest":"` + digest + `","failure":"runtime_outcome_uncertain"}],"nextCursor":1}`
+
+	response, err := validateRegisteredEventsResponse([]byte(event), turn, 0, digest, digest, digest)
+	if err != nil {
+		t.Fatalf("runtime_outcome_uncertain event rejected: %v", err)
+	}
+	if got := response.Events[0].Failure; got != "runtime_outcome_uncertain" {
+		t.Fatalf("failure = %q, want runtime_outcome_uncertain", got)
+	}
+
+	unknown := strings.Replace(event, `"runtime_outcome_uncertain"`, `"runtime_outcome_unknown"`, 1)
+	if _, err := validateRegisteredEventsResponse([]byte(unknown), turn, 0, digest, digest, digest); err == nil {
+		t.Fatal("unknown registered event failure accepted")
+	}
+}
+
 func TestCoordinatorWireFixturesAreStable(t *testing.T) {
 	created := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
 	lease := AuthorityLease{Principal: "coordinator", Profile: "writer", WorkerID: "worker-1", SessionLineageID: "11111111111111111111111111111111", WorkerStorageLineageID: "22222222222222222222222222222222", WorkerFenceEpoch: 1, ProfileVersion: "profile-v1", PolicyDigest: strings.Repeat("a", 64), BindingDigest: "binding-digest", IdempotencyDigest: "idempotency-digest", CreatedAt: created}

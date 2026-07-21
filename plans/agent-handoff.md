@@ -61,7 +61,7 @@ effect-token binding without fabricating a second authority ledger. Preserve
 this failure state until the matching agentd receipt contract is available.
 
 The broker-to-agentd registered turn seam now matches agentd ready PR #19 head
-`09bc4afaf9fe1bb62c8f2905fb49b52e56eb80aa`. Registered submit sends only the
+`9801e4182ee4435885c7e195b4720f48a68e4f89`. Registered submit sends only the
 strict `agentd/registered-lifecycle/v1` body: `idempotencyKey`, `taskKind`,
 `admissionTaskDigest`, `taskEvidenceDigest`, and `parameters`. It accepts only
 HTTP 202 with strict `agentd/registered-turn/v2` queued acknowledgement and
@@ -77,6 +77,11 @@ opaque source-owned fact and is not normalized into a GitHub SHA. Replayed
 cursors are rejected before forwarding, and a stored submit is never submitted
 again. The source fixture is vendored byte-for-byte at
 `testdata/agentd/registered-turn-v2.golden.json`.
+
+Agentd may emit the typed optional `runtime_outcome_uncertain` failure for a
+persisted running effect recovered after restart. The broker's strict
+source-closed failure union accepts that value alongside only the existing
+credential and runtime failures; unknown failure values remain denied.
 
 ### Authority agentd green-PR observation seam
 

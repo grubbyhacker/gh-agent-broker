@@ -385,7 +385,7 @@ func validateRegisteredEventsResponse(result json.RawMessage, turn registeredTur
 	}
 	previous := after
 	for _, event := range response.Events {
-		if event.Cursor <= previous || event.SessionID != turn.SessionID || event.TurnID != turn.TurnID || event.ModelEffectID != turn.ModelEffectID || event.Attempt < 0 || !registeredOpaqueID.MatchString(event.WorkerID) || event.StorageLineageID == "" || len(event.StorageLineageID) > 128 || event.FenceEpoch < 0 || event.AdmissionTaskDigest != admissionDigest || event.TaskEvidenceDigest != taskEvidenceDigest || !registeredEventPhase(event.Phase) || (event.Failure != "" && event.Failure != "credential_expired" && event.Failure != "credential_mint_failed" && event.Failure != "runtime_failed") || !validRegisteredVerifier(event.Verifier, contractDigest, taskEvidenceDigest) {
+		if event.Cursor <= previous || event.SessionID != turn.SessionID || event.TurnID != turn.TurnID || event.ModelEffectID != turn.ModelEffectID || event.Attempt < 0 || !registeredOpaqueID.MatchString(event.WorkerID) || event.StorageLineageID == "" || len(event.StorageLineageID) > 128 || event.FenceEpoch < 0 || event.AdmissionTaskDigest != admissionDigest || event.TaskEvidenceDigest != taskEvidenceDigest || !registeredEventPhase(event.Phase) || !registeredEventFailure(event.Failure) || !validRegisteredVerifier(event.Verifier, contractDigest, taskEvidenceDigest) {
 			return registeredEventsResponse{}, fmt.Errorf("agentd returned invalid registered event stream")
 		}
 		previous = event.Cursor
@@ -394,6 +394,14 @@ func validateRegisteredEventsResponse(result json.RawMessage, turn registeredTur
 		return registeredEventsResponse{}, fmt.Errorf("agentd returned invalid registered event cursor")
 	}
 	return response, nil
+}
+
+func registeredEventFailure(failure string) bool {
+	switch failure {
+	case "", "credential_expired", "credential_mint_failed", "runtime_failed", "runtime_outcome_uncertain":
+		return true
+	}
+	return false
 }
 
 func registeredEventPhase(phase string) bool {
