@@ -2,6 +2,14 @@
 
 ## Current State
 
+### GitHub branch-rules API seam
+
+Green-PR observation decodes GitHub's active branch-rules response as its
+documented top-level JSON array and requests every page with
+`per_page=100&page=N`. Required-status-check rules are aggregated across pages
+before the existing incomplete, duplicate, source, sorting, and digest checks.
+The focused mock and pagination test use the real array response shape.
+
 ### GitHub green-PR completion observation
 
 The registered v2 admission now accepts only the settled

@@ -183,6 +183,41 @@ func TestGreenPRChecksReadsLaterPagesForDuplicates(t *testing.T) {
 	}
 }
 
+func TestGreenPRRulesReadsTopLevelArrayAcrossPages(t *testing.T) {
+	c := greenPRTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/owner/repo/rules/branches/main" || r.URL.Query().Get("per_page") != "100" {
+			t.Fatalf("unexpected request: %s", r.URL.String())
+		}
+		switch r.URL.Query().Get("page") {
+		case "1":
+			rules := make([]any, 100)
+			for i := range rules {
+				rules[i] = map[string]any{"type": "non_required_rule"}
+			}
+			writeGreenPRTestJSON(t, w, rules)
+		case "2":
+			writeGreenPRTestJSON(t, w, []any{
+				map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": "second"}}}},
+				map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": "first"}}}},
+			})
+		default:
+			t.Fatalf("unexpected page: %s", r.URL.String())
+		}
+	})
+
+	rules, err := c.greenPRRules("default", 1, "owner/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []greenPRRule{{Context: "first"}, {Context: "second"}}
+	if !reflect.DeepEqual(rules, want) {
+		t.Fatalf("rules=%#v want=%#v", rules, want)
+	}
+	if got, wantDigest := greenPRRulesDigest(rules), greenPRRulesDigest(want); got != wantDigest {
+		t.Fatalf("digest=%q want=%q", got, wantDigest)
+	}
+}
+
 func TestSealGreenPRObservationBindsEveryBrokerField(t *testing.T) {
 	obs := GreenPRObservation{Version: GreenPRObservationVersion, RegisteredTaskDigest: "sha256:task", BrokerOperationID: "operation-a", AppSlug: "fleiglabs-repo-agent", InstallationID: 146437790, Repository: "grubbyhacker/repository-worker-lifecycle-test", TargetRepository: GreenPRRepositoryIdentity{DatabaseID: 42, NodeID: "R_42", FullName: "grubbyhacker/repository-worker-lifecycle-test"}, BaseRef: "main", WorkerRef: "refs/heads/agent/fleiglabs-repo-agent/work", PushedHeadSHA: strings.Repeat("a", 40), RequiredChecks: []GreenPRRequiredCheck{}, Verdict: "missing", ObservedAt: "2026-07-20T00:00:00Z"}
 	sealed, err := sealGreenPRObservation(obs)
@@ -212,7 +247,7 @@ func greenPRObservationHandler(t *testing.T, head, merge, mergeStatus string, he
 		case "/repos/owner/repo/pulls":
 			writeGreenPRTestJSON(t, w, []any{map[string]any{"id": 7, "node_id": "PR_7", "number": 7, "html_url": "https://example.test/pr/7", "state": "open", "draft": false, "base": map[string]any{"ref": "main"}, "head": map[string]any{"ref": "agent/fleiglabs-repo-agent/work", "sha": head, "repo": headIdentity}, "merge_commit_sha": merge}})
 		case "/repos/owner/repo/rules/branches/main":
-			writeGreenPRTestJSON(t, w, map[string]any{"rules": []any{map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": "required"}}}}}})
+			writeGreenPRTestJSON(t, w, []any{map[string]any{"type": "required_status_checks", "parameters": map[string]any{"required_status_checks": []any{map[string]any{"context": "required"}}}}})
 		default:
 			if strings.HasSuffix(r.URL.Path, "/check-runs") {
 				writeGreenPRTestJSON(t, w, map[string]any{"check_runs": []any{}})

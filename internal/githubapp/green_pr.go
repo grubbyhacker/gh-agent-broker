@@ -277,8 +277,10 @@ func (c *Client) greenPRRepository(app string, installation int64, fullName stri
 }
 
 func (c *Client) greenPRRules(app string, installation int64, repo, base string) ([]greenPRRule, error) {
-	var response struct {
-		Rules []struct {
+	seen := map[string]bool{}
+	out := []greenPRRule{}
+	for page := 1; ; page++ {
+		var rules []struct {
 			Type       string `json:"type"`
 			Parameters struct {
 				RequiredStatusChecks []struct {
@@ -286,22 +288,24 @@ func (c *Client) greenPRRules(app string, installation int64, repo, base string)
 					IntegrationID *int64 `json:"integration_id"`
 				} `json:"required_status_checks"`
 			} `json:"parameters"`
-		} `json:"rules"`
-	}
-	if err := c.doJSON(app, http.MethodGet, "/repos/"+repo+"/rules/branches/"+url.PathEscape(base), installation, nil, &response); err != nil {
-		return nil, err
-	}
-	seen := map[string]bool{}
-	out := []greenPRRule{}
-	for _, rule := range response.Rules {
-		if rule.Type == "required_status_checks" {
-			for _, check := range rule.Parameters.RequiredStatusChecks {
-				if check.Context == "" || seen[check.Context] {
-					return nil, fmt.Errorf("active required rules are incomplete or duplicate")
+		}
+		path := "/repos/" + repo + "/rules/branches/" + url.PathEscape(base) + "?per_page=100&page=" + strconv.Itoa(page)
+		if err := c.doJSON(app, http.MethodGet, path, installation, nil, &rules); err != nil {
+			return nil, err
+		}
+		for _, rule := range rules {
+			if rule.Type == "required_status_checks" {
+				for _, check := range rule.Parameters.RequiredStatusChecks {
+					if check.Context == "" || seen[check.Context] {
+						return nil, fmt.Errorf("active required rules are incomplete or duplicate")
+					}
+					seen[check.Context] = true
+					out = append(out, greenPRRule{check.Context, check.IntegrationID})
 				}
-				seen[check.Context] = true
-				out = append(out, greenPRRule{check.Context, check.IntegrationID})
 			}
+		}
+		if len(rules) < 100 {
+			break
 		}
 	}
 	if len(out) == 0 {
