@@ -18,16 +18,19 @@ import (
 
 type coordinatorTestRuntime struct {
 	*fakeAuthorityRuntime
-	mu        sync.Mutex
-	worker    AuthorityWorker
-	method    string
-	path      string
-	body      json.RawMessage
-	result    json.RawMessage
-	status    int
-	calls     int
-	responses []json.RawMessage
-	statuses  []int
+	mu              sync.Mutex
+	worker          AuthorityWorker
+	method          string
+	path            string
+	body            json.RawMessage
+	result          json.RawMessage
+	status          int
+	calls           int
+	responses       []json.RawMessage
+	statuses        []int
+	responsesByPath map[string]json.RawMessage
+	statusesByPath  map[string]int
+	paths           []string
 }
 
 func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker AuthorityWorker, method, path string, body json.RawMessage) (int, json.RawMessage, error) {
@@ -35,6 +38,10 @@ func (r *coordinatorTestRuntime) AgentdSessionRequest(_ context.Context, worker 
 	defer r.mu.Unlock()
 	r.worker, r.method, r.path, r.body = worker, method, path, bytes.Clone(body)
 	r.calls++
+	r.paths = append(r.paths, path)
+	if response, ok := r.responsesByPath[path]; ok {
+		return r.statusesByPath[path], bytes.Clone(response), nil
+	}
 	if len(r.responses) >= r.calls {
 		return r.statuses[r.calls-1], bytes.Clone(r.responses[r.calls-1]), nil
 	}
@@ -93,10 +100,15 @@ func TestRegisteredTurnEndpointCreatesOnceAndConvergesConcurrentReplay(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime.statuses = []int{http.StatusCreated, http.StatusAccepted}
-	runtime.responses = []json.RawMessage{
-		created,
-		[]byte(`{"version":"agentd/registered-turn/v2","sessionId":"` + sessionID + `","turnId":"turn:` + submitKey + `","modelEffectId":"model:` + submitKey + `","phase":"queued","cursor":1}`),
+	turnPath := "/v1/registered-sessions/" + sessionID + "/turns"
+	statusPath := "/v1/registered-sessions/" + sessionID + "/status?version=agentd%2Fregistered-lifecycle%2Fv1"
+	runtime.statusesByPath = map[string]int{
+		"/v1/registered-sessions": http.StatusCreated, turnPath: http.StatusAccepted, statusPath: http.StatusOK,
+	}
+	runtime.responsesByPath = map[string]json.RawMessage{
+		"/v1/registered-sessions": created,
+		turnPath:                  []byte(`{"version":"agentd/registered-turn/v2","sessionId":"` + sessionID + `","turnId":"turn:` + submitKey + `","modelEffectId":"model:` + submitKey + `","phase":"queued","cursor":1}`),
+		statusPath:                created,
 	}
 	body, err := json.Marshal(CoordinatorRegisteredTurnRequest{
 		Version: "agentd/registered-lifecycle/v1", SessionBinding: admission.SessionBinding,
@@ -130,8 +142,12 @@ func TestRegisteredTurnEndpointCreatesOnceAndConvergesConcurrentReplay(t *testin
 			t.Fatalf("response=%+v err=%v", got, err)
 		}
 	}
-	if runtime.calls != 2 {
-		t.Fatalf("concurrent replay performed %d agentd calls, want one create and one submit", runtime.calls)
+	counts := map[string]int{}
+	for _, path := range runtime.paths {
+		counts[path]++
+	}
+	if counts["/v1/registered-sessions"] != 1 || counts[turnPath] != 1 || counts[statusPath] != 1 || runtime.calls != 3 {
+		t.Fatalf("concurrent replay calls=%d paths=%v, want one create, one submit, and one typed status replay", runtime.calls, runtime.paths)
 	}
 }
 

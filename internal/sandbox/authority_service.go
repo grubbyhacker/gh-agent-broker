@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -140,7 +141,31 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 		encoded, err = marshalAgentdSessionStatus(status)
 		return status.SessionID, err
 	})
-	return encoded, err
+	if err != nil || encoded != nil {
+		return encoded, err
+	}
+	workspace, err = s.store.SessionWorkspace(ctx, binding)
+	if err != nil || !validAgentdID(workspace.AgentdSessionID) {
+		return nil, fmt.Errorf("durable agentd session identity is unavailable")
+	}
+	statusPath := "/v1/sessions/" + url.PathEscape(workspace.AgentdSessionID) + "/status"
+	if isRegistered {
+		statusPath = "/v1/registered-sessions/" + url.PathEscape(workspace.AgentdSessionID) + "/status?version=agentd%2Fregistered-lifecycle%2Fv1"
+	}
+	statusCode, result, err := transport.AgentdSessionRequest(ctx, worker, http.MethodGet, statusPath, nil)
+	if err != nil || statusCode != http.StatusOK {
+		return nil, fmt.Errorf("agentd session replay status is unavailable")
+	}
+	status, err := decodeAgentdSessionStatus(bytes.NewReader(result))
+	if err != nil {
+		return nil, fmt.Errorf("agentd session replay returned an invalid status")
+	}
+	expectedBinding := agentdWorkerBinding{WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch}
+	expectedWorkspace := agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}
+	if !exactAgentdSessionStatus(status, workspace.AgentdSessionID, binding, lease.Profile, lease.SessionLineageID, expectedWorkspace, expectedBinding) {
+		return nil, fmt.Errorf("agentd session replay returned a mismatched status")
+	}
+	return marshalAgentdSessionStatus(status)
 }
 
 func (r *AuthorityWorkerRequest) UnmarshalJSON(data []byte) error {
