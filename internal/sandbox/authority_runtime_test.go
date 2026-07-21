@@ -109,6 +109,30 @@ func TestAgentdCreateSessionPayloadMatchesCurrentSchema(t *testing.T) {
 	}
 }
 
+func TestAgentdRegisteredSessionOpenPayloadBindsDurableAdmission(t *testing.T) {
+	const admissionDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	payload, err := json.Marshal(agentdRegisteredSessionOpenRequest{
+		Version: "agentd/registered-lifecycle/v1", SessionID: "agentd-session", CoordinatorBinding: "session:work",
+		SessionLineageID: "lineage", AuthorityProfile: "writer", AuthorityProfileVersion: "profile-v1", PolicyDigest: "sha256:policy",
+		TaskKind: "github_green_pr_v1", TaskEvidenceDigest: "sha256:evidence", AdmissionTaskDigest: admissionDigest,
+		Parameters: RegisteredTaskParameters{Repository: "grubbyhacker/repository-worker-lifecycle-test", BaseBranch: "main", BranchRef: "agent/fleiglabs-repo-agent/work"},
+		Workspace:  agentdSessionWorkspace{WorkspaceRef: "/workspace", UID: 20000, GID: 20000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if digest, ok := got["admissionTaskDigest"].(string); !ok || digest != admissionDigest {
+		t.Fatalf("admissionTaskDigest=%#v, want %q", got["admissionTaskDigest"], admissionDigest)
+	}
+	if _, ok := got["registeredTaskDigest"]; ok {
+		t.Fatalf("registeredTaskDigest must not be emitted: %s", payload)
+	}
+}
+
 func TestAgentdRebindUsesCoordinatorChannelAndExactBody(t *testing.T) {
 	request := agentdRebindRequest{
 		IdempotencyKey: "broker-derived-key",

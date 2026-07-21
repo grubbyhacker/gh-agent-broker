@@ -57,6 +57,7 @@ type agentdRegisteredSessionOpenRequest struct {
 	PolicyDigest            string                   `json:"policyDigest"`
 	TaskKind                string                   `json:"taskKind"`
 	TaskEvidenceDigest      string                   `json:"taskEvidenceDigest"`
+	AdmissionTaskDigest     string                   `json:"admissionTaskDigest"`
 	Parameters              RegisteredTaskParameters `json:"parameters"`
 	Workspace               agentdSessionWorkspace   `json:"workspace"`
 }
@@ -100,7 +101,7 @@ func (s *AuthorityWorkerService) CreateSession(ctx context.Context, principal, b
 	derivedSessionID := "agentd-" + lease.SessionLineageID
 	var createPayload any = agentdCreateSessionRequest{Version: "agentd/v1", CoordinatorBinding: binding, AuthorityBinding: lease.Profile, WorkerID: lease.WorkerID, StorageLineageID: lease.WorkerStorageLineageID, FenceEpoch: lease.WorkerFenceEpoch, SessionLineageID: lease.SessionLineageID, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}}
 	if isRegistered {
-		createPayload = agentdRegisteredSessionOpenRequest{Version: "agentd/registered-lifecycle/v1", SessionID: derivedSessionID, CoordinatorBinding: binding, SessionLineageID: lease.SessionLineageID, AuthorityProfile: lease.Profile, AuthorityProfileVersion: lease.ProfileVersion, PolicyDigest: lease.PolicyDigest, TaskKind: registered.Task.TaskKind, TaskEvidenceDigest: registered.Task.TaskEvidenceDigest, Parameters: registered.Task.Parameters, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}}
+		createPayload = agentdRegisteredSessionOpenRequest{Version: "agentd/registered-lifecycle/v1", SessionID: derivedSessionID, CoordinatorBinding: binding, SessionLineageID: lease.SessionLineageID, AuthorityProfile: lease.Profile, AuthorityProfileVersion: lease.ProfileVersion, PolicyDigest: lease.PolicyDigest, TaskKind: registered.Task.TaskKind, TaskEvidenceDigest: registered.Task.TaskEvidenceDigest, AdmissionTaskDigest: registered.Digest, Parameters: registered.Task.Parameters, Workspace: agentdSessionWorkspace{WorkspaceRef: workspace.Path, UID: workspace.UID, GID: workspace.GID}}
 	}
 	payload, err := json.Marshal(createPayload)
 	if err != nil {

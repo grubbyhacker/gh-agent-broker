@@ -320,10 +320,11 @@ func TestRegisteredAdmissionDurableReadFailsClosedOnCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, change := range map[string]string{
-		"protocol": "UPDATE authority_registered_admissions SET protocol_version='broker/coordinator/v1' WHERE binding_digest=?",
-		"source":   "UPDATE authority_registered_admissions SET work_item_id='other-work' WHERE binding_digest=?",
-		"json":     "UPDATE authority_registered_admissions SET canonical_task_json='{}' WHERE binding_digest=?",
-		"digest":   "UPDATE authority_registered_admissions SET admission_task_digest='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE binding_digest=?",
+		"protocol":       "UPDATE authority_registered_admissions SET protocol_version='broker/coordinator/v1' WHERE binding_digest=?",
+		"source":         "UPDATE authority_registered_admissions SET work_item_id='other-work' WHERE binding_digest=?",
+		"json":           "UPDATE authority_registered_admissions SET canonical_task_json='{}' WHERE binding_digest=?",
+		"missing_digest": "UPDATE authority_registered_admissions SET admission_task_digest='' WHERE binding_digest=?",
+		"digest":         "UPDATE authority_registered_admissions SET admission_task_digest='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE binding_digest=?",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := store.db.ExecContext(ctx, change, lease.BindingDigest); err != nil {

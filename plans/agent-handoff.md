@@ -54,7 +54,11 @@ create/turn paths refuse before agentd routing. Broker-derived registered open
 and turn payloads use only the stored snapshot and broker lineage/workspace
 identities. Registered coordinator commands use the exact versioned
 registered-lifecycle routes and refuse resume; registered reassignment uses
-`/adopt`, while legacy reassignment retains `/rebind`.
+`/adopt`, while legacy reassignment retains `/rebind`. The registered lifecycle
+open payload forwards the required `admissionTaskDigest` only from the validated
+durable admission, alongside the existing `taskEvidenceDigest`; observation
+continues to use that same persisted admission digest as
+`registered_task_digest` and does not add another observation digest.
 Registered submit validates its turn-status response, while registered cancel,
 checkpoint, and status validate the exact canonical session status against the
 binding, workspace, and worker fence; legacy cancel retains its turn-status
