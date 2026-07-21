@@ -82,6 +82,32 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			writeJSON(w, http.StatusOK, CoordinatorLeaseAdmission{Version: coordinatorRegisteredProtocolVersion, Admission: out})
 			return
 		}
+		if r.Method == http.MethodPost && path == "coordinator/v1/registered-turn" {
+			var in CoordinatorRegisteredTurnRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.SubmitRegisteredTurn(r.Context(), principal, in)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusConflict, "registered_turn_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusAccepted, out)
+			return
+		}
+		if r.Method == http.MethodPost && path == "coordinator/v1/registered-events" {
+			var in CoordinatorRegisteredEventsRequest
+			if !decodeAuthorityJSON(w, r, &in) {
+				return
+			}
+			out, err := service.StreamRegisteredEvents(r.Context(), principal, in)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusConflict, "registered_events_denied", err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
 		if r.Method == http.MethodPost && strings.HasPrefix(path, "coordinator/v1/sessions/") {
 			operation := strings.TrimPrefix(path, "coordinator/v1/sessions/")
 			var in CoordinatorSessionRequest

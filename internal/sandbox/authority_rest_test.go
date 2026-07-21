@@ -178,14 +178,17 @@ func TestRegisteredCoordinatorAgentdV2Contract(t *testing.T) {
 	queued = strings.ReplaceAll(queued, "worker-42", worker.WorkerID)
 	queued = strings.ReplaceAll(queued, "lineage-42", worker.WorkerStorageLineageID)
 	queued = strings.ReplaceAll(queued, `"fenceEpoch":7`, `"fenceEpoch":`+strconv.FormatInt(worker.WorkerFenceEpoch, 10))
+	submitKey := "agentd:registered-turn:v1:turn-42"
+	queued = strings.ReplaceAll(queued, `"turnId":"turn:turn-42"`, `"turnId":"turn:`+submitKey+`"`)
+	queued = strings.ReplaceAll(queued, `"modelEffectId":"model:turn-42"`, `"modelEffectId":"model:`+submitKey+`"`)
 	runtime.statuses = []int{http.StatusAccepted, http.StatusOK, http.StatusOK, http.StatusOK}
 	runtime.responses = []json.RawMessage{
-		[]byte(`{"version":"agentd/registered-turn/v2","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued","cursor":1}`),
+		[]byte(`{"version":"agentd/registered-turn/v2","sessionId":"session-42","turnId":"turn:` + submitKey + `","modelEffectId":"model:` + submitKey + `","phase":"queued","cursor":1}`),
 		[]byte(queued),
 		[]byte(`{"version":"agentd/registered-events/v2","events":[],"nextCursor":2}`),
-		[]byte(queued),
+		[]byte(`{"version":"agentd/registered-events/v2","events":[],"nextCursor":2}`),
 	}
-	submit := CoordinatorSessionRequest{SessionBinding: admissionRequest.SessionBinding, IdempotencyKey: "turn-42"}
+	submit := CoordinatorSessionRequest{SessionBinding: admissionRequest.SessionBinding, IdempotencyKey: submitKey}
 	if _, err := service.CoordinatorSessionCommand(ctx, "coordinator", "submit", submit); err != nil {
 		t.Fatal(err)
 	}
@@ -209,6 +212,26 @@ func TestRegisteredCoordinatorAgentdV2Contract(t *testing.T) {
 	}
 	if runtime.calls != 3 || strings.Contains(runtime.path, "/verify") {
 		t.Fatalf("registered forwarding drifted: path=%q calls=%d", runtime.path, runtime.calls)
+	}
+	handler := NewAuthorityRESTHandler(service)
+	turnBody, err := json.Marshal(CoordinatorRegisteredTurnRequest{Version: "agentd/registered-lifecycle/v1", SessionBinding: admissionRequest.SessionBinding, IdempotencyKey: submitKey, TaskKind: admissionRequest.Task.TaskKind, AdmissionTaskDigest: admissionRequest.AdmissionTaskDigest, TaskEvidenceDigest: admissionRequest.Task.TaskEvidenceDigest, Parameters: admissionRequest.Task.Parameters})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turnRequest := httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v1/registered-turn", bytes.NewReader(turnBody))
+	turnRequest.Header.Set("Authorization", "Bearer coordinator-test-token")
+	turnResponse := httptest.NewRecorder()
+	handler.ServeHTTP(turnResponse, turnRequest)
+	if turnResponse.Code != http.StatusAccepted || runtime.calls != 3 {
+		t.Fatalf("registered turn REST replay status=%d calls=%d body=%s", turnResponse.Code, runtime.calls, turnResponse.Body.String())
+	}
+	eventsBody := []byte(`{"sessionBinding":"` + admissionRequest.SessionBinding + `","after":2}`)
+	eventsRequest := httptest.NewRequest(http.MethodPost, "/v1/authority-workers/coordinator/v1/registered-events", bytes.NewReader(eventsBody))
+	eventsRequest.Header.Set("Authorization", "Bearer coordinator-test-token")
+	eventsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(eventsResponse, eventsRequest)
+	if eventsResponse.Code != http.StatusOK || runtime.calls != 4 {
+		t.Fatalf("registered events REST status=%d calls=%d body=%s", eventsResponse.Code, runtime.calls, eventsResponse.Body.String())
 	}
 	if _, err := validateRegisteredTurnResponse([]byte(`{"version":"agentd/registered-turn/v1","sessionId":"session-42","turnId":"turn:turn-42","modelEffectId":"model:turn-42","phase":"queued","cursor":1}`), "session-42", "turn-42"); err == nil {
 		t.Fatal("wrong response version accepted")

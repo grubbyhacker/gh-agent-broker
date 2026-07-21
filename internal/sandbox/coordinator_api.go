@@ -52,6 +52,106 @@ type CoordinatorReassignmentStatus struct {
 	ErrorCode        string              `json:"error_code,omitempty"`
 }
 
+type CoordinatorRegisteredTurnRequest struct {
+	Version             string                   `json:"version"`
+	SessionBinding      string                   `json:"sessionBinding"`
+	IdempotencyKey      string                   `json:"idempotencyKey"`
+	TaskKind            string                   `json:"taskKind"`
+	AdmissionTaskDigest string                   `json:"admissionTaskDigest"`
+	TaskEvidenceDigest  string                   `json:"taskEvidenceDigest"`
+	Parameters          RegisteredTaskParameters `json:"parameters"`
+}
+
+func (r *CoordinatorRegisteredTurnRequest) UnmarshalJSON(data []byte) error {
+	type request CoordinatorRegisteredTurnRequest
+	var decoded request
+	if err := decodeRegisteredResponse(data, &decoded); err != nil {
+		return err
+	}
+	*r = CoordinatorRegisteredTurnRequest(decoded)
+	return nil
+}
+
+type CoordinatorRegisteredEventsRequest struct {
+	SessionBinding string `json:"sessionBinding"`
+	After          int64  `json:"after"`
+}
+
+func (r *CoordinatorRegisteredEventsRequest) UnmarshalJSON(data []byte) error {
+	type request CoordinatorRegisteredEventsRequest
+	var decoded request
+	if err := decodeRegisteredResponse(data, &decoded); err != nil {
+		return err
+	}
+	*r = CoordinatorRegisteredEventsRequest(decoded)
+	return nil
+}
+
+type CoordinatorRegisteredTurnResponse struct {
+	Lease         AuthorityLease `json:"lease"`
+	Version       string         `json:"version"`
+	SessionID     string         `json:"sessionId"`
+	TurnID        string         `json:"turnId"`
+	ModelEffectID string         `json:"modelEffectId"`
+	Phase         string         `json:"phase"`
+	Cursor        int64          `json:"cursor"`
+}
+
+type CoordinatorRegisteredEventsResponse struct {
+	Lease      AuthorityLease              `json:"lease"`
+	Version    string                      `json:"version"`
+	Events     []registeredEventProjection `json:"events"`
+	NextCursor int64                       `json:"nextCursor"`
+}
+
+func (s *AuthorityWorkerService) SubmitRegisteredTurn(ctx context.Context, principal string, request CoordinatorRegisteredTurnRequest) (CoordinatorRegisteredTurnResponse, error) {
+	admission, err := s.store.RegisteredAdmission(ctx, principal, request.SessionBinding)
+	if err != nil {
+		return CoordinatorRegisteredTurnResponse{}, err
+	}
+	wantKey := "agentd:registered-turn:v1:" + admission.Source.WorkItemID
+	if request.Version != "agentd/registered-lifecycle/v1" || request.IdempotencyKey != wantKey || request.TaskKind != admission.Task.TaskKind || request.AdmissionTaskDigest != admission.Digest || request.TaskEvidenceDigest != admission.Task.TaskEvidenceDigest || request.Parameters != admission.Task.Parameters {
+		return CoordinatorRegisteredTurnResponse{}, fmt.Errorf("registered turn does not match durable admission")
+	}
+	workspace, err := s.store.SessionWorkspace(ctx, request.SessionBinding)
+	if err != nil {
+		return CoordinatorRegisteredTurnResponse{}, err
+	}
+	if workspace.AgentdSessionID == "" {
+		if _, err := s.CreateSession(ctx, principal, request.SessionBinding); err != nil {
+			return CoordinatorRegisteredTurnResponse{}, err
+		}
+		workspace, err = s.store.SessionWorkspace(ctx, request.SessionBinding)
+		if err != nil || workspace.AgentdSessionID == "" {
+			return CoordinatorRegisteredTurnResponse{}, fmt.Errorf("registered session identity was not persisted")
+		}
+	}
+	out, err := s.CoordinatorSessionCommand(ctx, principal, "submit", CoordinatorSessionRequest{SessionBinding: request.SessionBinding, IdempotencyKey: request.IdempotencyKey})
+	if err != nil {
+		return CoordinatorRegisteredTurnResponse{}, err
+	}
+	turn, err := validateRegisteredTurnResponse(out.Result, workspace.AgentdSessionID, request.IdempotencyKey)
+	if err != nil {
+		return CoordinatorRegisteredTurnResponse{}, err
+	}
+	return CoordinatorRegisteredTurnResponse{Lease: out.Lease, Version: turn.Version, SessionID: turn.SessionID, TurnID: turn.TurnID, ModelEffectID: turn.ModelEffectID, Phase: turn.Phase, Cursor: turn.Cursor}, nil
+}
+
+func (s *AuthorityWorkerService) StreamRegisteredEvents(ctx context.Context, principal string, request CoordinatorRegisteredEventsRequest) (CoordinatorRegisteredEventsResponse, error) {
+	if request.After < 0 {
+		return CoordinatorRegisteredEventsResponse{}, fmt.Errorf("registered event cursor is invalid")
+	}
+	out, err := s.CoordinatorSessionCommand(ctx, principal, "events", CoordinatorSessionRequest{SessionBinding: request.SessionBinding, After: request.After})
+	if err != nil {
+		return CoordinatorRegisteredEventsResponse{}, err
+	}
+	var events registeredEventsResponse
+	if err := decodeRegisteredResponse(out.Result, &events); err != nil {
+		return CoordinatorRegisteredEventsResponse{}, err
+	}
+	return CoordinatorRegisteredEventsResponse{Lease: out.Lease, Version: events.Version, Events: events.Events, NextCursor: events.NextCursor}, nil
+}
+
 func (s *AuthorityWorkerService) CoordinatorSessionCommand(ctx context.Context, principal, operation string, request CoordinatorSessionRequest) (CoordinatorSessionResponse, error) {
 	if strings.TrimSpace(request.SessionBinding) == "" || len(request.SessionBinding) > 256 || request.After < 0 {
 		return CoordinatorSessionResponse{}, fmt.Errorf("bounded session_binding and cursor are required")
