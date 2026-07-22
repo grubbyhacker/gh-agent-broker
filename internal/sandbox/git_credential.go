@@ -46,9 +46,9 @@ type GitCredential struct {
 	ExpiresAt     int64  `json:"expires_at"`
 }
 type GitCredentialAuthority struct {
-	AgentID, Repository string
-	ExpiresAt           int64
-	TransportAuthority  TransportAuthority
+	ReceiptDigest, AgentID, Repository, SessionID, EffectID, ModelEffectID, RegisteredTaskDigest string
+	ExpiresAt                                                                                    int64
+	TransportAuthority                                                                           TransportAuthority
 }
 
 type gitCredentialQueryer interface {
@@ -278,7 +278,7 @@ func (s *AuthorityWorkerStore) AuthenticateGitCredential(ctx context.Context, ag
 func (s *AuthorityWorkerStore) authenticateGitCredential(ctx context.Context, queryer gitCredentialQueryer, agentID, secret, repository string) (GitCredentialAuthority, bool, error) {
 	var out GitCredentialAuthority
 	var fp, revoked, protocolVersion, workItemID, routeSnapshotID, canonical, admissionDigest string
-	rows, err := queryer.QueryContext(ctx, `SELECT c.agent_id,c.repository,c.expires_at_ms,c.secret_fingerprint,c.revoked_at,
+	rows, err := queryer.QueryContext(ctx, `SELECT c.receipt_digest,c.agent_id,c.repository,c.session_id,c.effect_id,c.model_effect_id,c.registered_task_digest,c.expires_at_ms,c.secret_fingerprint,c.revoked_at,
 		l.principal,l.profile,l.worker_id,l.session_lineage_id,l.binding_digest,
 		w.worker_storage_lineage_id,w.worker_fence_epoch,w.profile_version,w.policy_digest,
 		a.protocol_version,a.work_item_id,a.route_snapshot_id,a.canonical_task_json,a.admission_task_digest
@@ -289,6 +289,8 @@ func (s *AuthorityWorkerStore) authenticateGitCredential(ctx context.Context, qu
 			AND e.worker_fence_epoch=c.worker_fence_epoch AND e.authority_profile=c.authority_profile
 			AND e.authority_profile_version=c.authority_profile_version
 			AND e.registered_task_digest=c.registered_task_digest AND e.terminal_phase=''
+		JOIN authority_registered_turns t ON t.principal=c.principal AND t.binding_digest=c.binding_digest
+			AND t.session_id=c.session_id AND t.model_effect_id=c.model_effect_id
 		JOIN authority_session_leases l ON l.principal=c.principal AND l.binding_digest=c.binding_digest
 			AND l.worker_id=c.worker_id AND l.profile=c.authority_profile AND l.released_at=''
 		JOIN authority_workers w ON w.worker_id=c.worker_id
@@ -313,7 +315,8 @@ func (s *AuthorityWorkerStore) authenticateGitCredential(ctx context.Context, qu
 		return GitCredentialAuthority{}, false, nil
 	}
 	if err := rows.Scan(
-		&out.AgentID, &out.Repository, &out.ExpiresAt, &fp, &revoked,
+		&out.ReceiptDigest, &out.AgentID, &out.Repository, &out.SessionID, &out.EffectID,
+		&out.ModelEffectID, &out.RegisteredTaskDigest, &out.ExpiresAt, &fp, &revoked,
 		&out.TransportAuthority.Principal, &out.TransportAuthority.Profile,
 		&out.TransportAuthority.WorkerID, &out.TransportAuthority.SessionLineageID,
 		&out.TransportAuthority.SessionBindingDigest, &out.TransportAuthority.WorkerStorageLineageID,
