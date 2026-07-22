@@ -577,7 +577,7 @@ func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 
 func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *testing.T) {
 	const (
-		repository        = "owner/repo"
+		repository        = "grubbyhacker/repository-worker-lifecycle-test"
 		principalID       = "writer"
 		effectAgentID     = "effect-agent"
 		effectAgentSecret = "effect-secret"
@@ -590,7 +590,7 @@ func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *tes
 	var upstreamCalls int
 	gitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls++
-		if r.Method != http.MethodGet || r.URL.Path != "/owner/repo.git/info/refs" || r.URL.Query().Get("service") != "git-upload-pack" {
+		if r.Method != http.MethodGet || r.URL.Path != "/grubbyhacker/repository-worker-lifecycle-test.git/info/refs" || r.URL.Query().Get("service") != "git-upload-pack" {
 			t.Fatalf("unexpected fake Git request: %s %s", r.Method, r.URL.String())
 		}
 		writeTestBody(t, w, "effect-upload-pack-ok")
@@ -600,6 +600,7 @@ func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *tes
 	broker := newTestBroker(t, apiServer.URL, gitServer.URL, config.Agent{
 		ID: principalID, Enabled: true, Secret: "parent-secret-must-not-authenticate-effect", Repositories: []string{repository}, Operations: []string{"git.upload-pack"},
 	})
+	broker.cfg.GitHub.Installations[repository] = 42
 	observer, err := sandbox.OpenTransportObserver(context.Background(), authorityPath)
 	if err != nil {
 		t.Fatal(err)
@@ -623,7 +624,7 @@ func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *tes
 		}
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/git/owner/repo.git/info/refs?service=git-upload-pack", nil)
+	req := httptest.NewRequest(http.MethodGet, "/git/"+repository+".git/info/refs?service=git-upload-pack", nil)
 	req.SetBasicAuth(effectAgentID, effectAgentSecret)
 	resp := httptest.NewRecorder()
 	broker.ServeHTTP(resp, req)
@@ -681,39 +682,59 @@ func TestEffectCredentialGitDiscoveryRefusesInvalidCustodyWithoutObservationOrUp
 		header     string
 		mutate     func(*testing.T, *sql.DB)
 	}{
-		{name: "wrong secret", agentID: "effect-agent", secret: "wrong-secret", targetRepo: "owner/repo"},
-		{name: "wrong repository", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/other"},
-		{name: "released lease", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+		{name: "wrong secret", agentID: "effect-agent", secret: "wrong-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test"},
+		{name: "wrong repository", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/other"},
+		{name: "released lease", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
 			mustExecTestSQL(t, db, `UPDATE authority_session_leases SET released_at=?`, time.Now().UTC().Format(time.RFC3339Nano))
 		}},
-		{name: "terminal effect", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+		{name: "terminal effect", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
 			mustExecTestSQL(t, db, `UPDATE authority_effect_custody SET terminal_phase='failed'`)
 		}},
-		{name: "expired effect", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+		{name: "expired effect", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
 			mustExecTestSQL(t, db, `UPDATE authority_git_credentials SET expires_at_ms=?`, time.Now().Add(-time.Minute).UnixMilli())
 		}},
-		{name: "stale fence", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+		{name: "stale fence", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
 			mustExecTestSQL(t, db, `UPDATE authority_git_credentials SET worker_fence_epoch=worker_fence_epoch+1`)
 		}},
-		{name: "stale worker", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+		{name: "stale worker", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
 			mustExecTestSQL(t, db, `UPDATE authority_workers SET state='unhealthy'`)
 		}},
-		{name: "stale storage", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+		{name: "stale storage", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
 			mustExecTestSQL(t, db, `UPDATE authority_git_credentials SET worker_storage_lineage_id='other-storage'`)
 		}},
-		{name: "stale binding", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+		{name: "stale binding", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
 			mustExecTestSQL(t, db, `UPDATE authority_git_credentials SET binding_digest='other-binding'`)
 		}},
-		{name: "copied credential", agentID: "copied-agent", secret: "copied-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+		{name: "mismatched worker profile", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `UPDATE authority_workers SET profile='other-profile'`)
+		}},
+		{name: "corrupt admission json", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `UPDATE authority_registered_admissions SET canonical_task_json='{}'`)
+		}},
+		{name: "corrupt admission digest", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
+			wrong := "sha256:" + strings.Repeat("e", 64)
+			mustExecTestSQL(t, db, `UPDATE authority_registered_admissions SET admission_task_digest=?`, wrong)
+			mustExecTestSQL(t, db, `UPDATE authority_effect_custody SET registered_task_digest=?`, wrong)
+			mustExecTestSQL(t, db, `UPDATE authority_git_credentials SET registered_task_digest=?`, wrong)
+		}},
+		{name: "copied credential", agentID: "copied-agent", secret: "copied-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
 			mustExecTestSQL(t, db, `INSERT INTO authority_git_credentials(receipt_digest,receipt_json,principal,binding_digest,session_id,effect_id,model_effect_id,repository,worker_id,worker_storage_lineage_id,worker_fence_epoch,agent_id,secret_fingerprint,expires_at_ms,authority_profile,authority_profile_version,registered_task_digest,journal_cursor,journal_record_digest,authorized_at_ms,deadline_at_ms)
 				SELECT ?,receipt_json,principal,?,session_id,effect_id,model_effect_id,repository,worker_id,worker_storage_lineage_id,worker_fence_epoch,?,?,expires_at_ms,authority_profile,authority_profile_version,registered_task_digest,journal_cursor,journal_record_digest,authorized_at_ms,deadline_at_ms FROM authority_git_credentials WHERE agent_id='effect-agent'`, "sha256:"+strings.Repeat("d", 64), "copied-binding", "copied-agent", effectCredentialFingerprint(t, db, "copied-secret"))
 		}},
-		{name: "caller transport header", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", header: "atc1.caller-selected-authority"},
+		{name: "ambiguous duplicate credential", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `PRAGMA foreign_keys=OFF`)
+			mustExecTestSQL(t, db, `ALTER TABLE authority_git_credentials RENAME TO authority_git_credentials_unique`)
+			mustExecTestSQL(t, db, `CREATE TABLE authority_git_credentials AS SELECT * FROM authority_git_credentials_unique WHERE 0`)
+			mustExecTestSQL(t, db, `INSERT INTO authority_git_credentials SELECT * FROM authority_git_credentials_unique`)
+			mustExecTestSQL(t, db, `INSERT INTO authority_git_credentials SELECT ?,receipt_json,principal,binding_digest,session_id,effect_id,model_effect_id,repository,worker_id,worker_storage_lineage_id,worker_fence_epoch,agent_id,secret_fingerprint,expires_at_ms,revoked_at,authority_profile,authority_profile_version,registered_task_digest,journal_cursor,journal_record_digest,authorized_at_ms,deadline_at_ms FROM authority_git_credentials_unique`, "sha256:"+strings.Repeat("f", 64))
+			mustExecTestSQL(t, db, `DROP TABLE authority_git_credentials_unique`)
+		}},
+		{name: "caller transport header", agentID: "effect-agent", secret: "effect-secret", targetRepo: "grubbyhacker/repository-worker-lifecycle-test", header: "atc1.caller-selected-authority"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
-			seedEffectGitAuthority(t, authorityPath, "effect-agent", "effect-secret", "owner/repo", "writer", "worker-a", "binding-a", "session-lineage-a", "storage-a", 7)
+			seedEffectGitAuthority(t, authorityPath, "effect-agent", "effect-secret", "grubbyhacker/repository-worker-lifecycle-test", "writer", "worker-a", "binding-a", "session-lineage-a", "storage-a", 7)
 			db, err := sql.Open("sqlite", authorityPath)
 			if err != nil {
 				t.Fatal(err)
@@ -724,7 +745,7 @@ func TestEffectCredentialGitDiscoveryRefusesInvalidCustodyWithoutObservationOrUp
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			broker, upstreamCalls := newEffectGitTestBroker(t, authorityPath, "owner/repo", "writer")
+			broker, upstreamCalls := newEffectGitTestBroker(t, authorityPath, "grubbyhacker/repository-worker-lifecycle-test", "writer")
 			req := httptest.NewRequest(http.MethodGet, "/git/"+test.targetRepo+".git/info/refs?service=git-upload-pack", nil)
 			req.SetBasicAuth(test.agentID, test.secret)
 			if test.header != "" {
@@ -747,11 +768,11 @@ func TestEffectCredentialGitDiscoveryRefusesInvalidCustodyWithoutObservationOrUp
 
 func TestEffectCredentialGitDiscoveryCapacityTwoKeepsExactSessionAuthority(t *testing.T) {
 	authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
-	seedEffectGitAuthority(t, authorityPath, "effect-a", "secret-a", "owner/repo", "writer", "worker-a", "binding-a", "session-a", "storage-a", 1)
-	seedEffectGitAuthority(t, authorityPath, "effect-b", "secret-b", "owner/repo", "writer", "worker-b", "binding-b", "session-b", "storage-b", 2)
-	broker, upstreamCalls := newEffectGitTestBroker(t, authorityPath, "owner/repo", "writer")
+	seedEffectGitAuthority(t, authorityPath, "effect-a", "secret-a", "grubbyhacker/repository-worker-lifecycle-test", "writer", "worker-a", "binding-a", "session-a", "storage-a", 1)
+	seedEffectGitAuthority(t, authorityPath, "effect-b", "secret-b", "grubbyhacker/repository-worker-lifecycle-test", "writer", "worker-b", "binding-b", "session-b", "storage-b", 2)
+	broker, upstreamCalls := newEffectGitTestBroker(t, authorityPath, "grubbyhacker/repository-worker-lifecycle-test", "writer")
 	for _, credential := range []struct{ agent, secret string }{{"effect-b", "secret-b"}, {"effect-a", "secret-a"}} {
-		req := httptest.NewRequest(http.MethodGet, "/git/owner/repo.git/info/refs?service=git-upload-pack", nil)
+		req := httptest.NewRequest(http.MethodGet, "/git/grubbyhacker/repository-worker-lifecycle-test.git/info/refs?service=git-upload-pack", nil)
 		req.SetBasicAuth(credential.agent, credential.secret)
 		resp := httptest.NewRecorder()
 		broker.ServeHTTP(resp, req)
@@ -807,6 +828,111 @@ func TestEffectCredentialGitDiscoveryCapacityTwoKeepsExactSessionAuthority(t *te
 	}
 }
 
+func TestEffectCredentialGitDiscoveryRevalidatesBeforeReceived(t *testing.T) {
+	const (
+		repository = "grubbyhacker/repository-worker-lifecycle-test"
+		principal  = "writer"
+		binding    = "binding-a"
+	)
+	tests := []struct {
+		name       string
+		transition func(*testing.T, string, *sandbox.AuthorityWorkerStore)
+	}{
+		{name: "release after authentication", transition: func(t *testing.T, _ string, store *sandbox.AuthorityWorkerStore) {
+			if _, err := store.Release(context.Background(), principal, "session:"+binding); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "confirmed reassignment after authentication", transition: func(t *testing.T, path string, store *sandbox.AuthorityWorkerStore) {
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			mustExecTestSQL(t, db, `INSERT INTO authority_workers(worker_id,profile,profile_version,policy_digest,image_reference,generation,state,capacity,assigned_sessions,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, "worker-b", "writer-profile", "profile-version-a", "policy-digest-a", "image", 2, "ready", 2, 0, now, now, "storage-a", 8)
+			mustExecTestSQL(t, db, `UPDATE authority_workers SET replacement_worker_id='worker-b' WHERE worker_id='worker-a'`)
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			issuance, err := pushtripwire.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := issuance.ReplaceEnforcementCatalog(context.Background(), map[string]int64{"writer-profile": 1}); err != nil {
+				t.Fatal(err)
+			}
+			if err := issuance.Close(); err != nil {
+				t.Fatal(err)
+			}
+			workspace, err := store.SessionWorkspace(context.Background(), "session:"+binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Reassign(context.Background(), principal, "session:"+binding, "session-lineage-a", "worker-a", 7, "reassign-after-auth", workspace, 1); err != nil {
+				t.Fatal(err)
+			}
+			db, err = sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustExecTestSQL(t, db, `UPDATE authority_session_reassignments SET adoption_state='confirmed',adoption_confirmed_at=? WHERE coordinator_binding=? AND adoption_state='pending'`, time.Now().UTC().Format(time.RFC3339Nano), "session:"+binding)
+			var confirmed int
+			if err := db.QueryRow(`SELECT count(*) FROM authority_session_reassignments WHERE coordinator_binding=? AND adoption_state='confirmed'`, "session:"+binding).Scan(&confirmed); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if confirmed != 1 {
+				t.Fatalf("confirmed reassignments = %d", confirmed)
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
+			seedEffectGitAuthority(t, authorityPath, "effect-agent", "effect-secret", repository, principal, "worker-a", binding, "session-lineage-a", "storage-a", 7)
+			transitionStore, err := sandbox.OpenAuthorityWorkerStore(context.Background(), authorityPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if closeErr := transitionStore.Close(); closeErr != nil {
+					t.Errorf("close transition store: %v", closeErr)
+				}
+			})
+			broker, upstreamCalls := newEffectGitTestBroker(t, authorityPath, repository, principal)
+			authenticated := make(chan struct{})
+			resume := make(chan struct{})
+			broker.afterEffectCredentialAuthenticationForTest = func() {
+				close(authenticated)
+				<-resume
+			}
+			req := httptest.NewRequest(http.MethodGet, "/git/"+repository+".git/info/refs?service=git-upload-pack", nil)
+			req.SetBasicAuth("effect-agent", "effect-secret")
+			resp := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				broker.ServeHTTP(resp, req)
+				close(done)
+			}()
+			<-authenticated
+			test.transition(t, authorityPath, transitionStore)
+			close(resume)
+			<-done
+			if resp.Code != http.StatusServiceUnavailable {
+				t.Fatalf("post-transition status/body = %d %q", resp.Code, resp.Body.String())
+			}
+			if *upstreamCalls != 0 {
+				t.Fatalf("upstream calls = %d, want 0", *upstreamCalls)
+			}
+			if count := transportEventCountAtPath(t, authorityPath); count != 0 {
+				t.Fatalf("transport event count = %d, want 0", count)
+			}
+		})
+	}
+}
+
 func newEffectGitTestBroker(t *testing.T, authorityPath, repository, principal string) (*Server, *int) {
 	t.Helper()
 	apiServer := fakeTokenServer(t)
@@ -818,6 +944,7 @@ func newEffectGitTestBroker(t *testing.T, authorityPath, repository, principal s
 	}))
 	t.Cleanup(gitServer.Close)
 	broker := newTestBroker(t, apiServer.URL, gitServer.URL, config.Agent{ID: principal, Enabled: true, Secret: "parent-secret", Repositories: []string{repository}, Operations: []string{"git.upload-pack"}})
+	broker.cfg.GitHub.Installations[repository] = 42
 	observer, err := sandbox.OpenTransportObserver(context.Background(), authorityPath)
 	if err != nil {
 		t.Fatal(err)
@@ -899,24 +1026,36 @@ func seedEffectGitAuthority(t *testing.T, path, agentID, secret, repository, pri
 			t.Errorf("close authority seed database: %v", closeErr)
 		}
 	}()
+	var salt []byte
+	if err := db.QueryRow(`SELECT value FROM authority_settings WHERE name='request_hmac_salt'`).Scan(&salt); err != nil {
+		t.Fatal(err)
+	}
+	workItemID := binding
+	sessionBinding := "session:" + workItemID
+	bindingMAC := hmac.New(sha256.New, salt)
+	_, _ = bindingMAC.Write([]byte(sessionBinding))
+	bindingDigest := hex.EncodeToString(bindingMAC.Sum(nil))
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	nowMillis := time.Now().UnixMilli()
 	agentdSession := "agentd-" + worker
 	effect := "effect-" + worker
 	receiptSum := sha256.Sum256([]byte(worker))
 	receiptDigest := "sha256:" + hex.EncodeToString(receiptSum[:])
-	const taskDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const taskEvidenceDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	canonical := `{"registered_task":{"completionContract":"github_green_pr_v1","contractDigest":"sha256:40963efb60fd00563bd6a33f1325b45008a917ebf17c110f9d3c86f7dd77d1fb","parameters":{"baseBranch":"main","branchRef":"agent/fleiglabs-repo-agent/settled","repository":"` + repository + `"},"taskEvidenceDigest":"` + taskEvidenceDigest + `","taskKind":"github_green_pr_v1","taskVersion":"1.0.0","verifierId":"github_green_pr_v1"},"registered_task_source":{"route_snapshot_id":"route-` + worker + `","work_item_id":"` + workItemID + `"}}`
+	taskSum := sha256.Sum256([]byte(canonical))
+	taskDigest := "sha256:" + hex.EncodeToString(taskSum[:])
 	for _, statement := range []struct {
 		query string
 		args  []any
 	}{
-		{`INSERT INTO authority_workers(worker_id,profile,profile_version,policy_digest,image_reference,generation,state,capacity,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, []any{worker, "writer-profile", "profile-version-a", "policy-digest-a", "image", 1, "ready", 2, now, now, storage, fence}},
-		{`INSERT INTO authority_session_leases(principal,profile,idempotency_digest,request_fingerprint,binding_digest,worker_id,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?,?)`, []any{principal, "writer-profile", "idem-" + binding, "request-" + binding, binding, worker, now, sessionLineage}},
-		{`INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id,agentd_session_id) VALUES(?,?,?,?,?,?,?,?)`, []any{binding, worker, 20000, 20000, "/workspace/" + sessionLineage, now, sessionLineage, agentdSession}},
-		{`INSERT INTO authority_registered_admissions(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest) VALUES(?,?,?,?,?,?,?)`, []any{principal, binding, "broker/coordinator-registered/v1", "work-" + worker, "route-" + worker, `{}`, taskDigest}},
-		{`INSERT INTO authority_registered_turns(principal,binding_digest,idempotency_digest,session_id,turn_id,model_effect_id,submit_cursor) VALUES(?,?,?,?,?,?,?)`, []any{principal, binding, "turn-idem-" + worker, agentdSession, "turn-" + worker, effect, 1}},
-		{`INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id,session_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,authority_profile,authority_profile_version,policy_digest,registered_task_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, []any{principal, binding, effect, agentdSession, worker, storage, fence, "writer-profile", "profile-version-a", "policy-digest-a", taskDigest}},
-		{`INSERT INTO authority_git_credentials(receipt_digest,receipt_json,principal,binding_digest,session_id,effect_id,model_effect_id,repository,worker_id,worker_storage_lineage_id,worker_fence_epoch,agent_id,secret_fingerprint,expires_at_ms,authority_profile,authority_profile_version,registered_task_digest,journal_cursor,journal_record_digest,authorized_at_ms,deadline_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, []any{receiptDigest, `{}`, principal, binding, agentdSession, effect, effect, repository, worker, storage, fence, agentID, effectCredentialFingerprint(t, db, secret), nowMillis + 60*60*1000, "writer-profile", "profile-version-a", taskDigest, 1, "sha256:" + strings.Repeat("c", 64), nowMillis, nowMillis + 60*60*1000}},
+		{`INSERT INTO authority_workers(worker_id,profile,profile_version,policy_digest,image_reference,generation,state,capacity,assigned_sessions,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, []any{worker, "writer-profile", "profile-version-a", "policy-digest-a", "image", 1, "ready", 2, 1, now, now, storage, fence}},
+		{`INSERT INTO authority_session_leases(principal,profile,idempotency_digest,request_fingerprint,binding_digest,worker_id,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?,?)`, []any{principal, "writer-profile", "idem-" + binding, "request-" + binding, bindingDigest, worker, now, sessionLineage}},
+		{`INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id,agentd_session_id) VALUES(?,?,?,?,?,?,?,?)`, []any{bindingDigest, worker, 20000, 20000, "/workspace/" + sessionLineage, now, sessionLineage, agentdSession}},
+		{`INSERT INTO authority_registered_admissions(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest) VALUES(?,?,?,?,?,?,?)`, []any{principal, bindingDigest, "broker/coordinator/v2", workItemID, "route-" + worker, canonical, taskDigest}},
+		{`INSERT INTO authority_registered_turns(principal,binding_digest,idempotency_digest,session_id,turn_id,model_effect_id,submit_cursor) VALUES(?,?,?,?,?,?,?)`, []any{principal, bindingDigest, "turn-idem-" + worker, agentdSession, "turn-" + worker, effect, 1}},
+		{`INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id,session_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,authority_profile,authority_profile_version,policy_digest,registered_task_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, []any{principal, bindingDigest, effect, agentdSession, worker, storage, fence, "writer-profile", "profile-version-a", "policy-digest-a", taskDigest}},
+		{`INSERT INTO authority_git_credentials(receipt_digest,receipt_json,principal,binding_digest,session_id,effect_id,model_effect_id,repository,worker_id,worker_storage_lineage_id,worker_fence_epoch,agent_id,secret_fingerprint,expires_at_ms,authority_profile,authority_profile_version,registered_task_digest,journal_cursor,journal_record_digest,authorized_at_ms,deadline_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, []any{receiptDigest, `{}`, principal, bindingDigest, agentdSession, effect, effect, repository, worker, storage, fence, agentID, effectCredentialFingerprint(t, db, secret), nowMillis + 60*60*1000, "writer-profile", "profile-version-a", taskDigest, 1, "sha256:" + strings.Repeat("c", 64), nowMillis, nowMillis + 60*60*1000}},
 	} {
 		if _, err := db.Exec(statement.query, statement.args...); err != nil {
 			t.Fatal(err)

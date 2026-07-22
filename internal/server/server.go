@@ -38,17 +38,18 @@ import (
 )
 
 type Server struct {
-	configPath        string
-	mu                sync.RWMutex
-	cfg               *config.Config
-	gh                *githubapp.Client
-	audit             *audit.Logger
-	http              *http.Client
-	tripwire          *pushtripwire.Store
-	fence             pushtripwire.FenceAdapter
-	transport         *sandbox.TransportObserver
-	transportProfiles map[string]string
-	credentialStore   *sandbox.AuthorityWorkerStore
+	configPath                                 string
+	mu                                         sync.RWMutex
+	cfg                                        *config.Config
+	gh                                         *githubapp.Client
+	audit                                      *audit.Logger
+	http                                       *http.Client
+	tripwire                                   *pushtripwire.Store
+	fence                                      pushtripwire.FenceAdapter
+	transport                                  *sandbox.TransportObserver
+	transportProfiles                          map[string]string
+	credentialStore                            *sandbox.AuthorityWorkerStore
+	afterEffectCredentialAuthenticationForTest func()
 }
 
 func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *audit.Logger) (*Server, error) {
@@ -96,13 +97,21 @@ func (s *Server) beginTransport(ctx context.Context, principal auth.Principal, t
 }
 
 func (s *Server) beginTransportAuthority(ctx context.Context, principal auth.Principal, authority sandbox.TransportAuthority, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
+	op, err := transportOperation(principal, authority, method, service, repo, path, credentialHeader)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.transport.Received(ctx, op); err != nil {
+		return nil, err
+	}
+	return op, nil
+}
+
+func transportOperation(principal auth.Principal, authority sandbox.TransportAuthority, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
 	if authority.Principal != principal.TransportPrincipal {
 		return nil, errors.New("transport authority context principal mismatch")
 	}
 	op := &sandbox.TransportOperation{OperationID: ids.NewOperationID(), Method: method, Service: service, Repository: repo, RequestPath: path, RequestedRefs: []string{}, RefUpdates: []any{}, CredentialHeaderPresent: credentialHeader, Authority: authority}
-	if err := s.transport.Received(ctx, op); err != nil {
-		return nil, err
-	}
 	return op, nil
 }
 
@@ -2065,7 +2074,8 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	principal, ok := auth.AuthenticateAgent(r, cfg)
-	var effectAuthority *sandbox.TransportAuthority
+	var effectCredential *sandbox.GitCredentialAuthority
+	var effectAgentID, effectAgentSecret string
 	if !ok && s.credentialStore != nil {
 		id, secret, basic := r.BasicAuth()
 		if basic {
@@ -2077,9 +2087,10 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 					// The effect identity is retained for Basic authentication and audit.
 					// Its exact active transport authority comes from the same custody
 					// snapshot; the child never receives or selects an atc1 capability.
-					authority := custody.TransportAuthority
-					effectAuthority = &authority
-					principal, ok = auth.Principal{Agent: parent, ID: custody.AgentID, TransportPrincipal: authority.Principal}, true
+					credential := custody
+					effectCredential = &credential
+					effectAgentID, effectAgentSecret = id, secret
+					principal, ok = auth.Principal{Agent: parent, ID: custody.AgentID, TransportPrincipal: custody.TransportAuthority.Principal}, true
 				}
 			}
 		}
@@ -2088,20 +2099,30 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		writeAuthText(w, "agent authentication failed")
 		return
 	}
+	if effectCredential != nil && s.afterEffectCredentialAuthenticationForTest != nil {
+		s.afterEffectCredentialAuthenticationForTest()
+	}
 	operation := gitOperation(r, suffix)
 	if operation == "" {
 		http.Error(w, "unsupported git operation", http.StatusBadRequest)
 		return
 	}
+	if effectCredential != nil && s.transport == nil {
+		http.Error(w, "transport authority observation unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	var transport *sandbox.TransportOperation
 	if s.transport != nil {
 		var err error
-		if effectAuthority != nil {
+		if effectCredential != nil {
 			if strings.TrimSpace(r.Header.Get("X-GH-Agent-Broker-Transport-Context")) != "" {
 				http.Error(w, "effect credential cannot supply transport authority", http.StatusForbidden)
 				return
 			}
-			transport, err = s.beginTransportAuthority(r.Context(), principal, *effectAuthority, r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, true)
+			transport, err = transportOperation(principal, effectCredential.TransportAuthority, r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, true)
+			if err == nil {
+				err = s.transport.ReceivedEffectCredential(r.Context(), effectAgentID, effectAgentSecret, repo, *effectCredential, transport)
+			}
 		} else {
 			transport, err = s.beginTransport(r.Context(), principal, r.Header.Get("X-GH-Agent-Broker-Transport-Context"), r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, r.Header.Get("Authorization") != "")
 		}

@@ -281,18 +281,27 @@ operations without returning installation credentials to workers.
 An agentd child receives only its effect-scoped `BROKER_AGENT_ID` and
 `BROKER_AGENT_SECRET`. Smart-HTTP Basic authentication now resolves the exact
 active transport authority from the same read-only SQLite custody snapshot that
-validates the effect credential. The child neither receives nor projects an
-`atc1` capability, and any caller-supplied transport-context header on this path
-is rejected before an observation or upstream request. The snapshot binds the
-credential, nonterminal effect custody, active lease, ready worker generation,
-workspace/session, registered admission, storage lineage, fence, profile
-version, and policy digest. A separate read connection keeps this lookup from
-contending with the store's transactional issuance connection.
+validates the effect credential. Immediately before the first transport event,
+the observer opens a short `BEGIN IMMEDIATE` barrier that revalidates that exact
+snapshot and appends `received` atomically. Release and reassignment use the
+same SQLite writer ordering, so either the event commits first or changed
+custody is refused with no event or upstream request. The barrier commits before
+policy evaluation or forwarding; no transaction spans an upstream request.
+
+The child neither receives nor projects an `atc1` capability, and any
+caller-supplied transport-context header on this path is rejected before an
+observation or upstream request. The snapshot binds the credential,
+nonterminal effect custody, active lease, ready worker generation,
+workspace/session, profile and policy identity, storage lineage, fence, and the
+strictly revalidated canonical registered admission and digest. The initial
+authentication uses a separate read connection so it does not contend with the
+store's transactional issuance connection.
 
 The existing `atc1`-authenticated registered create and observe HTTP endpoints
 are unchanged. Focused tests cover Basic-only discovery through the real store
-and handler, capacity-two session isolation, stale/copied coordinate refusals,
-zero-event/zero-upstream denials, and the held-issuance-connection case.
+and handler, capacity-two session isolation, release and confirmed-reassignment
+interleavings, corrupt/ambiguous custody refusals, zero-event/zero-upstream
+denials, and the held-issuance-connection case.
 
 ### Roadmap PR10 broker coordinator surface
 

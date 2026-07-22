@@ -46,7 +46,12 @@ func TestEffectCredentialRejectsTerminalCustodyAcrossRestart(t *testing.T) {
 			if _, ok, err := store.AuthenticateGitCredential(ctx, "effect-agent", secret, "grubbyhacker/repository-worker-lifecycle-test"); err != nil || !ok {
 				t.Fatalf("active credential authentication = ok:%v err:%v", ok, err)
 			}
-			if err := store.RecordRegisteredEvents(ctx, "principal", "binding", 0, 2, []registeredEventProjection{{SessionID: "session", TurnID: "turn", ModelEffectID: "model:effect", Phase: phase, Cursor: 2, WorkerID: "worker", StorageLineageID: "storage", FenceEpoch: 1, AdmissionTaskDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}); err != nil {
+			request := registeredRequest(t, "work", "route")
+			validated, validateErr := validateRegisteredAdmission(request)
+			if validateErr != nil {
+				t.Fatal(validateErr)
+			}
+			if err := store.RecordRegisteredEvents(ctx, "principal", request.SessionBinding, 0, 2, []registeredEventProjection{{SessionID: "session", TurnID: "turn", ModelEffectID: "model:effect", Phase: phase, Cursor: 2, WorkerID: "worker", StorageLineageID: "storage", FenceEpoch: 1, AdmissionTaskDigest: validated.Digest, TaskEvidenceDigest: request.Task.TaskEvidenceDigest}}); err != nil {
 				t.Fatal(err)
 			}
 			if _, ok, err := store.AuthenticateGitCredential(ctx, "effect-agent", secret, "grubbyhacker/repository-worker-lifecycle-test"); err != nil || ok {
@@ -189,8 +194,14 @@ func insertActiveCredentialCustody(t *testing.T, store *AuthorityWorkerStore, se
 	t.Helper()
 	ctx := context.Background()
 	now := formatAuthorityTime(time.Now().UTC())
-	const principal, worker, profile, task, effect = "principal", "worker", "profile", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "model:effect"
-	binding := store.requestDigest("binding")
+	const principal, worker, effect = "principal", "worker", "model:effect"
+	request := registeredRequest(t, "work", "route")
+	validated, err := validateRegisteredAdmission(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, task := request.Profile, validated.Digest
+	binding := store.requestDigest(request.SessionBinding)
 	for _, query := range []struct {
 		query string
 		args  []any
@@ -198,7 +209,7 @@ func insertActiveCredentialCustody(t *testing.T, store *AuthorityWorkerStore, se
 		{`INSERT INTO authority_workers(worker_id,profile,profile_version,policy_digest,image_reference,generation,state,capacity,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, []any{worker, profile, "version", "policy", "image", 1, AuthorityWorkerReady, 1, now, now, "storage", 1}},
 		{`INSERT INTO authority_session_leases(principal,profile,idempotency_digest,request_fingerprint,binding_digest,worker_id,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?,?)`, []any{principal, profile, "idem", "request", binding, worker, now, "lineage"}},
 		{`INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id,agentd_session_id) VALUES(?,?,?,?,?,?,?,?)`, []any{binding, worker, 1, 1, "/workspace", now, "lineage", "session"}},
-		{`INSERT INTO authority_registered_admissions(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest) VALUES(?,?,?,?,?,?,?)`, []any{principal, binding, coordinatorRegisteredProtocolVersion, "work", "route", `{}`, task}},
+		{`INSERT INTO authority_registered_admissions(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest) VALUES(?,?,?,?,?,?,?)`, []any{principal, binding, coordinatorRegisteredProtocolVersion, request.Source.WorkItemID, request.Source.RouteSnapshotID, validated.CanonicalJSON, task}},
 		{`INSERT INTO authority_registered_turns(principal,binding_digest,idempotency_digest,session_id,turn_id,model_effect_id,submit_cursor) VALUES(?,?,?,?,?,?,?)`, []any{principal, binding, "idem", "session", "turn", effect, 1}},
 		{`INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id,session_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,authority_profile,authority_profile_version,policy_digest,registered_task_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, []any{principal, binding, effect, "session", worker, "storage", 1, profile, "version", "policy", task}},
 		{`INSERT INTO authority_git_credentials(receipt_digest,receipt_json,principal,binding_digest,session_id,effect_id,model_effect_id,repository,worker_id,worker_storage_lineage_id,worker_fence_epoch,agent_id,secret_fingerprint,expires_at_ms,authority_profile,authority_profile_version,registered_task_digest,journal_cursor,journal_record_digest,authorized_at_ms,deadline_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, []any{"sha256:" + strings.Repeat("b", 64), `{}`, principal, binding, "session", effect, effect, "grubbyhacker/repository-worker-lifecycle-test", worker, "storage", 1, "effect-agent", store.effectTokenFingerprint(secret), time.Now().Add(time.Hour).UnixMilli(), profile, "version", task, 1, "sha256:" + strings.Repeat("c", 64), time.Now().UnixMilli(), time.Now().Add(time.Hour).UnixMilli()}},
