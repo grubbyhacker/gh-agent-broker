@@ -71,6 +71,40 @@ func TestEffectCredentialRejectsTerminalCustodyAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestEffectCredentialAuthenticationDoesNotContendWithPrimaryIssuanceConnection(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenAuthorityWorkerStore(ctx, filepath.Join(t.TempDir(), "authority.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("close store: %v", closeErr)
+		}
+	})
+	const secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	insertActiveCredentialCustody(t, store, secret)
+	conn, err := store.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAuthorityConn(conn)
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	defer rollbackAuthorityConn(context.Background(), conn)
+
+	readCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	authority, ok, err := store.AuthenticateGitCredential(readCtx, "effect-agent", secret, "grubbyhacker/repository-worker-lifecycle-test")
+	if err != nil || !ok {
+		t.Fatalf("credential authentication while issuance connection held = ok:%v err:%v", ok, err)
+	}
+	if authority.TransportAuthority.WorkerID != "worker" || authority.TransportAuthority.SessionBindingDigest == "" {
+		t.Fatalf("credential authority = %#v", authority)
+	}
+}
+
 func TestContinuationEffectCustodyProjectsAndMintsAtomically(t *testing.T) {
 	ctx := context.Background()
 	cfg := authorityTestConfig(t)

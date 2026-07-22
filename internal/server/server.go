@@ -92,6 +92,10 @@ func (s *Server) beginTransport(ctx context.Context, principal auth.Principal, t
 	if err != nil {
 		return nil, err
 	}
+	return s.beginTransportAuthority(ctx, principal, authority, method, service, repo, path, credentialHeader)
+}
+
+func (s *Server) beginTransportAuthority(ctx context.Context, principal auth.Principal, authority sandbox.TransportAuthority, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
 	if authority.Principal != principal.TransportPrincipal {
 		return nil, errors.New("transport authority context principal mismatch")
 	}
@@ -2061,18 +2065,21 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	principal, ok := auth.AuthenticateAgent(r, cfg)
+	var effectAuthority *sandbox.TransportAuthority
 	if !ok && s.credentialStore != nil {
 		id, secret, basic := r.BasicAuth()
 		if basic {
 			if custody, valid, err := s.credentialStore.AuthenticateGitCredential(r.Context(), id, secret, repo); err == nil && valid {
-				if parent, found := cfg.AgentByID(custody.Principal); found {
+				if parent, found := cfg.AgentByID(custody.TransportAuthority.Principal); found && parent.Enabled {
 					parent.ID = custody.AgentID
 					parent.Secret = ""
 					parent.Repositories = []string{custody.Repository}
-					// The effect identity is retained for Basic authentication and audit,
-					// while the immutable parent principal remains the only identity that
-					// can satisfy a leased transport context.
-					principal, ok = auth.Principal{Agent: parent, ID: custody.AgentID, TransportPrincipal: custody.Principal}, true
+					// The effect identity is retained for Basic authentication and audit.
+					// Its exact active transport authority comes from the same custody
+					// snapshot; the child never receives or selects an atc1 capability.
+					authority := custody.TransportAuthority
+					effectAuthority = &authority
+					principal, ok = auth.Principal{Agent: parent, ID: custody.AgentID, TransportPrincipal: authority.Principal}, true
 				}
 			}
 		}
@@ -2089,7 +2096,15 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	var transport *sandbox.TransportOperation
 	if s.transport != nil {
 		var err error
-		transport, err = s.beginTransport(r.Context(), principal, r.Header.Get("X-GH-Agent-Broker-Transport-Context"), r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, r.Header.Get("Authorization") != "")
+		if effectAuthority != nil {
+			if strings.TrimSpace(r.Header.Get("X-GH-Agent-Broker-Transport-Context")) != "" {
+				http.Error(w, "effect credential cannot supply transport authority", http.StatusForbidden)
+				return
+			}
+			transport, err = s.beginTransportAuthority(r.Context(), principal, *effectAuthority, r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, true)
+		} else {
+			transport, err = s.beginTransport(r.Context(), principal, r.Header.Get("X-GH-Agent-Broker-Transport-Context"), r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, r.Header.Get("Authorization") != "")
+		}
 		if err != nil {
 			http.Error(w, "transport authority observation unavailable", http.StatusServiceUnavailable)
 			return

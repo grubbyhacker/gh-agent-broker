@@ -276,6 +276,24 @@ lifecycle management, fixed operator launch profiles, durable idempotent launch
 intents, recovery/reconciliation, scoped run visibility, and brokered GitHub
 operations without returning installation credentials to workers.
 
+### Effect-scoped Git transport authority
+
+An agentd child receives only its effect-scoped `BROKER_AGENT_ID` and
+`BROKER_AGENT_SECRET`. Smart-HTTP Basic authentication now resolves the exact
+active transport authority from the same read-only SQLite custody snapshot that
+validates the effect credential. The child neither receives nor projects an
+`atc1` capability, and any caller-supplied transport-context header on this path
+is rejected before an observation or upstream request. The snapshot binds the
+credential, nonterminal effect custody, active lease, ready worker generation,
+workspace/session, registered admission, storage lineage, fence, profile
+version, and policy digest. A separate read connection keeps this lookup from
+contending with the store's transactional issuance connection.
+
+The existing `atc1`-authenticated registered create and observe HTTP endpoints
+are unchanged. Focused tests cover Basic-only discovery through the real store
+and handler, capacity-two session isolation, stale/copied coordinate refusals,
+zero-event/zero-upstream denials, and the held-issuance-connection case.
+
 ### Roadmap PR10 broker coordinator surface
 
 The private `broker/coordinator/v1` REST surface now mediates the complete

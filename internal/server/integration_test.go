@@ -3,10 +3,14 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -25,6 +29,9 @@ import (
 	"gh-agent-broker/internal/githubapp"
 	"gh-agent-broker/internal/pushtripwire"
 	"gh-agent-broker/internal/repositoryroutepolicy"
+	"gh-agent-broker/internal/sandbox"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestFakeGitHubRESTIntegration(t *testing.T) {
@@ -565,6 +572,355 @@ func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 
 	if !sawUploadPack || !sawReceivePack {
 		t.Fatalf("fake Git handlers were not all exercised: upload=%v receive=%v", sawUploadPack, sawReceivePack)
+	}
+}
+
+func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *testing.T) {
+	const (
+		repository        = "owner/repo"
+		principalID       = "writer"
+		effectAgentID     = "effect-agent"
+		effectAgentSecret = "effect-secret"
+	)
+	authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
+	seedEffectGitAuthority(t, authorityPath, effectAgentID, effectAgentSecret, repository, principalID, "worker-a", "binding-a", "session-lineage-a", "storage-a", 7)
+
+	apiServer := fakeTokenServer(t)
+	defer apiServer.Close()
+	var upstreamCalls int
+	gitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		if r.Method != http.MethodGet || r.URL.Path != "/owner/repo.git/info/refs" || r.URL.Query().Get("service") != "git-upload-pack" {
+			t.Fatalf("unexpected fake Git request: %s %s", r.Method, r.URL.String())
+		}
+		writeTestBody(t, w, "effect-upload-pack-ok")
+	}))
+	defer gitServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, gitServer.URL, config.Agent{
+		ID: principalID, Enabled: true, Secret: "parent-secret-must-not-authenticate-effect", Repositories: []string{repository}, Operations: []string{"git.upload-pack"},
+	})
+	observer, err := sandbox.OpenTransportObserver(context.Background(), authorityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialStore, err := sandbox.OpenAuthorityWorkerStore(context.Background(), authorityPath)
+	if err != nil {
+		if closeErr := observer.Close(); closeErr != nil {
+			t.Errorf("close transport observer after credential-store failure: %v", closeErr)
+		}
+		t.Fatal(err)
+	}
+	broker.transport = observer
+	broker.credentialStore = credentialStore
+	broker.transportProfiles = map[string]string{"writer-profile": principalID}
+	t.Cleanup(func() {
+		if closeErr := credentialStore.Close(); closeErr != nil {
+			t.Errorf("close credential store: %v", closeErr)
+		}
+		if closeErr := observer.Close(); closeErr != nil {
+			t.Errorf("close transport observer: %v", closeErr)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/git/owner/repo.git/info/refs?service=git-upload-pack", nil)
+	req.SetBasicAuth(effectAgentID, effectAgentSecret)
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK || resp.Body.String() != "effect-upload-pack-ok" {
+		t.Fatalf("effect discovery status/body = %d %q", resp.Code, resp.Body.String())
+	}
+	if upstreamCalls != 1 {
+		t.Fatalf("upstream calls = %d, want 1", upstreamCalls)
+	}
+
+	db, err := sql.Open("sqlite", authorityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close authority query database: %v", closeErr)
+		}
+	}()
+	rows, err := db.Query(`SELECT phase,principal,worker_id,session_lineage_id,worker_storage_lineage_id,worker_fence_epoch,profile_version,policy_digest,repository FROM repository_transport_events ORDER BY cursor`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			t.Errorf("close authority event rows: %v", closeErr)
+		}
+	}()
+	var phases []string
+	for rows.Next() {
+		var phase, principal, worker, sessionLineage, storage, profileVersion, policyDigest, gotRepository string
+		var fence int64
+		if err := rows.Scan(&phase, &principal, &worker, &sessionLineage, &storage, &fence, &profileVersion, &policyDigest, &gotRepository); err != nil {
+			t.Fatal(err)
+		}
+		if principal != principalID || worker != "worker-a" || sessionLineage != "session-lineage-a" || storage != "storage-a" || fence != 7 || profileVersion != "profile-version-a" || policyDigest != "policy-digest-a" || gotRepository != repository {
+			t.Fatalf("event %q authority mismatch: principal=%q worker=%q session=%q storage=%q fence=%d profile=%q policy=%q repo=%q", phase, principal, worker, sessionLineage, storage, fence, profileVersion, policyDigest, gotRepository)
+		}
+		phases = append(phases, phase)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(phases, ","); got != "received,forwarded,completed" {
+		t.Fatalf("transport phases = %q", got)
+	}
+}
+
+func TestEffectCredentialGitDiscoveryRefusesInvalidCustodyWithoutObservationOrUpstream(t *testing.T) {
+	tests := []struct {
+		name       string
+		agentID    string
+		secret     string
+		targetRepo string
+		header     string
+		mutate     func(*testing.T, *sql.DB)
+	}{
+		{name: "wrong secret", agentID: "effect-agent", secret: "wrong-secret", targetRepo: "owner/repo"},
+		{name: "wrong repository", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/other"},
+		{name: "released lease", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `UPDATE authority_session_leases SET released_at=?`, time.Now().UTC().Format(time.RFC3339Nano))
+		}},
+		{name: "terminal effect", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `UPDATE authority_effect_custody SET terminal_phase='failed'`)
+		}},
+		{name: "expired effect", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `UPDATE authority_git_credentials SET expires_at_ms=?`, time.Now().Add(-time.Minute).UnixMilli())
+		}},
+		{name: "stale fence", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `UPDATE authority_git_credentials SET worker_fence_epoch=worker_fence_epoch+1`)
+		}},
+		{name: "stale worker", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `UPDATE authority_workers SET state='unhealthy'`)
+		}},
+		{name: "stale storage", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `UPDATE authority_git_credentials SET worker_storage_lineage_id='other-storage'`)
+		}},
+		{name: "stale binding", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `UPDATE authority_git_credentials SET binding_digest='other-binding'`)
+		}},
+		{name: "copied credential", agentID: "copied-agent", secret: "copied-secret", targetRepo: "owner/repo", mutate: func(t *testing.T, db *sql.DB) {
+			mustExecTestSQL(t, db, `INSERT INTO authority_git_credentials(receipt_digest,receipt_json,principal,binding_digest,session_id,effect_id,model_effect_id,repository,worker_id,worker_storage_lineage_id,worker_fence_epoch,agent_id,secret_fingerprint,expires_at_ms,authority_profile,authority_profile_version,registered_task_digest,journal_cursor,journal_record_digest,authorized_at_ms,deadline_at_ms)
+				SELECT ?,receipt_json,principal,?,session_id,effect_id,model_effect_id,repository,worker_id,worker_storage_lineage_id,worker_fence_epoch,?,?,expires_at_ms,authority_profile,authority_profile_version,registered_task_digest,journal_cursor,journal_record_digest,authorized_at_ms,deadline_at_ms FROM authority_git_credentials WHERE agent_id='effect-agent'`, "sha256:"+strings.Repeat("d", 64), "copied-binding", "copied-agent", effectCredentialFingerprint(t, db, "copied-secret"))
+		}},
+		{name: "caller transport header", agentID: "effect-agent", secret: "effect-secret", targetRepo: "owner/repo", header: "atc1.caller-selected-authority"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
+			seedEffectGitAuthority(t, authorityPath, "effect-agent", "effect-secret", "owner/repo", "writer", "worker-a", "binding-a", "session-lineage-a", "storage-a", 7)
+			db, err := sql.Open("sqlite", authorityPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.mutate != nil {
+				test.mutate(t, db)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			broker, upstreamCalls := newEffectGitTestBroker(t, authorityPath, "owner/repo", "writer")
+			req := httptest.NewRequest(http.MethodGet, "/git/"+test.targetRepo+".git/info/refs?service=git-upload-pack", nil)
+			req.SetBasicAuth(test.agentID, test.secret)
+			if test.header != "" {
+				req.Header.Set("X-GH-Agent-Broker-Transport-Context", test.header)
+			}
+			resp := httptest.NewRecorder()
+			broker.ServeHTTP(resp, req)
+			if resp.Code < 400 {
+				t.Fatalf("refusal status/body = %d %q", resp.Code, resp.Body.String())
+			}
+			if *upstreamCalls != 0 {
+				t.Fatalf("upstream calls = %d, want 0", *upstreamCalls)
+			}
+			if count := transportEventCountAtPath(t, authorityPath); count != 0 {
+				t.Fatalf("transport event count = %d, want 0", count)
+			}
+		})
+	}
+}
+
+func TestEffectCredentialGitDiscoveryCapacityTwoKeepsExactSessionAuthority(t *testing.T) {
+	authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
+	seedEffectGitAuthority(t, authorityPath, "effect-a", "secret-a", "owner/repo", "writer", "worker-a", "binding-a", "session-a", "storage-a", 1)
+	seedEffectGitAuthority(t, authorityPath, "effect-b", "secret-b", "owner/repo", "writer", "worker-b", "binding-b", "session-b", "storage-b", 2)
+	broker, upstreamCalls := newEffectGitTestBroker(t, authorityPath, "owner/repo", "writer")
+	for _, credential := range []struct{ agent, secret string }{{"effect-b", "secret-b"}, {"effect-a", "secret-a"}} {
+		req := httptest.NewRequest(http.MethodGet, "/git/owner/repo.git/info/refs?service=git-upload-pack", nil)
+		req.SetBasicAuth(credential.agent, credential.secret)
+		resp := httptest.NewRecorder()
+		broker.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("%s status/body = %d %q", credential.agent, resp.Code, resp.Body.String())
+		}
+	}
+	if *upstreamCalls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", *upstreamCalls)
+	}
+	db, err := sql.Open("sqlite", authorityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close authority query database: %v", closeErr)
+		}
+	}()
+	rows, err := db.Query(`SELECT operation_id,phase,worker_id,session_lineage_id,worker_storage_lineage_id,worker_fence_epoch FROM repository_transport_events ORDER BY cursor`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			t.Errorf("close authority event rows: %v", closeErr)
+		}
+	}()
+	var operations []string
+	for rows.Next() {
+		var operation, phase, worker, session, storage string
+		var fence int64
+		if err := rows.Scan(&operation, &phase, &worker, &session, &storage, &fence); err != nil {
+			t.Fatal(err)
+		}
+		if len(operations) == 0 || operations[len(operations)-1] != operation {
+			operations = append(operations, operation)
+		}
+		index := len(operations) - 1
+		wantWorker, wantSession, wantStorage, wantFence := "worker-b", "session-b", "storage-b", int64(2)
+		if index == 1 {
+			wantWorker, wantSession, wantStorage, wantFence = "worker-a", "session-a", "storage-a", 1
+		}
+		if worker != wantWorker || session != wantSession || storage != wantStorage || fence != wantFence {
+			t.Fatalf("operation %d phase %s crossed authority: worker=%q session=%q storage=%q fence=%d", index, phase, worker, session, storage, fence)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 2 {
+		t.Fatalf("operation count = %d, want 2", len(operations))
+	}
+}
+
+func newEffectGitTestBroker(t *testing.T, authorityPath, repository, principal string) (*Server, *int) {
+	t.Helper()
+	apiServer := fakeTokenServer(t)
+	t.Cleanup(apiServer.Close)
+	upstreamCalls := 0
+	gitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		writeTestBody(t, w, "effect-upload-pack-ok")
+	}))
+	t.Cleanup(gitServer.Close)
+	broker := newTestBroker(t, apiServer.URL, gitServer.URL, config.Agent{ID: principal, Enabled: true, Secret: "parent-secret", Repositories: []string{repository}, Operations: []string{"git.upload-pack"}})
+	observer, err := sandbox.OpenTransportObserver(context.Background(), authorityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialStore, err := sandbox.OpenAuthorityWorkerStore(context.Background(), authorityPath)
+	if err != nil {
+		if closeErr := observer.Close(); closeErr != nil {
+			t.Errorf("close transport observer after credential-store failure: %v", closeErr)
+		}
+		t.Fatal(err)
+	}
+	broker.transport = observer
+	broker.credentialStore = credentialStore
+	broker.transportProfiles = map[string]string{"writer-profile": principal}
+	t.Cleanup(func() {
+		if err := credentialStore.Close(); err != nil {
+			t.Errorf("close credential store: %v", err)
+		}
+		if err := observer.Close(); err != nil {
+			t.Errorf("close transport observer: %v", err)
+		}
+	})
+	return broker, &upstreamCalls
+}
+
+func transportEventCountAtPath(t *testing.T, path string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close authority query database: %v", closeErr)
+		}
+	}()
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM repository_transport_events`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func mustExecTestSQL(t *testing.T, db *sql.DB, query string, args ...any) {
+	t.Helper()
+	if _, err := db.Exec(query, args...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func effectCredentialFingerprint(t *testing.T, db *sql.DB, secret string) string {
+	t.Helper()
+	var salt []byte
+	if err := db.QueryRow(`SELECT value FROM authority_settings WHERE name='request_hmac_salt'`).Scan(&salt); err != nil {
+		t.Fatal(err)
+	}
+	fingerprintKey := hmac.New(sha256.New, salt)
+	_, _ = fingerprintKey.Write([]byte("gh-agent-broker/effect-token-fingerprint-key/v1"))
+	fingerprint := hmac.New(sha256.New, fingerprintKey.Sum(nil))
+	_, _ = fingerprint.Write([]byte(secret))
+	return hex.EncodeToString(fingerprint.Sum(nil))
+}
+
+func seedEffectGitAuthority(t *testing.T, path, agentID, secret, repository, principal, worker, binding, sessionLineage, storage string, fence int64) {
+	t.Helper()
+	store, err := sandbox.OpenAuthorityWorkerStore(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close authority seed database: %v", closeErr)
+		}
+	}()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	nowMillis := time.Now().UnixMilli()
+	agentdSession := "agentd-" + worker
+	effect := "effect-" + worker
+	receiptSum := sha256.Sum256([]byte(worker))
+	receiptDigest := "sha256:" + hex.EncodeToString(receiptSum[:])
+	const taskDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO authority_workers(worker_id,profile,profile_version,policy_digest,image_reference,generation,state,capacity,created_at,updated_at,worker_storage_lineage_id,worker_fence_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, []any{worker, "writer-profile", "profile-version-a", "policy-digest-a", "image", 1, "ready", 2, now, now, storage, fence}},
+		{`INSERT INTO authority_session_leases(principal,profile,idempotency_digest,request_fingerprint,binding_digest,worker_id,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?,?)`, []any{principal, "writer-profile", "idem-" + binding, "request-" + binding, binding, worker, now, sessionLineage}},
+		{`INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id,agentd_session_id) VALUES(?,?,?,?,?,?,?,?)`, []any{binding, worker, 20000, 20000, "/workspace/" + sessionLineage, now, sessionLineage, agentdSession}},
+		{`INSERT INTO authority_registered_admissions(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest) VALUES(?,?,?,?,?,?,?)`, []any{principal, binding, "broker/coordinator-registered/v1", "work-" + worker, "route-" + worker, `{}`, taskDigest}},
+		{`INSERT INTO authority_registered_turns(principal,binding_digest,idempotency_digest,session_id,turn_id,model_effect_id,submit_cursor) VALUES(?,?,?,?,?,?,?)`, []any{principal, binding, "turn-idem-" + worker, agentdSession, "turn-" + worker, effect, 1}},
+		{`INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id,session_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,authority_profile,authority_profile_version,policy_digest,registered_task_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, []any{principal, binding, effect, agentdSession, worker, storage, fence, "writer-profile", "profile-version-a", "policy-digest-a", taskDigest}},
+		{`INSERT INTO authority_git_credentials(receipt_digest,receipt_json,principal,binding_digest,session_id,effect_id,model_effect_id,repository,worker_id,worker_storage_lineage_id,worker_fence_epoch,agent_id,secret_fingerprint,expires_at_ms,authority_profile,authority_profile_version,registered_task_digest,journal_cursor,journal_record_digest,authorized_at_ms,deadline_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, []any{receiptDigest, `{}`, principal, binding, agentdSession, effect, effect, repository, worker, storage, fence, agentID, effectCredentialFingerprint(t, db, secret), nowMillis + 60*60*1000, "writer-profile", "profile-version-a", taskDigest, 1, "sha256:" + strings.Repeat("c", 64), nowMillis, nowMillis + 60*60*1000}},
+	} {
+		if _, err := db.Exec(statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
