@@ -3,6 +3,7 @@ package sandbox
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -24,6 +25,24 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 			}
 			if !out.Authorized {
 				writeJSON(w, http.StatusForbidden, out)
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		if path == "agentd/transport-context" {
+			w.Header().Set("Cache-Control", "no-store")
+			if r.Method != http.MethodPost {
+				writeRESTCodeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+				return
+			}
+			var in AgentdTransportContextRequest
+			if !decodeAgentdTransportContextJSON(w, r, &in) {
+				return
+			}
+			out, err := service.AgentdTransportContext(r.Context(), agentdTransportBearerToken(r), in)
+			if err != nil {
+				writeRESTCodeError(w, http.StatusForbidden, "transport_context_denied", "transport context denied")
 				return
 			}
 			writeJSON(w, http.StatusOK, out)
@@ -323,6 +342,32 @@ func decodeAuthorityJSON(w http.ResponseWriter, r *http.Request, out any) bool {
 		return false
 	}
 	return true
+}
+
+func decodeAgentdTransportContextJSON(w http.ResponseWriter, r *http.Request, out *AgentdTransportContextRequest) bool {
+	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	d.DisallowUnknownFields()
+	if d.Decode(out) != nil {
+		writeRESTCodeError(w, http.StatusBadRequest, "invalid_transport_context_request", "invalid request")
+		return false
+	}
+	if err := d.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeRESTCodeError(w, http.StatusBadRequest, "invalid_transport_context_request", "invalid request")
+		return false
+	}
+	return true
+}
+
+func agentdTransportBearerToken(r *http.Request) string {
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
+		return ""
+	}
+	value := strings.TrimSpace(values[0])
+	if !strings.HasPrefix(strings.ToLower(value), "bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(value[len("bearer "):])
 }
 
 func authorityResponse(w http.ResponseWriter, out AuthorityWorker, err error) {

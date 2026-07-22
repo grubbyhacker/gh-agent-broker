@@ -328,12 +328,16 @@ func (s *AuthorityWorkerStore) AcquireRegistered(ctx context.Context, principal 
 }
 
 func (s *AuthorityWorkerStore) RegisteredAdmission(ctx context.Context, principal, binding string) (registeredAdmission, error) {
-	var a registeredAdmission
-	var protocol, profile string
-	err := s.db.QueryRowContext(ctx, `SELECT a.protocol_version,l.profile,a.work_item_id,a.route_snapshot_id,a.canonical_task_json,a.admission_task_digest FROM authority_registered_admissions a JOIN authority_session_leases l ON l.principal=a.principal AND l.binding_digest=a.binding_digest WHERE a.principal=? AND a.binding_digest=?`, principal, s.requestDigest(binding)).Scan(&protocol, &profile, &a.Source.WorkItemID, &a.Source.RouteSnapshotID, &a.CanonicalJSON, &a.Digest)
+	var protocol, profile, workItemID, routeSnapshotID, canonical, digest string
+	err := s.db.QueryRowContext(ctx, `SELECT a.protocol_version,l.profile,a.work_item_id,a.route_snapshot_id,a.canonical_task_json,a.admission_task_digest FROM authority_registered_admissions a JOIN authority_session_leases l ON l.principal=a.principal AND l.binding_digest=a.binding_digest WHERE a.principal=? AND a.binding_digest=?`, principal, s.requestDigest(binding)).Scan(&protocol, &profile, &workItemID, &routeSnapshotID, &canonical, &digest)
 	if err != nil {
 		return registeredAdmission{}, err
 	}
+	return validateDurableRegisteredAdmission(protocol, profile, workItemID, routeSnapshotID, canonical, digest)
+}
+
+func validateDurableRegisteredAdmission(protocol, profile, workItemID, routeSnapshotID, canonical, digest string) (registeredAdmission, error) {
+	a := registeredAdmission{Source: RegisteredTaskSource{WorkItemID: workItemID, RouteSnapshotID: routeSnapshotID}, CanonicalJSON: canonical, Digest: digest}
 	if protocol != coordinatorRegisteredProtocolVersion {
 		return registeredAdmission{}, fmt.Errorf("registered admission state is corrupt: protocol version")
 	}

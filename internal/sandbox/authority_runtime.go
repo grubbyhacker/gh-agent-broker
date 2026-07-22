@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	agentdBrokerValidationURL  = "http://sandbox-broker:8091/v1/authority-workers/agentd/session-validation"
-	agentdBrokerObservationURL = "http://broker:8080/v1/registered/github-green-pr/observe"
+	agentdBrokerValidationURL       = "http://sandbox-broker:8091/v1/authority-workers/agentd/session-validation"
+	agentdBrokerTransportContextURL = "http://sandbox-broker:8091/v1/authority-workers/agentd/transport-context"
+	agentdBrokerObservationURL      = "http://broker:8080/v1/registered/github-green-pr/observe"
 	//nolint:gosec // This fixed internal route is not a credential and cannot be caller-selected.
 	agentdBrokerCredentialMintURL = "http://sandbox-broker:8091/v1/authority-workers/git-credential/mint"
 )
@@ -118,24 +119,24 @@ func authorityWorkerRuntimeSpec(spec AuthorityWorkerSpec, secret, coordinatorTok
 	// source relative to that directory. State is durable within the worker's
 	// engine-enforced storage-lineage subpath.
 	env := map[string]string{
-		"AGENTD_BROKER_VALIDATION_URL":      agentdBrokerValidationURL,
-		"AGENTD_BROKER_VALIDATION_TOKEN":    deriveAgentdValidationToken(secret, spec.WorkerID, spec.WorkerStorageLineageID, spec.WorkerFenceEpoch),
-		"AGENTD_BROKER_OBSERVATION_URL":     agentdBrokerObservationURL,
-		"AGENTD_BROKER_OBSERVATION_TOKEN":   deriveAgentdValidationToken(secret, spec.WorkerID, spec.WorkerStorageLineageID, spec.WorkerFenceEpoch),
-		"AGENTD_BROKER_CREDENTIAL_MINT_URL": agentdBrokerCredentialMintURL,
-		"AGENTD_BROKER_CONTROL_TOKEN":       deriveAgentdValidationToken(secret, spec.WorkerID, spec.WorkerStorageLineageID, spec.WorkerFenceEpoch),
-		"AGENTD_COORDINATOR_TOKEN":          coordinatorToken,
-		"AGENTD_STATE_PATH":                 filepath.Join(spec.SessionIsolation.WorkspaceRoot, agentdControlV1StateDirectory, agentdControlV1StateFile),
-		"AGENTD_WORKER_ID":                  spec.WorkerID,
-		"AGENTD_STORAGE_LINEAGE_ID":         spec.WorkerStorageLineageID,
-		"AGENTD_FENCE_EPOCH":                strconv.FormatInt(spec.WorkerFenceEpoch, 10),
-		"AGENTD_AUTHORITY_PROFILE":          spec.Profile,
-		"AGENTD_AUTHORITY_PROFILE_VERSION":  spec.ProfileVersion,
-		"AGENTD_POLICY_DIGEST":              spec.PolicyDigest,
-		"AGENTD_AUTHORITY_BINDING":          spec.Profile,
-		"AGENTD_SESSION_ROOT":               spec.SessionIsolation.WorkspaceRoot,
-		"AGENTD_SESSION_UID_MIN":            strconv.Itoa(spec.SessionIsolation.UIDStart),
-		"AGENTD_SESSION_CAPACITY":           strconv.Itoa(spec.SessionCapacity),
+		"AGENTD_BROKER_VALIDATION_URL":        agentdBrokerValidationURL,
+		"AGENTD_BROKER_VALIDATION_TOKEN":      deriveAgentdValidationToken(secret, spec.WorkerID, spec.WorkerStorageLineageID, spec.WorkerFenceEpoch),
+		"AGENTD_BROKER_TRANSPORT_CONTEXT_URL": agentdBrokerTransportContextURL,
+		"AGENTD_BROKER_OBSERVATION_URL":       agentdBrokerObservationURL,
+		"AGENTD_BROKER_CREDENTIAL_MINT_URL":   agentdBrokerCredentialMintURL,
+		"AGENTD_BROKER_CONTROL_TOKEN":         deriveAgentdValidationToken(secret, spec.WorkerID, spec.WorkerStorageLineageID, spec.WorkerFenceEpoch),
+		"AGENTD_COORDINATOR_TOKEN":            coordinatorToken,
+		"AGENTD_STATE_PATH":                   filepath.Join(spec.SessionIsolation.WorkspaceRoot, agentdControlV1StateDirectory, agentdControlV1StateFile),
+		"AGENTD_WORKER_ID":                    spec.WorkerID,
+		"AGENTD_STORAGE_LINEAGE_ID":           spec.WorkerStorageLineageID,
+		"AGENTD_FENCE_EPOCH":                  strconv.FormatInt(spec.WorkerFenceEpoch, 10),
+		"AGENTD_AUTHORITY_PROFILE":            spec.Profile,
+		"AGENTD_AUTHORITY_PROFILE_VERSION":    spec.ProfileVersion,
+		"AGENTD_POLICY_DIGEST":                spec.PolicyDigest,
+		"AGENTD_AUTHORITY_BINDING":            spec.Profile,
+		"AGENTD_SESSION_ROOT":                 spec.SessionIsolation.WorkspaceRoot,
+		"AGENTD_SESSION_UID_MIN":              strconv.Itoa(spec.SessionIsolation.UIDStart),
+		"AGENTD_SESSION_CAPACITY":             strconv.Itoa(spec.SessionCapacity),
 	}
 	labels := map[string]string{
 		"gh-agent-broker.run_id":                 "authority-" + spec.WorkerID,

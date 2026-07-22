@@ -1,0 +1,100 @@
+{
+  "version": "broker-agentd-transport-context-contract/v1",
+  "endpoint": {
+    "url": "http://sandbox-broker:8091/v1/authority-workers/agentd/transport-context",
+    "method": "POST",
+    "path": "/v1/authority-workers/agentd/transport-context",
+    "requestContentType": "application/json",
+    "requestBodyLimitBytes": 4096,
+    "clientDeadlineMilliseconds": 250
+  },
+  "authentication": {
+    "scheme": "Bearer",
+    "credential": "agentd-generation-av1",
+    "header": "Authorization: Bearer <av1>",
+    "credentialBinding": [
+      "workerId",
+      "workerStorageLineageId",
+      "workerFenceEpoch"
+    ]
+  },
+  "request": {
+    "version": "broker/agentd-transport-context/v1",
+    "additionalProperties": false,
+    "requiredFields": [
+      "version",
+      "sessionId",
+      "coordinatorBinding",
+      "sessionLineageId",
+      "workerId",
+      "workerStorageLineageId",
+      "workerFenceEpoch",
+      "authorityProfile",
+      "authorityProfileVersion",
+      "policyDigest"
+    ],
+    "forbiddenAuthorityFields": [
+      "principal",
+      "bindingDigest",
+      "repository",
+      "task",
+      "push",
+      "pullRequest",
+      "sha",
+      "completion"
+    ]
+  },
+  "response": {
+    "status": 200,
+    "version": "broker/agentd-transport-context/v1",
+    "additionalProperties": false,
+    "requiredFields": [
+      "version",
+      "transportContext"
+    ],
+    "transportContextPattern": "^atc1\\.[A-Za-z0-9_-]{43}$",
+    "cacheControl": "no-store"
+  },
+  "refusals": [
+    {
+      "status": 400,
+      "code": "invalid_transport_context_request"
+    },
+    {
+      "status": 403,
+      "code": "transport_context_denied"
+    },
+    {
+      "status": 405,
+      "code": "method_not_allowed"
+    }
+  ],
+  "binding": {
+    "source": "one broker authority-store snapshot",
+    "requestFieldsAreEqualityConstraintsOnly": true,
+    "derivedFields": [
+      "principal",
+      "leaseBindingDigest",
+      "registeredAdmission",
+      "workspace",
+      "agentdSession",
+      "activeWorkerGeneration",
+      "latestConfirmedAdoption"
+    ],
+    "transportContextInputs": [
+      "principal",
+      "authorityProfile",
+      "workerId",
+      "workerStorageLineageId",
+      "workerFenceEpoch",
+      "sessionLineageId",
+      "leaseBindingDigest"
+    ]
+  },
+  "custody": {
+    "brokerPersistsTransportContext": false,
+    "brokerLogsTransportContext": false,
+    "responseMayBeCached": false,
+    "agentdPersistenceAllowed": false
+  }
+}
