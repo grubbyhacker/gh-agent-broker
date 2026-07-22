@@ -287,6 +287,10 @@ snapshot and appends `received` atomically. Release and reassignment use the
 same SQLite writer ordering, so either the event commits first or changed
 custody is refused with no event or upstream request. The barrier commits before
 policy evaluation or forwarding; no transaction spans an upstream request.
+The registered turn anchors root session ownership; continuation credentials
+remain valid because their exact current effect identity is bound by the
+credential and continuation-custody row rather than incorrectly equated with
+the turn's retained root effect.
 
 The child neither receives nor projects an `atc1` capability, and any
 caller-supplied transport-context header on this path is rejected before an

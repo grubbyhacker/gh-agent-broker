@@ -144,45 +144,64 @@ func TestContinuationEffectCustodyProjectsAndMintsAtomically(t *testing.T) {
 	event := func(cursor int64, effect, phase string) registeredEventProjection {
 		return registeredEventProjection{Cursor: cursor, SessionID: sessionID, TurnID: "turn:" + request.IdempotencyKey, ModelEffectID: effect, Phase: phase, WorkerID: admission.Lease.WorkerID, StorageLineageID: admission.Lease.WorkerStorageLineageID, FenceEpoch: admission.Lease.WorkerFenceEpoch, AdmissionTaskDigest: request.AdmissionTaskDigest, TaskEvidenceDigest: request.Task.TaskEvidenceDigest}
 	}
-	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 0, 1, []registeredEventProjection{event(1, rootEffect, "completed")}); err != nil {
+	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 0, 1, []registeredEventProjection{event(1, rootEffect, "authorized")}); err != nil {
 		t.Fatal(err)
 	}
-	wrongFence := event(2, continuationEffect, "authorized")
+	now := time.Now().UnixMilli()
+	rootReceipt := GitCredentialReceipt{Version: gitCredentialReceiptVersion, SessionID: sessionID, EffectID: rootEffect, ModelEffectID: rootEffect, RegisteredTaskDigest: request.AdmissionTaskDigest, AuthorityProfile: admission.Lease.Profile, AuthorityProfileVersion: admission.Lease.ProfileVersion, WorkerID: admission.Lease.WorkerID, WorkerStorageLineageID: admission.Lease.WorkerStorageLineageID, FenceEpoch: admission.Lease.WorkerFenceEpoch, JournalCursor: 1, JournalRecordDigest: "sha256:" + strings.Repeat("b", 64), AuthorizedAt: now, DeadlineAt: now + 60*60*1000}
+	control := credentialControlToken(controlSecret, rootReceipt.WorkerID, rootReceipt.WorkerStorageLineageID, rootReceipt.FenceEpoch)
+	rootCredential, err := service.MintGitCredential(ctx, control, rootReceipt)
+	if err != nil {
+		t.Fatalf("root credential mint: %v", err)
+	}
+	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 1, 2, []registeredEventProjection{event(2, rootEffect, "completed")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, authErr := store.AuthenticateGitCredential(ctx, rootCredential.AgentID, rootCredential.AgentSecret, request.Task.Parameters.Repository); authErr != nil || ok {
+		t.Fatalf("terminal root credential authentication = ok:%v err:%v", ok, authErr)
+	}
+	wrongFence := event(3, continuationEffect, "authorized")
 	wrongFence.FenceEpoch++
-	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 1, 2, []registeredEventProjection{wrongFence}); err == nil {
+	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 2, 3, []registeredEventProjection{wrongFence}); err == nil {
 		t.Fatal("wrong fence continuation was projected")
 	}
-	wrongTask := event(2, continuationEffect, "authorized")
+	wrongTask := event(3, continuationEffect, "authorized")
 	wrongTask.TaskEvidenceDigest = "sha256:" + strings.Repeat("b", 64)
-	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 1, 2, []registeredEventProjection{wrongTask}); err == nil {
+	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 2, 3, []registeredEventProjection{wrongTask}); err == nil {
 		t.Fatal("wrong task continuation was projected")
 	}
-	if err = store.RecordRegisteredEvents(ctx, "coordinator", "session:other-work", 1, 2, []registeredEventProjection{event(2, continuationEffect, "authorized")}); err == nil {
+	if err = store.RecordRegisteredEvents(ctx, "coordinator", "session:other-work", 2, 3, []registeredEventProjection{event(3, continuationEffect, "authorized")}); err == nil {
 		t.Fatal("wrong binding continuation was projected")
 	}
 	state, err := store.RegisteredTurn(ctx, "coordinator", request.SessionBinding)
-	if err != nil || state.EventsAfter != 1 {
+	if err != nil || state.EventsAfter != 2 {
 		t.Fatalf("rejected projection advanced cursor: state=%+v err=%v", state, err)
 	}
 	var projected int
 	if err = store.db.QueryRowContext(ctx, `SELECT count(*) FROM authority_effect_custody WHERE principal=? AND binding_digest=? AND model_effect_id=?`, "coordinator", admission.Lease.BindingDigest, continuationEffect).Scan(&projected); err != nil || projected != 0 {
 		t.Fatalf("rejected projection created continuation custody: count=%d err=%v", projected, err)
 	}
-	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 1, 2, []registeredEventProjection{event(2, continuationEffect, "authorized")}); err != nil {
+	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 2, 3, []registeredEventProjection{event(3, continuationEffect, "authorized")}); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UnixMilli()
-	receipt := GitCredentialReceipt{Version: gitCredentialReceiptVersion, SessionID: sessionID, EffectID: continuationEffect, ModelEffectID: continuationEffect, RegisteredTaskDigest: request.AdmissionTaskDigest, AuthorityProfile: admission.Lease.Profile, AuthorityProfileVersion: admission.Lease.ProfileVersion, WorkerID: admission.Lease.WorkerID, WorkerStorageLineageID: admission.Lease.WorkerStorageLineageID, FenceEpoch: admission.Lease.WorkerFenceEpoch, JournalCursor: 2, JournalRecordDigest: "sha256:" + strings.Repeat("c", 64), AuthorizedAt: now, DeadlineAt: now + 60*60*1000}
-	control := credentialControlToken(controlSecret, receipt.WorkerID, receipt.WorkerStorageLineageID, receipt.FenceEpoch)
-	if _, err = service.MintGitCredential(ctx, control, receipt); err != nil {
+	receipt := GitCredentialReceipt{Version: gitCredentialReceiptVersion, SessionID: sessionID, EffectID: continuationEffect, ModelEffectID: continuationEffect, RegisteredTaskDigest: request.AdmissionTaskDigest, AuthorityProfile: admission.Lease.Profile, AuthorityProfileVersion: admission.Lease.ProfileVersion, WorkerID: admission.Lease.WorkerID, WorkerStorageLineageID: admission.Lease.WorkerStorageLineageID, FenceEpoch: admission.Lease.WorkerFenceEpoch, JournalCursor: 3, JournalRecordDigest: "sha256:" + strings.Repeat("c", 64), AuthorizedAt: now, DeadlineAt: now + 60*60*1000}
+	continuationCredential, err := service.MintGitCredential(ctx, control, receipt)
+	if err != nil {
 		t.Fatalf("continuation credential mint: %v", err)
+	}
+	authority, ok, authErr := store.AuthenticateGitCredential(ctx, continuationCredential.AgentID, continuationCredential.AgentSecret, request.Task.Parameters.Repository)
+	if authErr != nil || !ok {
+		t.Fatalf("continuation credential authentication = ok:%v err:%v", ok, authErr)
+	}
+	if authority.EffectID != continuationEffect || authority.ModelEffectID != continuationEffect || authority.SessionID != sessionID || authority.TransportAuthority.WorkerID != admission.Lease.WorkerID {
+		t.Fatalf("continuation credential authority = %#v", authority)
 	}
 	replay := receipt
 	replay.JournalCursor++
 	if _, err = service.MintGitCredential(ctx, control, replay); err == nil {
 		t.Fatal("distinct continuation receipt replay minted twice")
 	}
-	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 2, 3, []registeredEventProjection{event(3, continuationEffect, "completed")}); err != nil {
+	if err = store.RecordRegisteredEvents(ctx, "coordinator", request.SessionBinding, 3, 4, []registeredEventProjection{event(4, continuationEffect, "completed")}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = service.MintGitCredential(ctx, control, receipt); err == nil {

@@ -290,7 +290,7 @@ func (s *AuthorityWorkerStore) authenticateGitCredential(ctx context.Context, qu
 			AND e.authority_profile_version=c.authority_profile_version
 			AND e.registered_task_digest=c.registered_task_digest AND e.terminal_phase=''
 		JOIN authority_registered_turns t ON t.principal=c.principal AND t.binding_digest=c.binding_digest
-			AND t.session_id=c.session_id AND t.model_effect_id=c.model_effect_id
+			AND t.session_id=c.session_id
 		JOIN authority_session_leases l ON l.principal=c.principal AND l.binding_digest=c.binding_digest
 			AND l.worker_id=c.worker_id AND l.profile=c.authority_profile AND l.released_at=''
 		JOIN authority_workers w ON w.worker_id=c.worker_id

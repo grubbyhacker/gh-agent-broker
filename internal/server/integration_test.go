@@ -887,6 +887,42 @@ func TestEffectCredentialGitDiscoveryRevalidatesBeforeReceived(t *testing.T) {
 				t.Fatalf("confirmed reassignments = %d", confirmed)
 			}
 		}},
+		{name: "coordinated task and continuation effect swap after authentication", transition: func(t *testing.T, path string, store *sandbox.AuthorityWorkerStore) {
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var canonical string
+			if err := db.QueryRow(`SELECT canonical_task_json FROM authority_registered_admissions`).Scan(&canonical); err != nil {
+				t.Fatal(err)
+			}
+			canonical = strings.Replace(canonical, "sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64), 1)
+			taskSum := sha256.Sum256([]byte(canonical))
+			taskDigest := "sha256:" + hex.EncodeToString(taskSum[:])
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(`UPDATE authority_registered_admissions SET canonical_task_json=?,admission_task_digest=?`, canonical, taskDigest); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(`UPDATE authority_effect_custody SET model_effect_id='effect-swapped',registered_task_digest=?`, taskDigest); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(`UPDATE authority_git_credentials SET receipt_digest=?,effect_id='effect-swapped',model_effect_id='effect-swapped',registered_task_digest=?`, "sha256:"+strings.Repeat("d", 64), taskDigest); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			swapped, ok, authErr := store.AuthenticateGitCredential(context.Background(), "effect-agent", "effect-secret", repository)
+			if authErr != nil || !ok || swapped.EffectID != "effect-swapped" || swapped.RegisteredTaskDigest != taskDigest {
+				t.Fatalf("coordinated swapped snapshot = %#v ok:%v err:%v", swapped, ok, authErr)
+			}
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1038,6 +1074,7 @@ func seedEffectGitAuthority(t *testing.T, path, agentID, secret, repository, pri
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	nowMillis := time.Now().UnixMilli()
 	agentdSession := "agentd-" + worker
+	rootEffect := "root-" + worker
 	effect := "effect-" + worker
 	receiptSum := sha256.Sum256([]byte(worker))
 	receiptDigest := "sha256:" + hex.EncodeToString(receiptSum[:])
@@ -1053,7 +1090,9 @@ func seedEffectGitAuthority(t *testing.T, path, agentID, secret, repository, pri
 		{`INSERT INTO authority_session_leases(principal,profile,idempotency_digest,request_fingerprint,binding_digest,worker_id,created_at,session_lineage_id) VALUES(?,?,?,?,?,?,?,?)`, []any{principal, "writer-profile", "idem-" + binding, "request-" + binding, bindingDigest, worker, now, sessionLineage}},
 		{`INSERT INTO authority_session_workspaces(binding_digest,worker_id,uid,gid,workspace_path,created_at,session_lineage_id,agentd_session_id) VALUES(?,?,?,?,?,?,?,?)`, []any{bindingDigest, worker, 20000, 20000, "/workspace/" + sessionLineage, now, sessionLineage, agentdSession}},
 		{`INSERT INTO authority_registered_admissions(principal,binding_digest,protocol_version,work_item_id,route_snapshot_id,canonical_task_json,admission_task_digest) VALUES(?,?,?,?,?,?,?)`, []any{principal, bindingDigest, "broker/coordinator/v2", workItemID, "route-" + worker, canonical, taskDigest}},
-		{`INSERT INTO authority_registered_turns(principal,binding_digest,idempotency_digest,session_id,turn_id,model_effect_id,submit_cursor) VALUES(?,?,?,?,?,?,?)`, []any{principal, bindingDigest, "turn-idem-" + worker, agentdSession, "turn-" + worker, effect, 1}},
+		// registered_turns retains the root effect. The active custody and minted
+		// credential deliberately name a later authorized continuation effect.
+		{`INSERT INTO authority_registered_turns(principal,binding_digest,idempotency_digest,session_id,turn_id,model_effect_id,submit_cursor) VALUES(?,?,?,?,?,?,?)`, []any{principal, bindingDigest, "turn-idem-" + worker, agentdSession, "turn-" + worker, rootEffect, 1}},
 		{`INSERT INTO authority_effect_custody(principal,binding_digest,model_effect_id,session_id,worker_id,worker_storage_lineage_id,worker_fence_epoch,authority_profile,authority_profile_version,policy_digest,registered_task_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, []any{principal, bindingDigest, effect, agentdSession, worker, storage, fence, "writer-profile", "profile-version-a", "policy-digest-a", taskDigest}},
 		{`INSERT INTO authority_git_credentials(receipt_digest,receipt_json,principal,binding_digest,session_id,effect_id,model_effect_id,repository,worker_id,worker_storage_lineage_id,worker_fence_epoch,agent_id,secret_fingerprint,expires_at_ms,authority_profile,authority_profile_version,registered_task_digest,journal_cursor,journal_record_digest,authorized_at_ms,deadline_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, []any{receiptDigest, `{}`, principal, bindingDigest, agentdSession, effect, effect, repository, worker, storage, fence, agentID, effectCredentialFingerprint(t, db, secret), nowMillis + 60*60*1000, "writer-profile", "profile-version-a", taskDigest, 1, "sha256:" + strings.Repeat("c", 64), nowMillis, nowMillis + 60*60*1000}},
 	} {
