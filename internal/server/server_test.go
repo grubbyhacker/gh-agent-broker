@@ -343,6 +343,42 @@ func TestRegisteredGreenPRPolicyCheckRequiresExactEndpointOperations(t *testing.
 	}
 }
 
+func TestConfiguredTransportAgentFailsClosedOnInvalidMapping(t *testing.T) {
+	authority := sandbox.TransportAuthority{Principal: "authority-worker-operator", Profile: "general-writer-v1"}
+	enabled := config.Agent{ID: "fleiglabs-repo-agent", Enabled: true}
+	disabled := config.Agent{ID: "disabled-agent", Enabled: false}
+	tests := []struct {
+		name     string
+		mappings map[string]string
+		agents   []config.Agent
+		wantID   string
+	}{
+		{name: "mapped enabled agent", mappings: map[string]string{"general-writer-v1": enabled.ID}, agents: []config.Agent{enabled}, wantID: enabled.ID},
+		{name: "missing mapping", mappings: nil, agents: []config.Agent{enabled}},
+		{name: "different profile mapping", mappings: map[string]string{"other-profile": enabled.ID}, agents: []config.Agent{enabled}},
+		{name: "empty mapping", mappings: map[string]string{"general-writer-v1": ""}, agents: []config.Agent{enabled}},
+		{name: "whitespace mapping", mappings: map[string]string{"general-writer-v1": " fleiglabs-repo-agent"}, agents: []config.Agent{enabled}},
+		{name: "unknown mapped agent", mappings: map[string]string{"general-writer-v1": "unknown-agent"}, agents: []config.Agent{enabled}},
+		{name: "disabled mapped agent", mappings: map[string]string{"general-writer-v1": disabled.ID}, agents: []config.Agent{disabled}},
+		{name: "stale configured-agent mismatch", mappings: map[string]string{"general-writer-v1": enabled.ID}, agents: []config.Agent{{ID: "replacement-agent", Enabled: true}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			broker := &Server{transportProfiles: test.mappings}
+			agent, ok := broker.configuredTransportAgent(&config.Config{Agents: test.agents}, authority)
+			if test.wantID == "" {
+				if ok || agent.ID != "" {
+					t.Fatalf("invalid mapping resolved agent %#v", agent)
+				}
+				return
+			}
+			if !ok || agent.ID != test.wantID {
+				t.Fatalf("mapped agent = %#v, ok=%v, want %q", agent, ok, test.wantID)
+			}
+		})
+	}
+}
+
 func TestDryRunAcceptsRepositoryAliasesAndBrokerInjectedMetadata(t *testing.T) {
 	srv := &Server{cfg: &config.Config{
 		GitHub: config.GitHubConfig{Installations: map[string]int64{"owner/repo": 42}},

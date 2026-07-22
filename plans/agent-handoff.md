@@ -2,6 +2,20 @@
 
 ## Current State
 
+### Profile-mapped Git/App identity is distinct from control authority
+
+Effect-scoped Git credentials and the bodyless registered Green-PR
+create/observe endpoints now resolve their configured policy and GitHub App
+identity through the fixed `transport_observation.profile_agent_ids` mapping.
+The durable authority principal remains the control-plane identity carried as
+`TransportPrincipal` and written to repository transport events; it is not
+required to duplicate a configured broker agent ID. Missing, empty,
+whitespace-padded, unknown, disabled, wrong-profile, or stale mappings fail
+closed. Focused regressions use `authority-worker-operator` as the authority
+principal and `fleiglabs-repo-agent` as the profile-mapped Git/App agent, so the
+two roles cannot be conflated again in either Git or registered completion
+handling.
+
 ### Synchronous agentd fence validation during transactional session issuance
 
 `IssueAgentdSession` still holds its `BEGIN IMMEDIATE` transaction from the

@@ -577,13 +577,14 @@ func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 
 func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *testing.T) {
 	const (
-		repository        = "grubbyhacker/repository-worker-lifecycle-test"
-		principalID       = "writer"
-		effectAgentID     = "effect-agent"
-		effectAgentSecret = "effect-secret"
+		repository         = "grubbyhacker/repository-worker-lifecycle-test"
+		authorityPrincipal = "authority-worker-operator"
+		configuredAgentID  = "fleiglabs-repo-agent"
+		effectAgentID      = "effect-agent"
+		effectAgentSecret  = "effect-secret"
 	)
 	authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
-	seedEffectGitAuthority(t, authorityPath, effectAgentID, effectAgentSecret, repository, principalID, "worker-a", "binding-a", "session-lineage-a", "storage-a", 7)
+	seedEffectGitAuthority(t, authorityPath, effectAgentID, effectAgentSecret, repository, authorityPrincipal, "worker-a", "binding-a", "session-lineage-a", "storage-a", 7)
 
 	apiServer := fakeTokenServer(t)
 	defer apiServer.Close()
@@ -598,7 +599,7 @@ func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *tes
 	defer gitServer.Close()
 
 	broker := newTestBroker(t, apiServer.URL, gitServer.URL, config.Agent{
-		ID: principalID, Enabled: true, Secret: "parent-secret-must-not-authenticate-effect", Repositories: []string{repository}, Operations: []string{"git.upload-pack"},
+		ID: configuredAgentID, Enabled: true, Secret: "parent-secret-must-not-authenticate-effect", Repositories: []string{repository}, Operations: []string{"git.upload-pack"},
 	})
 	broker.cfg.GitHub.Installations[repository] = 42
 	observer, err := sandbox.OpenTransportObserver(context.Background(), authorityPath)
@@ -614,7 +615,7 @@ func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *tes
 	}
 	broker.transport = observer
 	broker.credentialStore = credentialStore
-	broker.transportProfiles = map[string]string{"writer-profile": principalID}
+	broker.transportProfiles = map[string]string{"writer-profile": configuredAgentID}
 	t.Cleanup(func() {
 		if closeErr := credentialStore.Close(); closeErr != nil {
 			t.Errorf("close credential store: %v", closeErr)
@@ -660,7 +661,7 @@ func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *tes
 		if err := rows.Scan(&phase, &principal, &worker, &sessionLineage, &storage, &fence, &profileVersion, &policyDigest, &gotRepository); err != nil {
 			t.Fatal(err)
 		}
-		if principal != principalID || worker != "worker-a" || sessionLineage != "session-lineage-a" || storage != "storage-a" || fence != 7 || profileVersion != "profile-version-a" || policyDigest != "policy-digest-a" || gotRepository != repository {
+		if principal != authorityPrincipal || worker != "worker-a" || sessionLineage != "session-lineage-a" || storage != "storage-a" || fence != 7 || profileVersion != "profile-version-a" || policyDigest != "policy-digest-a" || gotRepository != repository {
 			t.Fatalf("event %q authority mismatch: principal=%q worker=%q session=%q storage=%q fence=%d profile=%q policy=%q repo=%q", phase, principal, worker, sessionLineage, storage, fence, profileVersion, policyDigest, gotRepository)
 		}
 		phases = append(phases, phase)
@@ -670,6 +671,92 @@ func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *tes
 	}
 	if got := strings.Join(phases, ","); got != "received,forwarded,completed" {
 		t.Fatalf("transport phases = %q", got)
+	}
+}
+
+func TestRegisteredGreenPRAdmissionUsesProfileMappedConfiguredAgent(t *testing.T) {
+	const (
+		repository         = "grubbyhacker/repository-worker-lifecycle-test"
+		authorityPrincipal = "authority-worker-operator"
+		configuredAgentID  = "fleiglabs-repo-agent"
+		binding            = "registered-interface"
+	)
+	ctx := context.Background()
+	authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
+	seedEffectGitAuthority(t, authorityPath, "effect-agent", "effect-secret", repository, authorityPrincipal, "worker-a", binding, "session-lineage-a", "storage-a", 7)
+
+	db, err := sql.Open("sqlite", authorityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bindingDigest string
+	if err := db.QueryRow(`SELECT binding_digest FROM authority_session_leases WHERE principal=?`, authorityPrincipal).Scan(&bindingDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	observer, err := sandbox.OpenTransportObserver(ctx, authorityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := observer.Close(); err != nil {
+			t.Errorf("close transport observer: %v", err)
+		}
+	})
+	transportContext, err := observer.LeaseTransportContext(ctx, authorityPrincipal, bindingDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := observer.ResolveAuthority(ctx, transportContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := sandbox.TransportOperation{
+		OperationID: "push-distinct-principals", Method: http.MethodPost,
+		Service: "git-receive-pack", Repository: repository,
+		RequestPath:   "/git/grubbyhacker/repository-worker-lifecycle-test.git/git-receive-pack",
+		RequestedRefs: []string{},
+		RefUpdates:    []map[string]string{{"After": strings.Repeat("a", 40), "Ref": "refs/heads/agent/fleiglabs-repo-agent/settled"}},
+		Authority:     authority,
+	}
+	if err := observer.Received(ctx, &operation); err != nil {
+		t.Fatal(err)
+	}
+	if err := observer.Forwarded(ctx, &operation); err != nil {
+		t.Fatal(err)
+	}
+	if err := observer.Terminal(ctx, &operation, "completed", "allowed", "", http.StatusOK, http.StatusOK); err != nil {
+		t.Fatal(err)
+	}
+
+	broker := newTestBroker(t, "http://github-api-must-not-be-called.invalid", "http://github-git-must-not-be-called.invalid", config.Agent{
+		ID: configuredAgentID, Enabled: true, GitHubApp: "default",
+		Repositories:   []string{repository},
+		Operations:     []string{"repo.probe", "pull.read", "pull.create", "checks.read", "status.read"},
+		BranchPatterns: []string{"^agent/fleiglabs-repo-agent/[a-z0-9][a-z0-9-]{0,62}$"},
+		BaseBranches:   []string{"main"},
+	})
+	broker.cfg.GitHub.Installations[repository] = 42
+	broker.transport = observer
+	broker.transportProfiles = map[string]string{"writer-profile": configuredAgentID}
+	for _, action := range []string{"creation", "observation"} {
+		t.Run(action, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/registered/github-green-pr/"+action, nil)
+			req.Header.Set("Authorization", "Bearer "+transportContext)
+			resp := httptest.NewRecorder()
+			principal, appName, admission, installation, _, ok := broker.registeredGreenPRAdmission(resp, req, action)
+			if !ok {
+				t.Fatalf("registered admission refused: status=%d body=%q", resp.Code, resp.Body.String())
+			}
+			if principal.ID != configuredAgentID || principal.Agent.ID != configuredAgentID || principal.TransportPrincipal != authorityPrincipal {
+				t.Fatalf("principal = %#v, want mapped agent %q and authority %q", principal, configuredAgentID, authorityPrincipal)
+			}
+			if appName != "default" || installation != 42 || admission.OperationID != operation.OperationID || admission.PushedSHA != strings.Repeat("a", 40) {
+				t.Fatalf("derived admission mismatch: app=%q installation=%d admission=%#v", appName, installation, admission)
+			}
+		})
 	}
 }
 
