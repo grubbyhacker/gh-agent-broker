@@ -615,7 +615,7 @@ func TestEffectCredentialGitDiscoveryDerivesTransportAuthorityFromCustody(t *tes
 	}
 	broker.transport = observer
 	broker.credentialStore = credentialStore
-	broker.transportProfiles = map[string]string{"writer-profile": configuredAgentID}
+	broker.cfg.TransportObservation.ProfileAgentIDs = map[string]string{"writer-profile": configuredAgentID}
 	t.Cleanup(func() {
 		if closeErr := credentialStore.Close(); closeErr != nil {
 			t.Errorf("close credential store: %v", closeErr)
@@ -740,7 +740,7 @@ func TestRegisteredGreenPRAdmissionUsesProfileMappedConfiguredAgent(t *testing.T
 	})
 	broker.cfg.GitHub.Installations[repository] = 42
 	broker.transport = observer
-	broker.transportProfiles = map[string]string{"writer-profile": configuredAgentID}
+	broker.cfg.TransportObservation.ProfileAgentIDs = map[string]string{"writer-profile": configuredAgentID}
 	for _, action := range []string{"creation", "observation"} {
 		t.Run(action, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/v1/registered/github-green-pr/"+action, nil)
@@ -1081,7 +1081,7 @@ func newEffectGitTestBroker(t *testing.T, authorityPath, repository, principal s
 	}
 	broker.transport = observer
 	broker.credentialStore = credentialStore
-	broker.transportProfiles = map[string]string{"writer-profile": principal}
+	broker.cfg.TransportObservation.ProfileAgentIDs = map[string]string{"writer-profile": principal}
 	t.Cleanup(func() {
 		if err := credentialStore.Close(); err != nil {
 			t.Errorf("close credential store: %v", err)
@@ -1472,6 +1472,68 @@ func TestReloadPreservesTripwireIssuanceHalt(t *testing.T) {
 	}
 	if err := reloaded.CheckIssuance(context.Background(), "curator", 7); err == nil {
 		t.Fatal("reload abandoned issuance halt")
+	}
+}
+
+func TestReloadRemapsTransportProfileUsingCurrentConfigSnapshot(t *testing.T) {
+	const (
+		profile    = "writer-profile"
+		oldAgentID = "agent-a"
+		newAgentID = "agent-b"
+	)
+	apiServer := fakeTokenServer(t)
+	defer apiServer.Close()
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID: oldAgentID, Enabled: true, Secret: "agent-a-secret",
+		Repositories: []string{"owner/repo"}, Operations: []string{"git.upload-pack"},
+	})
+	broker.cfg.Agents = append(broker.cfg.Agents, config.Agent{
+		ID: newAgentID, Enabled: true, Secret: "agent-b-secret",
+		Repositories: []string{"owner/repo"}, Operations: []string{"git.upload-pack"},
+	})
+	broker.cfg.TransportObservation.ProfileAgentIDs = map[string]string{profile: oldAgentID}
+	authority := sandbox.TransportAuthority{Principal: "authority-worker-operator", Profile: profile}
+	before, _ := broker.snapshot()
+	if agent, ok := broker.configuredTransportAgent(before, authority); !ok || agent.ID != oldAgentID {
+		t.Fatalf("pre-reload mapped agent = %#v, ok=%v, want %q", agent, ok, oldAgentID)
+	}
+
+	configPath := filepath.Join(t.TempDir(), "broker.yaml")
+	authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
+	body := fmt.Sprintf(`github:
+  app_id: 1
+  private_key_path: %q
+  api_base_url: %q
+  git_base_url: https://github.invalid
+  installations:
+    owner/repo: 42
+transport_observation:
+  enabled: true
+  authority_store_path: %q
+  profile_agent_ids:
+    %s: %s
+agents:
+  - id: %s
+    enabled: true
+    secret: agent-a-secret
+    repositories: [owner/repo]
+    operations: [git.upload-pack]
+  - id: %s
+    enabled: true
+    secret: agent-b-secret
+    repositories: [owner/repo]
+    operations: [git.upload-pack]
+`, before.GitHub.PrivateKeyPath, apiServer.URL, authorityPath, profile, newAgentID, oldAgentID, newAgentID)
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	broker.configPath = configPath
+	if err := broker.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := broker.snapshot()
+	if agent, ok := broker.configuredTransportAgent(after, authority); !ok || agent.ID != newAgentID {
+		t.Fatalf("post-reload mapped agent = %#v, ok=%v, want %q", agent, ok, newAgentID)
 	}
 }
 

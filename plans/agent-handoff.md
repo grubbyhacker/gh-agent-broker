@@ -16,6 +16,11 @@ principal and `fleiglabs-repo-agent` as the profile-mapped Git/App agent, so the
 two roles cannot be conflated again in either Git or registered completion
 handling.
 
+Reloaded profile mappings and configured agents are resolved from the same
+immutable config snapshot. A reload that remaps a profile from one still-enabled
+agent to another therefore takes effect atomically with the corresponding App
+and policy configuration instead of retaining the startup mapping.
+
 ### Synchronous agentd fence validation during transactional session issuance
 
 `IssueAgentdSession` still holds its `BEGIN IMMEDIATE` transaction from the

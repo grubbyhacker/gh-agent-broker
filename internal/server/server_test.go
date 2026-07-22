@@ -364,8 +364,11 @@ func TestConfiguredTransportAgentFailsClosedOnInvalidMapping(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			broker := &Server{transportProfiles: test.mappings}
-			agent, ok := broker.configuredTransportAgent(&config.Config{Agents: test.agents}, authority)
+			broker := &Server{}
+			agent, ok := broker.configuredTransportAgent(&config.Config{
+				TransportObservation: config.TransportObservationConfig{ProfileAgentIDs: test.mappings},
+				Agents:               test.agents,
+			}, authority)
 			if test.wantID == "" {
 				if ok || agent.ID != "" {
 					t.Fatalf("invalid mapping resolved agent %#v", agent)

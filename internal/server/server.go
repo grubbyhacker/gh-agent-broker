@@ -47,7 +47,6 @@ type Server struct {
 	tripwire                                   *pushtripwire.Store
 	fence                                      pushtripwire.FenceAdapter
 	transport                                  *sandbox.TransportObserver
-	transportProfiles                          map[string]string
 	credentialStore                            *sandbox.AuthorityWorkerStore
 	afterEffectCredentialAuthenticationForTest func()
 }
@@ -76,15 +75,14 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 		}
 	}
 	return &Server{
-		configPath:        configPath,
-		cfg:               cfg,
-		gh:                gh,
-		audit:             auditLog,
-		http:              &http.Client{Timeout: 10 * time.Minute},
-		tripwire:          tripwire,
-		transport:         transport,
-		transportProfiles: cfg.TransportObservation.ProfileAgentIDs,
-		credentialStore:   credentialStore,
+		configPath:      configPath,
+		cfg:             cfg,
+		gh:              gh,
+		audit:           auditLog,
+		http:            &http.Client{Timeout: 10 * time.Minute},
+		tripwire:        tripwire,
+		transport:       transport,
+		credentialStore: credentialStore,
 	}, nil
 }
 
@@ -496,7 +494,7 @@ func configuredAgent(cfg *config.Config, id string) (config.Agent, bool) {
 // not a configured agent ID: it remains the control-plane identity retained in
 // TransportPrincipal and repository transport events.
 func (s *Server) configuredTransportAgent(cfg *config.Config, authority sandbox.TransportAuthority) (config.Agent, bool) {
-	agentID, mapped := s.transportProfiles[authority.Profile]
+	agentID, mapped := cfg.TransportObservation.ProfileAgentIDs[authority.Profile]
 	if !mapped || agentID == "" || strings.TrimSpace(agentID) != agentID {
 		return config.Agent{}, false
 	}
