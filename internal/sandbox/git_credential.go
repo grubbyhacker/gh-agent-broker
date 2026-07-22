@@ -46,8 +46,13 @@ type GitCredential struct {
 	ExpiresAt     int64  `json:"expires_at"`
 }
 type GitCredentialAuthority struct {
-	AgentID, Repository, Principal string
-	ExpiresAt                      int64
+	ReceiptDigest, AgentID, Repository, SessionID, EffectID, ModelEffectID, RegisteredTaskDigest string
+	ExpiresAt                                                                                    int64
+	TransportAuthority                                                                           TransportAuthority
+}
+
+type gitCredentialQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 var credentialDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
@@ -267,16 +272,82 @@ func (s *AuthorityWorkerStore) AuthenticateGitCredential(ctx context.Context, ag
 	if agentID == "" || secret == "" {
 		return GitCredentialAuthority{}, false, nil
 	}
+	return s.authenticateGitCredential(ctx, s.validationDB, agentID, secret, repository)
+}
+
+func (s *AuthorityWorkerStore) authenticateGitCredential(ctx context.Context, queryer gitCredentialQueryer, agentID, secret, repository string) (GitCredentialAuthority, bool, error) {
 	var out GitCredentialAuthority
-	var fp, revoked string
-	err := s.db.QueryRowContext(ctx, `SELECT c.agent_id,c.repository,c.principal,c.expires_at_ms,c.secret_fingerprint,c.revoked_at FROM authority_git_credentials c JOIN authority_effect_custody e ON e.principal=c.principal AND e.binding_digest=c.binding_digest AND e.model_effect_id=c.model_effect_id AND e.terminal_phase='' JOIN authority_session_leases l ON l.principal=c.principal AND l.binding_digest=c.binding_digest AND l.worker_id=c.worker_id AND l.profile=c.authority_profile AND l.released_at='' JOIN authority_workers w ON w.worker_id=c.worker_id AND w.worker_storage_lineage_id=c.worker_storage_lineage_id AND w.worker_fence_epoch=c.worker_fence_epoch AND w.profile_version=c.authority_profile_version AND w.state=? JOIN authority_session_workspaces ws ON ws.binding_digest=c.binding_digest AND ws.worker_id=c.worker_id AND ws.agentd_session_id=c.session_id JOIN authority_registered_admissions a ON a.principal=c.principal AND a.binding_digest=c.binding_digest AND a.admission_task_digest=c.registered_task_digest WHERE c.agent_id=?`, AuthorityWorkerReady, agentID).Scan(&out.AgentID, &out.Repository, &out.Principal, &out.ExpiresAt, &fp, &revoked)
-	if err == sql.ErrNoRows {
-		return GitCredentialAuthority{}, false, nil
-	}
+	var fp, revoked, protocolVersion, workItemID, routeSnapshotID, canonical, admissionDigest string
+	rows, err := queryer.QueryContext(ctx, `SELECT c.receipt_digest,c.agent_id,c.repository,c.session_id,c.effect_id,c.model_effect_id,c.registered_task_digest,c.expires_at_ms,c.secret_fingerprint,c.revoked_at,
+		l.principal,l.profile,l.worker_id,l.session_lineage_id,l.binding_digest,
+		w.worker_storage_lineage_id,w.worker_fence_epoch,w.profile_version,w.policy_digest,
+		a.protocol_version,a.work_item_id,a.route_snapshot_id,a.canonical_task_json,a.admission_task_digest
+		FROM authority_git_credentials c
+		JOIN authority_effect_custody e ON e.principal=c.principal AND e.binding_digest=c.binding_digest
+			AND c.effect_id=c.model_effect_id AND e.model_effect_id=c.model_effect_id AND e.session_id=c.session_id
+			AND e.worker_id=c.worker_id AND e.worker_storage_lineage_id=c.worker_storage_lineage_id
+			AND e.worker_fence_epoch=c.worker_fence_epoch AND e.authority_profile=c.authority_profile
+			AND e.authority_profile_version=c.authority_profile_version
+			AND e.registered_task_digest=c.registered_task_digest AND e.terminal_phase=''
+		JOIN authority_registered_turns t ON t.principal=c.principal AND t.binding_digest=c.binding_digest
+			AND t.session_id=c.session_id
+		JOIN authority_session_leases l ON l.principal=c.principal AND l.binding_digest=c.binding_digest
+			AND l.worker_id=c.worker_id AND l.profile=c.authority_profile AND l.released_at=''
+		JOIN authority_workers w ON w.worker_id=c.worker_id
+			AND w.profile=l.profile AND w.profile=c.authority_profile
+			AND w.worker_storage_lineage_id=c.worker_storage_lineage_id
+			AND w.worker_fence_epoch=c.worker_fence_epoch AND w.profile_version=c.authority_profile_version
+			AND w.policy_digest=e.policy_digest AND w.state=?
+		JOIN authority_session_workspaces ws ON ws.binding_digest=c.binding_digest
+			AND ws.worker_id=c.worker_id AND ws.session_lineage_id=l.session_lineage_id
+			AND ws.agentd_session_id=c.session_id
+		JOIN authority_registered_admissions a ON a.principal=c.principal
+			AND a.binding_digest=c.binding_digest AND a.admission_task_digest=c.registered_task_digest
+		WHERE c.agent_id=?`, AuthorityWorkerReady, agentID)
 	if err != nil {
 		return GitCredentialAuthority{}, false, err
 	}
+	defer closeTransportRows(rows)
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return GitCredentialAuthority{}, false, err
+		}
+		return GitCredentialAuthority{}, false, nil
+	}
+	if err := rows.Scan(
+		&out.ReceiptDigest, &out.AgentID, &out.Repository, &out.SessionID, &out.EffectID,
+		&out.ModelEffectID, &out.RegisteredTaskDigest, &out.ExpiresAt, &fp, &revoked,
+		&out.TransportAuthority.Principal, &out.TransportAuthority.Profile,
+		&out.TransportAuthority.WorkerID, &out.TransportAuthority.SessionLineageID,
+		&out.TransportAuthority.SessionBindingDigest, &out.TransportAuthority.WorkerStorageLineageID,
+		&out.TransportAuthority.WorkerFenceEpoch, &out.TransportAuthority.ProfileVersion,
+		&out.TransportAuthority.PolicyDigest, &protocolVersion, &workItemID,
+		&routeSnapshotID, &canonical, &admissionDigest,
+	); err != nil {
+		return GitCredentialAuthority{}, false, err
+	}
+	if rows.Next() {
+		return GitCredentialAuthority{}, false, nil
+	}
+	if err := rows.Err(); err != nil {
+		return GitCredentialAuthority{}, false, err
+	}
 	if revoked != "" || out.ExpiresAt <= time.Now().UnixMilli() || out.Repository != repository || !secureTokenEqual(fp, s.effectTokenFingerprint(secret)) {
+		return GitCredentialAuthority{}, false, nil
+	}
+	var wire struct {
+		Source RegisteredTaskSource `json:"registered_task_source"`
+		Task   RegisteredTask       `json:"registered_task"`
+	}
+	if json.Unmarshal([]byte(canonical), &wire) != nil || wire.Source.WorkItemID != workItemID || wire.Source.RouteSnapshotID != routeSnapshotID || wire.Task.Parameters.Repository != out.Repository {
+		return GitCredentialAuthority{}, false, nil
+	}
+	validated, err := validateRegisteredAdmission(RegisteredAdmissionRequest{
+		Version: protocolVersion, Profile: out.TransportAuthority.Profile,
+		IdempotencyKey: "effect-git-authority-validation", SessionBinding: "session:" + wire.Source.WorkItemID,
+		Source: wire.Source, Task: wire.Task, AdmissionTaskDigest: admissionDigest,
+	})
+	if err != nil || validated.CanonicalJSON != canonical || validated.Digest != admissionDigest || s.requestDigest("session:"+wire.Source.WorkItemID) != out.TransportAuthority.SessionBindingDigest {
 		return GitCredentialAuthority{}, false, nil
 	}
 	return out, true, nil

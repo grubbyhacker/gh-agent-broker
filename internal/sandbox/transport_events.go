@@ -173,6 +173,45 @@ func (o *TransportObserver) Received(ctx context.Context, op *TransportOperation
 	return o.append(ctx, op, "received", "", "", 0, 0)
 }
 
+// ReceivedEffectCredential is the linearization barrier between effect
+// credential custody and Git transport. It revalidates the complete custody
+// snapshot and appends Received under the same SQLite writer transaction that
+// orders release and reassignment. The transaction commits before any upstream
+// request is made.
+func (o *TransportObserver) ReceivedEffectCredential(ctx context.Context, agentID, secret, repository string, expected GitCredentialAuthority, op *TransportOperation) error {
+	conn, err := o.store.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("open effect transport barrier: %w", err)
+	}
+	defer closeAuthorityConn(conn)
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin effect transport barrier: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			rollbackAuthorityConn(context.WithoutCancel(ctx), conn)
+		}
+	}()
+	current, valid, err := o.store.authenticateGitCredential(ctx, conn, agentID, secret, repository)
+	if err != nil {
+		return fmt.Errorf("revalidate effect transport authority: %w", err)
+	}
+	if !valid || current != expected {
+		return fmt.Errorf("effect transport authority is unavailable")
+	}
+	op.Authority = current.TransportAuthority
+	if err := insertTransportEvent(ctx, conn, op, 1, "received", "", "", 0, 0); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit effect transport barrier: %w", err)
+	}
+	committed = true
+	op.phaseOrdinal = 1
+	return nil
+}
+
 func (o *TransportObserver) Forwarded(ctx context.Context, op *TransportOperation) error {
 	return o.append(ctx, op, "forwarded", "allowed", "", 0, 0)
 }
@@ -192,7 +231,28 @@ func (o *TransportObserver) append(ctx context.Context, op *TransportOperation, 
 	if expectedOrdinal == 0 || op.phaseOrdinal+1 != expectedOrdinal {
 		return fmt.Errorf("invalid transport phase transition to %q", phase)
 	}
-	op.phaseOrdinal++
+	phaseOrdinal := op.phaseOrdinal + 1
+	tx, err := o.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transport append: %w", err)
+	}
+	defer rollbackTransportTx(tx)
+	if err := insertTransportEvent(ctx, tx, op, phaseOrdinal, phase, decision, outcome, status, backend); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transport %s: %w", phase, err)
+	}
+	op.phaseOrdinal = phaseOrdinal
+	return nil
+}
+
+type transportEventQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertTransportEvent(ctx context.Context, queryer transportEventQueryer, op *TransportOperation, phaseOrdinal int, phase, decision, outcome string, status, backend int) error {
 	requested, err := json.Marshal(op.RequestedRefs)
 	if err != nil {
 		return fmt.Errorf("encode requested refs: %w", err)
@@ -205,13 +265,8 @@ func (o *TransportObserver) append(ctx context.Context, op *TransportOperation, 
 	if op.CredentialHeaderPresent {
 		credential = 1
 	}
-	tx, err := o.store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin transport append: %w", err)
-	}
-	defer rollbackTransportTx(tx)
 	var previous string
-	if err := tx.QueryRowContext(ctx, `SELECT event_digest FROM repository_transport_events ORDER BY cursor DESC LIMIT 1`).Scan(&previous); err != nil {
+	if err := queryer.QueryRowContext(ctx, `SELECT event_digest FROM repository_transport_events ORDER BY cursor DESC LIMIT 1`).Scan(&previous); err != nil {
 		if err != sql.ErrNoRows {
 			return fmt.Errorf("read previous transport digest: %w", err)
 		}
@@ -222,21 +277,18 @@ func (o *TransportObserver) append(ctx context.Context, op *TransportOperation, 
 	payload, err := json.Marshal(struct {
 		OperationID, Phase, Principal, WorkerID, SessionLineageID, WorkerStorageLineageID, ProfileVersion, PolicyDigest, Method, Service, Repository, RequestPath, RequestedRefs, RefUpdates, Decision, Outcome, Previous string
 		PhaseOrdinal, WorkerFenceEpoch, CredentialHeaderPresent, HTTPStatus, BackendStatus                                                                                                                                int64
-	}{op.OperationID, phase, op.Authority.Principal, op.Authority.WorkerID, op.Authority.SessionLineageID, op.Authority.WorkerStorageLineageID, op.Authority.ProfileVersion, op.Authority.PolicyDigest, op.Method, op.Service, op.Repository, op.RequestPath, string(requested), string(updates), decision, outcome, previous, int64(op.phaseOrdinal), op.Authority.WorkerFenceEpoch, int64(credential), int64(status), int64(backend)})
+	}{op.OperationID, phase, op.Authority.Principal, op.Authority.WorkerID, op.Authority.SessionLineageID, op.Authority.WorkerStorageLineageID, op.Authority.ProfileVersion, op.Authority.PolicyDigest, op.Method, op.Service, op.Repository, op.RequestPath, string(requested), string(updates), decision, outcome, previous, int64(phaseOrdinal), op.Authority.WorkerFenceEpoch, int64(credential), int64(status), int64(backend)})
 	if err != nil {
 		return fmt.Errorf("encode transport digest: %w", err)
 	}
 	sum := sha256.Sum256(payload)
 	digest := hex.EncodeToString(sum[:])
-	_, err = tx.ExecContext(ctx, `INSERT INTO repository_transport_events(
+	_, err = queryer.ExecContext(ctx, `INSERT INTO repository_transport_events(
 		operation_id,phase_ordinal,phase,principal,worker_id,session_lineage_id,worker_storage_lineage_id,worker_fence_epoch,profile_version,policy_digest,method,service,repository,request_path,requested_refs_json,ref_updates_json,credential_header_present,decision,outcome_code,http_status,backend_status,before_refs_digest,after_refs_digest,previous_event_digest,event_digest)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		op.OperationID, op.phaseOrdinal, phase, op.Authority.Principal, op.Authority.WorkerID, op.Authority.SessionLineageID, op.Authority.WorkerStorageLineageID, op.Authority.WorkerFenceEpoch, op.Authority.ProfileVersion, op.Authority.PolicyDigest, op.Method, op.Service, op.Repository, op.RequestPath, string(requested), string(updates), credential, decision, outcome, status, backend, "", "", previous, digest)
+		op.OperationID, phaseOrdinal, phase, op.Authority.Principal, op.Authority.WorkerID, op.Authority.SessionLineageID, op.Authority.WorkerStorageLineageID, op.Authority.WorkerFenceEpoch, op.Authority.ProfileVersion, op.Authority.PolicyDigest, op.Method, op.Service, op.Repository, op.RequestPath, string(requested), string(updates), credential, decision, outcome, status, backend, "", "", previous, digest)
 	if err != nil {
 		return fmt.Errorf("append transport %s: %w", phase, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit transport %s: %w", phase, err)
 	}
 	return nil
 }
