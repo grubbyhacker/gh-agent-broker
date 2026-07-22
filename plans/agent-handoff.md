@@ -130,9 +130,20 @@ principal, profile, worker ID, storage-lineage ID, fence epoch, session lineage,
 and active lease binding. A released, stale, forged, or cross-session context
 cannot select an admission or push. Green-PR admission queries those exact
 coordinates, so two active leases no longer cause profile-global ambiguity.
-Agentd's corrected PR #18 uses the exact URL through its
-`AGENTD_BROKER_OBSERVATION_TOKEN` bearer contract; no GitHub credential is
-projected. The authority worker network is
+Agentd no longer receives a worker-global observation token. Its authenticated
+parent lazily exchanges the existing generation-bound `av1` control identity
+at the fixed
+`POST /v1/authority-workers/agentd/transport-context` route for the exact
+session's `atc1`. The strict request carries only session/worker/profile
+equality constraints; one authority-store snapshot derives the principal,
+lease binding, registered admission, workspace, session, active worker
+generation, and latest confirmed adoption. Pending adoption, release, stale
+generation, cross-session coordinates, malformed input, and non-`av1`
+authority fail closed. The response is `Cache-Control: no-store`; neither the
+parent `av1` nor child `atc1` is logged or persisted. The canonical producer
+contract is `contracts/agentd-transport-context-v1.json` (SHA-256
+`e817b8e7af3ebd7c852823a4be1bb9704f113ee06083b86ab452bbb33cf07699`).
+The authority worker network is
 `gh-agent-broker_default`, whose reviewed compose topology contains the
 `broker` service at port 8080.
 

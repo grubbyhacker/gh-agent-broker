@@ -107,8 +107,12 @@ func (o *TransportObserver) LeaseTransportContext(ctx context.Context, principal
 }
 
 func (o *TransportObserver) transportContext(authority TransportAuthority) string {
+	return deriveTransportContext(o.store.salt, authority)
+}
+
+func deriveTransportContext(secret []byte, authority TransportAuthority) string {
 	payload := authority.Principal + "\x00" + authority.Profile + "\x00" + authority.WorkerID + "\x00" + authority.WorkerStorageLineageID + "\x00" + fmt.Sprint(authority.WorkerFenceEpoch) + "\x00" + authority.SessionLineageID + "\x00" + authority.SessionBindingDigest
-	mac := hmac.New(sha256.New, o.store.salt)
+	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write([]byte("gh-agent-broker/transport-context/v1\x00" + payload))
 	return "atc1." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }

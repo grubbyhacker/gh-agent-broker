@@ -781,6 +781,9 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	if got, want := runtime.Env["AGENTD_BROKER_OBSERVATION_URL"], "http://broker:8080/v1/registered/github-green-pr/observe"; got != want {
 		t.Fatalf("AGENTD_BROKER_OBSERVATION_URL=%q, want %q", got, want)
 	}
+	if got := runtime.Env["AGENTD_BROKER_TRANSPORT_CONTEXT_URL"]; got != agentdBrokerTransportContextURL {
+		t.Fatalf("AGENTD_BROKER_TRANSPORT_CONTEXT_URL=%q, want %q", got, agentdBrokerTransportContextURL)
+	}
 	if _, ok := runtime.Env[profile.BrokerSecretEnv]; ok {
 		t.Fatal("runtime projected the reusable broker principal secret")
 	}
@@ -799,6 +802,9 @@ func TestAuthorityWorkerCommandBecomesDockerEntrypoint(t *testing.T) {
 	}
 	if runtime.Env["AGENTD_BROKER_CONTROL_TOKEN"] != validationToken {
 		t.Fatal("control token is not the exact generation-bound control identity")
+	}
+	if token, ok := runtime.Env["AGENTD_BROKER_OBSERVATION_TOKEN"]; ok || token != "" {
+		t.Fatal("worker-scoped observation token was projected instead of a session capability")
 	}
 	for _, other := range []string{
 		deriveAgentdValidationToken("secret", "other-worker", worker.WorkerStorageLineageID, worker.WorkerFenceEpoch),
