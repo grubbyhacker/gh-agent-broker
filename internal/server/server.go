@@ -47,7 +47,6 @@ type Server struct {
 	tripwire                                   *pushtripwire.Store
 	fence                                      pushtripwire.FenceAdapter
 	transport                                  *sandbox.TransportObserver
-	transportProfiles                          map[string]string
 	credentialStore                            *sandbox.AuthorityWorkerStore
 	afterEffectCredentialAuthenticationForTest func()
 }
@@ -76,15 +75,14 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 		}
 	}
 	return &Server{
-		configPath:        configPath,
-		cfg:               cfg,
-		gh:                gh,
-		audit:             auditLog,
-		http:              &http.Client{Timeout: 10 * time.Minute},
-		tripwire:          tripwire,
-		transport:         transport,
-		transportProfiles: cfg.TransportObservation.ProfileAgentIDs,
-		credentialStore:   credentialStore,
+		configPath:      configPath,
+		cfg:             cfg,
+		gh:              gh,
+		audit:           auditLog,
+		http:            &http.Client{Timeout: 10 * time.Minute},
+		tripwire:        tripwire,
+		transport:       transport,
+		credentialStore: credentialStore,
 	}, nil
 }
 
@@ -449,12 +447,12 @@ func (s *Server) registeredGreenPRAdmission(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "registered transport authority is unavailable"})
 		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
-	agent, found := configuredAgent(cfg, authority.Principal)
-	if !found || s.transportProfiles[authority.Profile] != authority.Principal {
+	agent, found := s.configuredTransportAgent(cfg, authority)
+	if !found {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "registered transport authority is unavailable"})
 		return auth.Principal{}, "", sandbox.GreenPRTransportAdmission{}, 0, nil, false
 	}
-	principal := auth.Principal{ID: authority.Principal, Agent: agent}
+	principal := auth.Principal{ID: agent.ID, Agent: agent, TransportPrincipal: authority.Principal}
 	admission, err := s.transport.GreenPRAdmission(r.Context(), transportContext)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "registered green PR " + action + " is unavailable"})
@@ -489,6 +487,18 @@ func configuredAgent(cfg *config.Config, id string) (config.Agent, bool) {
 		}
 	}
 	return config.Agent{}, false
+}
+
+// configuredTransportAgent maps a durable authority profile to the broker's
+// configured Git/App policy identity. The authority principal is deliberately
+// not a configured agent ID: it remains the control-plane identity retained in
+// TransportPrincipal and repository transport events.
+func (s *Server) configuredTransportAgent(cfg *config.Config, authority sandbox.TransportAuthority) (config.Agent, bool) {
+	agentID, mapped := cfg.TransportObservation.ProfileAgentIDs[authority.Profile]
+	if !mapped || agentID == "" || strings.TrimSpace(agentID) != agentID {
+		return config.Agent{}, false
+	}
+	return configuredAgent(cfg, agentID)
 }
 
 // registeredGreenPRPolicyCheck requires the registered principal to authorize
@@ -2080,7 +2090,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		id, secret, basic := r.BasicAuth()
 		if basic {
 			if custody, valid, err := s.credentialStore.AuthenticateGitCredential(r.Context(), id, secret, repo); err == nil && valid {
-				if parent, found := cfg.AgentByID(custody.TransportAuthority.Principal); found && parent.Enabled {
+				if parent, found := s.configuredTransportAgent(cfg, custody.TransportAuthority); found {
 					parent.ID = custody.AgentID
 					parent.Secret = ""
 					parent.Repositories = []string{custody.Repository}
