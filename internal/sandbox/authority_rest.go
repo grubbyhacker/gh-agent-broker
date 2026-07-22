@@ -36,6 +36,10 @@ func NewAuthorityRESTHandler(service *AuthorityWorkerService) http.Handler {
 				writeRESTCodeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 				return
 			}
+			if values := r.Header.Values("Content-Type"); len(values) != 1 || strings.TrimSpace(values[0]) != "application/json" {
+				writeRESTCodeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "content type must be application/json")
+				return
+			}
 			var in AgentdTransportContextRequest
 			if !decodeAgentdTransportContextJSON(w, r, &in) {
 				return

@@ -142,7 +142,7 @@ generation, cross-session coordinates, malformed input, and non-`av1`
 authority fail closed. The response is `Cache-Control: no-store`; neither the
 parent `av1` nor child `atc1` is logged or persisted. The canonical producer
 contract is `contracts/agentd-transport-context-v1.json` (SHA-256
-`634ba381e4d2eb7c8a6e16e0c75b4986b1bc7524fc567aa4fc488daef13f61a6`).
+`e817b8e7af3ebd7c852823a4be1bb9704f113ee06083b86ab452bbb33cf07699`).
 The authority worker network is
 `gh-agent-broker_default`, whose reviewed compose topology contains the
 `broker` service at port 8080.

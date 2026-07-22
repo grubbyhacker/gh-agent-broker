@@ -11,6 +11,7 @@
   "authentication": {
     "scheme": "Bearer",
     "credential": "agentd-generation-av1",
+    "credentialPattern": "^av1\\.[A-Za-z0-9_-]{43}$",
     "header": "Authorization: Bearer <av1>",
     "credentialBinding": [
       "workerId",
@@ -67,6 +68,10 @@
     {
       "status": 405,
       "code": "method_not_allowed"
+    },
+    {
+      "status": 415,
+      "code": "unsupported_media_type"
     }
   ],
   "binding": {
@@ -95,6 +100,8 @@
     "brokerPersistsTransportContext": false,
     "brokerLogsTransportContext": false,
     "responseMayBeCached": false,
-    "agentdPersistenceAllowed": false
+    "agentdPersistenceAllowed": false,
+    "agentdProjectsParentCredentialToChild": false,
+    "agentdProjectsTransportContextToChild": false
   }
 }

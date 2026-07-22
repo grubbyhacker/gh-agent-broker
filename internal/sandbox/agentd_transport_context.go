@@ -116,7 +116,7 @@ func (s *AuthorityWorkerService) AgentdTransportContext(ctx context.Context, cre
 }
 
 func (s *AuthorityWorkerStore) agentdTransportContextSnapshot(ctx context.Context, sessionID string) (agentdTransportContextSnapshot, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT
+	rows, err := s.validationDB.QueryContext(ctx, `SELECT
 		l.principal,l.profile,l.worker_id,l.session_lineage_id,l.binding_digest,
 		w.worker_storage_lineage_id,w.worker_fence_epoch,w.profile_version,w.policy_digest,w.state,
 		a.protocol_version,a.work_item_id,a.route_snapshot_id,a.canonical_task_json,a.admission_task_digest,
@@ -126,7 +126,8 @@ func (s *AuthorityWorkerStore) agentdTransportContextSnapshot(ctx context.Contex
 		COALESCE(r.predecessor_worker_id,''),COALESCE(r.predecessor_storage_lineage_id,''),COALESCE(r.predecessor_fence_epoch,0),
 		COALESCE(r.replacement_worker_id,''),COALESCE(r.replacement_storage_lineage_id,''),COALESCE(r.replacement_fence_epoch,0),
 		COALESCE(r.rebind_idempotency_key,''),COALESCE(r.workspace_ref,''),COALESCE(r.workspace_uid,0),COALESCE(r.workspace_gid,0),
-		COALESCE(r.adoption_state,''),COALESCE(r.adoption_error_code,'')
+		COALESCE(r.adoption_state,''),COALESCE(r.adoption_error_code,''),
+		CASE WHEN r.binding_digest IS NULL THEN 0 ELSE 1 END
 	FROM authority_session_leases l
 	JOIN authority_workers w ON w.worker_id=l.worker_id
 	JOIN authority_registered_admissions a ON a.principal=l.principal AND a.binding_digest=l.binding_digest
@@ -140,6 +141,7 @@ func (s *AuthorityWorkerStore) agentdTransportContextSnapshot(ctx context.Contex
 	defer closeTransportRows(rows)
 	var snapshot agentdTransportContextSnapshot
 	var protocol, workItemID, routeSnapshotID, canonical, digest string
+	var hasAdoption int
 	matches := 0
 	for rows.Next() {
 		matches++
@@ -155,7 +157,7 @@ func (s *AuthorityWorkerStore) agentdTransportContextSnapshot(ctx context.Contex
 			&snapshot.Adoption.Predecessor.WorkerID, &snapshot.Adoption.Predecessor.StorageLineageID, &snapshot.Adoption.Predecessor.FenceEpoch,
 			&snapshot.Adoption.Successor.WorkerID, &snapshot.Adoption.Successor.StorageLineageID, &snapshot.Adoption.Successor.FenceEpoch,
 			&snapshot.Adoption.RebindIdempotencyKey, &snapshot.Adoption.Workspace.WorkspaceRef, &snapshot.Adoption.Workspace.UID, &snapshot.Adoption.Workspace.GID,
-			&snapshot.Adoption.State, &snapshot.Adoption.ErrorCode,
+			&snapshot.Adoption.State, &snapshot.Adoption.ErrorCode, &hasAdoption,
 		); err != nil {
 			return agentdTransportContextSnapshot{}, err
 		}
@@ -171,6 +173,6 @@ func (s *AuthorityWorkerStore) agentdTransportContextSnapshot(ctx context.Contex
 		return agentdTransportContextSnapshot{}, err
 	}
 	snapshot.CoordinatorBinding = "session:" + admission.Source.WorkItemID
-	snapshot.HasAdoption = snapshot.Adoption.State != ""
+	snapshot.HasAdoption = hasAdoption == 1
 	return snapshot, nil
 }

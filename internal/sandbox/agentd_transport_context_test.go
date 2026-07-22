@@ -6,12 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type transportContextFixture struct {
@@ -148,6 +150,7 @@ func TestAgentdTransportContextHandlerRefusesAuthSchemaAndEveryMismatchedCoordin
 	}
 	xHeaderRequest := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encodeTransportContextRequest(t, request)))
 	xHeaderRequest.Header.Set("X-Sandbox-Token", fixture.av1())
+	xHeaderRequest.Header.Set("Content-Type", "application/json")
 	xHeaderResponse := httptest.NewRecorder()
 	fixture.handler.ServeHTTP(xHeaderResponse, xHeaderRequest)
 	assertTransportContextError(t, xHeaderResponse, http.StatusForbidden, "transport_context_denied")
@@ -183,6 +186,55 @@ func TestAgentdTransportContextHandlerRefusesAuthSchemaAndEveryMismatchedCoordin
 	}
 	response := requestTransportContext(t, fixture.handler, http.MethodGet, path, fixture.av1(), nil)
 	assertTransportContextError(t, response, http.StatusMethodNotAllowed, "method_not_allowed")
+	for name, contentTypes := range map[string][]string{
+		"absent":    nil,
+		"wrong":     {"text/plain"},
+		"charset":   {"application/json; charset=utf-8"},
+		"duplicate": {"application/json", "application/json"},
+	} {
+		t.Run("content type "+name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(encodeTransportContextRequest(t, request)))
+			req.Header.Set("Authorization", "Bearer "+fixture.av1())
+			for _, contentType := range contentTypes {
+				req.Header.Add("Content-Type", contentType)
+			}
+			response := httptest.NewRecorder()
+			fixture.handler.ServeHTTP(response, req)
+			assertTransportContextError(t, response, http.StatusUnsupportedMediaType, "unsupported_media_type")
+		})
+	}
+}
+
+func TestAgentdTransportContextDoesNotContendWithPrimaryIssuanceConnection(t *testing.T) {
+	fixture := newTransportContextFixture(t, 1)
+	conn, err := fixture.store.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+			t.Errorf("rollback held issuance connection: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Errorf("close held issuance connection: %v", err)
+		}
+	}()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/authority-workers/agentd/transport-context", bytes.NewReader(encodeTransportContextRequest(t, fixture.requests[0]))).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+fixture.av1())
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	started := time.Now()
+	fixture.handler.ServeHTTP(response, req)
+	elapsed := time.Since(started)
+	if response.Code != http.StatusOK || ctx.Err() != nil || elapsed >= 250*time.Millisecond {
+		t.Fatalf("status=%d context=%v elapsed=%s body=%s", response.Code, ctx.Err(), elapsed, response.Body.String())
+	}
 }
 
 func TestAgentdTransportContextRestartReleaseAndNoPersistence(t *testing.T) {
@@ -277,6 +329,16 @@ func TestAgentdTransportContextWaitsForConfirmedAdoptionAndFencesPredecessor(t *
 	successorAV1 := deriveAgentdValidationToken(fixture.secret, successor.WorkerID, successor.WorkerStorageLineageID, successor.WorkerFenceEpoch)
 	pending := requestTransportContext(t, fixture.handler, http.MethodPost, path, successorAV1, encodeTransportContextRequest(t, successorRequest))
 	assertTransportContextError(t, pending, http.StatusForbidden, "transport_context_denied")
+	for _, state := range []string{"", "unknown", "corrupt"} {
+		if _, err := fixture.store.db.ExecContext(ctx, `UPDATE authority_session_reassignments SET adoption_state=? WHERE binding_digest=?`, state, reassignment.Lease.BindingDigest); err != nil {
+			t.Fatal(err)
+		}
+		refused := requestTransportContext(t, fixture.handler, http.MethodPost, path, successorAV1, encodeTransportContextRequest(t, successorRequest))
+		assertTransportContextError(t, refused, http.StatusForbidden, "transport_context_denied")
+	}
+	if _, err := fixture.store.db.ExecContext(ctx, `UPDATE authority_session_reassignments SET adoption_state=? WHERE binding_digest=?`, authorityAdoptionPending, reassignment.Lease.BindingDigest); err != nil {
+		t.Fatal(err)
+	}
 	runtime, ok := fixture.service.runtime.(*fakeAuthorityRuntime)
 	if !ok {
 		t.Fatal("transport context fixture runtime type changed")
@@ -314,7 +376,7 @@ func TestAgentdTransportContextManifestPinsHandlerContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(manifestBytes)
-	if got := hex.EncodeToString(sum[:]); got != "634ba381e4d2eb7c8a6e16e0c75b4986b1bc7524fc567aa4fc488daef13f61a6" {
+	if got := hex.EncodeToString(sum[:]); got != "e817b8e7af3ebd7c852823a4be1bb9704f113ee06083b86ab452bbb33cf07699" {
 		t.Fatalf("manifest digest=%s", got)
 	}
 	var manifest struct {
@@ -327,28 +389,81 @@ func TestAgentdTransportContextManifestPinsHandlerContract(t *testing.T) {
 			RequestBodyLimitBytes      int    `json:"requestBodyLimitBytes"`
 			ClientDeadlineMilliseconds int    `json:"clientDeadlineMilliseconds"`
 		} `json:"endpoint"`
+		Authentication struct {
+			Scheme            string   `json:"scheme"`
+			Credential        string   `json:"credential"`
+			CredentialPattern string   `json:"credentialPattern"`
+			Header            string   `json:"header"`
+			CredentialBinding []string `json:"credentialBinding"`
+		} `json:"authentication"`
 		Request struct {
-			Version              string   `json:"version"`
-			AdditionalProperties bool     `json:"additionalProperties"`
-			RequiredFields       []string `json:"requiredFields"`
+			Version                  string   `json:"version"`
+			AdditionalProperties     bool     `json:"additionalProperties"`
+			RequiredFields           []string `json:"requiredFields"`
+			ForbiddenAuthorityFields []string `json:"forbiddenAuthorityFields"`
 		} `json:"request"`
 		Response struct {
 			Status                  int      `json:"status"`
 			Version                 string   `json:"version"`
+			AdditionalProperties    bool     `json:"additionalProperties"`
 			RequiredFields          []string `json:"requiredFields"`
 			TransportContextPattern string   `json:"transportContextPattern"`
 			CacheControl            string   `json:"cacheControl"`
 		} `json:"response"`
+		Refusals []struct {
+			Status int    `json:"status"`
+			Code   string `json:"code"`
+		} `json:"refusals"`
+		Binding struct {
+			Source                                  string   `json:"source"`
+			RequestFieldsAreEqualityConstraintsOnly bool     `json:"requestFieldsAreEqualityConstraintsOnly"`
+			DerivedFields                           []string `json:"derivedFields"`
+			TransportContextInputs                  []string `json:"transportContextInputs"`
+		} `json:"binding"`
+		Custody struct {
+			BrokerPersistsTransportContext        bool `json:"brokerPersistsTransportContext"`
+			BrokerLogsTransportContext            bool `json:"brokerLogsTransportContext"`
+			ResponseMayBeCached                   bool `json:"responseMayBeCached"`
+			AgentdPersistenceAllowed              bool `json:"agentdPersistenceAllowed"`
+			AgentdProjectsParentCredentialToChild bool `json:"agentdProjectsParentCredentialToChild"`
+			AgentdProjectsTransportContextToChild bool `json:"agentdProjectsTransportContextToChild"`
+		} `json:"custody"`
 	}
-	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(manifestBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
 		t.Fatal(err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		t.Fatalf("manifest has trailing JSON: %v", err)
 	}
 	if manifest.Version != "broker-agentd-transport-context-contract/v1" || manifest.Endpoint.Method != http.MethodPost || manifest.Endpoint.Path != "/v1/authority-workers/agentd/transport-context" || manifest.Endpoint.URL != agentdBrokerTransportContextURL || manifest.Endpoint.RequestContentType != "application/json" || manifest.Endpoint.RequestBodyLimitBytes != 4096 || manifest.Endpoint.ClientDeadlineMilliseconds != 250 || manifest.Request.Version != agentdTransportContextProtocolVersion || manifest.Request.AdditionalProperties || manifest.Response.Status != http.StatusOK || manifest.Response.Version != agentdTransportContextProtocolVersion || manifest.Response.TransportContextPattern != `^atc1\.[A-Za-z0-9_-]{43}$` || manifest.Response.CacheControl != "no-store" {
 		t.Fatalf("manifest drifted: %+v", manifest)
 	}
 	wantRequestFields := []string{"version", "sessionId", "coordinatorBinding", "sessionLineageId", "workerId", "workerStorageLineageId", "workerFenceEpoch", "authorityProfile", "authorityProfileVersion", "policyDigest"}
-	if !equalStrings(manifest.Request.RequiredFields, wantRequestFields) || !equalStrings(manifest.Response.RequiredFields, []string{"version", "transportContext"}) {
+	if !equalStrings(manifest.Request.RequiredFields, wantRequestFields) || !equalStrings(manifest.Request.ForbiddenAuthorityFields, []string{"principal", "bindingDigest", "repository", "task", "push", "pullRequest", "sha", "completion"}) || manifest.Response.AdditionalProperties || !equalStrings(manifest.Response.RequiredFields, []string{"version", "transportContext"}) {
 		t.Fatalf("manifest fields request=%q response=%q", manifest.Request.RequiredFields, manifest.Response.RequiredFields)
+	}
+	if manifest.Authentication.Scheme != "Bearer" || manifest.Authentication.Credential != "agentd-generation-av1" || manifest.Authentication.CredentialPattern != `^av1\.[A-Za-z0-9_-]{43}$` || manifest.Authentication.Header != "Authorization: Bearer <av1>" || !equalStrings(manifest.Authentication.CredentialBinding, []string{"workerId", "workerStorageLineageId", "workerFenceEpoch"}) {
+		t.Fatalf("manifest authentication drifted: %+v", manifest.Authentication)
+	}
+	if manifest.Binding.Source != "one broker authority-store snapshot" || !manifest.Binding.RequestFieldsAreEqualityConstraintsOnly || !equalStrings(manifest.Binding.DerivedFields, []string{"principal", "leaseBindingDigest", "registeredAdmission", "workspace", "agentdSession", "activeWorkerGeneration", "latestConfirmedAdoption"}) || !equalStrings(manifest.Binding.TransportContextInputs, []string{"principal", "authorityProfile", "workerId", "workerStorageLineageId", "workerFenceEpoch", "sessionLineageId", "leaseBindingDigest"}) {
+		t.Fatalf("manifest binding drifted: %+v", manifest.Binding)
+	}
+	wantRefusals := []struct {
+		status int
+		code   string
+	}{{400, "invalid_transport_context_request"}, {403, "transport_context_denied"}, {405, "method_not_allowed"}, {415, "unsupported_media_type"}}
+	if len(manifest.Refusals) != len(wantRefusals) {
+		t.Fatalf("manifest refusals=%+v", manifest.Refusals)
+	}
+	for i, want := range wantRefusals {
+		if manifest.Refusals[i].Status != want.status || manifest.Refusals[i].Code != want.code {
+			t.Fatalf("manifest refusal %d=%+v", i, manifest.Refusals[i])
+		}
+	}
+	if manifest.Custody.BrokerPersistsTransportContext || manifest.Custody.BrokerLogsTransportContext || manifest.Custody.ResponseMayBeCached || manifest.Custody.AgentdPersistenceAllowed || manifest.Custody.AgentdProjectsParentCredentialToChild || manifest.Custody.AgentdProjectsTransportContextToChild {
+		t.Fatalf("manifest custody drifted: %+v", manifest.Custody)
 	}
 	fixture := newTransportContextFixture(t, 1)
 	response := requestTransportContext(t, fixture.handler, manifest.Endpoint.Method, manifest.Endpoint.Path, fixture.av1(), encodeTransportContextRequest(t, fixture.requests[0]))
