@@ -32,6 +32,38 @@ func TestEffectTokenFingerprintIsDomainSeparatedHMAC(t *testing.T) {
 	}
 }
 
+func TestAuthenticateGitCredentialWithOutcomeIsBoundedAndCredentialFree(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenAuthorityWorkerStore(ctx, filepath.Join(t.TempDir(), "authority.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	const secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	insertActiveCredentialCustody(t, store, secret)
+	cases := []struct {
+		name, agentID, suppliedSecret, repository string
+		want                                      GitCredentialValidationClass
+	}{
+		{"malformed", "", secret, "grubbyhacker/repository-worker-lifecycle-test", GitCredentialMalformed},
+		{"row_absent", "effect-agent-missing", secret, "grubbyhacker/repository-worker-lifecycle-test", GitCredentialRowAbsent},
+		{"fingerprint_mismatch", "effect-agent", "wrong-" + secret, "grubbyhacker/repository-worker-lifecycle-test", GitCredentialFingerprintMismatch},
+		{"repository_mismatch", "effect-agent", secret, "grubbyhacker/other", GitCredentialRepositoryMismatch},
+		{"valid", "effect-agent", secret, "grubbyhacker/repository-worker-lifecycle-test", GitCredentialValid},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, valid, class, err := store.AuthenticateGitCredentialWithOutcome(ctx, tc.agentID, tc.suppliedSecret, tc.repository)
+			if err != nil || valid != (tc.want == GitCredentialValid) || class != tc.want {
+				t.Fatalf("valid=%v class=%q err=%v", valid, class, err)
+			}
+			if strings.Contains(string(class), "effect-agent") || strings.Contains(string(class), secret) {
+				t.Fatalf("validation class leaked credential material: %q", class)
+			}
+		})
+	}
+}
+
 func TestEffectCredentialRejectsTerminalCustodyAcrossRestart(t *testing.T) {
 	for _, phase := range []string{"green", "escalated", "failed"} {
 		t.Run(phase, func(t *testing.T) {

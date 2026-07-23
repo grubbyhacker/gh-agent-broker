@@ -1852,10 +1852,11 @@ func TestGitTransportPreAdmissionStagesAreOrderedAndSanitized(t *testing.T) {
 		authorize  func(*http.Request)
 		wantStatus int
 		wantStages []string
+		wantReason string
 	}{
-		{name: "challenge", wantStatus: http.StatusUnauthorized, wantStages: []string{"request_received", "basic_challenge"}},
-		{name: "rejected_basic_retry", authorize: func(req *http.Request) { req.SetBasicAuth("agent-1", "wrong-"+secret) }, wantStatus: http.StatusUnauthorized, wantStages: []string{"request_received", "helper_basic_seen", "credential_rejected"}},
-		{name: "accepted_basic_retry", authorize: func(req *http.Request) { req.SetBasicAuth("agent-1", secret) }, wantStatus: http.StatusOK, wantStages: []string{"request_received", "helper_basic_seen", "authenticated_retry", "credential_accepted"}},
+		{name: "challenge", wantStatus: http.StatusUnauthorized, wantStages: []string{"request_received", "basic_challenge"}, wantReason: "agent_credentials_required"},
+		{name: "rejected_basic_retry", authorize: func(req *http.Request) { req.SetBasicAuth("agent-1", "wrong-"+secret) }, wantStatus: http.StatusUnauthorized, wantStages: []string{"request_received", "helper_basic_seen", "credential_rejected"}, wantReason: "credential_validation_malformed"},
+		{name: "accepted_basic_retry", authorize: func(req *http.Request) { req.SetBasicAuth("agent-1", secret) }, wantStatus: http.StatusOK, wantStages: []string{"request_received", "helper_basic_seen", "authenticated_retry", "credential_accepted"}, wantReason: "agent_authenticated"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1882,6 +1883,9 @@ func TestGitTransportPreAdmissionStagesAreOrderedAndSanitized(t *testing.T) {
 					t.Fatalf("stage[%d] = %#v", i, event)
 				}
 			}
+			if got := events[len(events)-1].Extra["reason"]; got != tc.wantReason {
+				t.Fatalf("terminal reason = %#v, want %q", got, tc.wantReason)
+			}
 			auditBytes, err := os.ReadFile(broker.cfg.Audit.Path)
 			if err != nil {
 				t.Fatal(err)
@@ -1892,6 +1896,46 @@ func TestGitTransportPreAdmissionStagesAreOrderedAndSanitized(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestGitTransportEffectCredentialRejectionRecordsSanitizedValidationOutcome(t *testing.T) {
+	const (
+		effectAgentID = "effect-agent"
+		secret        = "effect-secret"
+		wrongSecret   = "wrong-effect-secret"
+		repository    = "grubbyhacker/repository-worker-lifecycle-test"
+	)
+	authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
+	seedEffectGitAuthority(t, authorityPath, effectAgentID, secret, repository, "writer", "worker-a", "binding-a", "session-a", "storage-a", 7)
+	broker, _ := newEffectGitTestBroker(t, authorityPath, repository, "writer")
+	req := httptest.NewRequest(http.MethodGet, "/git/"+repository+".git/info/refs?service=git-upload-pack", nil)
+	req.SetBasicAuth(effectAgentID, wrongSecret)
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusUnauthorized, resp.Body.String())
+	}
+	events := gitTransportStageEvents(readBrokerAuditEvents(t, broker.cfg.Audit.Path))
+	if len(events) != 3 {
+		t.Fatalf("stage events = %#v", events)
+	}
+	for i, want := range []string{"request_received", "helper_basic_seen", "credential_rejected"} {
+		if events[i].Result != want || events[i].OperationID != events[0].OperationID || events[i].Extra["request_id"] != events[0].OperationID {
+			t.Fatalf("stage[%d] = %#v, want %q", i, events[i], want)
+		}
+	}
+	if got := events[2].Extra["reason"]; got != "credential_validation_fingerprint_mismatch" {
+		t.Fatalf("rejection reason = %#v", got)
+	}
+	auditBytes, err := os.ReadFile(broker.cfg.Audit.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{effectAgentID, secret, wrongSecret, base64.StdEncoding.EncodeToString([]byte(effectAgentID + ":" + wrongSecret))} {
+		if bytes.Contains(auditBytes, []byte(forbidden)) {
+			t.Fatalf("audit retained credential-bearing material %q", forbidden)
+		}
 	}
 }
 
@@ -1952,6 +1996,20 @@ func TestEffectCredentialCustodyBarrierStageReflectsCommitAndFailure(t *testing.
 			terminal := events[len(events)-1]
 			if terminal.Result != tc.wantStage || terminal.Extra["reason"] != tc.wantReason || terminal.Extra["request_id"] != events[0].OperationID || (tc.wantStageStatus != 0 && terminal.Extra["http_status"] != float64(tc.wantStageStatus)) {
 				t.Fatalf("stages = %#v, want terminal stage=%q reason=%q status=%d", events, tc.wantStage, tc.wantReason, tc.wantStageStatus)
+			}
+			if tc.name == "committed" {
+				db, err := sql.Open("sqlite", authorityPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = db.Close() }()
+				var operationID string
+				if err := db.QueryRow(`SELECT operation_id FROM repository_transport_events ORDER BY cursor LIMIT 1`).Scan(&operationID); err != nil {
+					t.Fatal(err)
+				}
+				if operationID != events[0].OperationID {
+					t.Fatalf("durable transport operation = %q, audit operation = %q", operationID, events[0].OperationID)
+				}
 			}
 		})
 	}
