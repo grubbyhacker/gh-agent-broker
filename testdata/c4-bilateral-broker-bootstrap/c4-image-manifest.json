@@ -1,0 +1,33 @@
+{
+  "version": "broker/c4-bilateral-fixture-images/v1",
+  "producer": {
+    "source": "https://github.com/grubbyhacker/gh-agent-broker",
+    "revision": "a853041c07d6a9c9d4678a2c80db90f5cec4f42d"
+  },
+  "images": {
+    "agentdGitPushSmoke": {
+      "reference": "registry.invalid/grubbyhacker/agentd-c4-git-push-smoke@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "revision": "1671d6590d6adac09ab3eee0e64f5855789436da",
+      "source": "https://github.com/grubbyhacker/agentd",
+      "title": "agentd-c4-git-push-smoke",
+      "target": "agentd-c4-git-push-smoke"
+    },
+    "brokerFixtureBootstrap": {
+      "reference": "registry.invalid/grubbyhacker/c4-bilateral-broker-bootstrap@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "revision": "a853041c07d6a9c9d4678a2c80db90f5cec4f42d",
+      "source": "https://github.com/grubbyhacker/gh-agent-broker",
+      "title": "c4-bilateral-broker-bootstrap",
+      "target": "c4-bilateral-broker-bootstrap"
+    },
+    "gitHttpFixture": {
+      "reference": "registry.invalid/grubbyhacker/c4-bilateral-git-http-fixture@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "revision": "a853041c07d6a9c9d4678a2c80db90f5cec4f42d",
+      "source": "https://github.com/grubbyhacker/gh-agent-broker",
+      "title": "c4-bilateral-git-http-fixture",
+      "target": "c4-bilateral-git-http-fixture"
+    }
+  }
+}

@@ -88,16 +88,16 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 	}, nil
 }
 
-func (s *Server) beginTransport(ctx context.Context, principal auth.Principal, transportContext, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
+func (s *Server) beginTransport(ctx context.Context, operationID string, principal auth.Principal, transportContext, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
 	authority, err := s.transport.ResolveAuthority(ctx, transportContext)
 	if err != nil {
 		return nil, err
 	}
-	return s.beginTransportAuthority(ctx, principal, authority, method, service, repo, path, credentialHeader)
+	return s.beginTransportAuthority(ctx, operationID, principal, authority, method, service, repo, path, credentialHeader)
 }
 
-func (s *Server) beginTransportAuthority(ctx context.Context, principal auth.Principal, authority sandbox.TransportAuthority, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
-	op, err := transportOperation(principal, authority, method, service, repo, path, credentialHeader)
+func (s *Server) beginTransportAuthority(ctx context.Context, operationID string, principal auth.Principal, authority sandbox.TransportAuthority, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
+	op, err := transportOperation(operationID, principal, authority, method, service, repo, path, credentialHeader)
 	if err != nil {
 		return nil, err
 	}
@@ -107,11 +107,14 @@ func (s *Server) beginTransportAuthority(ctx context.Context, principal auth.Pri
 	return op, nil
 }
 
-func transportOperation(principal auth.Principal, authority sandbox.TransportAuthority, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
+func transportOperation(operationID string, principal auth.Principal, authority sandbox.TransportAuthority, method, service, repo, path string, credentialHeader bool) (*sandbox.TransportOperation, error) {
 	if authority.Principal != principal.TransportPrincipal {
 		return nil, errors.New("transport authority context principal mismatch")
 	}
-	op := &sandbox.TransportOperation{OperationID: ids.NewOperationID(), Method: method, Service: service, Repository: repo, RequestPath: path, RequestedRefs: []string{}, RefUpdates: []any{}, CredentialHeaderPresent: credentialHeader, Authority: authority}
+	if operationID == "" {
+		return nil, errors.New("transport operation is missing audit correlation ID")
+	}
+	op := &sandbox.TransportOperation{OperationID: operationID, Method: method, Service: service, Repository: repo, RequestPath: path, RequestedRefs: []string{}, RefUpdates: []any{}, CredentialHeaderPresent: credentialHeader, Authority: authority}
 	return op, nil
 }
 
@@ -2082,10 +2085,12 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	principal, ok := auth.AuthenticateAgent(r, cfg)
 	var effectCredential *sandbox.GitCredentialAuthority
 	var effectAgentID, effectAgentSecret string
+	validationClass := sandbox.GitCredentialMalformed
 	if !ok && s.credentialStore != nil {
 		id, secret, basic := r.BasicAuth()
 		if basic {
-			if custody, valid, err := s.credentialStore.AuthenticateGitCredential(r.Context(), id, secret, repo); err == nil && valid {
+			if custody, valid, class, err := s.credentialStore.AuthenticateGitCredentialWithOutcome(r.Context(), id, secret, repo); err == nil && valid {
+				validationClass = class
 				if parent, found := cfg.AgentByID(custody.TransportAuthority.Principal); found && parent.Enabled {
 					parent.ID = custody.AgentID
 					parent.Secret = ""
@@ -2098,6 +2103,10 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 					effectAgentID, effectAgentSecret = id, secret
 					principal, ok = auth.Principal{Agent: parent, ID: custody.AgentID, TransportPrincipal: custody.TransportAuthority.Principal}, true
 				}
+			} else if err != nil {
+				validationClass = sandbox.GitCredentialStoreError
+			} else {
+				validationClass = class
 			}
 		}
 	}
@@ -2106,7 +2115,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		reason := "agent_credentials_required"
 		if requestStage.credentialHeaderPresent {
 			stage = "credential_rejected"
-			reason = "agent_authentication_failed"
+			reason = "credential_validation_" + string(validationClass)
 		}
 		s.recordGitTransportStage(opID, requestStage, stage, policy.DecisionDeny, reason, http.StatusUnauthorized, "")
 		writeAuthText(w, "agent authentication failed")
@@ -2139,12 +2148,12 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "effect credential cannot supply transport authority", http.StatusForbidden)
 				return
 			}
-			transport, err = transportOperation(principal, effectCredential.TransportAuthority, r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, true)
+			transport, err = transportOperation(opID, principal, effectCredential.TransportAuthority, r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, true)
 			if err == nil {
 				err = s.transport.ReceivedEffectCredential(r.Context(), effectAgentID, effectAgentSecret, repo, *effectCredential, transport)
 			}
 		} else {
-			transport, err = s.beginTransport(r.Context(), principal, r.Header.Get("X-GH-Agent-Broker-Transport-Context"), r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, r.Header.Get("Authorization") != "")
+			transport, err = s.beginTransport(r.Context(), opID, principal, r.Header.Get("X-GH-Agent-Broker-Transport-Context"), r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, r.Header.Get("Authorization") != "")
 		}
 		if err != nil {
 			if effectCredential != nil {
