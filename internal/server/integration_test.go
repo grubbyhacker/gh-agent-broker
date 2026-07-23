@@ -1994,6 +1994,190 @@ func TestBranchLifecycleGuardWarnModeAllowsLookupFailure(t *testing.T) {
 	}
 }
 
+func TestGitTransportPreAdmissionStagesAreOrderedAndSanitized(t *testing.T) {
+	const secret = "c4-stage-secret-never-durable"
+	tests := []struct {
+		name       string
+		authorize  func(*http.Request)
+		wantStatus int
+		wantStages []string
+		wantReason string
+	}{
+		{name: "challenge", wantStatus: http.StatusUnauthorized, wantStages: []string{"request_received", "basic_challenge"}, wantReason: "agent_credentials_required"},
+		{name: "rejected_basic_retry", authorize: func(req *http.Request) { req.SetBasicAuth("agent-1", "wrong-"+secret) }, wantStatus: http.StatusUnauthorized, wantStages: []string{"request_received", "helper_basic_seen", "credential_rejected"}, wantReason: "credential_validation_malformed"},
+		{name: "accepted_basic_retry", authorize: func(req *http.Request) { req.SetBasicAuth("agent-1", secret) }, wantStatus: http.StatusOK, wantStages: []string{"request_received", "helper_basic_seen", "authenticated_retry", "credential_accepted"}, wantReason: "agent_authenticated"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			apiServer := fakeTokenServer(t)
+			defer apiServer.Close()
+			gitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { writeTestBody(t, w, "ok") }))
+			defer gitServer.Close()
+			broker := newTestBroker(t, apiServer.URL, gitServer.URL, config.Agent{ID: "agent-1", Enabled: true, Secret: secret, Repositories: []string{"owner/repo"}, Operations: []string{"git.upload-pack"}})
+			req := httptest.NewRequest(http.MethodGet, "/git/owner/repo.git/info/refs?service=git-upload-pack", nil)
+			if tc.authorize != nil {
+				tc.authorize(req)
+			}
+			resp := httptest.NewRecorder()
+			broker.ServeHTTP(resp, req)
+			if resp.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", resp.Code, tc.wantStatus, resp.Body.String())
+			}
+			events := gitTransportStageEvents(readBrokerAuditEvents(t, broker.cfg.Audit.Path))
+			if len(events) != len(tc.wantStages) {
+				t.Fatalf("stage events = %#v, want %#v", events, tc.wantStages)
+			}
+			for i, event := range events {
+				if event.Result != tc.wantStages[i] || event.Extra["request_id"] != events[0].OperationID || event.Extra["request_path"] != "/git/owner/repo.git/info/refs" || event.Extra["service"] != "git-upload-pack" {
+					t.Fatalf("stage[%d] = %#v", i, event)
+				}
+			}
+			if got := events[len(events)-1].Extra["reason"]; got != tc.wantReason {
+				t.Fatalf("terminal reason = %#v, want %q", got, tc.wantReason)
+			}
+			auditBytes, err := os.ReadFile(broker.cfg.Audit.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, forbidden := range []string{secret, "wrong-" + secret, base64.StdEncoding.EncodeToString([]byte("agent-1:" + secret)), "Authorization"} {
+				if bytes.Contains(auditBytes, []byte(forbidden)) {
+					t.Fatalf("audit retained credential-bearing material %q", forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestGitTransportEffectCredentialRejectionRecordsSanitizedValidationOutcome(t *testing.T) {
+	const (
+		effectAgentID = "effect-agent"
+		secret        = "effect-secret"
+		wrongSecret   = "wrong-effect-secret"
+		repository    = "grubbyhacker/repository-worker-lifecycle-test"
+	)
+	authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
+	seedEffectGitAuthority(t, authorityPath, effectAgentID, secret, repository, "writer", "worker-a", "binding-a", "session-a", "storage-a", 7)
+	broker, _ := newEffectGitTestBroker(t, authorityPath, repository, "writer")
+	req := httptest.NewRequest(http.MethodGet, "/git/"+repository+".git/info/refs?service=git-upload-pack", nil)
+	req.SetBasicAuth(effectAgentID, wrongSecret)
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusUnauthorized, resp.Body.String())
+	}
+	events := gitTransportStageEvents(readBrokerAuditEvents(t, broker.cfg.Audit.Path))
+	if len(events) != 3 {
+		t.Fatalf("stage events = %#v", events)
+	}
+	for i, want := range []string{"request_received", "helper_basic_seen", "credential_rejected"} {
+		if events[i].Result != want || events[i].OperationID != events[0].OperationID || events[i].Extra["request_id"] != events[0].OperationID {
+			t.Fatalf("stage[%d] = %#v, want %q", i, events[i], want)
+		}
+	}
+	if got := events[2].Extra["reason"]; got != "credential_validation_fingerprint_mismatch" {
+		t.Fatalf("rejection reason = %#v", got)
+	}
+	auditBytes, err := os.ReadFile(broker.cfg.Audit.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{effectAgentID, secret, wrongSecret, base64.StdEncoding.EncodeToString([]byte(effectAgentID + ":" + wrongSecret))} {
+		if bytes.Contains(auditBytes, []byte(forbidden)) {
+			t.Fatalf("audit retained credential-bearing material %q", forbidden)
+		}
+	}
+}
+
+func TestEffectCredentialCustodyBarrierStageReflectsCommitAndFailure(t *testing.T) {
+	tests := []struct {
+		name             string
+		interrupt        bool
+		suppliedContext  bool
+		missingTransport bool
+		wantStatus       int
+		wantStage        string
+		wantReason       string
+		wantStageStatus  int
+	}{
+		{name: "committed", wantStatus: http.StatusOK, wantStage: "custody_barrier_committed", wantReason: "effect_credential_revalidated_and_recorded"},
+		{name: "failed", interrupt: true, wantStatus: http.StatusServiceUnavailable, wantStage: "custody_barrier_failed", wantReason: "effect_transport_authority_unavailable", wantStageStatus: http.StatusServiceUnavailable},
+		{name: "supplied_transport_context", suppliedContext: true, wantStatus: http.StatusForbidden, wantStage: "pre_admission_rejected", wantReason: "effect_transport_context_supplied", wantStageStatus: http.StatusForbidden},
+		{name: "missing_transport_observer", missingTransport: true, wantStatus: http.StatusServiceUnavailable, wantStage: "custody_barrier_failed", wantReason: "effect_transport_authority_observation_unavailable", wantStageStatus: http.StatusServiceUnavailable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			authorityPath := filepath.Join(t.TempDir(), "authority.sqlite")
+			seedEffectGitAuthority(t, authorityPath, "effect-agent", "effect-secret", "grubbyhacker/repository-worker-lifecycle-test", "writer", "worker-a", "binding-a", "session-a", "storage-a", 7)
+			broker, upstreamCalls := newEffectGitTestBroker(t, authorityPath, "grubbyhacker/repository-worker-lifecycle-test", "writer")
+			if tc.interrupt {
+				broker.afterEffectCredentialAuthenticationForTest = func() {
+					if _, err := broker.credentialStore.Release(context.Background(), "writer", "session:binding-a"); err != nil {
+						t.Fatalf("release custody before barrier: %v", err)
+					}
+				}
+			}
+			if tc.missingTransport {
+				broker.transport = nil
+			}
+			req := httptest.NewRequest(http.MethodGet, "/git/grubbyhacker/repository-worker-lifecycle-test.git/info/refs?service=git-upload-pack", nil)
+			req.SetBasicAuth("effect-agent", "effect-secret")
+			if tc.suppliedContext {
+				req.Header.Set("X-GH-Agent-Broker-Transport-Context", "atc1.synthetic-context")
+			}
+			resp := httptest.NewRecorder()
+			broker.ServeHTTP(resp, req)
+			if resp.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", resp.Code, tc.wantStatus, resp.Body.String())
+			}
+			if tc.interrupt && *upstreamCalls != 0 {
+				t.Fatalf("upstream calls = %d, want 0 after barrier failure", *upstreamCalls)
+			}
+			events := gitTransportStageEvents(readBrokerAuditEvents(t, broker.cfg.Audit.Path))
+			wantStages := []string{"request_received", "helper_basic_seen", "authenticated_retry", "credential_accepted", tc.wantStage}
+			if len(events) != len(wantStages) {
+				t.Fatalf("stages = %#v, want %#v", events, wantStages)
+			}
+			for i, event := range events {
+				if event.Result != wantStages[i] {
+					t.Fatalf("stage[%d] = %#v, want %q", i, event, wantStages[i])
+				}
+			}
+			terminal := events[len(events)-1]
+			if terminal.Result != tc.wantStage || terminal.Extra["reason"] != tc.wantReason || terminal.Extra["request_id"] != events[0].OperationID || (tc.wantStageStatus != 0 && terminal.Extra["http_status"] != float64(tc.wantStageStatus)) {
+				t.Fatalf("stages = %#v, want terminal stage=%q reason=%q status=%d", events, tc.wantStage, tc.wantReason, tc.wantStageStatus)
+			}
+			if tc.name == "committed" {
+				db, err := sql.Open("sqlite", authorityPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if closeErr := db.Close(); closeErr != nil {
+						t.Errorf("close authority database: %v", closeErr)
+					}
+				}()
+				var operationID string
+				if err := db.QueryRow(`SELECT operation_id FROM repository_transport_events ORDER BY cursor LIMIT 1`).Scan(&operationID); err != nil {
+					t.Fatal(err)
+				}
+				if operationID != events[0].OperationID {
+					t.Fatalf("durable transport operation = %q, audit operation = %q", operationID, events[0].OperationID)
+				}
+			}
+		})
+	}
+}
+
+func gitTransportStageEvents(events []audit.Event) []audit.Event {
+	var out []audit.Event
+	for _, event := range events {
+		if event.Operation == "repository_transport_stage" {
+			out = append(out, event)
+		}
+	}
+	return out
+}
+
 func newTestBroker(t *testing.T, apiBaseURL, gitBaseURL string, agent config.Agent) *Server {
 	t.Helper()
 	keyPath := writeTestPrivateKey(t)

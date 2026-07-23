@@ -51,6 +51,24 @@ type GitCredentialAuthority struct {
 	TransportAuthority                                                                           TransportAuthority
 }
 
+// GitCredentialValidationClass is deliberately credential-free. It is safe to
+// persist in broker diagnostics but must never include an agent ID, secret, or
+// fingerprint.
+type GitCredentialValidationClass string
+
+const (
+	GitCredentialMalformed                 GitCredentialValidationClass = "malformed"
+	GitCredentialRowAbsent                 GitCredentialValidationClass = "credential_row_absent"    //nolint:gosec // G101: terminal observability classification labels are not credential values.
+	GitCredentialRowAmbiguous              GitCredentialValidationClass = "credential_row_ambiguous" //nolint:gosec // G101: terminal observability classification labels are not credential values.
+	GitCredentialFingerprintMismatch       GitCredentialValidationClass = "fingerprint_mismatch"
+	GitCredentialRevoked                   GitCredentialValidationClass = "revoked"
+	GitCredentialExpired                   GitCredentialValidationClass = "expired"
+	GitCredentialRepositoryMismatch        GitCredentialValidationClass = "repository_mismatch"
+	GitCredentialAuthorityIntegrityFailure GitCredentialValidationClass = "authority_integrity_failed"
+	GitCredentialStoreError                GitCredentialValidationClass = "store_error"
+	GitCredentialValid                     GitCredentialValidationClass = "valid"
+)
+
 type gitCredentialQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
@@ -273,6 +291,58 @@ func (s *AuthorityWorkerStore) AuthenticateGitCredential(ctx context.Context, ag
 		return GitCredentialAuthority{}, false, nil
 	}
 	return s.authenticateGitCredential(ctx, s.validationDB, agentID, secret, repository)
+}
+
+// AuthenticateGitCredentialWithOutcome returns the same authority decision as
+// AuthenticateGitCredential plus a bounded diagnostic class. The class is
+// intentionally derived without exposing credential material.
+func (s *AuthorityWorkerStore) AuthenticateGitCredentialWithOutcome(ctx context.Context, agentID, secret, repository string) (GitCredentialAuthority, bool, GitCredentialValidationClass, error) {
+	if agentID == "" || secret == "" || repository == "" {
+		return GitCredentialAuthority{}, false, GitCredentialMalformed, nil
+	}
+	rows, err := s.validationDB.QueryContext(ctx, `SELECT repository,secret_fingerprint,expires_at_ms,revoked_at FROM authority_git_credentials WHERE agent_id=?`, agentID)
+	if err != nil {
+		return GitCredentialAuthority{}, false, GitCredentialStoreError, err
+	}
+	defer closeTransportRows(rows)
+	count := 0
+	var storedRepo, fingerprint, revoked string
+	var expiresAt int64
+	for rows.Next() {
+		count++
+		if err := rows.Scan(&storedRepo, &fingerprint, &expiresAt, &revoked); err != nil {
+			return GitCredentialAuthority{}, false, GitCredentialStoreError, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return GitCredentialAuthority{}, false, GitCredentialStoreError, err
+	}
+	if count == 0 {
+		return GitCredentialAuthority{}, false, GitCredentialRowAbsent, nil
+	}
+	if count != 1 {
+		return GitCredentialAuthority{}, false, GitCredentialRowAmbiguous, nil
+	}
+	if !secureTokenEqual(fingerprint, s.effectTokenFingerprint(secret)) {
+		return GitCredentialAuthority{}, false, GitCredentialFingerprintMismatch, nil
+	}
+	if revoked != "" {
+		return GitCredentialAuthority{}, false, GitCredentialRevoked, nil
+	}
+	if expiresAt <= time.Now().UnixMilli() {
+		return GitCredentialAuthority{}, false, GitCredentialExpired, nil
+	}
+	if storedRepo != repository {
+		return GitCredentialAuthority{}, false, GitCredentialRepositoryMismatch, nil
+	}
+	authority, valid, err := s.authenticateGitCredential(ctx, s.validationDB, agentID, secret, repository)
+	if err != nil {
+		return GitCredentialAuthority{}, false, GitCredentialStoreError, err
+	}
+	if !valid {
+		return GitCredentialAuthority{}, false, GitCredentialAuthorityIntegrityFailure, nil
+	}
+	return authority, true, GitCredentialValid, nil
 }
 
 func (s *AuthorityWorkerStore) authenticateGitCredential(ctx context.Context, queryer gitCredentialQueryer, agentID, secret, repository string) (GitCredentialAuthority, bool, error) {
