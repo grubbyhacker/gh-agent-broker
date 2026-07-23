@@ -38,7 +38,11 @@ func TestAuthenticateGitCredentialWithOutcomeIsBoundedAndCredentialFree(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
+	t.Cleanup(func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("close store: %v", closeErr)
+		}
+	})
 	const secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	insertActiveCredentialCustody(t, store, secret)
 	cases := []struct {

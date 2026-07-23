@@ -2151,7 +2151,11 @@ func TestEffectCredentialCustodyBarrierStageReflectsCommitAndFailure(t *testing.
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer func() { _ = db.Close() }()
+				defer func() {
+					if closeErr := db.Close(); closeErr != nil {
+						t.Errorf("close authority database: %v", closeErr)
+					}
+				}()
 				var operationID string
 				if err := db.QueryRow(`SELECT operation_id FROM repository_transport_events ORDER BY cursor LIMIT 1`).Scan(&operationID); err != nil {
 					t.Fatal(err)

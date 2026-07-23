@@ -58,8 +58,8 @@ type GitCredentialValidationClass string
 
 const (
 	GitCredentialMalformed                 GitCredentialValidationClass = "malformed"
-	GitCredentialRowAbsent                 GitCredentialValidationClass = "credential_row_absent"
-	GitCredentialRowAmbiguous              GitCredentialValidationClass = "credential_row_ambiguous"
+	GitCredentialRowAbsent                 GitCredentialValidationClass = "credential_row_absent"    //nolint:gosec // G101: terminal observability classification labels are not credential values.
+	GitCredentialRowAmbiguous              GitCredentialValidationClass = "credential_row_ambiguous" //nolint:gosec // G101: terminal observability classification labels are not credential values.
 	GitCredentialFingerprintMismatch       GitCredentialValidationClass = "fingerprint_mismatch"
 	GitCredentialRevoked                   GitCredentialValidationClass = "revoked"
 	GitCredentialExpired                   GitCredentialValidationClass = "expired"

@@ -2760,7 +2760,9 @@ func safeGitPathSegment(segment string) bool {
 		return false
 	}
 	for _, char := range segment {
-		if !(char >= 'a' && char <= 'z') && !(char >= 'A' && char <= 'Z') && !(char >= '0' && char <= '9') && char != '-' && char != '_' && char != '.' {
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char >= '0' && char <= '9', char == '-', char == '_', char == '.':
+		default:
 			return false
 		}
 	}
