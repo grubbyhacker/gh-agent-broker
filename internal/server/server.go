@@ -2067,9 +2067,15 @@ func (s *Server) handleIssueLabelRemove(w http.ResponseWriter, r *http.Request, 
 
 func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	opID := ids.NewOperationID()
+	requestStage := gitTransportRequest(r)
+	s.recordGitTransportStage(opID, requestStage, "request_received", policy.DecisionDeny, "request_received", 0, "")
+	if requestStage.basicAuthPresent {
+		s.recordGitTransportStage(opID, requestStage, "helper_basic_seen", policy.DecisionDeny, "basic_authorization_present", 0, "")
+	}
 	cfg, gh := s.snapshot()
 	repo, suffix, ok := parseGitPath(r.URL.Path)
 	if !ok {
+		s.recordGitTransportStage(opID, requestStage, "pre_admission_rejected", policy.DecisionDeny, "invalid_git_path", http.StatusNotFound, "")
 		http.Error(w, "invalid git path", http.StatusNotFound)
 		return
 	}
@@ -2096,18 +2102,31 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !ok {
+		stage := "basic_challenge"
+		reason := "agent_credentials_required"
+		if requestStage.credentialHeaderPresent {
+			stage = "credential_rejected"
+			reason = "agent_authentication_failed"
+		}
+		s.recordGitTransportStage(opID, requestStage, stage, policy.DecisionDeny, reason, http.StatusUnauthorized, "")
 		writeAuthText(w, "agent authentication failed")
 		return
 	}
+	if requestStage.basicAuthPresent {
+		s.recordGitTransportStage(opID, requestStage, "authenticated_retry", policy.DecisionAllow, "basic_authentication_accepted", 0, principal.ID)
+	}
+	s.recordGitTransportStage(opID, requestStage, "credential_accepted", policy.DecisionAllow, "agent_authenticated", 0, principal.ID)
 	if effectCredential != nil && s.afterEffectCredentialAuthenticationForTest != nil {
 		s.afterEffectCredentialAuthenticationForTest()
 	}
 	operation := gitOperation(r, suffix)
 	if operation == "" {
+		s.recordGitTransportStage(opID, requestStage, "pre_admission_rejected", policy.DecisionDeny, "unsupported_git_operation", http.StatusBadRequest, principal.ID)
 		http.Error(w, "unsupported git operation", http.StatusBadRequest)
 		return
 	}
 	if effectCredential != nil && s.transport == nil {
+		s.recordGitTransportStage(opID, requestStage, "custody_barrier_failed", policy.DecisionDeny, "effect_transport_authority_observation_unavailable", http.StatusServiceUnavailable, principal.ID)
 		http.Error(w, "transport authority observation unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -2116,6 +2135,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		var err error
 		if effectCredential != nil {
 			if strings.TrimSpace(r.Header.Get("X-GH-Agent-Broker-Transport-Context")) != "" {
+				s.recordGitTransportStage(opID, requestStage, "pre_admission_rejected", policy.DecisionDeny, "effect_transport_context_supplied", http.StatusForbidden, principal.ID)
 				http.Error(w, "effect credential cannot supply transport authority", http.StatusForbidden)
 				return
 			}
@@ -2127,8 +2147,16 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			transport, err = s.beginTransport(r.Context(), principal, r.Header.Get("X-GH-Agent-Broker-Transport-Context"), r.Method, strings.ReplaceAll(operation, ".", "-"), repo, r.URL.Path, r.Header.Get("Authorization") != "")
 		}
 		if err != nil {
+			if effectCredential != nil {
+				s.recordGitTransportStage(opID, requestStage, "custody_barrier_failed", policy.DecisionDeny, "effect_transport_authority_unavailable", http.StatusServiceUnavailable, principal.ID)
+			} else {
+				s.recordGitTransportStage(opID, requestStage, "pre_admission_rejected", policy.DecisionDeny, "transport_authority_observation_unavailable", http.StatusServiceUnavailable, principal.ID)
+			}
 			http.Error(w, "transport authority observation unavailable", http.StatusServiceUnavailable)
 			return
+		}
+		if effectCredential != nil {
+			s.recordGitTransportStage(opID, requestStage, "custody_barrier_committed", policy.DecisionAllow, "effect_credential_revalidated_and_recorded", 0, principal.ID)
 		}
 	}
 	var bodyReader io.Reader = r.Body
@@ -2645,6 +2673,103 @@ func parseGitPath(path string) (repo, suffix string, ok bool) {
 		return "", "", false
 	}
 	return repo, suffix, true
+}
+
+type gitTransportRequestIdentity struct {
+	method                  string
+	service                 string
+	repo                    string
+	requestPath             string
+	credentialHeaderPresent bool
+	basicAuthPresent        bool
+}
+
+// gitTransportRequest retains only request facts that are safe to persist.
+// Authorization is represented as presence only: no scheme, username,
+// password, or header value reaches the audit record.
+func gitTransportRequest(r *http.Request) gitTransportRequestIdentity {
+	method := "other"
+	switch r.Method {
+	case http.MethodGet:
+		method = http.MethodGet
+	case http.MethodPost:
+		method = http.MethodPost
+	}
+	identity := gitTransportRequestIdentity{
+		method:                  method,
+		credentialHeaderPresent: r.Header.Get("Authorization") != "" || r.Header.Get("X-Agent-ID") != "" || r.Header.Get("X-Agent-Secret") != "",
+		basicAuthPresent:        strings.HasPrefix(strings.ToLower(r.Header.Get("Authorization")), "basic "),
+		requestPath:             "/git/[invalid]",
+	}
+	repo, suffix, ok := parseGitPath(r.URL.Path)
+	if !ok || !safeGitRepository(repo) || !safeGitSuffix(suffix) {
+		return identity
+	}
+	identity.repo = repo
+	identity.requestPath = "/git/" + repo + ".git" + suffix
+	if r.Method == http.MethodGet && suffix == "/info/refs" {
+		service, valid := gitDiscoveryService(r.URL.RawQuery)
+		if valid {
+			identity.service = service
+		} else {
+			identity.service = "unsupported"
+		}
+	} else if r.Method == http.MethodPost {
+		switch suffix {
+		case "/git-upload-pack":
+			identity.service = "git-upload-pack"
+		case "/git-receive-pack":
+			identity.service = "git-receive-pack"
+		default:
+			identity.service = "unsupported"
+		}
+	}
+	return identity
+}
+
+func safeGitRepository(repo string) bool {
+	owner, name, ok := strings.Cut(repo, "/")
+	return ok && safeGitPathSegment(owner) && safeGitPathSegment(name)
+}
+
+func safeGitSuffix(suffix string) bool {
+	return suffix == "/info/refs" || suffix == "/git-upload-pack" || suffix == "/git-receive-pack" || suffix == ""
+}
+
+func safeGitPathSegment(segment string) bool {
+	if segment == "" || len(segment) > 100 {
+		return false
+	}
+	for _, char := range segment {
+		if !(char >= 'a' && char <= 'z') && !(char >= 'A' && char <= 'Z') && !(char >= '0' && char <= '9') && char != '-' && char != '_' && char != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) recordGitTransportStage(operationID string, request gitTransportRequestIdentity, stage, decision, reason string, status int, agentID string) {
+	extra := map[string]interface{}{
+		"request_id":                operationID,
+		"stage":                     stage,
+		"method":                    request.method,
+		"service":                   request.service,
+		"request_path":              request.requestPath,
+		"credential_header_present": request.credentialHeaderPresent,
+		"reason":                    reason,
+	}
+	if status != 0 {
+		extra["http_status"] = status
+	}
+	s.audit.Log(audit.Event{
+		OperationID: operationID,
+		AgentID:     agentID,
+		Operation:   "repository_transport_stage",
+		Repo:        request.repo,
+		Decision:    decision,
+		Result:      stage,
+		Extra:       extra,
+	})
 }
 
 func gitOperation(r *http.Request, suffix string) string {
