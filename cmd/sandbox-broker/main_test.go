@@ -56,6 +56,9 @@ func TestParsePruneCommandDefaults(t *testing.T) {
 	if got := cmd.Policy.MaxAge; got != 24*time.Hour {
 		t.Fatalf("max_age = %v, want %v", got, 24*time.Hour)
 	}
+	if got := cmd.Policy.KeepNewest; got != 20 {
+		t.Fatalf("keep_newest = %d, want 20", got)
+	}
 	if !cmd.Policy.TerminalOnly {
 		t.Fatalf("terminal-only = %v, want true", cmd.Policy.TerminalOnly)
 	}

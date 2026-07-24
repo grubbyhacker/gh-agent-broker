@@ -211,7 +211,7 @@ func parsePruneCommand(args []string) (pruneCommand, error) {
 		DockerSocket: "/var/run/docker.sock",
 		Policy: sandbox.RetentionPolicy{
 			MaxAge:       24 * time.Hour,
-			KeepNewest:   0,
+			KeepNewest:   20,
 			TerminalOnly: true,
 			MaxBytes:     0,
 			DryRun:       false,
@@ -236,7 +236,23 @@ func parsePruneCommand(args []string) (pruneCommand, error) {
 }
 
 func parseSlimCommand(args []string) (pruneCommand, error) {
-	return parsePruneCommand(args)
+	cmd, err := parsePruneCommand(args)
+	if err != nil {
+		return pruneCommand{}, err
+	}
+	if !hasFlag(args[1:], "keep-newest") {
+		cmd.Policy.KeepNewest = 0
+	}
+	return cmd, nil
+}
+
+func hasFlag(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == "-"+name || strings.HasPrefix(arg, "-"+name+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func runPruneRuns(args []string) {
