@@ -2,6 +2,18 @@
 
 ## Current State
 
+### Aggressive sandbox-run retention contract
+
+`PruneRuns` now retains at least the newest 20 terminal runs (`stopped`,
+`failed`, `timed_out`, or `cleaned`) regardless of age. It applies the 24-hour
+age policy to the remaining terminal runs and computes `max_bytes` across the
+entire terminal-run store, including protected runs. When over budget, it
+removes oldest non-protected terminal runs even when young; pending and running
+runs remain untouched when `terminal_only=true`. Focused tests cover age-only
+deletion, young budget deletion, newest-20 protection, and active-run safety.
+`make check` is presently blocked locally because golangci-lint invokes the
+Go 1.26.5 compiler against mise's Go 1.26.4 standard library.
+
 ### Profile-mapped Git/App identity is distinct from control authority
 
 Effect-scoped Git credentials and the bodyless registered Green-PR

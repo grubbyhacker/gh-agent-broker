@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,30 +15,26 @@ func TestPruneRunsDeletesOldTerminalRunsAndSkipsActive(t *testing.T) {
 	service := NewService(cfg, newFakeRuntime(), testAudit(t))
 
 	now := time.Now().UTC()
-	writePruneRunMetadata(t, cfg, "run-old-1", StatusStopped, now.Add(-5*time.Hour), now.Add(-5*time.Hour), nil)
-	writePruneRunMetadata(t, cfg, "run-old-2", StatusStopped, now.Add(-6*time.Hour), now.Add(-6*time.Hour), nil)
-	writePruneRunMetadata(t, cfg, "run-new", StatusStopped, now.Add(-30*time.Minute), now.Add(-30*time.Minute), nil)
+	writePruneRunMetadata(t, cfg, "run-old", StatusStopped, now.Add(-25*time.Hour), now.Add(-25*time.Hour), nil)
+	writeTerminalRuns(t, cfg, 20, now.Add(-20*time.Hour), time.Hour)
 	writePruneRunMetadata(t, cfg, "run-running", StatusRunning, now.Add(-6*time.Hour), time.Time{}, nil)
 
-	writeRunMarker(t, cfg, "run-old-1", "keep-me", "one")
-	writeRunMarker(t, cfg, "run-old-2", "keep-me", "two")
-	writeRunMarker(t, cfg, "run-new", "keep-me", "three")
+	writeRunMarker(t, cfg, "run-old", "keep-me", "one")
 	writeRunMarker(t, cfg, "run-running", "keep-me", "four")
 
 	report, err := service.PruneRuns(context.Background(), RetentionPolicy{
-		MaxAge:     2 * time.Hour,
-		KeepNewest: 1,
+		MaxAge: 24 * time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("PruneRuns() error = %v", err)
 	}
-	if report.Deleted != 2 {
-		t.Fatalf("deleted = %d, want %d", report.Deleted, 2)
+	if report.Deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", report.Deleted)
 	}
 	if report.Skipped != 0 {
 		t.Fatalf("skipped = %d, want 0", report.Skipped)
 	}
-	for _, runID := range []string{"run-old-1", "run-old-2"} {
+	for _, runID := range []string{"run-old"} {
 		if _, err := os.Stat(filepath.Join(cfg.RunsDir, runID)); !os.IsNotExist(err) {
 			t.Fatalf("run dir %s should be removed, err=%v", runID, err)
 		}
@@ -47,38 +44,22 @@ func TestPruneRunsDeletesOldTerminalRunsAndSkipsActive(t *testing.T) {
 	}
 }
 
-func TestPruneRunsUsesMaxBytesBudgetAndPreservesNewest(t *testing.T) {
+func TestPruneRunsDeletesYoungTerminalRunWhenOverBudget(t *testing.T) {
 	cfg := baseTestConfig(t)
 	service := NewService(cfg, newFakeRuntime(), testAudit(t))
 
 	now := time.Now().UTC()
-	writePruneRunMetadata(t, cfg, "run-oldest", StatusStopped, now.Add(-36*time.Hour), now.Add(-36*time.Hour), nil)
-	writePruneRunMetadata(t, cfg, "run-mid", StatusStopped, now.Add(-24*time.Hour), now.Add(-24*time.Hour), map[string][]byte{"artifact.txt": []byte("size-two")})
-	writePruneRunMetadata(t, cfg, "run-newest", StatusStopped, now.Add(-18*time.Hour), now.Add(-18*time.Hour), map[string][]byte{
-		"artifact.txt": []byte("size-three"),
-	})
-
-	writeRunMarker(t, cfg, "run-oldest", "artifact.bin", make([]byte, 2048))
-	writeRunMarker(t, cfg, "run-mid", "artifact.bin", make([]byte, 1024))
-	writeRunMarker(t, cfg, "run-newest", "artifact.bin", make([]byte, 256))
-
-	oldestSize, err := runDirSizeBytes(filepath.Join(cfg.RunsDir, "run-oldest"))
-	if err != nil {
-		t.Fatalf("runDirSizeBytes() = %v", err)
-	}
-	midSize, err := runDirSizeBytes(filepath.Join(cfg.RunsDir, "run-mid"))
-	if err != nil {
-		t.Fatalf("runDirSizeBytes() = %v", err)
-	}
-	newestSize, err := runDirSizeBytes(filepath.Join(cfg.RunsDir, "run-newest"))
+	writePruneRunMetadata(t, cfg, "run-young-oldest", StatusStopped, now.Add(-2*time.Hour), now.Add(-2*time.Hour), nil)
+	writeRunMarker(t, cfg, "run-young-oldest", "artifact.bin", make([]byte, 1024))
+	writeTerminalRuns(t, cfg, 20, now.Add(-90*time.Minute), time.Minute)
+	protectedSize, err := runDirSizeBytes(filepath.Join(cfg.RunsDir, "run-00"))
 	if err != nil {
 		t.Fatalf("runDirSizeBytes() = %v", err)
 	}
 
 	report, err := service.PruneRuns(context.Background(), RetentionPolicy{
-		MaxAge:     12 * time.Hour,
-		KeepNewest: 1,
-		MaxBytes:   midSize + newestSize - 1,
+		MaxAge:   24 * time.Hour,
+		MaxBytes: protectedSize * 20,
 	})
 	if err != nil {
 		t.Fatalf("PruneRuns() error = %v", err)
@@ -86,17 +67,51 @@ func TestPruneRunsUsesMaxBytesBudgetAndPreservesNewest(t *testing.T) {
 	if report.Deleted != 1 {
 		t.Fatalf("deleted = %d, want %d", report.Deleted, 1)
 	}
-	if _, err := os.Stat(filepath.Join(cfg.RunsDir, "run-mid")); err != nil {
-		t.Fatalf("run-mid should remain after budget prune: %v", err)
+	if _, err := os.Stat(filepath.Join(cfg.RunsDir, "run-young-oldest")); !os.IsNotExist(err) {
+		t.Fatalf("young terminal run should be removed by budget prune, err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(cfg.RunsDir, "run-newest")); err != nil {
-		t.Fatalf("run-newest should remain after budget prune: %v", err)
+	if report.BudgetBefore <= report.Policy.MaxBytes {
+		t.Fatalf("budget before = %d, want > %d", report.BudgetBefore, report.Policy.MaxBytes)
 	}
-	if _, err := os.Stat(filepath.Join(cfg.RunsDir, "run-oldest")); !os.IsNotExist(err) {
-		t.Fatalf("run-oldest should be removed by budget prune, err=%v", err)
+}
+
+func TestPruneRunsProtectsNewestTwentyTerminalRuns(t *testing.T) {
+	cfg := baseTestConfig(t)
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	now := time.Now().UTC()
+	writeTerminalRuns(t, cfg, 22, now.Add(-2*time.Hour), time.Minute)
+
+	report, err := service.PruneRuns(context.Background(), RetentionPolicy{MaxAge: 24 * time.Hour, MaxBytes: 1})
+	if err != nil {
+		t.Fatalf("PruneRuns() error = %v", err)
 	}
-	if report.BudgetBefore < oldestSize+midSize {
-		t.Fatalf("budget before = %d, want >= %d", report.BudgetBefore, oldestSize+midSize)
+	if report.Deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", report.Deleted)
+	}
+	for i := 2; i < 22; i++ {
+		runID := fmt.Sprintf("run-%02d", i)
+		if _, err := os.Stat(filepath.Join(cfg.RunsDir, runID)); err != nil {
+			t.Fatalf("newest protected run %s should remain: %v", runID, err)
+		}
+	}
+}
+
+func TestPruneRunsLeavesActiveRunsUntouchedWhenTerminalOnly(t *testing.T) {
+	cfg := baseTestConfig(t)
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	now := time.Now().UTC()
+	writeTerminalRuns(t, cfg, 21, now.Add(-2*time.Hour), time.Minute)
+	writePruneRunMetadata(t, cfg, "run-pending", StatusPending, now.Add(-48*time.Hour), time.Time{}, nil)
+	writePruneRunMetadata(t, cfg, "run-running", StatusRunning, now.Add(-48*time.Hour), time.Time{}, nil)
+
+	_, err := service.PruneRuns(context.Background(), RetentionPolicy{MaxAge: 24 * time.Hour, TerminalOnly: true, MaxBytes: 1})
+	if err != nil {
+		t.Fatalf("PruneRuns() error = %v", err)
+	}
+	for _, runID := range []string{"run-pending", "run-running"} {
+		if _, err := os.Stat(filepath.Join(cfg.RunsDir, runID)); err != nil {
+			t.Fatalf("active run %s should remain: %v", runID, err)
+		}
 	}
 }
 
@@ -154,8 +169,16 @@ func TestPruneRunsToleratesCorruptMetadataAndSkips(t *testing.T) {
 	if report.Skipped != 2 {
 		t.Fatalf("skipped = %d, want 2", report.Skipped)
 	}
-	if report.Deleted != 1 {
-		t.Fatalf("deleted = %d, want 1", report.Deleted)
+	if report.Deleted != 0 {
+		t.Fatalf("deleted = %d, want 0", report.Deleted)
+	}
+}
+
+func writeTerminalRuns(t *testing.T, cfg Config, count int, first time.Time, interval time.Duration) {
+	t.Helper()
+	for i := 0; i < count; i++ {
+		at := first.Add(time.Duration(i) * interval)
+		writePruneRunMetadata(t, cfg, fmt.Sprintf("run-%02d", i), StatusStopped, at, at, nil)
 	}
 }
 

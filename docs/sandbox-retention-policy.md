@@ -14,26 +14,35 @@ reconstructible state after terminal completion.
 Inputs are provided by `prune-runs`/`slim-runs` CLI flags and emitted as
 `PruneReport.Policy` / `SlimReport.Policy`.
 
-For both commands:
+For `prune-runs`:
 
-- `max_age` (`time.Duration`, default `24h`)  
-  Only terminal runs older than this age are eligible.
-- `keep_newest` (`int`, default `0`)  
-  Preserve the newest `N` terminal-eligible runs before age/budget-driven action.
-- `terminal-only` (`bool`, default `true`)  
+- `max_age` (`time.Duration`, default `24h`)
+  Terminal runs older than this age are deleted unless protected by `keep_newest`.
+- `keep_newest` (`int`, minimum and default `20`)
+  Preserve at least the newest 20 terminal runs before age or budget-driven
+  action. Higher values retain additional terminal runs.
+- `terminal-only` (`bool`, default `true`)
   If `true`, non-terminal runs are never affected.
-- `max_bytes` (`int64`, default `0`)  
-  Optional aggregate disk budget in bytes after candidate selection. Older
-  candidates are removed until budget is met.
-- `dry-run` (`bool`, default `false`)  
+- `max_bytes` (`int64`, default `0`)
+  Optional hard aggregate disk budget in bytes across all terminal runs. When
+  the terminal store exceeds it, the oldest non-protected terminal runs are
+  deleted until the budget is met or only protected runs remain, including runs
+  younger than `max_age`.
+- `dry-run` (`bool`, default `false`)
   Report what would change; do not mutate disk.
-- `max_output` (`int`, default `200`)  
+- `max_output` (`int`, default `200`)
   Truncates JSON report entries.
+
+`slim-runs` accepts the same flags, but retains its existing optional
+`keep_newest` behavior (default `0`) and does not delete run directories.
+
+Terminal runs are exactly `stopped`, `failed`, `timed_out`, and `cleaned`.
 
 ## Slim behavior
 
-`slim-runs` follows the same terminal/age/budget candidate selection as
-`prune-runs` and then performs run-local reconstruction-aware cleanup.
+`slim-runs` performs run-local reconstruction-aware cleanup. Its selection is
+separate from destructive `prune-runs` retention: the hard aggregate budget
+and mandatory newest-20 protection described above apply to `prune-runs`.
 
 - Kept inputs:
   - `metadata.json`
