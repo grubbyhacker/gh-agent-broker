@@ -13,3 +13,8 @@ the existing `/v1/repos/{owner}/{repo}/pulls` API path.
 The staged `repository_transport_stage` audit events remain on the real Git
 path. No local repository backend, registered green-PR endpoint, agentd
 authority lifecycle, or agentd-issued Git credential path remains.
+
+Receive-pack command-prefix parse rejections now emit a dedicated transport
+stage with a named failure reason, bytes consumed, request content framing,
+and at most the first 128 bytes hex-encoded. Successful upstream Git requests
+also emit an `upstream_completed` transport stage.

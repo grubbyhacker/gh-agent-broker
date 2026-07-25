@@ -3,8 +3,11 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"gh-agent-broker/internal/config"
@@ -38,6 +41,64 @@ func TestReceivePackBranch(t *testing.T) {
 
 	if got := receivePackBranch(body); got != "refs/heads/agent/a1/test" {
 		t.Fatalf("receivePackBranch() = %q", got)
+	}
+}
+
+func TestReadReceivePackCommandPrefixFailureReasons(t *testing.T) {
+	validUpdate := "0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/curator/test\n"
+	boundPayload := validUpdate + strings.Repeat(" ", 65531-len(validUpdate))
+	boundBody := make([]byte, 0, (4+len(boundPayload))*4+4)
+	for range 4 {
+		boundBody = append(boundBody, []byte("ffff")...)
+		boundBody = append(boundBody, boundPayload...)
+	}
+	boundBody = append(boundBody, []byte("ffff")...)
+	tooManyUpdates := make([]byte, 0, 65*(4+len(validUpdate)))
+	for range 65 {
+		tooManyUpdates = append(tooManyUpdates, pktLine(validUpdate)...)
+	}
+	type failureCase struct {
+		name   string
+		body   []byte
+		reason string
+	}
+	tests := make([]failureCase, 0, 9)
+	tests = append(tests,
+		failureCase{name: "short read", body: []byte("00"), reason: receivePackPrefixFailureShortRead},
+		failureCase{name: "bad pkt-line length", body: []byte("0003"), reason: receivePackPrefixFailureBadPktLineLength},
+		failureCase{name: "non-hex length", body: []byte("zzzz"), reason: receivePackPrefixFailureNonHexLength},
+		failureCase{name: "zero updates", body: []byte("0000"), reason: receivePackPrefixFailureZeroUpdates},
+		failureCase{name: "malformed SHA", body: append(pktLine("not-a-sha 1111111111111111111111111111111111111111 refs/heads/curator/test\n"), []byte("0000")...), reason: receivePackPrefixFailureMalformedSHA},
+		failureCase{name: "malformed ref name", body: append(pktLine("0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/tags/v1\n"), []byte("0000")...), reason: receivePackPrefixFailureMalformedRefName},
+		failureCase{name: "exceeded bound", body: boundBody, reason: receivePackPrefixFailureExceededBound},
+		failureCase{name: "malformed update", body: append(pktLine("only-two fields\n"), []byte("0000")...), reason: receivePackPrefixFailureMalformedUpdate},
+		failureCase{name: "too many updates", body: tooManyUpdates, reason: receivePackPrefixFailureTooManyUpdates},
+	)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := readReceivePackCommandPrefix(bytes.NewReader(tt.body))
+			if err == nil {
+				t.Fatal("readReceivePackCommandPrefix() error = nil")
+			}
+			var parseErr *receivePackPrefixParseError
+			if !errors.As(err, &parseErr) {
+				t.Fatalf("error = %T %v, want receivePackPrefixParseError", err, err)
+			}
+			if parseErr.reason != tt.reason {
+				t.Fatalf("reason = %q, want %q", parseErr.reason, tt.reason)
+			}
+		})
+	}
+}
+
+func TestReadReceivePackCommandPrefixTracksPartialRead(t *testing.T) {
+	prefix, _, err := readReceivePackCommandPrefix(bytes.NewReader([]byte("00")))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("error = %v, want unexpected EOF", err)
+	}
+	if got := len(prefix); got != 2 {
+		t.Fatalf("prefix bytes read = %d, want 2", got)
 	}
 }
 

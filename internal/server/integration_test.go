@@ -21,6 +21,7 @@ import (
 	"gh-agent-broker/internal/audit"
 	"gh-agent-broker/internal/config"
 	"gh-agent-broker/internal/githubapp"
+	"gh-agent-broker/internal/policy"
 )
 
 func TestFakeGitHubRESTIntegration(t *testing.T) {
@@ -511,6 +512,89 @@ func TestFakeGitSmartHTTPIntegration(t *testing.T) {
 
 	if !sawUploadPack || !sawReceivePack {
 		t.Fatalf("fake Git handlers were not all exercised: upload=%v receive=%v", sawUploadPack, sawReceivePack)
+	}
+}
+
+func TestCuratorReceivePackWithBasicAuthAllowsOpaquePushAndRecordsCompletion(t *testing.T) {
+	apiServer := fakeTokenServer(t)
+	defer apiServer.Close()
+	gitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/owner/repo.git/git-receive-pack" {
+			t.Fatalf("unexpected Git request: %s %s", r.Method, r.URL.Path)
+		}
+		if got := readBody(t, r); !strings.Contains(got, "refs/heads/curator/diagnostic-test") {
+			t.Fatalf("receive-pack body missing curator branch: %q", got)
+		}
+		writeTestBody(t, w, "receive-pack-ok")
+	}))
+	defer gitServer.Close()
+
+	broker := newTestBroker(t, apiServer.URL, gitServer.URL, config.Agent{
+		ID:             "curator",
+		Enabled:        true,
+		Secret:         "curator-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"git.receive-pack"},
+		BranchPatterns: []string{"^refs/heads/curator/.+$"},
+		GitReceivePack: config.GitReceivePackAllowOpaque,
+	})
+	body := append(pktLine("0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/curator/diagnostic-test\x00 report-status\n"), []byte("0000")...)
+	req := httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", bytes.NewReader(body))
+	req.SetBasicAuth("curator", "curator-secret")
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("receive-pack status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+
+	events := readBrokerAuditEvents(t, broker.cfg.Audit.Path)
+	ev := lastAuditEventForOperation(t, events, "repository_transport_stage")
+	if ev.Result != "upstream_completed" || ev.Decision != policy.DecisionAllow {
+		t.Fatalf("completion event = %+v", ev)
+	}
+}
+
+func TestReceivePackPrefixRejectionAuditsBoundedDiagnostics(t *testing.T) {
+	apiServer := fakeTokenServer(t)
+	defer apiServer.Close()
+	broker := newTestBroker(t, apiServer.URL, "https://github.invalid", config.Agent{
+		ID:             "curator",
+		Enabled:        true,
+		Secret:         "curator-secret",
+		Repositories:   []string{"owner/repo"},
+		Operations:     []string{"git.receive-pack"},
+		BranchPatterns: []string{"^refs/heads/curator/.+$"},
+		GitReceivePack: config.GitReceivePackAllowOpaque,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/git/owner/repo.git/git-receive-pack", bytes.NewReader([]byte("zzzz")))
+	req.SetBasicAuth("curator", "curator-secret")
+	req.ContentLength = 4
+	req.TransferEncoding = []string{"chunked"}
+	resp := httptest.NewRecorder()
+	broker.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("receive-pack status = %d, want %d", resp.Code, http.StatusBadRequest)
+	}
+
+	events := readBrokerAuditEvents(t, broker.cfg.Audit.Path)
+	ev := lastAuditEventForOperation(t, events, "repository_transport_stage")
+	if ev.Result != "receive_pack_command_prefix_rejected" {
+		t.Fatalf("rejection event = %+v", ev)
+	}
+	if got, want := ev.Extra["prefix_bytes_read"], float64(4); got != want {
+		t.Fatalf("prefix_bytes_read = %#v, want %#v", got, want)
+	}
+	if got, want := ev.Extra["parse_failure_reason"], receivePackPrefixFailureNonHexLength; got != want {
+		t.Fatalf("parse_failure_reason = %#v, want %#v", got, want)
+	}
+	if got, want := ev.Extra["content_length"], float64(4); got != want {
+		t.Fatalf("content_length = %#v, want %#v", got, want)
+	}
+	if got, want := ev.Extra["transfer_encoding"], "chunked"; got != want {
+		t.Fatalf("transfer_encoding = %#v, want %#v", got, want)
+	}
+	if got, want := ev.Extra["prefix_hex_head"], "7a7a7a7a"; got != want {
+		t.Fatalf("prefix_hex_head = %#v, want %#v", got, want)
 	}
 }
 
