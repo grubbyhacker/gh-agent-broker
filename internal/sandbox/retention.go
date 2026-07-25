@@ -10,10 +10,7 @@ import (
 	"time"
 )
 
-const (
-	defaultPruneMaxOutput = 200
-	minimumKeepNewest     = 20
-)
+const defaultPruneMaxOutput = 200
 
 const (
 	reasonNotDirectory = "not_a_directory"
@@ -112,9 +109,6 @@ func (p RetentionPolicy) maxAgeReached(at time.Time, now time.Time) bool {
 
 func (s *Service) PruneRuns(ctx context.Context, policy RetentionPolicy) (PruneReport, error) {
 	policy = policy.normalize()
-	if policy.KeepNewest < minimumKeepNewest {
-		policy.KeepNewest = minimumKeepNewest
-	}
 	report := PruneReport{
 		Timestamp:   time.Now().UTC(),
 		RunsDir:     s.cfg.RunsDir,
@@ -226,63 +220,55 @@ func (s *Service) PruneRuns(ctx context.Context, policy RetentionPolicy) (PruneR
 		report.Considered++
 	}
 
-	terminal := make([]*retentionCandidate, 0, len(candidates))
+	active := make([]*retentionCandidate, 0, len(candidates))
 	for i := range candidates {
-		if isTerminalStatus(candidates[i].Status) {
-			terminal = append(terminal, &candidates[i])
+		if candidates[i].Reason == reasonEligible {
+			active = append(active, &candidates[i])
 		}
 	}
 
-	sort.SliceStable(terminal, func(i, j int) bool {
-		if terminal[i].LastActivity.Equal(terminal[j].LastActivity) {
-			return terminal[i].RunID < terminal[j].RunID
+	sort.SliceStable(active, func(i, j int) bool {
+		if active[i].LastActivity.Equal(active[j].LastActivity) {
+			return active[i].RunID < active[j].RunID
 		}
-		return terminal[i].LastActivity.After(terminal[j].LastActivity)
+		return active[i].LastActivity.After(active[j].LastActivity)
 	})
 
-	for i := 0; i < policy.KeepNewest && i < len(terminal); i++ {
-		terminal[i].Keep = true
-		terminal[i].Reason = reasonKeepNewest
+	for i := 0; i < policy.KeepNewest && i < len(active); i++ {
+		active[i].Keep = true
+		active[i].Reason = reasonKeepNewest
 	}
 
-	deletable := make([]*retentionCandidate, 0, len(terminal))
-	for _, candidate := range terminal {
+	selected := make([]*retentionCandidate, 0, len(active))
+	for _, candidate := range active {
 		if candidate.Keep {
 			continue
 		}
-		deletable = append(deletable, candidate)
 		if !policy.maxAgeReached(candidate.LastActivity, now) {
 			candidate.Reason = reasonTooNew
 			continue
 		}
-		candidate.Delete = true
-		candidate.Reason = reasonDeleteAge
+		candidate.Reason = reasonEligible
+		selected = append(selected, candidate)
 	}
 
-	for _, candidate := range terminal {
+	report.BudgetBefore = 0
+	for _, candidate := range selected {
 		if candidate.sizeKnown {
 			report.BudgetBefore += candidate.SizeBytes
 		}
 	}
-	report.BudgetAfter = report.BudgetBefore
-	for _, candidate := range deletable {
-		if candidate.Delete && candidate.sizeKnown {
-			report.BudgetAfter -= candidate.SizeBytes
-		}
-	}
 
-	if policy.MaxBytes > 0 && report.BudgetAfter > policy.MaxBytes {
-		sort.SliceStable(deletable, func(i, j int) bool {
-			if deletable[i].LastActivity.Equal(deletable[j].LastActivity) {
-				return deletable[i].RunID < deletable[j].RunID
+	report.BudgetAfter = report.BudgetBefore
+	if policy.MaxBytes > 0 && report.BudgetBefore > policy.MaxBytes {
+		sort.SliceStable(selected, func(i, j int) bool {
+			if selected[i].LastActivity.Equal(selected[j].LastActivity) {
+				return selected[i].RunID < selected[j].RunID
 			}
-			return deletable[i].LastActivity.Before(deletable[j].LastActivity)
+			return selected[i].LastActivity.Before(selected[j].LastActivity)
 		})
 
-		for _, candidate := range deletable {
-			if candidate.Delete {
-				continue
-			}
+		for _, candidate := range selected {
 			if report.BudgetAfter <= policy.MaxBytes {
 				candidate.Reason = reasonWithinBudget
 				continue
@@ -296,9 +282,14 @@ func (s *Service) PruneRuns(ctx context.Context, policy RetentionPolicy) (PruneR
 			candidate.Reason = reasonDeleteBudget
 			report.BudgetAfter -= candidate.SizeBytes
 		}
+	} else {
+		for _, candidate := range selected {
+			candidate.Delete = true
+			candidate.Reason = reasonDeleteAge
+		}
 	}
 
-	for _, candidate := range deletable {
+	for _, candidate := range selected {
 		if !candidate.Delete {
 			continue
 		}

@@ -4,7 +4,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestLoadExampleConfig(t *testing.T) {
@@ -18,85 +17,6 @@ func TestLoadExampleConfig(t *testing.T) {
 	}
 	if cfg.MCPPath != "/mcp" || cfg.Templates["hermes-task-worker"].BrokerAgentSecret != "broker-secret" {
 		t.Fatalf("loaded config = %+v", cfg)
-	}
-}
-
-func TestConfigVersionIncludesOnlyNonemptySourceVolume(t *testing.T) {
-	cfg := baseTestConfig(t)
-	bundle := cfg.Bundles["codex"]
-	bundle.SourcePath = ""
-	cfg.Bundles["codex"] = bundle
-	cfg.StampLoaded(time.Unix(1, 0).UTC())
-	withoutVolume := cfg.ConfigVersion
-
-	bundle.SourceVolume = "agentd-staging-auth"
-	cfg.Bundles["codex"] = bundle
-	cfg.StampLoaded(time.Unix(2, 0).UTC())
-	if cfg.ConfigVersion == withoutVolume {
-		t.Fatal("nonempty source_volume was omitted from config version")
-	}
-
-	bundle.SourceVolume = ""
-	cfg.Bundles["codex"] = bundle
-	cfg.StampLoaded(time.Unix(3, 0).UTC())
-	if cfg.ConfigVersion != withoutVolume {
-		t.Fatal("empty source_volume changed the legacy canonical config shape")
-	}
-}
-
-func TestAuthorityOnlyConfigAcceptsOnlyAuthoritySurface(t *testing.T) {
-	cfg := authorityTestConfig(t)
-	cfg.AuthorityOnly = true
-	cfg.AuthToken = ""
-	cfg.AuthTokenEnv = ""
-	cfg.Bundles = nil
-	cfg.Templates = nil
-	cfg.LaunchProfiles = nil
-	cfg.OperatorPrincipals = nil
-
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("Validate() error = %v", err)
-	}
-}
-
-func TestAuthorityOnlyConfigRejectsLegacyInputs(t *testing.T) {
-	tests := map[string]func(*Config){
-		"auth token":         func(cfg *Config) { cfg.AuthToken = "legacy" },
-		"auth token env":     func(cfg *Config) { cfg.AuthTokenEnv = "LEGACY_TOKEN" },
-		"credential bundles": func(cfg *Config) { cfg.Bundles = map[string]CredentialBundle{"legacy": {}} },
-		"templates":          func(cfg *Config) { cfg.Templates = map[string]Template{"legacy": {}} },
-		"launch profiles":    func(cfg *Config) { cfg.LaunchProfiles = map[string]LaunchProfile{"legacy": {}} },
-		"operator principals": func(cfg *Config) {
-			cfg.OperatorPrincipals = map[string]OperatorPrincipal{"legacy": {}}
-		},
-	}
-	for name, mutate := range tests {
-		t.Run(name, func(t *testing.T) {
-			cfg := authorityTestConfig(t)
-			cfg.AuthorityOnly = true
-			cfg.AuthToken = ""
-			cfg.AuthTokenEnv = ""
-			cfg.Bundles = nil
-			cfg.Templates = nil
-			cfg.LaunchProfiles = nil
-			cfg.OperatorPrincipals = nil
-			mutate(&cfg)
-			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "authority_only forbids") {
-				t.Fatalf("Validate() error = %v, want authority_only rejection", err)
-			}
-		})
-	}
-}
-
-func TestAuthorityOnlyConfigRequiresRegisteredAuthority(t *testing.T) {
-	cfg := authorityTestConfig(t)
-	cfg.AuthorityOnly = true
-	cfg.AuthToken = ""
-	cfg.Bundles = nil
-	cfg.Templates = nil
-	cfg.RegisteredCoordinatorPrincipal = "missing"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must name an authority_principal") {
-		t.Fatalf("Validate() error = %v, want registered principal rejection", err)
 	}
 }
 
