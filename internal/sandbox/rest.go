@@ -3,7 +3,6 @@ package sandbox
 import (
 	"bytes"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -563,7 +562,7 @@ func secureTokenEqual(got, want string) bool {
 	}
 	gotSum := sha256.Sum256([]byte(got))
 	wantSum := sha256.Sum256([]byte(want))
-	return subtle.ConstantTimeCompare(gotSum[:], wantSum[:]) == 1
+	return gotSum == wantSum
 }
 
 func writeRESTError(w http.ResponseWriter, status int, message string) {

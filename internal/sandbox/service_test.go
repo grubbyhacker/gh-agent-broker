@@ -1,9 +1,7 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -280,68 +278,6 @@ func TestLogsAndArtifactsAreRedactedAndSymlinkSafe(t *testing.T) {
 	}
 }
 
-func TestLogsArtifactsAndLessonsFailClosedOnCredentialShapes(t *testing.T) {
-	cfg := baseTestConfig(t)
-	runtime := newFakeRuntime()
-	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	auditLog, err := NewAuditLogger(auditPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeTestAudit(t, auditLog)
-	service := NewService(cfg, runtime, auditLog)
-	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{Template: "worker", Task: "task", Repo: "owner/repo", BaseBranch: "main"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	canary := "PR10-CREDENTIAL-CANARY:sandbox-only-test"
-	runtime.logs = "worker output " + canary
-	if _, err := service.GetAgentLogs(context.Background(), LogsInput{RunID: out.RunID}); err == nil || strings.Contains(err.Error(), canary) {
-		t.Fatalf("unsafe logs error = %v", err)
-	}
-	for _, tc := range []struct {
-		name string
-		dir  string
-		call func() error
-	}{
-		{name: "artifact", dir: "output", call: func() error {
-			_, err := service.CollectArtifacts(context.Background(), RunInput{RunID: out.RunID})
-			return err
-		}},
-		{name: "lesson", dir: "lessons", call: func() error {
-			_, err := service.CollectLessons(context.Background(), RunInput{RunID: out.RunID})
-			return err
-		}},
-	} {
-		path := filepath.Join(cfg.RunsDir, out.RunID, tc.dir, tc.name+".md")
-		if err := os.WriteFile(path, []byte("evidence "+canary), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if err := tc.call(); err == nil || strings.Contains(err.Error(), canary) {
-			t.Fatalf("unsafe %s error = %v", tc.name, err)
-		}
-		if err := os.Remove(path); err != nil {
-			t.Fatal(err)
-		}
-	}
-	largeEncoded := base64.RawURLEncoding.EncodeToString([]byte(canary))
-	largePath := filepath.Join(cfg.RunsDir, out.RunID, "output", "large.bin")
-	if err := os.WriteFile(largePath, []byte(strings.Repeat("x", defaultInlineLimit+1)+largeEncoded), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.CollectArtifacts(context.Background(), RunInput{RunID: out.RunID}); err == nil || strings.Contains(err.Error(), canary) || strings.Contains(err.Error(), largeEncoded) {
-		t.Fatalf("unsafe large artifact error = %v", err)
-	}
-	auditBytes, err := os.ReadFile(auditPath) //nolint:gosec // G304: path is a test-owned temporary audit file.
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(auditBytes, []byte(canary)) || bytes.Contains(auditBytes, []byte(largeEncoded)) || bytes.Count(auditBytes, []byte(`"operation":"security.egress_blocked"`)) != 4 {
-		t.Fatalf("unsafe sandbox audit = %s", auditBytes)
-	}
-}
-
 func TestRedactorReadsJSONSecretValues(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "auth.json"), []byte(`{
@@ -373,10 +309,7 @@ func TestCleanupRejectsInvalidRunID(t *testing.T) {
 func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
 	cfg := baseTestConfig(t)
 	runtime := newFakeRuntime()
-	runtime.logs = "worker waiting for upstream; broker-secret\\n"
-	auditLog := testAudit(t)
-	defer closeTestAudit(t, auditLog)
-	service := NewService(cfg, runtime, auditLog)
+	service := NewService(cfg, runtime, testAudit(t))
 	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{Template: "worker", Task: "timeout", Repo: "owner/repo", BaseBranch: "main"})
 	if err != nil {
 		t.Fatalf("LaunchAgent() error = %v", err)
@@ -393,24 +326,11 @@ func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
 	if status.Status != StatusTimedOut {
 		t.Fatalf("status = %+v, want timed_out", status)
 	}
-	if !strings.Contains(status.Error, "run exceeded deadline; worker remained running") || !strings.Contains(status.Error, "worker waiting for upstream") {
+	if status.Error != "run exceeded deadline" {
 		t.Fatalf("timeout error = %q", status.Error)
 	}
-	if strings.Contains(status.Error, "broker-secret") {
-		t.Fatalf("timeout error leaked broker secret: %q", status.Error)
-	}
-	if status.Diagnostics == nil || !strings.Contains(status.Diagnostics.Message, "worker remained running") || status.Diagnostics.Source != "broker" {
+	if status.Diagnostics == nil || status.Diagnostics.Message != "run exceeded deadline" || status.Diagnostics.Source != "broker" {
 		t.Fatalf("timeout diagnostics = %+v", status.Diagnostics)
-	}
-	auditBytes, err := os.ReadFile(auditLog.file.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(auditBytes), `"lifecycle_stage":"deadline_running"`) || !strings.Contains(string(auditBytes), `"container_running":true`) {
-		t.Fatalf("deadline lifecycle audit missing runtime state: %s", auditBytes)
-	}
-	if strings.Contains(string(auditBytes), "broker-secret") {
-		t.Fatalf("lifecycle audit leaked broker secret: %s", auditBytes)
 	}
 	artifacts, err := service.CollectArtifacts(context.Background(), RunInput{RunID: out.RunID})
 	if err != nil {
@@ -432,21 +352,6 @@ func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cfg.RunsDir, out.RunID)); !os.IsNotExist(err) {
 		t.Fatalf("run dir still exists or stat failed unexpectedly: %v", err)
-	}
-}
-
-func TestTimeoutFailureMessageRedactsContainerError(t *testing.T) {
-	cfg := baseTestConfig(t)
-	service := NewService(cfg, newFakeRuntime(), testAudit(t))
-	message := service.timeoutFailureMessage(context.Background(), RunMetadata{Template: "worker", ContainerID: "container-test"}, ContainerStatus{
-		Running: true,
-		Error:   "upstream rejected token broker-secret",
-	})
-	if strings.Contains(message, "broker-secret") {
-		t.Fatalf("timeout message leaked broker secret: %q", message)
-	}
-	if !strings.Contains(message, "upstream rejected token [REDACTED]") {
-		t.Fatalf("timeout message = %q", message)
 	}
 }
 

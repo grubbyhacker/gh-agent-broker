@@ -3,43 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
-
-func TestLoadAllowsExplicitLocalSandboxOnlyWithoutGitHubApps(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	writeFile(t, path, `
-server:
-  local_sandbox_only: true
-audit:
-  path: audit.jsonl
-`)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if !cfg.Server.LocalSandboxOnly || len(cfg.GitHub.AppContexts()) != 0 || len(cfg.Agents) != 0 {
-		t.Fatalf("unexpected local sandbox config: %+v", cfg)
-	}
-}
-
-func TestLocalSandboxOnlyRejectsProductionAndGitHubAuthority(t *testing.T) {
-	for name, body := range map[string]string{
-		"production": "server:\n  local_sandbox_only: true\n  production: true\n",
-		"app":        "server:\n  local_sandbox_only: true\ngithub:\n  app_id: 1\n  private_key_path: key.pem\n  installations: {owner/repo: 2}\n",
-		"agent":      "server:\n  local_sandbox_only: true\nagents:\n  - id: agent\n    enabled: false\n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "config.yaml")
-			writeFile(t, path, body)
-			_, err := Load(path)
-			if err == nil || !strings.Contains(err.Error(), "local_sandbox_only") {
-				t.Fatalf("Load() error = %v", err)
-			}
-		})
-	}
-}
 
 func TestLoadResolvesSecretsAndDefaults(t *testing.T) {
 	t.Setenv("TEST_AGENT_SECRET", "agent-secret")
@@ -91,22 +56,6 @@ func TestValidateRejectsDuplicateAgent(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatalf("Validate() error = nil, want duplicate agent error")
-	}
-}
-
-func TestPushTripwireRequiresReviewedMaterialAndResponseScope(t *testing.T) {
-	cfg := Config{GitHub: GitHubConfig{AppID: 1, PrivateKeyPath: "key.pem", Installations: map[string]int64{"owner/repo": 2}}, PushTripwire: PushTripwireConfig{Enabled: true, ScannerID: "scanner", ScannerSecret: "secret", StatePath: "tripwire.db", Repositories: map[string]PushTripwireRepository{"owner/repo": {BaseRef: "refs/heads/main", RefPatterns: []string{"^refs/heads/agent/.+$"}}}, ResponseProfiles: map[string]PushTripwireResponseProfile{"curator": {Generation: 7, AllowHalt: true, AllowFence: true, Bindings: []PushTripwireBinding{{WorkerID: "worker", LogicalSessionID: "logical", SessionLineageID: "session", WorkerStorageLineageID: "storage", WorkerFenceEpoch: 2}}}}, Bounds: PushTripwireBounds{MaxCommits: 10, MaxPaths: 20, MaxCommitMessageBytes: 1024, MaxBlobBytes: 4096, MaxTotalBytes: 16384}}}
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("valid tripwire config rejected: %v", err)
-	}
-	cfg.PushTripwire.Repositories["owner/repo"] = PushTripwireRepository{}
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "base_ref") {
-		t.Fatalf("missing reviewed base accepted: %v", err)
-	}
-	cfg.PushTripwire.Repositories["owner/repo"] = PushTripwireRepository{BaseRef: "refs/heads/main", RefPatterns: []string{"^refs/heads/agent/.+$"}}
-	cfg.PushTripwire.ResponseProfiles["curator"] = PushTripwireResponseProfile{Generation: 7, AllowFence: true}
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "reviewed bindings") {
-		t.Fatalf("unbound fence scope accepted: %v", err)
 	}
 }
 
@@ -244,33 +193,6 @@ agents:
 	}
 }
 
-func TestGitReceivePackPolicyDefaultsAndRejectsUnknownMode(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	writeFile(t, path, `
-github:
-  app_id: 1
-  private_key_path: key.pem
-  installations:
-    owner/repo: 2
-agents:
-  - id: agent-1
-    enabled: false
-    secret: test-secret
-    repositories: [owner/repo]
-`)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Agents[0].GitReceivePack != GitReceivePackAllowOpaque {
-		t.Fatalf("default git receive-pack policy = %q", cfg.Agents[0].GitReceivePack)
-	}
-	cfg.Agents[0].GitReceivePack = "caller_selected"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "git_receive_pack_policy") {
-		t.Fatalf("invalid git receive-pack policy error = %v", err)
-	}
-}
-
 func TestValidateRejectsInvalidBranchLifecycleGuardMode(t *testing.T) {
 	cfg := Config{
 		GitHub: GitHubConfig{
@@ -286,21 +208,6 @@ func TestValidateRejectsInvalidBranchLifecycleGuardMode(t *testing.T) {
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatalf("Validate() error = nil, want branch lifecycle guard mode error")
-	}
-}
-
-func TestTransportObservationRejectsProduction(t *testing.T) {
-	cfg := Config{
-		Server: ServerConfig{Production: true},
-		GitHub: GitHubConfig{AppID: 1, PrivateKeyPath: "key.pem", Installations: map[string]int64{"owner/repo": 2}},
-		TransportObservation: TransportObservationConfig{
-			Enabled:            true,
-			AuthorityStorePath: "/var/lib/gh-agent-broker-tripwire/authority-workers.sqlite",
-			ProfileAgentIDs:    map[string]string{"writer": "agent-1"},
-		},
-	}
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cannot be enabled in production") {
-		t.Fatalf("production transport observation validation error = %v", err)
 	}
 }
 

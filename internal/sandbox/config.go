@@ -13,8 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"gh-agent-broker/internal/repositoryroutepolicy"
-
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,35 +26,28 @@ const (
 )
 
 type Config struct {
-	AuthorityOnly                  bool                          `yaml:"authority_only"`
-	Listen                         string                        `yaml:"listen"`
-	MCPPath                        string                        `yaml:"mcp_path"`
-	AuthToken                      string                        `yaml:"auth_token"`
-	AuthTokenEnv                   string                        `yaml:"auth_token_env"`
-	RunsDir                        string                        `yaml:"runs_dir"`
-	LaunchIntentStore              string                        `yaml:"launch_intent_store_path"`
-	AuthorityStore                 string                        `yaml:"authority_worker_store_path"`
-	BrokerURL                      string                        `yaml:"broker_url"`
-	Production                     bool                          `yaml:"production"`
-	Repositories                   []string                      `yaml:"repositories"`
-	RepositoryRoutePolicyPath      string                        `yaml:"repository_route_policy_path"`
-	RepositoryRoutePolicyDigest    string                        `yaml:"-"`
-	Networks                       map[string]NetworkPolicy      `yaml:"network_policies"`
-	Bundles                        map[string]CredentialBundle   `yaml:"credential_bundles"`
-	Templates                      map[string]Template           `yaml:"templates"`
-	LaunchProfiles                 map[string]LaunchProfile      `yaml:"launch_profiles"`
-	AuthorityProfiles              map[string]AuthorityProfile   `yaml:"authority_profiles"`
-	AuthorityPrincipals            map[string]AuthorityPrincipal `yaml:"authority_principals"`
-	RegisteredCoordinatorPrincipal string                        `yaml:"registered_coordinator_principal"`
-	OperatorPrincipals             map[string]OperatorPrincipal  `yaml:"operator_principals"`
-	Audit                          SandboxAuditConfig            `yaml:"audit"`
-	MaxTaskBytes                   int                           `yaml:"max_task_bytes"`
-	MaxParameterBytes              int                           `yaml:"max_parameter_bytes"`
-	LogByteLimit                   int                           `yaml:"log_byte_limit"`
-	StopGrace                      Duration                      `yaml:"stop_grace"`
-	ResolvedPaths                  map[string]CredentialBundle   `yaml:"-"`
-	ConfigLoadedAt                 time.Time                     `yaml:"-"`
-	ConfigVersion                  string                        `yaml:"-"`
+	Listen             string                       `yaml:"listen"`
+	MCPPath            string                       `yaml:"mcp_path"`
+	AuthToken          string                       `yaml:"auth_token"`
+	AuthTokenEnv       string                       `yaml:"auth_token_env"`
+	RunsDir            string                       `yaml:"runs_dir"`
+	LaunchIntentStore  string                       `yaml:"launch_intent_store_path"`
+	BrokerURL          string                       `yaml:"broker_url"`
+	Production         bool                         `yaml:"production"`
+	Repositories       []string                     `yaml:"repositories"`
+	Networks           map[string]NetworkPolicy     `yaml:"network_policies"`
+	Bundles            map[string]CredentialBundle  `yaml:"credential_bundles"`
+	Templates          map[string]Template          `yaml:"templates"`
+	LaunchProfiles     map[string]LaunchProfile     `yaml:"launch_profiles"`
+	OperatorPrincipals map[string]OperatorPrincipal `yaml:"operator_principals"`
+	Audit              SandboxAuditConfig           `yaml:"audit"`
+	MaxTaskBytes       int                          `yaml:"max_task_bytes"`
+	MaxParameterBytes  int                          `yaml:"max_parameter_bytes"`
+	LogByteLimit       int                          `yaml:"log_byte_limit"`
+	StopGrace          Duration                     `yaml:"stop_grace"`
+	ResolvedPaths      map[string]CredentialBundle  `yaml:"-"`
+	ConfigLoadedAt     time.Time                    `yaml:"-"`
+	ConfigVersion      string                       `yaml:"-"`
 }
 
 type SandboxAuditConfig struct {
@@ -69,14 +60,12 @@ type NetworkPolicy struct {
 }
 
 type CredentialBundle struct {
-	SourcePath               string   `yaml:"source_path"`
-	SourceVolume             string   `yaml:"source_volume"`
-	MountPath                string   `yaml:"mount_path"`
-	ReadOnly                 bool     `yaml:"readonly"`
-	AllowedTemplates         []string `yaml:"allowed_templates"`
-	AllowedAuthorityProfiles []string `yaml:"allowed_authority_profiles"`
-	SecretFiles              []string `yaml:"secret_files"`
-	RedactFiles              []string `yaml:"redact_files"`
+	SourcePath       string   `yaml:"source_path"`
+	MountPath        string   `yaml:"mount_path"`
+	ReadOnly         bool     `yaml:"readonly"`
+	AllowedTemplates []string `yaml:"allowed_templates"`
+	SecretFiles      []string `yaml:"secret_files"`
+	RedactFiles      []string `yaml:"redact_files"`
 }
 
 type Template struct {
@@ -178,17 +167,6 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.ApplyDefaults()
-	if cfg.RepositoryRoutePolicyPath != "" {
-		policy, err := repositoryroutepolicy.Load(cfg.RepositoryRoutePolicyPath)
-		if err != nil {
-			return Config{}, fmt.Errorf("load repository route policy: %w", err)
-		}
-		cfg.RepositoryRoutePolicyDigest = policy.Digest
-		for name, profile := range cfg.AuthorityProfiles {
-			profile.RepositoryRoutePolicyDigest = policy.Digest
-			cfg.AuthorityProfiles[name] = profile
-		}
-	}
 	cfg.ResolveSecrets()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -214,9 +192,6 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.LaunchIntentStore == "" {
 		c.LaunchIntentStore = filepath.Join(c.RunsDir, "launch-intents.sqlite")
-	}
-	if c.AuthorityStore == "" {
-		c.AuthorityStore = filepath.Join(c.RunsDir, "authority-workers.sqlite")
 	}
 	if c.MaxTaskBytes == 0 {
 		c.MaxTaskBytes = defaultMaxTaskBytes
@@ -248,44 +223,11 @@ func (c *Config) ResolveSecrets() {
 			c.OperatorPrincipals[name] = principal
 		}
 	}
-	for name, principal := range c.AuthorityPrincipals {
-		if principal.Token == "" && principal.TokenEnv != "" {
-			principal.Token = os.Getenv(principal.TokenEnv)
-			c.AuthorityPrincipals[name] = principal
-		}
-	}
 }
 
 func (c *Config) Validate() error {
 	var errs []string
-	if c.AuthorityOnly {
-		if strings.TrimSpace(c.AuthToken) != "" || strings.TrimSpace(c.AuthTokenEnv) != "" {
-			errs = append(errs, "authority_only forbids auth_token and auth_token_env")
-		}
-		if len(c.Bundles) != 0 {
-			errs = append(errs, "authority_only forbids credential_bundles")
-		}
-		if len(c.Templates) != 0 {
-			errs = append(errs, "authority_only forbids templates")
-		}
-		if len(c.LaunchProfiles) != 0 {
-			errs = append(errs, "authority_only forbids launch_profiles")
-		}
-		if len(c.OperatorPrincipals) != 0 {
-			errs = append(errs, "authority_only forbids operator_principals")
-		}
-		if len(c.AuthorityProfiles) == 0 {
-			errs = append(errs, "authority_only requires authority_profiles")
-		}
-		if len(c.AuthorityPrincipals) == 0 {
-			errs = append(errs, "authority_only requires authority_principals")
-		}
-		if strings.TrimSpace(c.RegisteredCoordinatorPrincipal) == "" {
-			errs = append(errs, "authority_only requires registered_coordinator_principal")
-		} else if _, ok := c.AuthorityPrincipals[c.RegisteredCoordinatorPrincipal]; !ok {
-			errs = append(errs, "registered_coordinator_principal must name an authority_principal")
-		}
-	} else if strings.TrimSpace(c.AuthToken) == "" {
+	if strings.TrimSpace(c.AuthToken) == "" {
 		errs = append(errs, "auth_token or auth_token_env is required")
 	}
 	if strings.TrimSpace(c.BrokerURL) == "" {
@@ -296,9 +238,6 @@ func (c *Config) Validate() error {
 	}
 	if c.LaunchIntentStore != "" && !filepath.IsAbs(c.LaunchIntentStore) {
 		errs = append(errs, "launch_intent_store_path must be an absolute path")
-	}
-	if c.AuthorityStore != "" && !filepath.IsAbs(c.AuthorityStore) {
-		errs = append(errs, "authority_worker_store_path must be an absolute path")
 	}
 	if c.MaxTaskBytes < 1 {
 		errs = append(errs, "max_task_bytes must be positive")
@@ -335,9 +274,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	for name, bundle := range c.Bundles {
-		errs = append(errs, c.validateBundle(name, bundle)...)
+		errs = append(errs, validateBundle(name, bundle)...)
 	}
-	if !c.AuthorityOnly && len(c.Templates) == 0 {
+	if len(c.Templates) == 0 {
 		errs = append(errs, "templates must not be empty")
 	}
 	for name, tmpl := range c.Templates {
@@ -345,12 +284,6 @@ func (c *Config) Validate() error {
 	}
 	for name, profile := range c.LaunchProfiles {
 		errs = append(errs, c.validateLaunchProfile(name, profile)...)
-	}
-	for name, profile := range c.AuthorityProfiles {
-		errs = append(errs, c.validateAuthorityProfile(name, profile)...)
-	}
-	for name, principal := range c.AuthorityPrincipals {
-		errs = append(errs, c.validateAuthorityPrincipal(name, principal)...)
 	}
 	for name, principal := range c.OperatorPrincipals {
 		errs = append(errs, c.validateOperatorPrincipal(name, principal)...)
@@ -361,21 +294,13 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func (c Config) validateBundle(name string, bundle CredentialBundle) []string {
+func validateBundle(name string, bundle CredentialBundle) []string {
 	var errs []string
 	if name == "" {
 		errs = append(errs, "credential bundle name is required")
 	}
-	hasPath := strings.TrimSpace(bundle.SourcePath) != ""
-	hasVolume := strings.TrimSpace(bundle.SourceVolume) != ""
-	if hasPath == hasVolume {
-		errs = append(errs, fmt.Sprintf("credential bundle %q must set exactly one of source_path or source_volume", name))
-	}
-	if hasPath && !filepath.IsAbs(bundle.SourcePath) {
+	if !filepath.IsAbs(bundle.SourcePath) {
 		errs = append(errs, fmt.Sprintf("credential bundle %q source_path must be absolute", name))
-	}
-	if hasVolume && !safeDockerVolumeName(bundle.SourceVolume) {
-		errs = append(errs, fmt.Sprintf("credential bundle %q source_volume is unsafe", name))
 	}
 	if !filepath.IsAbs(bundle.MountPath) {
 		errs = append(errs, fmt.Sprintf("credential bundle %q mount_path must be absolute", name))
@@ -383,37 +308,12 @@ func (c Config) validateBundle(name string, bundle CredentialBundle) []string {
 	if !bundle.ReadOnly {
 		errs = append(errs, fmt.Sprintf("credential bundle %q readonly must be true", name))
 	}
-	if hasPath && (filepath.Clean(bundle.SourcePath) == "/var/run/docker.sock" || strings.HasPrefix(filepath.Clean(bundle.SourcePath), "/var/run/docker.sock/")) {
+	if filepath.Clean(bundle.SourcePath) == "/var/run/docker.sock" || strings.HasPrefix(filepath.Clean(bundle.SourcePath), "/var/run/docker.sock/") {
 		errs = append(errs, fmt.Sprintf("credential bundle %q cannot mount Docker socket", name))
 	}
 	if bundle.MountPath == "/" || strings.HasPrefix(bundle.MountPath, "/input") || strings.HasPrefix(bundle.MountPath, "/work") ||
 		strings.HasPrefix(bundle.MountPath, "/output") || strings.HasPrefix(bundle.MountPath, "/lessons") {
 		errs = append(errs, fmt.Sprintf("credential bundle %q mount_path conflicts with sandbox paths", name))
-	}
-	if hasVolume {
-		if filepath.Clean(bundle.MountPath) != authorityCodexHomeMountPath {
-			errs = append(errs, fmt.Sprintf("credential bundle %q source_volume must mount at %q", name, authorityCodexHomeMountPath))
-		}
-		if len(bundle.AllowedTemplates) != 0 {
-			errs = append(errs, fmt.Sprintf("credential bundle %q source_volume cannot allow sandbox templates", name))
-		}
-		if len(bundle.AllowedAuthorityProfiles) == 0 {
-			errs = append(errs, fmt.Sprintf("credential bundle %q source_volume must allow an authority profile", name))
-		}
-	}
-	for _, profile := range bundle.AllowedAuthorityProfiles {
-		if _, ok := c.AuthorityProfiles[profile]; !ok {
-			errs = append(errs, fmt.Sprintf("credential bundle %q allows unknown authority profile %q", name, profile))
-		}
-	}
-	if hasVolume {
-		for profileName, profile := range c.AuthorityProfiles {
-			if bundle.SourceVolume == profile.Storage.SessionVolume ||
-				bundle.SourceVolume == profile.Storage.CheckpointVolume ||
-				bundle.SourceVolume == profile.Storage.EvidenceVolume {
-				errs = append(errs, fmt.Sprintf("credential bundle %q source_volume conflicts with authority profile %q managed storage volumes", name, profileName))
-			}
-		}
 	}
 	for _, p := range append(bundle.SecretFiles, bundle.RedactFiles...) {
 		if !safeRelativePath(p) {
@@ -421,10 +321,6 @@ func (c Config) validateBundle(name string, bundle CredentialBundle) []string {
 		}
 	}
 	return errs
-}
-
-func safeDockerVolumeName(value string) bool {
-	return len(value) <= 80 && regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]+$`).MatchString(value)
 }
 
 func (c Config) validateTemplate(name string, tmpl Template) []string {
@@ -811,22 +707,6 @@ func safeParameterName(name string) bool {
 }
 
 func (c Config) versionDigest() string {
-	bundles := make(map[string]any, len(c.Bundles))
-	for name, bundle := range c.Bundles {
-		entry := map[string]any{
-			"SourcePath": bundle.SourcePath, "MountPath": bundle.MountPath, "ReadOnly": bundle.ReadOnly,
-			"AllowedTemplates": bundle.AllowedTemplates, "SecretFiles": bundle.SecretFiles, "RedactFiles": bundle.RedactFiles,
-		}
-		// Preserve the pre-source_volume canonical shape for legacy configs so
-		// startup reconciliation accepts their nonterminal launch intents.
-		if bundle.SourceVolume != "" {
-			entry["SourceVolume"] = bundle.SourceVolume
-		}
-		if len(bundle.AllowedAuthorityProfiles) > 0 {
-			entry["AllowedAuthorityProfiles"] = bundle.AllowedAuthorityProfiles
-		}
-		bundles[name] = entry
-	}
 	templates := make(map[string]any, len(c.Templates))
 	for name, tmpl := range c.Templates {
 		templates[name] = map[string]any{
@@ -856,29 +736,23 @@ func (c Config) versionDigest() string {
 		}
 	}
 	view := map[string]any{
-		"listen":               c.Listen,
-		"mcp_path":             c.MCPPath,
-		"auth_token_env":       c.AuthTokenEnv,
-		"runs_dir":             c.RunsDir,
-		"broker_url":           c.BrokerURL,
-		"production":           c.Production,
-		"repositories":         c.Repositories,
-		"network_policies":     c.Networks,
-		"credential_bundles":   bundles,
-		"templates":            templates,
-		"launch_profiles":      c.LaunchProfiles,
-		"authority_profiles":   c.AuthorityProfiles,
-		"authority_principals": c.AuthorityPrincipals,
-		"operator_principals":  principals,
-		"audit":                c.Audit,
-		"max_task_bytes":       c.MaxTaskBytes,
-		"max_parameter_bytes":  c.MaxParameterBytes,
-		"log_byte_limit":       c.LogByteLimit,
-		"stop_grace":           c.StopGrace,
-	}
-	if c.AuthorityOnly {
-		view["authority_only"] = true
-		view["registered_coordinator_principal"] = c.RegisteredCoordinatorPrincipal
+		"listen":              c.Listen,
+		"mcp_path":            c.MCPPath,
+		"auth_token_env":      c.AuthTokenEnv,
+		"runs_dir":            c.RunsDir,
+		"broker_url":          c.BrokerURL,
+		"production":          c.Production,
+		"repositories":        c.Repositories,
+		"network_policies":    c.Networks,
+		"credential_bundles":  c.Bundles,
+		"templates":           templates,
+		"launch_profiles":     c.LaunchProfiles,
+		"operator_principals": principals,
+		"audit":               c.Audit,
+		"max_task_bytes":      c.MaxTaskBytes,
+		"max_parameter_bytes": c.MaxParameterBytes,
+		"log_byte_limit":      c.LogByteLimit,
+		"stop_grace":          c.StopGrace,
 	}
 	b, err := json.Marshal(view)
 	if err != nil {

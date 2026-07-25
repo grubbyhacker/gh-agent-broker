@@ -8,30 +8,17 @@ import (
 	"regexp"
 	"strings"
 
-	"gh-agent-broker/internal/repositoryroutepolicy"
-
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Server                    ServerConfig                  `yaml:"server"`
-	Audit                     AuditConfig                   `yaml:"audit"`
-	GitHub                    GitHubConfig                  `yaml:"github"`
-	MutationLimits            MutationLimitsConfig          `yaml:"mutation_limits"`
-	Idempotency               IdempotencyConfig             `yaml:"idempotency"`
-	PushTripwire              PushTripwireConfig            `yaml:"push_tripwire"`
-	TransportObservation      TransportObservationConfig    `yaml:"transport_observation"`
-	Agents                    []Agent                       `yaml:"agents"`
-	RepositoryRoutePolicyPath string                        `yaml:"repository_route_policy_path"`
-	RepositoryRoutePolicy     *repositoryroutepolicy.Policy `yaml:"-"`
-}
-
-// TransportObservationConfig is staging-only. Profiles map the reviewed
-// authority profile name to its broker agent ID; requests cannot supply either.
-type TransportObservationConfig struct {
-	Enabled            bool              `yaml:"enabled"`
-	AuthorityStorePath string            `yaml:"authority_store_path"`
-	ProfileAgentIDs    map[string]string `yaml:"profile_agent_ids"`
+	Server         ServerConfig         `yaml:"server"`
+	Audit          AuditConfig          `yaml:"audit"`
+	GitHub         GitHubConfig         `yaml:"github"`
+	MutationLimits MutationLimitsConfig `yaml:"mutation_limits"`
+	Idempotency    IdempotencyConfig    `yaml:"idempotency"`
+	PushTripwire   PushTripwireConfig   `yaml:"push_tripwire"`
+	Agents         []Agent              `yaml:"agents"`
 }
 
 type PushTripwireConfig struct {
@@ -170,13 +157,6 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	cfg.applyDefaults()
-	if cfg.RepositoryRoutePolicyPath != "" {
-		policy, err := repositoryroutepolicy.Load(cfg.RepositoryRoutePolicyPath)
-		if err != nil {
-			return nil, fmt.Errorf("load repository route policy: %w", err)
-		}
-		cfg.RepositoryRoutePolicy = policy
-	}
 	if err := cfg.resolveSecrets(); err != nil {
 		return nil, err
 	}
@@ -321,17 +301,6 @@ func (c *Config) Validate() error {
 					errs = append(errs, fmt.Sprintf("push_tripwire repository %q has invalid ref pattern", repo))
 				}
 			}
-		}
-	}
-	if c.TransportObservation.Enabled {
-		if c.Server.Production {
-			errs = append(errs, "transport_observation cannot be enabled in production")
-		}
-		if c.TransportObservation.AuthorityStorePath == "" || !strings.HasPrefix(c.TransportObservation.AuthorityStorePath, "/") {
-			errs = append(errs, "transport_observation authority_store_path must be absolute")
-		}
-		if len(c.TransportObservation.ProfileAgentIDs) == 0 {
-			errs = append(errs, "transport_observation profile_agent_ids must not be empty")
 		}
 	}
 	seen := map[string]bool{}

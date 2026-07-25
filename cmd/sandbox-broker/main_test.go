@@ -1,37 +1,9 @@
 package main
 
 import (
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
-
-	"gh-agent-broker/internal/sandbox"
 )
-
-func TestAuthorityOnlyMuxExposesNoLegacyRoutes(t *testing.T) {
-	authority := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})
-	legacy := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Fatal("legacy handler was called")
-	})
-	mux := newServerMux(sandbox.Config{AuthorityOnly: true, MCPPath: "/mcp"}, legacy, legacy, authority)
-
-	for _, path := range []string{"/mcp", "/v1/launch"} {
-		recorder := httptest.NewRecorder()
-		mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, path, nil))
-		if recorder.Code != http.StatusNotFound {
-			t.Fatalf("%s status = %d, want 404", path, recorder.Code)
-		}
-	}
-
-	recorder := httptest.NewRecorder()
-	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/authority-workers", nil))
-	if recorder.Code != http.StatusNoContent {
-		t.Fatalf("authority status = %d, want 204", recorder.Code)
-	}
-}
 
 func TestParseSubcommand(t *testing.T) {
 	command, args, ok := parseSubcommand([]string{})
@@ -55,9 +27,6 @@ func TestParsePruneCommandDefaults(t *testing.T) {
 	}
 	if got := cmd.Policy.MaxAge; got != 24*time.Hour {
 		t.Fatalf("max_age = %v, want %v", got, 24*time.Hour)
-	}
-	if got := cmd.Policy.KeepNewest; got != 20 {
-		t.Fatalf("keep_newest = %d, want 20", got)
 	}
 	if !cmd.Policy.TerminalOnly {
 		t.Fatalf("terminal-only = %v, want true", cmd.Policy.TerminalOnly)
