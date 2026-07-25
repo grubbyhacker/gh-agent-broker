@@ -4,6 +4,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1905,6 +1906,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(parseErr, errReceivePackCommandPrefixLimit) {
 				status = http.StatusRequestEntityTooLarge
 			}
+			s.recordGitTransportStageWithExtra(opID, requestStage, "receive_pack_command_prefix_rejected", policy.DecisionDeny, "receive_pack_command_prefix_rejected", status, principal.ID, receivePackPrefixFailureAuditExtra(r, prefix, parseErr))
 			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Decision: policy.DecisionDeny, Result: "receive_pack_command_prefix_rejected"})
 			if !s.denyTransport(r.Context(), transport, "receive_pack_command_prefix_rejected", status) {
 				http.Error(w, "transport event persistence failed", http.StatusServiceUnavailable)
@@ -2106,6 +2108,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Error: err.Error()})
 			return
 		}
+		s.recordGitTransportStage(opID, requestStage, "upstream_completed", result.Decision, "upstream_response", resp.StatusCode, principal.ID)
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: "status " + strconv.Itoa(resp.StatusCode)})
 		return
 	}
@@ -2124,6 +2127,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	if operation == "git.receive-pack" && receivePackRejected(responseBody) {
 		resultCode = "github_ref_update_rejected"
 	}
+	s.recordGitTransportStage(opID, requestStage, "upstream_completed", result.Decision, "upstream_response", resp.StatusCode, principal.ID)
 	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: operation, Repo: repo, Branch: branch, Decision: result.Decision, Result: resultCode})
 }
 
@@ -2401,6 +2405,10 @@ func safeGitPathSegment(segment string) bool {
 }
 
 func (s *Server) recordGitTransportStage(operationID string, request gitTransportRequestIdentity, stage, decision, reason string, status int, agentID string) {
+	s.recordGitTransportStageWithExtra(operationID, request, stage, decision, reason, status, agentID, nil)
+}
+
+func (s *Server) recordGitTransportStageWithExtra(operationID string, request gitTransportRequestIdentity, stage, decision, reason string, status int, agentID string, additionalExtra map[string]interface{}) {
 	extra := map[string]interface{}{
 		"request_id":                operationID,
 		"stage":                     stage,
@@ -2412,6 +2420,9 @@ func (s *Server) recordGitTransportStage(operationID string, request gitTranspor
 	}
 	if status != 0 {
 		extra["http_status"] = status
+	}
+	for key, value := range additionalExtra {
+		extra[key] = value
 	}
 	s.audit.Log(audit.Event{
 		OperationID: operationID,
@@ -2479,55 +2490,113 @@ type receivePackUpdate struct{ Before, After, Ref string }
 
 const maxReceivePackCommandPrefixBytes = 256 << 10
 
+const (
+	receivePackPrefixFailureShortRead        = "short_read"
+	receivePackPrefixFailureBadPktLineLength = "bad_pkt_line_length"
+	receivePackPrefixFailureNonHexLength     = "non_hex_length"
+	receivePackPrefixFailureZeroUpdates      = "zero_updates"
+	receivePackPrefixFailureMalformedSHA     = "malformed_sha"
+	receivePackPrefixFailureMalformedRefName = "malformed_ref_name"
+	receivePackPrefixFailureExceededBound    = "exceeded_256_kib_bound"
+	receivePackPrefixFailureMalformedUpdate  = "malformed_update"
+	receivePackPrefixFailureTooManyUpdates   = "too_many_updates"
+)
+
 var errReceivePackCommandPrefixLimit = errors.New("receive-pack command prefix exceeds limit")
 
+type receivePackPrefixParseError struct {
+	reason string
+	err    error
+}
+
+func (e *receivePackPrefixParseError) Error() string {
+	return "receive-pack command prefix parse failed: " + e.reason
+}
+
+func (e *receivePackPrefixParseError) Unwrap() error { return e.err }
+
+type receivePackPrefixReader struct {
+	reader io.Reader
+	prefix bytes.Buffer
+}
+
+func (r *receivePackPrefixReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		_, _ = r.prefix.Write(p[:n])
+	}
+	return n, err
+}
+
+func (r *receivePackPrefixReader) fail(reason string, err error) ([]byte, []receivePackUpdate, error) {
+	return r.prefix.Bytes(), nil, &receivePackPrefixParseError{reason: reason, err: err}
+}
+
 func readReceivePackCommandPrefix(body io.Reader) ([]byte, []receivePackUpdate, error) {
-	var prefix bytes.Buffer
+	reader := &receivePackPrefixReader{reader: body}
 	updates := make([]receivePackUpdate, 0, 1)
 	for {
 		var header [4]byte
-		if _, err := io.ReadFull(body, header[:]); err != nil {
-			return nil, nil, fmt.Errorf("read receive-pack pkt-line header: %w", err)
+		if _, err := io.ReadFull(reader, header[:]); err != nil {
+			return reader.fail(receivePackPrefixFailureShortRead, fmt.Errorf("read receive-pack pkt-line header: %w", err))
 		}
-		if prefix.Len()+len(header) > maxReceivePackCommandPrefixBytes {
-			return nil, nil, errReceivePackCommandPrefixLimit
+		if reader.prefix.Len() > maxReceivePackCommandPrefixBytes {
+			return reader.fail(receivePackPrefixFailureExceededBound, errReceivePackCommandPrefixLimit)
 		}
-		prefix.Write(header[:])
 		n, err := strconv.ParseInt(string(header[:]), 16, 32)
-		if err != nil || n < 0 {
-			return nil, nil, errors.New("invalid pkt-line length")
+		if err != nil {
+			return reader.fail(receivePackPrefixFailureNonHexLength, errors.New("invalid pkt-line length"))
+		}
+		if n < 0 || n < 4 && n != 0 {
+			return reader.fail(receivePackPrefixFailureBadPktLineLength, errors.New("invalid pkt-line length"))
 		}
 		if n == 0 {
 			if len(updates) == 0 {
-				return nil, nil, errors.New("no receive-pack updates")
+				return reader.fail(receivePackPrefixFailureZeroUpdates, errors.New("no receive-pack updates"))
 			}
-			return prefix.Bytes(), updates, nil
-		}
-		if n < 4 {
-			return nil, nil, errors.New("invalid receive-pack command length")
+			return reader.prefix.Bytes(), updates, nil
 		}
 		payloadSize := int(n) - 4
-		if prefix.Len()+payloadSize > maxReceivePackCommandPrefixBytes {
-			return nil, nil, errReceivePackCommandPrefixLimit
+		if reader.prefix.Len()+payloadSize > maxReceivePackCommandPrefixBytes {
+			return reader.fail(receivePackPrefixFailureExceededBound, errReceivePackCommandPrefixLimit)
 		}
 		payload := make([]byte, payloadSize)
-		if _, err := io.ReadFull(body, payload); err != nil {
-			return nil, nil, fmt.Errorf("read receive-pack command: %w", err)
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			return reader.fail(receivePackPrefixFailureShortRead, fmt.Errorf("read receive-pack command: %w", err))
 		}
-		prefix.Write(payload)
 		line := string(payload)
 		if nul := strings.IndexByte(line, 0); nul >= 0 {
 			line = line[:nul]
 		}
 		fields := strings.Fields(line)
-		if len(fields) != 3 || !strings.HasPrefix(fields[2], "refs/heads/") || !githubSHA.MatchString(fields[0]) || !githubSHA.MatchString(fields[1]) {
-			return nil, nil, errors.New("invalid receive-pack update")
+		if len(fields) != 3 {
+			return reader.fail(receivePackPrefixFailureMalformedUpdate, errors.New("invalid receive-pack update"))
+		}
+		if !githubSHA.MatchString(fields[0]) || !githubSHA.MatchString(fields[1]) {
+			return reader.fail(receivePackPrefixFailureMalformedSHA, errors.New("invalid receive-pack update"))
+		}
+		if !strings.HasPrefix(fields[2], "refs/heads/") {
+			return reader.fail(receivePackPrefixFailureMalformedRefName, errors.New("invalid receive-pack update"))
 		}
 		updates = append(updates, receivePackUpdate{Before: fields[0], After: fields[1], Ref: fields[2]})
 		if len(updates) > 64 {
-			return nil, nil, errors.New("too many receive-pack updates")
+			return reader.fail(receivePackPrefixFailureTooManyUpdates, errors.New("too many receive-pack updates"))
 		}
 	}
+}
+
+func receivePackPrefixFailureAuditExtra(r *http.Request, prefix []byte, parseErr error) map[string]interface{} {
+	extra := map[string]interface{}{
+		"prefix_bytes_read": len(prefix),
+		"prefix_hex_head":   hex.EncodeToString(prefix[:min(len(prefix), 128)]),
+		"content_length":    r.ContentLength,
+		"transfer_encoding": strings.Join(r.TransferEncoding, ","),
+	}
+	var parseFailure *receivePackPrefixParseError
+	if errors.As(parseErr, &parseFailure) {
+		extra["parse_failure_reason"] = parseFailure.reason
+	}
+	return extra
 }
 
 func receivePackUpdates(body []byte) ([]receivePackUpdate, error) {
