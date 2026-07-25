@@ -18,3 +18,9 @@ Receive-pack command-prefix parse rejections now emit a dedicated transport
 stage with a named failure reason, bytes consumed, request content framing,
 and at most the first 128 bytes hex-encoded. Successful upstream Git requests
 also emit an `upstream_completed` transport stage.
+
+Receive-pack parsing accepts leading `shallow <40-hex-oid>` pkt-lines before
+the command list and preserves them byte-for-byte when replaying the request
+upstream. Malformed shallow lines are rejected with the named
+`malformed_shallow` reason. Push certificates remain unsupported because their
+embedded commands require separate parsing to preserve ref policy enforcement.

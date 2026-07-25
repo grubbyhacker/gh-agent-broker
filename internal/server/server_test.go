@@ -44,6 +44,56 @@ func TestReceivePackBranch(t *testing.T) {
 	}
 }
 
+func TestReadReceivePackCommandPrefixAllowsLeadingShallowLines(t *testing.T) {
+	const (
+		oldOID     = "0000000000000000000000000000000000000000"
+		newOID     = "1111111111111111111111111111111111111111"
+		shallowOID = "0e1718a4281405e68902338962ca32e9ce527fff"
+	)
+	command := oldOID + " " + newOID + " refs/heads/curator/test\x00 report-status side-band-64k\n"
+	packData := []byte("PACK\x00\x00\x00\x02")
+
+	tests := []struct {
+		name     string
+		shallows []string
+	}{
+		{name: "one shallow line", shallows: []string{shallowOID}},
+		{name: "multiple shallow lines", shallows: []string{shallowOID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+		{name: "no shallow lines"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wantPrefix := make([]byte, 0)
+			for _, oid := range tt.shallows {
+				wantPrefix = append(wantPrefix, pktLine("shallow "+oid+"\n")...)
+			}
+			wantPrefix = append(wantPrefix, pktLine(command)...)
+			wantPrefix = append(wantPrefix, []byte("0000")...)
+			body := append(append([]byte{}, wantPrefix...), packData...)
+
+			bodyReader := bytes.NewReader(body)
+			prefix, updates, err := readReceivePackCommandPrefix(bodyReader)
+			if err != nil {
+				t.Fatalf("readReceivePackCommandPrefix() error = %v", err)
+			}
+			if !bytes.Equal(prefix, wantPrefix) {
+				t.Fatalf("prefix = %x, want %x", prefix, wantPrefix)
+			}
+			if len(updates) != 1 || updates[0].Ref != "refs/heads/curator/test" {
+				t.Fatalf("updates = %+v, want curator branch update", updates)
+			}
+			forwarded, err := io.ReadAll(io.MultiReader(bytes.NewReader(prefix), bodyReader))
+			if err != nil {
+				t.Fatalf("read reconstructed body: %v", err)
+			}
+			if !bytes.Equal(forwarded, body) {
+				t.Fatalf("reconstructed body = %x, want byte-identical %x", forwarded, body)
+			}
+		})
+	}
+}
+
 func TestReadReceivePackCommandPrefixFailureReasons(t *testing.T) {
 	validUpdate := "0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/heads/curator/test\n"
 	boundPayload := validUpdate + strings.Repeat(" ", 65531-len(validUpdate))
@@ -62,7 +112,7 @@ func TestReadReceivePackCommandPrefixFailureReasons(t *testing.T) {
 		body   []byte
 		reason string
 	}
-	tests := make([]failureCase, 0, 9)
+	tests := make([]failureCase, 0, 10)
 	tests = append(tests,
 		failureCase{name: "short read", body: []byte("00"), reason: receivePackPrefixFailureShortRead},
 		failureCase{name: "bad pkt-line length", body: []byte("0003"), reason: receivePackPrefixFailureBadPktLineLength},
@@ -72,6 +122,7 @@ func TestReadReceivePackCommandPrefixFailureReasons(t *testing.T) {
 		failureCase{name: "malformed ref name", body: append(pktLine("0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 refs/tags/v1\n"), []byte("0000")...), reason: receivePackPrefixFailureMalformedRefName},
 		failureCase{name: "exceeded bound", body: boundBody, reason: receivePackPrefixFailureExceededBound},
 		failureCase{name: "malformed update", body: append(pktLine("only-two fields\n"), []byte("0000")...), reason: receivePackPrefixFailureMalformedUpdate},
+		failureCase{name: "malformed shallow", body: append(pktLine("shallow not-a-sha\n"), []byte("0000")...), reason: receivePackPrefixFailureMalformedShallow},
 		failureCase{name: "too many updates", body: tooManyUpdates, reason: receivePackPrefixFailureTooManyUpdates},
 	)
 
