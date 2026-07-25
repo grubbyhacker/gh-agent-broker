@@ -2499,6 +2499,7 @@ const (
 	receivePackPrefixFailureMalformedRefName = "malformed_ref_name"
 	receivePackPrefixFailureExceededBound    = "exceeded_256_kib_bound"
 	receivePackPrefixFailureMalformedUpdate  = "malformed_update"
+	receivePackPrefixFailureMalformedShallow = "malformed_shallow"
 	receivePackPrefixFailureTooManyUpdates   = "too_many_updates"
 )
 
@@ -2564,6 +2565,12 @@ func readReceivePackCommandPrefix(body io.Reader) ([]byte, []receivePackUpdate, 
 		if _, err := io.ReadFull(reader, payload); err != nil {
 			return reader.fail(receivePackPrefixFailureShortRead, fmt.Errorf("read receive-pack command: %w", err))
 		}
+		if len(updates) == 0 && bytes.HasPrefix(payload, []byte("shallow")) {
+			if !validReceivePackShallow(payload) {
+				return reader.fail(receivePackPrefixFailureMalformedShallow, errors.New("invalid receive-pack shallow"))
+			}
+			continue
+		}
 		line := string(payload)
 		if nul := strings.IndexByte(line, 0); nul >= 0 {
 			line = line[:nul]
@@ -2583,6 +2590,14 @@ func readReceivePackCommandPrefix(body io.Reader) ([]byte, []receivePackUpdate, 
 			return reader.fail(receivePackPrefixFailureTooManyUpdates, errors.New("too many receive-pack updates"))
 		}
 	}
+}
+
+func validReceivePackShallow(payload []byte) bool {
+	if len(payload) > 0 && payload[len(payload)-1] == '\n' {
+		payload = payload[:len(payload)-1]
+	}
+	const shallowPrefix = "shallow "
+	return len(payload) == len(shallowPrefix)+40 && bytes.HasPrefix(payload, []byte(shallowPrefix)) && githubSHA.Match(payload[len(shallowPrefix):])
 }
 
 func receivePackPrefixFailureAuditExtra(r *http.Request, prefix []byte, parseErr error) map[string]interface{} {
