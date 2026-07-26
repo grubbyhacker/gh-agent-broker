@@ -63,10 +63,7 @@ Build a GitHub Agent Access Broker that lets agent containers use GitHub App acc
 
 ## Local Staging
 
-- Run local staging from the `vps-ops` repository with `mise run deploy:staging -- gh-agent-broker`.
-- In local staging, the broker REST and health API is available at `http://127.0.0.1:8080`.
-- In local staging, the issue-reporter MCP endpoint is available at `http://127.0.0.1:8090/mcp`.
-- `sandbox-broker` is disabled in local staging because `local.yml` sets `sandbox_broker_enabled: false`.
+- There is currently no local environment. The workspace-root `AGENTS.md` is authoritative.
 
 ## Compose Services
 
