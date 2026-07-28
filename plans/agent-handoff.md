@@ -9,6 +9,10 @@ The repository-agent lifecycle experiment has been removed. The production
 surface remains the broker-agent authenticated smart-HTTP proxy at `/git/*`
 and the GitHub REST proxy at `/v1/repos/*`.
 
+Development, CI, and Go-based container builds use Go 1.26.5. The `go 1.25.0`
+directive is intentionally retained as the module compatibility floor; the
+`toolchain go1.26.5` directive pins the build toolchain.
+
 For a curator push, `handleGit` authenticates the configured broker agent,
 checks Git policy and branch/ref preflight, resolves the configured GitHub App
 installation, mints its installation token, and forwards smart-HTTP to GitHub
