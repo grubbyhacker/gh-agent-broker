@@ -44,6 +44,8 @@ func main() {
 		cmdHealth(os.Args[2:])
 	case "config-check":
 		cmdConfigCheck(os.Args[2:])
+	case "reload":
+		cmdReload(os.Args[2:])
 	case "configure":
 		cmdConfigure(os.Args[2:])
 	case "credential-helper":
@@ -97,7 +99,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|dismiss-review|resolve-review-thread|add-label|remove-label|issues|issue|issue-comments|commit-status|check-runs|comment> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|reload|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|dismiss-review|resolve-review-thread|add-label|remove-label|issues|issue|issue-comments|commit-status|check-runs|comment> [flags]")
 }
 
 func commonFlags(fs *flag.FlagSet) (broker, agentID, secret *string) {
@@ -134,6 +136,17 @@ func cmdConfigCheck(args []string) {
 		fatal(err)
 	}
 	fmt.Println("ok")
+}
+
+func cmdReload(args []string) {
+	fs := flag.NewFlagSet("reload", flag.ExitOnError)
+	broker := fs.String("broker", envDefault("BROKER_URL", "http://127.0.0.1:8080"), "broker base URL")
+	secret := fs.String("admin-secret", "", "broker admin secret (defaults to BROKER_ADMIN_SECRET)")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveAdminSecret(secret)
+	doRequestWithHeaders(http.MethodPost, *broker, "/v1/admin/reload", "", "", nil, map[string]string{"X-Admin-Secret": *secret})
 }
 
 func cmdConfigure(args []string) {
@@ -559,6 +572,12 @@ func envDefault(key, fallback string) string {
 func resolveSecret(secret *string) {
 	if *secret == "" {
 		*secret = os.Getenv("BROKER_AGENT_SECRET")
+	}
+}
+
+func resolveAdminSecret(secret *string) {
+	if *secret == "" {
+		*secret = os.Getenv("BROKER_ADMIN_SECRET")
 	}
 }
 
