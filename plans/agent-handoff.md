@@ -1,5 +1,10 @@
 # Agent handoff
 
+`gh-agent-broker-cli reload` calls the broker admin reload endpoint with
+`BROKER_ADMIN_SECRET` (or `-admin-secret`) and prints the server response. A
+restart is still required when changing `server.listen`, `audit.path`,
+`push_tripwire.enabled`, or `push_tripwire.state_path`.
+
 The repository-agent lifecycle experiment has been removed. The production
 surface remains the broker-agent authenticated smart-HTTP proxy at `/git/*`
 and the GitHub REST proxy at `/v1/repos/*`.

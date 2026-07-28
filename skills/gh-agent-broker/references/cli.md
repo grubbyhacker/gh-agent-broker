@@ -3,6 +3,19 @@
 The CLI reads `BROKER_URL`, `BROKER_AGENT_ID`, and `BROKER_AGENT_SECRET`.
 Pass flags only when overriding those environment values.
 
+## Reload Broker Configuration
+
+Operators can apply compatible configuration changes without restarting the
+broker:
+
+```sh
+BROKER_ADMIN_SECRET=replace-me-admin-secret gh-agent-broker-cli reload
+```
+
+`reload` reads `BROKER_URL` and `BROKER_ADMIN_SECRET`; `-broker` and
+`-admin-secret` override them. If the broker reports that a restart is
+required, the CLI prints that server message and exits nonzero.
+
 ## Git Remote
 
 ```sh

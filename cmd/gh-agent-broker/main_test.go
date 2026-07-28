@@ -26,6 +26,38 @@ func TestCommonFlagsDoesNotExposeSecretAsDefault(t *testing.T) {
 	}
 }
 
+func TestCmdReloadUsesAdminEndpoint(t *testing.T) {
+	t.Setenv("BROKER_ADMIN_SECRET", "admin-secret")
+
+	var sawReload bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawReload = true
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %q, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/admin/reload" {
+			t.Errorf("path = %q, want /v1/admin/reload", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Admin-Secret"); got != "admin-secret" {
+			t.Errorf("X-Admin-Secret = %q, want admin secret", got)
+		}
+		if _, _, ok := r.BasicAuth(); ok {
+			t.Error("reload request must not use agent basic authentication")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"status":"reloaded"}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	cmdReload([]string{"-broker", server.URL})
+
+	if !sawReload {
+		t.Fatal("reload endpoint was not called")
+	}
+}
+
 func TestCredentialHelperGetWritesBrokerCredentialsFromEnv(t *testing.T) {
 	var out bytes.Buffer
 	getenv := func(key string) string {
