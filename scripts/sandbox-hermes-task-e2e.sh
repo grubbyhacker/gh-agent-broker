@@ -210,7 +210,7 @@ echo "running sandbox Hermes task marker E2E client"
       -e SANDBOX_E2E_EXPECT_REDACTED_FILE \
       -e SANDBOX_E2E_EXPECT_REDACTED \
       -e SANDBOX_E2E_TIMEOUT \
-      golang:1.26 \
+      golang:1.26.5 \
       go run ./cmd/sandbox-e2e --task-marker-only
   fi
 )

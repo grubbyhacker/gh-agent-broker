@@ -69,12 +69,14 @@ environment variables.
 
 ## Development
 
-This repo targets Go 1.26.x. `make check` is the source of truth for local and
-CI hygiene:
+This repo builds and tests with Go 1.26.5. The `go 1.25.0` directive in
+`go.mod` remains the compatibility floor, while `toolchain go1.26.5` pins the
+build toolchain. `mise run check` is the source of truth for local and CI
+hygiene:
 
 ```sh
-make fmt
-make check
+mise run fmt
+mise run check
 ```
 
 `make check` runs formatting checks, `go mod tidy` drift detection,

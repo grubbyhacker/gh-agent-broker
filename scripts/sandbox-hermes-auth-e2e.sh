@@ -213,7 +213,7 @@ echo "running sandbox Hermes auth E2E client"
       -e SANDBOX_E2E_SLEEPER_TEMPLATE \
       -e SANDBOX_E2E_EXPECT_REDACTED_FILE \
       -e SANDBOX_E2E_EXPECT_REDACTED \
-      golang:1.26 \
+      golang:1.26.5 \
       go run ./cmd/sandbox-e2e --hermes-auth-only
   fi
 )
