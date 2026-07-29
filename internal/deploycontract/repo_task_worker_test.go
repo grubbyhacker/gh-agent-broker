@@ -2,6 +2,7 @@ package deploycontract
 
 import (
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -46,6 +47,15 @@ func TestRepoTaskWorkerContract(t *testing.T) {
 	}
 	if strings.Contains(text, "codex ") || strings.Contains(text, "OPENAI_API_KEY") {
 		t.Error("repository task worker must remain model-free")
+	}
+}
+
+func TestRepoTaskWorkerSubmoduleHandling(t *testing.T) {
+	cmd := exec.Command("bash", "workers/submodule_worker_test.sh", "workers/repo-task/worker.sh")
+	cmd.Dir = "../.."
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run repository task worker submodule regression test: %v\n%s", err, output)
 	}
 }
 

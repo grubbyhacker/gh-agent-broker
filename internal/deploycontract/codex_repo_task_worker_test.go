@@ -69,6 +69,15 @@ func TestCodexRepoTaskWorkerJWTValidation(t *testing.T) {
 	}
 }
 
+func TestCodexRepoTaskWorkerSubmoduleHandling(t *testing.T) {
+	cmd := exec.Command("bash", "workers/submodule_worker_test.sh", "workers/codex-repo-task/worker.sh")
+	cmd.Dir = "../.."
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run Codex repository task worker submodule regression test: %v\n%s", err, output)
+	}
+}
+
 func TestPublishedBrokerImageCarriesCodexRepoTaskWorker(t *testing.T) {
 	t.Parallel()
 

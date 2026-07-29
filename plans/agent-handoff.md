@@ -21,11 +21,12 @@ the existing `/v1/repos/{owner}/{repo}/pulls` API path.
 
 `/usr/local/bin/agent-repo-task-worker` is a generic, model-free worker copied
 from the published broker image into per-repository images. It uses only the
-broker-mediated Git remote and `gh-agent-broker-cli` for GitHub access. Its
-dependency-manifest hash exactly matches the reusable image workflow for
-repositories without submodules. A checkout containing submodules is treated
-as unverifiable and triggers an explicit dependency reinstall, because the
-worker must not initialize submodules through a direct GitHub remote.
+broker-mediated Git remote and `gh-agent-broker-cli` for GitHub access. The
+shared `publish-agent-image.yml` initializes submodules during image build and
+copies their content to `/workspace`. The worker compares the checkout's
+gitlink SHA entries against the baked dependency manifest before copying that
+content into the fresh checkout. A mismatch fails loudly as a stale image;
+the worker never initializes a submodule through a direct GitHub remote.
 
 `/usr/local/bin/agent-codex-repo-task-worker` is the Codex counterpart for a
 repository image that supplies Codex CLI. It copies only

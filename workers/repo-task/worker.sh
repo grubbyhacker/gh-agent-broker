@@ -2,7 +2,10 @@
 set -euo pipefail
 
 readonly worker_name='agent-repo-task-worker'
-readonly dependency_manifest_path='/usr/local/share/agent-image/dependency-manifest.sha256'
+readonly dependency_manifest_path="${AGENT_IMAGE_DEPENDENCY_MANIFEST_PATH:-/usr/local/share/agent-image/dependency-manifest.sha256}"
+readonly dependency_manifest_output_path="${AGENT_IMAGE_DEPENDENCY_MANIFEST_OUTPUT_PATH:-/output/dependency-manifest.txt}"
+# publish-agent-image.yml copies initialized submodule content to /workspace.
+readonly baked_workspace_path="${AGENT_IMAGE_WORKSPACE:-/workspace}"
 stage='initializing'
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
@@ -41,9 +44,10 @@ validate_inputs() {
   fi
 }
 
-# This matches publish-agent-image.yml for repositories without submodules.
-# Submodule recursion cannot be reproduced without bypassing the broker, so a
-# checkout with a gitlink deliberately becomes a loud mismatch, never a match.
+# publish-agent-image.yml records these gitlinks as
+# "submodule <sha> <path>" in dependency-manifest.inputs. Comparing the
+# resulting manifest before copying from the image proves the baked content was
+# built for the same submodule pointers as this checkout.
 has_submodules() {
   local entry metadata
   while IFS= read -r -d '' entry; do
@@ -51,6 +55,38 @@ has_submodules() {
     [[ "${metadata%% *}" == '160000' ]] && return 0
   done < <(git ls-files --stage -z)
   return 1
+}
+
+collect_submodule_manifest_entries() {
+  local entry metadata path mode sha
+  while IFS= read -r -d '' entry; do
+    metadata="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    mode="${metadata%% *}"
+    [[ "$mode" == '160000' ]] || continue
+    sha="${metadata#* }"
+    sha="${sha%% *}"
+    printf 'submodule %s %s\n' "$sha" "$path"
+  done < <(git ls-files --stage -z)
+}
+
+hydrate_baked_submodules() {
+  local entry metadata path mode baked_path
+  while IFS= read -r -d '' entry; do
+    metadata="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    mode="${metadata%% *}"
+    [[ "$mode" == '160000' ]] || continue
+    [[ "$path" != /* && "$path" != *'..'* ]] || fail "invalid submodule path in checkout: $path"
+    baked_path="$baked_workspace_path/$path"
+    if [[ ! -d "$baked_path" ]]; then
+      manifest_status="mismatch: baked submodule content is missing at $baked_path"
+      fail "baked submodule content is missing for $path"
+    fi
+    rm -rf -- "$path"
+    mkdir -p "$path"
+    cp -a "$baked_path/." "$path/"
+  done < <(git ls-files --stage -z)
 }
 
 collect_lockfiles() {
@@ -75,10 +111,30 @@ compute_dependency_manifest() {
     mise exec -- sha256sum mise.toml
     for manifest_file in "${lockfiles[@]}"; do mise exec -- sha256sum "$manifest_file"; done
     for manifest_file in "${manifest_files[@]}"; do mise exec -- sha256sum "$manifest_file"; done
+    collect_submodule_manifest_entries
   } | LC_ALL=C mise exec -- sort | mise exec -- sha256sum | {
     IFS=' ' read -r manifest_sha _
     printf '%s\n' "$manifest_sha"
   }
+}
+
+check_dependency_manifest() {
+  local baked_manifest current_manifest
+  manifest_status='missing baked manifest'
+  [[ -f "$dependency_manifest_path" ]] || return
+  IFS= read -r baked_manifest < "$dependency_manifest_path" || true
+  [[ "$baked_manifest" =~ ^[a-fA-F0-9]{64}$ ]] || fail "invalid baked dependency manifest hash: $dependency_manifest_path"
+  current_manifest=$(compute_dependency_manifest)
+  if [[ "$current_manifest" == "$baked_manifest" ]]; then
+    manifest_status='match'
+    hydrate_baked_submodules
+    printf 'manifest match, using baked dependencies\n' | mise exec -- tee "$dependency_manifest_output_path"
+    return
+  fi
+  manifest_status="mismatch: baked=$baked_manifest checkout=$current_manifest"
+  if has_submodules; then
+    fail 'baked submodule SHA does not match the checkout; rebuild the agent image before running this worker'
+  fi
 }
 
 install_repository_dependencies() {
@@ -108,6 +164,7 @@ install_repository_dependencies() {
   if [[ -f Cargo.lock ]]; then [[ -f Cargo.toml ]] || fail 'Cargo.lock requires Cargo.toml'; mise exec -- cargo fetch --locked; fi
 }
 
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 require_env BROKER_URL
 require_env AGENT_REPO
 require_env AGENT_BASE_BRANCH
@@ -135,25 +192,9 @@ git config user.name "${GIT_AUTHOR_NAME:-Repository Task Worker}"
 git config user.email "${GIT_AUTHOR_EMAIL:-repository-task-worker@users.noreply.github.com}"
 
 stage='dependency manifest check'
-manifest_status='missing baked manifest'
-if [[ -f "$dependency_manifest_path" ]]; then
-  IFS= read -r baked_manifest < "$dependency_manifest_path" || true
-  if [[ ! "$baked_manifest" =~ ^[a-fA-F0-9]{64}$ ]]; then
-    fail "invalid baked dependency manifest hash: $dependency_manifest_path"
-  elif has_submodules; then
-    manifest_status='unverifiable: checkout contains submodules; reinstalling dependencies'
-  else
-    current_manifest=$(compute_dependency_manifest)
-    if [[ "$current_manifest" == "$baked_manifest" ]]; then
-      manifest_status='match'
-      printf 'manifest match, using baked dependencies\n' | mise exec -- tee /output/dependency-manifest.txt
-    else
-      manifest_status="mismatch: baked=$baked_manifest checkout=$current_manifest; reinstalling dependencies"
-    fi
-  fi
-fi
+check_dependency_manifest
 if [[ "$manifest_status" != 'match' ]]; then
-  printf 'DEPENDENCY MANIFEST %s\n' "$manifest_status" | mise exec -- tee /output/dependency-manifest.txt
+  printf 'DEPENDENCY MANIFEST %s\n' "$manifest_status" | mise exec -- tee "$dependency_manifest_output_path"
   stage='dependency installation after manifest mismatch'
   install_repository_dependencies
 fi
@@ -183,3 +224,4 @@ pr_body="${AGENT_PR_BODY:-Automated repository task ${AGENT_TASK} completed for 
 stage='completed'
 write_result ready_for_review 'task changed the repository and a pull request was created'
 printf 'Repository task %s completed on %s and opened a ready-for-review pull request.\n' "$AGENT_TASK" "$AGENT_BRANCH" > /output/final-summary.md
+fi
