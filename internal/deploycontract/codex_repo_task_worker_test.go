@@ -2,6 +2,7 @@ package deploycontract
 
 import (
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -54,6 +55,17 @@ func TestCodexRepoTaskWorkerContract(t *testing.T) {
 	violations := codexExecContractViolations(strings.Replace(text, "mise exec -- codex exec", "codex exec", 1))
 	if len(violations) > 0 {
 		t.Errorf("Codex repository task worker authority contract violations:\n%s", strings.Join(violations, "\n"))
+	}
+}
+
+func TestCodexRepoTaskWorkerJWTValidation(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.Command("mise", "exec", "--", "bash", "workers/codex-repo-task/worker_test.sh")
+	cmd.Dir = "../.."
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run Codex repository task worker JWT regression test: %v\n%s", err, output)
 	}
 }
 

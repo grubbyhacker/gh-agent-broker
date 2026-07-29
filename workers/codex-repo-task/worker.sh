@@ -76,12 +76,16 @@ prepare_codex_home() {
   mise exec -- mkdir -p "$HOME"
 }
 
+decode_access_token_payload() {
+  mise exec -- jq -er '.tokens.access_token | select(type == "string" and length > 0) | split(".") | if length == 3 then .[1] else error("access token is not a JWT") end | gsub("-"; "+") | gsub("_"; "/") | . + ("=" * ((4 - (length % 4)) % 4)) | @base64d' "$1"
+}
+
 validate_access_token_expiry() {
   local payload exp now issued_at refresh_token
   refresh_token=$(mise exec -- jq -er '.tokens.refresh_token | if type == "string" and . == "" then . else error("refresh token must be present and empty") end' "$CODEX_HOME/auth.json") || fail 'credential bundle must be access-token-only with an empty refresh token'
-  payload=$(mise exec -- jq -er '.tokens.access_token | select(type == "string" and length > 0) | split(".") | if length == 3 then .[1] else error("access token is not a JWT") end | gsub("-"; "+") | gsub("_"; "/") | . + ("=" * ((4 - (length % 4)) % 4)) | @base64d' "$CODEX_HOME/auth.json") || fail 'credential bundle does not contain a decodable access token'
+  payload=$(decode_access_token_payload "$CODEX_HOME/auth.json") || fail 'credential bundle does not contain a decodable access token'
   exp=$(printf '%s' "$payload" | mise exec -- jq -er '.exp | if type == "number" and floor == . then . else error("JWT exp must be an integer") end') || fail 'access token JWT is missing a valid exp claim'
-  issued_at=$(printf '%s' "$payload" | mise exec -- jq -er 'if .iat == null then empty elif (.iat | type) == "number" and (.iat | floor) == . then .iat else error("JWT iat must be an integer") end') || fail 'access token JWT has an invalid iat claim'
+  issued_at=$(printf '%s' "$payload" | mise exec -- jq -er 'if .iat == null then empty elif (.iat | type) == "number" and (.iat | floor) == .iat then .iat else error("JWT iat must be an integer") end') || fail 'access token JWT has an invalid iat claim'
   now=$(mise exec -- date +%s)
   (( exp > now + token_expiry_margin_seconds )) || fail 'access token is expired or expires too soon to start work'
   printf 'Codex access token current time: %s\n' "$(mise exec -- date -u -d "@$now" '+%Y-%m-%dT%H:%M:%SZ')"
@@ -170,6 +174,7 @@ install_repository_dependencies() {
   if [[ -f Cargo.lock ]]; then [[ -f Cargo.toml ]] || fail 'Cargo.lock requires Cargo.toml'; mise exec -- cargo fetch --locked; fi
 }
 
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 require_env BROKER_URL
 require_env AGENT_REPO
 require_env AGENT_BASE_BRANCH
@@ -263,3 +268,4 @@ mise exec -- /usr/local/bin/gh-agent-broker-cli pr -broker "$BROKER_URL" -repo "
 stage='completed'
 write_result ready_for_review 'Codex changed the repository and a pull request was created'
 printf 'Codex repository task completed on %s and opened a ready-for-review pull request.\n' "$AGENT_BRANCH" > /output/final-summary.md
+fi

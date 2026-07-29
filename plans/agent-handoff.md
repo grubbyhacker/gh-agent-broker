@@ -35,6 +35,10 @@ are expired or too close to expiry. It uses the same broker-mediated checkout,
 commit, push, and pull-request flow as the model-free worker. Its task prompt
 is supplied by `AGENT_CODEX_PROMPT` or `AGENT_CODEX_PROMPT_FILE`; the wrapper
 instructs Codex not to read credentials or perform GitHub delivery actions.
+Its JWT expiry check decodes the base64url payload (including restored padding)
+with `jq`; a shell regression test uses a synthetic, unpadded payload that
+contains a base64url underscore and verifies both accepted future tokens and
+rejected expired tokens.
 
 The staged `repository_transport_stage` audit events remain on the real Git
 path. No local repository backend, registered green-PR endpoint, agentd
