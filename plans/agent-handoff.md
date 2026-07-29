@@ -27,6 +27,15 @@ repositories without submodules. A checkout containing submodules is treated
 as unverifiable and triggers an explicit dependency reinstall, because the
 worker must not initialize submodules through a direct GitHub remote.
 
+`/usr/local/bin/agent-codex-repo-task-worker` is the Codex counterpart for a
+repository image that supplies Codex CLI. It copies only
+`/credentials/codex/auth.json` into a mode-0600 `CODEX_HOME` below `/dev/shm`,
+after rejecting writable or alternate credential sources and access tokens that
+are expired or too close to expiry. It uses the same broker-mediated checkout,
+commit, push, and pull-request flow as the model-free worker. Its task prompt
+is supplied by `AGENT_CODEX_PROMPT` or `AGENT_CODEX_PROMPT_FILE`; the wrapper
+instructs Codex not to read credentials or perform GitHub delivery actions.
+
 The staged `repository_transport_stage` audit events remain on the real Git
 path. No local repository backend, registered green-PR endpoint, agentd
 authority lifecycle, or agentd-issued Git credential path remains.
