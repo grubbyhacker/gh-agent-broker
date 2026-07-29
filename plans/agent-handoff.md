@@ -31,8 +31,13 @@ the worker never initializes a submodule through a direct GitHub remote.
 `/usr/local/bin/agent-codex-repo-task-worker` is the Codex counterpart for a
 repository image that supplies Codex CLI. It copies only
 `/credentials/codex/auth.json` into a mode-0600 `CODEX_HOME` below `/dev/shm`,
-after rejecting writable or alternate credential sources and access tokens that
-are expired or too close to expiry. It uses the same broker-mediated checkout,
+after broker checkout, dependency-manifest verification, baked-submodule
+hydration, and any dependency installation. This ordering is defense in depth
+only: the raw credential bundle remains readable at `/credentials/codex` during
+preparation, which violates design section 4.3 and is a known defect. Required
+follow-up work is a credential-free preparation container that produces a
+workspace and provenance record, followed by a fresh coding container that
+receives that workspace and the credential. It uses the same broker-mediated checkout,
 commit, push, and pull-request flow as the model-free worker. Its task prompt
 is supplied by `AGENT_CODEX_PROMPT` or `AGENT_CODEX_PROMPT_FILE`; the wrapper
 instructs Codex not to read credentials or perform GitHub delivery actions.

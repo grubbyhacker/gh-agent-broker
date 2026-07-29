@@ -245,8 +245,6 @@ trap on_exit EXIT
 
 stage='credential safety checks'
 validate_credential_sources
-prepare_codex_home
-validate_access_token_expiry
 load_prompt
 
 stage='broker health check'
@@ -271,6 +269,10 @@ if [[ "$manifest_status" != 'match' ]]; then
   stage='dependency installation after manifest mismatch'
   install_repository_dependencies
 fi
+
+stage='Codex credential preparation'
+prepare_codex_home
+validate_access_token_expiry
 
 stage='Codex repository task'
 codex_prompt=$(printf '%s\n\n%s\n' "$codex_task_prompt" '- Work only in this repository checkout.
