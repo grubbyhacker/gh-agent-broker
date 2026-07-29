@@ -3,6 +3,14 @@ set -euo pipefail
 
 fail_test() { printf 'worker JWT regression test: %s\n' "$*" >&2; exit 1; }
 
+# Production runs commands through Mise. The CI test job invokes this script
+# directly, so emulate only the `mise exec --` form used by the exercised code.
+mise() {
+  [[ "$1" == 'exec' && "$2" == '--' ]] || fail_test 'unexpected mise invocation'
+  shift 2
+  command "$@"
+}
+
 source workers/codex-repo-task/worker.sh
 
 tmpdir=$(mise exec -- mktemp -d)
@@ -39,3 +47,15 @@ if expired_output=$( (validate_access_token_expiry) 2>&1); then
   fail_test 'expired JWT unexpectedly passed validation'
 fi
 [[ "$expired_output" == *'access token is expired or expires too soon to start work'* ]] || fail_test 'expired JWT was rejected for the wrong reason'
+
+near_expiry_at=$((now + token_expiry_margin_seconds - 1))
+near_expiry_payload=$(mise exec -- jq -cnr --argjson iat "$issued_at" --argjson exp "$near_expiry_at" --arg marker '􏿿' '{iat: $iat, exp: $exp, marker: $marker} | @base64')
+near_expiry_payload=${near_expiry_payload//+/-}
+near_expiry_payload=${near_expiry_payload//\//_}
+near_expiry_payload=${near_expiry_payload//=}
+near_expiry_token="eyJhbGciOiJub25lIn0.${near_expiry_payload}.synthetic-signature"
+mise exec -- jq -n --arg token "$near_expiry_token" '{tokens: {access_token: $token, refresh_token: ""}}' > "$CODEX_HOME/auth.json"
+if near_expiry_output=$( (validate_access_token_expiry) 2>&1); then
+  fail_test 'JWT inside the safety margin unexpectedly passed validation'
+fi
+[[ "$near_expiry_output" == *'access token is expired or expires too soon to start work'* ]] || fail_test 'JWT inside the safety margin was rejected for the wrong reason'

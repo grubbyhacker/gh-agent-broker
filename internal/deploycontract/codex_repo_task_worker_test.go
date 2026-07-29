@@ -61,7 +61,7 @@ func TestCodexRepoTaskWorkerContract(t *testing.T) {
 func TestCodexRepoTaskWorkerJWTValidation(t *testing.T) {
 	t.Parallel()
 
-	cmd := exec.Command("mise", "exec", "--", "bash", "workers/codex-repo-task/worker_test.sh")
+	cmd := exec.Command("bash", "workers/codex-repo-task/worker_test.sh")
 	cmd.Dir = "../.."
 	output, err := cmd.CombinedOutput()
 	if err != nil {
