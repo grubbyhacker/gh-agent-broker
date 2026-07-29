@@ -19,6 +19,14 @@ installation, mints its installation token, and forwards smart-HTTP to GitHub
 with `x-access-token` Basic authentication. Pull requests are opened through
 the existing `/v1/repos/{owner}/{repo}/pulls` API path.
 
+`/usr/local/bin/agent-repo-task-worker` is a generic, model-free worker copied
+from the published broker image into per-repository images. It uses only the
+broker-mediated Git remote and `gh-agent-broker-cli` for GitHub access. Its
+dependency-manifest hash exactly matches the reusable image workflow for
+repositories without submodules. A checkout containing submodules is treated
+as unverifiable and triggers an explicit dependency reinstall, because the
+worker must not initialize submodules through a direct GitHub remote.
+
 The staged `repository_transport_stage` audit events remain on the real Git
 path. No local repository backend, registered green-PR endpoint, agentd
 authority lifecycle, or agentd-issued Git credential path remains.
