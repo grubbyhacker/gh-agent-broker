@@ -17,6 +17,7 @@ COPY --from=build /out/broker-issue-reporter /usr/local/bin/broker-issue-reporte
 COPY --from=build /out/sandbox-broker /usr/local/bin/sandbox-broker
 COPY --from=build /out/gh-agent-proxy /usr/local/bin/gh-agent-proxy
 COPY --chmod=0755 workers/repo-task/worker.sh /usr/local/bin/agent-repo-task-worker
+COPY --chmod=0755 workers/codex-repo-task/worker.sh /usr/local/bin/agent-codex-repo-task-worker
 COPY --from=build --chown=65532:65532 /out/audit /var/log/gh-agent-broker
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/gh-agent-broker"]
