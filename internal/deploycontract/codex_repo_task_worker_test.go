@@ -46,6 +46,38 @@ func TestCodexRepoTaskWorkerContract(t *testing.T) {
 	if strings.Contains(text, "https://github.com") || strings.Contains(text, "git@github.com") {
 		t.Error("Codex repository task worker must not use a direct GitHub remote")
 	}
+	mainStart := strings.Index(text, "if [[ \"${BASH_SOURCE[0]}\" == \"$0\" ]]; then")
+	if mainStart == -1 {
+		t.Fatal("Codex repository task worker must have a main block")
+	}
+	main := text[mainStart:]
+	preparationEnd := strings.Index(main, "stage='Codex credential preparation'")
+	if preparationEnd == -1 {
+		t.Error("Codex repository task worker must have a Codex credential preparation stage")
+	} else {
+		for _, requiredBeforeCredentialCopy := range []string{
+			"stage='broker-mediated checkout'",
+			"stage='dependency manifest check'",
+			"install_repository_dependencies",
+		} {
+			if index := strings.Index(main, requiredBeforeCredentialCopy); index == -1 || index > preparationEnd {
+				t.Errorf("Codex credential preparation must follow %q", requiredBeforeCredentialCopy)
+			}
+		}
+		codexTaskStart := strings.Index(main[preparationEnd:], "stage='Codex repository task'")
+		if codexTaskStart == -1 {
+			t.Error("Codex credential preparation must precede the Codex repository task")
+		}
+		for _, requiredDuringCredentialPreparation := range []string{
+			"prepare_codex_home",
+			"validate_access_token_expiry",
+		} {
+			index := strings.Index(main[preparationEnd:], requiredDuringCredentialPreparation)
+			if index == -1 || (codexTaskStart != -1 && index > codexTaskStart) {
+				t.Errorf("Codex credential preparation must contain %q", requiredDuringCredentialPreparation)
+			}
+		}
+	}
 	for _, forbidden := range []string{"gh ", "ssh ", "tofu ", "ansible ", "doppler ", "scp ", "sftp "} {
 		if strings.Contains(text, forbidden) {
 			t.Errorf("Codex repository task worker must not depend on %q", strings.TrimSpace(forbidden))
@@ -66,6 +98,15 @@ func TestCodexRepoTaskWorkerJWTValidation(t *testing.T) {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("run Codex repository task worker JWT regression test: %v\n%s", err, output)
+	}
+}
+
+func TestCodexRepoTaskWorkerSubmoduleHandling(t *testing.T) {
+	cmd := exec.Command("bash", "workers/submodule_worker_test.sh", "workers/codex-repo-task/worker.sh")
+	cmd.Dir = "../.."
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run Codex repository task worker submodule regression test: %v\n%s", err, output)
 	}
 }
 
