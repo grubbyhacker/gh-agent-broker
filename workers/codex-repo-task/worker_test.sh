@@ -59,3 +59,38 @@ if near_expiry_output=$( (validate_access_token_expiry) 2>&1); then
   fail_test 'JWT inside the safety margin unexpectedly passed validation'
 fi
 [[ "$near_expiry_output" == *'access token is expired or expires too soon to start work'* ]] || fail_test 'JWT inside the safety margin was rejected for the wrong reason'
+
+submodule_test_root=$(mise exec -- mktemp -d)
+trap 'mise exec -- rm -rf "$tmpdir" "$submodule_test_root"' EXIT
+mise exec -- git init --quiet "$submodule_test_root/submodule-origin"
+mise exec -- git -C "$submodule_test_root/submodule-origin" config user.name test
+mise exec -- git -C "$submodule_test_root/submodule-origin" config user.email test@example.invalid
+printf 'baked theme content\n' > "$submodule_test_root/submodule-origin/theme.txt"
+mise exec -- git -C "$submodule_test_root/submodule-origin" add theme.txt
+mise exec -- git -C "$submodule_test_root/submodule-origin" commit --quiet -m initial
+submodule_sha=$(mise exec -- git -C "$submodule_test_root/submodule-origin" rev-parse HEAD)
+
+mise exec -- git init --quiet "$submodule_test_root/super-origin"
+mise exec -- git -C "$submodule_test_root/super-origin" config user.name test
+mise exec -- git -C "$submodule_test_root/super-origin" config user.email test@example.invalid
+mise exec -- git -C "$submodule_test_root/super-origin" -c protocol.file.allow=always submodule add --quiet "$submodule_test_root/submodule-origin" theme
+mise exec -- git -C "$submodule_test_root/super-origin" commit --quiet -am submodule
+mise exec -- git clone --quiet "$submodule_test_root/super-origin" "$submodule_test_root/checkout"
+
+mise exec -- mkdir -p "$submodule_test_root/baked/theme" "$submodule_test_root/output"
+mise exec -- cp "$submodule_test_root/submodule-origin/theme.txt" "$submodule_test_root/baked/theme/theme.txt"
+printf 'submodule %s theme\n' "$submodule_sha" > "$submodule_test_root/dependency-manifest.inputs"
+baked_manifest=$(mise exec -- sha256sum "$submodule_test_root/dependency-manifest.inputs" | mise exec -- cut -d ' ' -f 1)
+
+cd "$submodule_test_root/checkout"
+SUBMODULE_RESTORE_LOG_PATH="$submodule_test_root/output/submodules.txt" restore_baked_submodules "$submodule_test_root/dependency-manifest.inputs" "$submodule_test_root/baked" "$baked_manifest"
+[[ "$(mise exec -- cat theme/theme.txt)" == 'baked theme content' ]] || fail_test 'baked submodule content was not restored'
+mise exec -- git diff --ignore-submodules=all --quiet || fail_test 'restored submodule content must not create a diff'
+[[ -z "$(mise exec -- git status --porcelain --ignore-submodules=all)" ]] || fail_test 'restored submodule content must not appear in status'
+
+printf 'submodule %040d theme\n' 0 > "$submodule_test_root/stale-manifest.inputs"
+stale_manifest=$(mise exec -- sha256sum "$submodule_test_root/stale-manifest.inputs" | mise exec -- cut -d ' ' -f 1)
+if stale_output=$(SUBMODULE_RESTORE_LOG_PATH="$submodule_test_root/output/stale-submodules.txt" restore_baked_submodules "$submodule_test_root/stale-manifest.inputs" "$submodule_test_root/baked" "$stale_manifest" 2>&1); then
+  fail_test 'stale baked submodule SHA unexpectedly passed restoration'
+fi
+[[ "$stale_output" == *"baked submodule theme is stale: checkout expects $submodule_sha"* ]] || fail_test 'stale baked submodule SHA was rejected for the wrong reason'

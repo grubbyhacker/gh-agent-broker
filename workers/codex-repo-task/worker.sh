@@ -3,6 +3,8 @@ set -euo pipefail
 
 readonly worker_name='agent-codex-repo-task-worker'
 readonly dependency_manifest_path='/usr/local/share/agent-image/dependency-manifest.sha256'
+readonly dependency_manifest_inputs_path='/usr/local/share/agent-image/dependency-manifest.inputs'
+readonly baked_workspace_path='/workspace'
 readonly credential_bundle_path='/credentials/codex/auth.json'
 readonly codex_home_base='/dev/shm/codex-home'
 readonly token_expiry_margin_seconds=300
@@ -109,7 +111,6 @@ load_prompt() {
   [[ -n "$codex_task_prompt" ]] || fail 'Codex task prompt must not be empty'
 }
 
-# This matches publish-agent-image.yml for repositories without submodules.
 has_submodules() {
   local entry metadata
   while IFS= read -r -d '' entry; do
@@ -117,6 +118,37 @@ has_submodules() {
     [[ "${metadata%% *}" == '160000' ]] && return 0
   done < <(mise exec -- git ls-files --stage -z)
   return 1
+}
+
+restore_baked_submodules() {
+  local manifest_inputs_path="$1" baked_workspace="$2" baked_manifest="$3"
+  local entry metadata path expected_sha manifest_kind manifest_sha manifest_path
+  local output_path="${SUBMODULE_RESTORE_LOG_PATH:-/output/submodules.txt}"
+  local restored=0
+
+  has_submodules || return 0
+  [[ -f "$manifest_inputs_path" ]] || fail "checkout contains submodules but the agent image does not include $manifest_inputs_path; rebuild the image with publish-agent-image.yml that preserves submodule manifest entries"
+  [[ "$(mise exec -- sha256sum "$manifest_inputs_path" | mise exec -- cut -d ' ' -f 1)" == "$baked_manifest" ]] || fail "baked dependency manifest inputs do not match $dependency_manifest_path"
+
+  while IFS= read -r -d '' entry; do
+    metadata="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    [[ "${metadata%% *}" == '160000' ]] || continue
+    expected_sha="${metadata#* }"
+    expected_sha="${expected_sha%% *}"
+    manifest_sha=''
+    while IFS=' ' read -r manifest_kind manifest_sha manifest_path; do
+      [[ "$manifest_kind" == 'submodule' && "$manifest_path" == "$path" ]] && break
+      manifest_sha=''
+    done < "$manifest_inputs_path"
+    [[ "$manifest_sha" =~ ^[a-fA-F0-9]{40}$ ]] || fail "baked dependency manifest has no submodule entry for $path"
+    [[ "$manifest_sha" == "$expected_sha" ]] || fail "baked submodule $path is stale: checkout expects $expected_sha but image contains $manifest_sha; rebuild the agent image"
+    [[ -d "$baked_workspace/$path" ]] || fail "baked submodule content is missing for $path at $baked_workspace/$path; rebuild the agent image"
+    mise exec -- mkdir -p "$path"
+    mise exec -- tar --exclude-vcs -C "$baked_workspace/$path" -cf - . | mise exec -- tar -C "$path" -xf -
+    ((restored += 1))
+  done < <(mise exec -- git ls-files --stage -z)
+  printf 'restored %d baked submodule(s)\n' "$restored" | mise exec -- tee "$output_path"
 }
 
 collect_lockfiles() {
@@ -206,6 +238,14 @@ mise exec -- git checkout --quiet -B "$AGENT_BRANCH" FETCH_HEAD
 mise exec -- git config user.name "${GIT_AUTHOR_NAME:-Codex Repository Task Worker}"
 mise exec -- git config user.email "${GIT_AUTHOR_EMAIL:-codex-repo-task-worker@users.noreply.github.com}"
 
+stage='baked submodule restoration'
+if has_submodules; then
+  [[ -f "$dependency_manifest_path" ]] || fail "checkout contains submodules but the baked dependency manifest is missing: $dependency_manifest_path"
+  IFS= read -r baked_manifest < "$dependency_manifest_path" || true
+  [[ "$baked_manifest" =~ ^[a-fA-F0-9]{64}$ ]] || fail "invalid baked dependency manifest hash: $dependency_manifest_path"
+  restore_baked_submodules "$dependency_manifest_inputs_path" "$baked_workspace_path" "$baked_manifest"
+fi
+
 stage='dependency manifest check'
 manifest_status='missing baked manifest'
 if [[ -f "$dependency_manifest_path" ]]; then
@@ -213,7 +253,7 @@ if [[ -f "$dependency_manifest_path" ]]; then
   if [[ ! "$baked_manifest" =~ ^[a-fA-F0-9]{64}$ ]]; then
     fail "invalid baked dependency manifest hash: $dependency_manifest_path"
   elif has_submodules; then
-    manifest_status='unverifiable: checkout contains submodules; reinstalling dependencies'
+    manifest_status='match: submodules restored from baked image'
   else
     current_manifest=$(compute_dependency_manifest)
     if [[ "$current_manifest" == "$baked_manifest" ]]; then
@@ -250,7 +290,7 @@ if [[ -n "${AGENT_VERIFY_TASK:-}" ]]; then
 fi
 
 stage='change detection'
-if mise exec -- git diff --quiet && mise exec -- git diff --cached --quiet && [[ -z "$(mise exec -- git status --porcelain)" ]]; then
+if mise exec -- git diff --ignore-submodules=all --quiet && mise exec -- git diff --cached --ignore-submodules=all --quiet && [[ -z "$(mise exec -- git status --porcelain --ignore-submodules=all)" ]]; then
   fail 'Codex completed without a repository change'
 fi
 

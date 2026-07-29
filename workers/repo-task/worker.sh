@@ -3,6 +3,8 @@ set -euo pipefail
 
 readonly worker_name='agent-repo-task-worker'
 readonly dependency_manifest_path='/usr/local/share/agent-image/dependency-manifest.sha256'
+readonly dependency_manifest_inputs_path='/usr/local/share/agent-image/dependency-manifest.inputs'
+readonly baked_workspace_path='/workspace'
 stage='initializing'
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
@@ -41,16 +43,44 @@ validate_inputs() {
   fi
 }
 
-# This matches publish-agent-image.yml for repositories without submodules.
-# Submodule recursion cannot be reproduced without bypassing the broker, so a
-# checkout with a gitlink deliberately becomes a loud mismatch, never a match.
 has_submodules() {
   local entry metadata
   while IFS= read -r -d '' entry; do
     metadata="${entry%%$'\t'*}"
     [[ "${metadata%% *}" == '160000' ]] && return 0
-  done < <(git ls-files --stage -z)
+  done < <(mise exec -- git ls-files --stage -z)
   return 1
+}
+
+restore_baked_submodules() {
+  local manifest_inputs_path="$1" baked_workspace="$2" baked_manifest="$3"
+  local entry metadata path expected_sha manifest_kind manifest_sha manifest_path
+  local output_path="${SUBMODULE_RESTORE_LOG_PATH:-/output/submodules.txt}"
+  local restored=0
+
+  has_submodules || return 0
+  [[ -f "$manifest_inputs_path" ]] || fail "checkout contains submodules but the agent image does not include $manifest_inputs_path; rebuild the image with publish-agent-image.yml that preserves submodule manifest entries"
+  [[ "$(mise exec -- sha256sum "$manifest_inputs_path" | mise exec -- cut -d ' ' -f 1)" == "$baked_manifest" ]] || fail "baked dependency manifest inputs do not match $dependency_manifest_path"
+
+  while IFS= read -r -d '' entry; do
+    metadata="${entry%%$'\t'*}"
+    path="${entry#*$'\t'}"
+    [[ "${metadata%% *}" == '160000' ]] || continue
+    expected_sha="${metadata#* }"
+    expected_sha="${expected_sha%% *}"
+    manifest_sha=''
+    while IFS=' ' read -r manifest_kind manifest_sha manifest_path; do
+      [[ "$manifest_kind" == 'submodule' && "$manifest_path" == "$path" ]] && break
+      manifest_sha=''
+    done < "$manifest_inputs_path"
+    [[ "$manifest_sha" =~ ^[a-fA-F0-9]{40}$ ]] || fail "baked dependency manifest has no submodule entry for $path"
+    [[ "$manifest_sha" == "$expected_sha" ]] || fail "baked submodule $path is stale: checkout expects $expected_sha but image contains $manifest_sha; rebuild the agent image"
+    [[ -d "$baked_workspace/$path" ]] || fail "baked submodule content is missing for $path at $baked_workspace/$path; rebuild the agent image"
+    mise exec -- mkdir -p "$path"
+    mise exec -- tar --exclude-vcs -C "$baked_workspace/$path" -cf - . | mise exec -- tar -C "$path" -xf -
+    ((restored += 1))
+  done < <(mise exec -- git ls-files --stage -z)
+  printf 'restored %d baked submodule(s)\n' "$restored" | mise exec -- tee "$output_path"
 }
 
 collect_lockfiles() {
@@ -61,7 +91,7 @@ collect_lockfiles() {
       package-lock.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|go.sum|Cargo.lock|Gemfile.lock|requirements*.txt) lockfiles+=("$path") ;;
       */*lock*|*lock*.json|*lock*.yaml|*lock*.yml|*Lock*|*requirements*.txt) fail "unsupported dependency lockfile: $path; extend publish-agent-image.yml before using this worker" ;;
     esac
-  done < <(git ls-files)
+  done < <(mise exec -- git ls-files)
 }
 
 compute_dependency_manifest() {
@@ -69,7 +99,7 @@ compute_dependency_manifest() {
   collect_lockfiles
   manifest_files=()
   for manifest_file in package.json go.mod pyproject.toml Cargo.toml; do
-    git ls-files --error-unmatch -- "$manifest_file" >/dev/null 2>&1 && manifest_files+=("$manifest_file")
+    mise exec -- git ls-files --error-unmatch -- "$manifest_file" >/dev/null 2>&1 && manifest_files+=("$manifest_file")
   done
   {
     mise exec -- sha256sum mise.toml
@@ -116,23 +146,31 @@ require_env AGENT_TASK
 AGENT_BRANCH="agent/contributor/${AGENT_RUN_ID}"
 export AGENT_BRANCH
 validate_inputs
-mkdir -p /work/repo /output
+mise exec -- mkdir -p /work/repo /output
 trap on_exit EXIT
 
 stage='broker health check'
-/usr/local/bin/gh-agent-broker-cli health -broker "$BROKER_URL" > /output/broker-health.txt
-/usr/local/bin/gh-agent-broker-cli probe -broker "$BROKER_URL" -repo "$AGENT_REPO" > /output/broker-repo-probe.json
+mise exec -- /usr/local/bin/gh-agent-broker-cli health -broker "$BROKER_URL" > /output/broker-health.txt
+mise exec -- /usr/local/bin/gh-agent-broker-cli probe -broker "$BROKER_URL" -repo "$AGENT_REPO" > /output/broker-repo-probe.json
 
 stage='broker-mediated checkout'
 cd /work/repo
-git init --quiet
-git check-ref-format --branch "$AGENT_BASE_BRANCH" >/dev/null || fail 'AGENT_BASE_BRANCH must be a valid Git branch name'
-git remote add origin placeholder
-/usr/local/bin/gh-agent-broker-cli configure -broker "$BROKER_URL" -repo "$AGENT_REPO" -remote origin > /output/broker-remote.txt
-git fetch --quiet origin "$AGENT_BASE_BRANCH"
-git checkout --quiet -B "$AGENT_BRANCH" FETCH_HEAD
-git config user.name "${GIT_AUTHOR_NAME:-Repository Task Worker}"
-git config user.email "${GIT_AUTHOR_EMAIL:-repository-task-worker@users.noreply.github.com}"
+mise exec -- git init --quiet
+mise exec -- git check-ref-format --branch "$AGENT_BASE_BRANCH" >/dev/null || fail 'AGENT_BASE_BRANCH must be a valid Git branch name'
+mise exec -- git remote add origin placeholder
+mise exec -- /usr/local/bin/gh-agent-broker-cli configure -broker "$BROKER_URL" -repo "$AGENT_REPO" -remote origin > /output/broker-remote.txt
+mise exec -- git fetch --quiet origin "$AGENT_BASE_BRANCH"
+mise exec -- git checkout --quiet -B "$AGENT_BRANCH" FETCH_HEAD
+mise exec -- git config user.name "${GIT_AUTHOR_NAME:-Repository Task Worker}"
+mise exec -- git config user.email "${GIT_AUTHOR_EMAIL:-repository-task-worker@users.noreply.github.com}"
+
+stage='baked submodule restoration'
+if has_submodules; then
+  [[ -f "$dependency_manifest_path" ]] || fail "checkout contains submodules but the baked dependency manifest is missing: $dependency_manifest_path"
+  IFS= read -r baked_manifest < "$dependency_manifest_path" || true
+  [[ "$baked_manifest" =~ ^[a-fA-F0-9]{64}$ ]] || fail "invalid baked dependency manifest hash: $dependency_manifest_path"
+  restore_baked_submodules "$dependency_manifest_inputs_path" "$baked_workspace_path" "$baked_manifest"
+fi
 
 stage='dependency manifest check'
 manifest_status='missing baked manifest'
@@ -141,7 +179,7 @@ if [[ -f "$dependency_manifest_path" ]]; then
   if [[ ! "$baked_manifest" =~ ^[a-fA-F0-9]{64}$ ]]; then
     fail "invalid baked dependency manifest hash: $dependency_manifest_path"
   elif has_submodules; then
-    manifest_status='unverifiable: checkout contains submodules; reinstalling dependencies'
+    manifest_status='match: submodules restored from baked image'
   else
     current_manifest=$(compute_dependency_manifest)
     if [[ "$current_manifest" == "$baked_manifest" ]]; then
@@ -163,21 +201,21 @@ mise run "$AGENT_TASK" > /output/task.txt 2>&1
 if [[ -n "${AGENT_VERIFY_TASK:-}" ]]; then stage='repository verification task'; mise run "$AGENT_VERIFY_TASK" > /output/verify.txt 2>&1; fi
 
 stage='change detection'
-if git diff --quiet && git diff --cached --quiet && [[ -z "$(git status --porcelain)" ]]; then
+if mise exec -- git diff --ignore-submodules=all --quiet && mise exec -- git diff --cached --ignore-submodules=all --quiet && [[ -z "$(mise exec -- git status --porcelain --ignore-submodules=all)" ]]; then
   write_result no_change_required 'task completed successfully; repository is unchanged'
   printf 'No change required: mise task %s completed successfully.\n' "$AGENT_TASK" > /output/final-summary.md
   exit 0
 fi
 
 stage='commit and push'
-git add --all
-git commit --quiet -m "Run repository task ${AGENT_RUN_ID}"
-git push --quiet origin "HEAD:${AGENT_BRANCH}"
+mise exec -- git add --all
+mise exec -- git commit --quiet -m "Run repository task ${AGENT_RUN_ID}"
+mise exec -- git push --quiet origin "HEAD:${AGENT_BRANCH}"
 
 stage='pull request creation'
 pr_title="${AGENT_PR_TITLE:-Repository task: ${AGENT_TASK}}"
 pr_body="${AGENT_PR_BODY:-Automated repository task ${AGENT_TASK} completed for run ${AGENT_RUN_ID}.}"
-/usr/local/bin/gh-agent-broker-cli pr -broker "$BROKER_URL" -repo "$AGENT_REPO" -title "$pr_title" -head "$AGENT_BRANCH" -base "$AGENT_BASE_BRANCH" -body "$pr_body" \
+mise exec -- /usr/local/bin/gh-agent-broker-cli pr -broker "$BROKER_URL" -repo "$AGENT_REPO" -title "$pr_title" -head "$AGENT_BRANCH" -base "$AGENT_BASE_BRANCH" -body "$pr_body" \
   -metadata "Agent-Id=${BROKER_AGENT_ID:?BROKER_AGENT_ID is required for pull request metadata}" -metadata "Run-Id=${AGENT_RUN_ID}" > /output/pull-request.json
 
 stage='completed'
