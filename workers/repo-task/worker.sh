@@ -6,20 +6,19 @@ readonly dependency_manifest_path="${AGENT_IMAGE_DEPENDENCY_MANIFEST_PATH:-/usr/
 readonly dependency_manifest_output_path="${AGENT_IMAGE_DEPENDENCY_MANIFEST_OUTPUT_PATH:-/output/dependency-manifest.txt}"
 # publish-agent-image.yml copies initialized submodule content to /workspace.
 readonly baked_workspace_path="${AGENT_IMAGE_WORKSPACE:-/workspace}"
+readonly worker_result_lib_path="${WORKER_RESULT_LIB_PATH:-/usr/local/lib/agent-worker-result.sh}"
 stage='initializing'
+verification_status='not_run'
+
+if [[ ! -r "$worker_result_lib_path" ]]; then
+  # shellcheck source=../result.sh
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/result.sh"
+else
+  source "$worker_result_lib_path"
+fi
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
 require_env() { [[ -n "${!1:-}" ]] || fail "missing required environment variable: $1"; }
-
-write_result() {
-  local outcome="$1" detail="$2"
-  mise exec -- jq -n --arg outcome "$outcome" --arg detail "$detail" --arg stage "$stage" \
-    --arg run_id "$AGENT_RUN_ID" --arg repository "$AGENT_REPO" --arg base_branch "$AGENT_BASE_BRANCH" \
-    --arg branch "$AGENT_BRANCH" --arg task "$AGENT_TASK" --arg verify_task "${AGENT_VERIFY_TASK:-}" \
-    --arg manifest_status "${manifest_status:-not_checked}" \
-    '{outcome: $outcome, detail: $detail, stage: $stage, run_id: $run_id, repository: $repository, base_branch: $base_branch, branch: $branch, task: $task, verify_task: $verify_task, dependency_manifest: $manifest_status}' \
-    > /output/result.json
-}
 
 on_exit() {
   local status=$?
@@ -200,7 +199,11 @@ fi
 
 stage='repository task'
 mise run "$AGENT_TASK" > /output/task.txt 2>&1
-if [[ -n "${AGENT_VERIFY_TASK:-}" ]]; then stage='repository verification task'; mise run "$AGENT_VERIFY_TASK" > /output/verify.txt 2>&1; fi
+if [[ -n "${AGENT_VERIFY_TASK:-}" ]]; then
+  stage='repository verification task'
+  mise run "$AGENT_VERIFY_TASK" > /output/verify.txt 2>&1
+  verification_status='passed'
+fi
 
 stage='change detection'
 if git diff --quiet && git diff --cached --quiet && [[ -z "$(git status --porcelain)" ]]; then
@@ -220,7 +223,10 @@ pr_body="${AGENT_PR_BODY:-Automated repository task ${AGENT_TASK} completed for 
 /usr/local/bin/gh-agent-broker-cli pr -broker "$BROKER_URL" -repo "$AGENT_REPO" -title "$pr_title" -head "$AGENT_BRANCH" -base "$AGENT_BASE_BRANCH" -body "$pr_body" \
   -metadata "Agent-Id=${BROKER_AGENT_ID:?BROKER_AGENT_ID is required for pull request metadata}" -metadata "Run-Id=${AGENT_RUN_ID}" > /output/pull-request.json
 
+stage='pull request result validation'
+pull_request=$(read_pull_request) || fail 'broker pull request response did not contain a valid pull request identity'
+
 stage='completed'
-write_result ready_for_review 'task changed the repository and a pull request was created'
+write_result ready_for_review 'task changed the repository and a pull request was created' "$pull_request"
 printf 'Repository task %s completed on %s and opened a ready-for-review pull request.\n' "$AGENT_TASK" "$AGENT_BRANCH" > /output/final-summary.md
 fi

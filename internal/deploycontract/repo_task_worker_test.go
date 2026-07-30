@@ -59,6 +59,15 @@ func TestRepoTaskWorkerSubmoduleHandling(t *testing.T) {
 	}
 }
 
+func TestRepoTaskWorkerTerminalResult(t *testing.T) {
+	cmd := exec.Command("bash", "workers/result_test.sh", "workers/repo-task/worker.sh")
+	cmd.Dir = "../.."
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run repository task worker terminal result regression test: %v\n%s", err, output)
+	}
+}
+
 func TestPublishedBrokerImageCarriesRepoTaskWorker(t *testing.T) {
 	t.Parallel()
 

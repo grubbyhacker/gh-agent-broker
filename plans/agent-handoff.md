@@ -12,6 +12,15 @@ or `cancelled` as appropriate) rather than truncation. The worker still does
 not publish or call GitHub. Signal Plane owns comment/outbox delivery in its
 follow-on slice.
 
+Both deterministic repository workers now produce the shared bounded
+`repository-task-worker-result/v1` contract. It always includes a structured
+`verification.status` (`passed`, `failed`, or `not_run`), and a
+`ready_for_review` outcome includes only the broker-created pull request's
+validated `number`, `html_url`, and `url`. The worker validates that identity
+before publishing readiness; malformed or absent broker output fails closed
+with the same bounded, log-free failure result. Workers never publish final
+issue comments; Signal Plane remains the terminal-comment owner.
+
 `gh-agent-broker-cli reload` calls the broker admin reload endpoint with
 `BROKER_ADMIN_SECRET` (or `-admin-secret`) and prints the server response. A
 restart is still required when changing `server.listen`, `audit.path`,

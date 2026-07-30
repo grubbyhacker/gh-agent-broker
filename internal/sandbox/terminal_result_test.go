@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +20,7 @@ func TestTerminalResultPreservesBoundedRedactedWorkerOutputAcrossRestart(t *test
 	if err := os.MkdirAll(filepath.Join(cfg.RunsDir, meta.RunID, "output"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	result := `{"outcome":"no_change_required","stage":"verification","nested":{"note":"bundle-secret"}}`
+	result := `{"version":"repository-task-worker-result/v1","outcome":"ready_for_review","detail":"pull request created","stage":"completed","run_id":"terminal-completed","repository":"owner/repo","base_branch":"main","branch":"agent/test/terminal","verification":{"status":"passed"},"verify_task":"verify","dependency_manifest":"match","pull_request":{"number":42,"html_url":"https://github.example/owner/repo/pull/42","url":"https://api.github.example/repos/owner/repo/pulls/42"},"nested":{"note":"bundle-secret"}}`
 	if err := os.WriteFile(filepath.Join(cfg.RunsDir, meta.RunID, "output", "result.json"), []byte(result), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -41,8 +42,15 @@ func TestTerminalResultPreservesBoundedRedactedWorkerOutputAcrossRestart(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Version != terminalResultVersion || got.Outcome != "no_change_required" || got.IdempotencyKeyDigest != "idem-digest" || got.LaunchConfigVersion != "config-version" {
+	if got.Version != terminalResultVersion || got.Outcome != "ready_for_review" || got.IdempotencyKeyDigest != "idem-digest" || got.LaunchConfigVersion != "config-version" {
 		t.Fatalf("correlation projection = %+v", got)
+	}
+	var expected map[string]any
+	if err := json.Unmarshal([]byte(`{"version":"repository-task-worker-result/v1","outcome":"ready_for_review","detail":"pull request created","stage":"completed","run_id":"terminal-completed","repository":"owner/repo","base_branch":"main","branch":"agent/test/terminal","verification":{"status":"passed"},"verify_task":"verify","dependency_manifest":"match","pull_request":{"number":42,"html_url":"https://github.example/owner/repo/pull/42","url":"https://api.github.example/repos/owner/repo/pulls/42"},"nested":{"note":"[REDACTED]"}}`), &expected); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Result, expected) {
+		t.Fatalf("worker result shape changed: got %#v, want %#v", got.Result, expected)
 	}
 	encoded, err := json.Marshal(got)
 	if err != nil {
