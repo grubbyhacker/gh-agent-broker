@@ -444,9 +444,9 @@ func TestCompletionStatusFileWrittenForConfiguredTemplate(t *testing.T) {
 	}
 	runtime.finish(out.RunID, 0, "")
 
-	meta := waitForMetadataStatus(t, cfg, out.RunID, StatusStopped)
-	if meta.Status != StatusStopped {
-		t.Fatalf("status = %+v, want stopped", meta)
+	meta := waitForMetadataStatus(t, cfg, out.RunID, StatusCompleted)
+	if meta.Status != StatusCompleted {
+		t.Fatalf("status = %+v, want completed", meta)
 	}
 	var statusFile completionStatusFile
 	if err := json.Unmarshal(runtime.writtenFile("/data/intake/curator-status.json"), &statusFile); err != nil {
@@ -479,7 +479,7 @@ func TestExitWatcherFinalizesRunAndWritesTerminalAudit(t *testing.T) {
 		t.Fatalf("LaunchAgent() error = %v", err)
 	}
 	runtime.finish(out.RunID, 0, "")
-	meta := waitForMetadataStatus(t, cfg, out.RunID, StatusStopped)
+	meta := waitForMetadataStatus(t, cfg, out.RunID, StatusCompleted)
 	if meta.ExitCode == nil || *meta.ExitCode != 0 {
 		t.Fatalf("exit code = %+v, want 0", meta.ExitCode)
 	}
@@ -490,7 +490,7 @@ func TestExitWatcherFinalizesRunAndWritesTerminalAudit(t *testing.T) {
 	if statusFile.Status != "success" || statusFile.ExitCode != 0 {
 		t.Fatalf("completion status = %+v", statusFile)
 	}
-	waitForTerminalAudit(t, auditPath, out.RunID, finalizeReasonWorkerExit, terminalSourceExited, StatusStopped)
+	waitForTerminalAudit(t, auditPath, out.RunID, finalizeReasonWorkerExit, terminalSourceExited, StatusCompleted)
 }
 
 func TestTimeoutStopAlreadyStoppedFinalizesExitedRun(t *testing.T) {
@@ -513,8 +513,8 @@ func TestTimeoutStopAlreadyStoppedFinalizesExitedRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgentStatus() error = %v", err)
 	}
-	if status.Status != StatusStopped || status.ExitCode == nil || *status.ExitCode != 0 {
-		t.Fatalf("status = %+v, want stopped exit 0", status)
+	if status.Status != StatusCompleted || status.ExitCode == nil || *status.ExitCode != 0 {
+		t.Fatalf("status = %+v, want completed exit 0", status)
 	}
 	if strings.Contains(status.Error, "run exceeded deadline") {
 		t.Fatalf("stop 304 race was misreported as timeout: %+v", status)
@@ -525,6 +525,26 @@ func TestTimeoutStopAlreadyStoppedFinalizesExitedRun(t *testing.T) {
 	}
 	if statusFile.Status != "success" || statusFile.ExitCode != 0 {
 		t.Fatalf("completion status = %+v", statusFile)
+	}
+}
+
+func TestManualStopRemainsStopped(t *testing.T) {
+	cfg := baseTestConfig(t)
+	runtime := newFakeRuntime()
+	service := NewService(cfg, runtime, testAudit(t))
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
+		Template: "worker", Task: "stop", Repo: "owner/repo", BaseBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("LaunchAgent() error = %v", err)
+	}
+
+	status, err := service.StopAgent(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatalf("StopAgent() error = %v", err)
+	}
+	if status.Status != StatusStopped {
+		t.Fatalf("status = %+v, want stopped", status)
 	}
 }
 

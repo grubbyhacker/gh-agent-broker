@@ -36,7 +36,9 @@ For `prune-runs`:
 `slim-runs` accepts the same flags, but retains its existing optional
 `keep_newest` behavior (default `0`) and does not delete run directories.
 
-Terminal runs are exactly `stopped`, `failed`, `timed_out`, and `cleaned`.
+Terminal runs are exactly `completed`, `stopped`, `failed`, `timed_out`, and
+`cleaned`. A natural worker exit with code zero is `completed`; `stopped` is
+reserved for an explicit stop.
 
 ## Slim behavior
 

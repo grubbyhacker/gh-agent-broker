@@ -164,9 +164,9 @@ func main() {
 	if worker.Status != "running" {
 		fatalf("worker launch status = %q", worker.Status)
 	}
-	workerStatus := waitStatus(ctx, session, worker.RunID, "stopped", "failed", "timed_out")
-	if workerStatus.Status != "stopped" || workerStatus.ExitCode == nil || *workerStatus.ExitCode != 0 {
-		fatalf("worker did not stop cleanly: %+v", workerStatus)
+	workerStatus := waitStatus(ctx, session, worker.RunID, "completed", "stopped", "failed", "timed_out")
+	if workerStatus.Status != "completed" || workerStatus.ExitCode == nil || *workerStatus.ExitCode != 0 {
+		fatalf("worker did not complete cleanly: %+v", workerStatus)
 	}
 	if !authOnly {
 		inspectContainer(containerIDForRun(worker.RunID))
@@ -231,9 +231,9 @@ func main() {
 
 	secondTask := "real launch marker SMOKE-E2E-TWO"
 	second := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgsWithDeliverables(workerTemplate, secondTask, repo, baseBranch, []string{"repo/relative.md"})))
-	secondStatus := waitStatus(ctx, session, second.RunID, "stopped", "failed", "timed_out")
-	if secondStatus.Status != "stopped" || secondStatus.ExitCode == nil || *secondStatus.ExitCode != 0 {
-		fatalf("second marker worker did not stop cleanly: %+v", secondStatus)
+	secondStatus := waitStatus(ctx, session, second.RunID, "completed", "stopped", "failed", "timed_out")
+	if secondStatus.Status != "completed" || secondStatus.ExitCode == nil || *secondStatus.ExitCode != 0 {
+		fatalf("second marker worker did not complete cleanly: %+v", secondStatus)
 	}
 	secondArtifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": second.RunID}))
 	secondFinal := requireFile(secondArtifacts, "final-summary.md")
@@ -246,7 +246,7 @@ func main() {
 	}
 
 	missing := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgs(missingDeliverableTemplate, "missing deliverable test", repo, baseBranch)))
-	missingStatus := waitStatus(ctx, session, missing.RunID, "stopped", "failed", "timed_out")
+	missingStatus := waitStatus(ctx, session, missing.RunID, "completed", "stopped", "failed", "timed_out")
 	if missingStatus.Status != "failed" || missingStatus.ExitCode == nil || *missingStatus.ExitCode == 0 {
 		fatalf("missing deliverable template did not fail: %+v", missingStatus)
 	}
@@ -259,7 +259,7 @@ func main() {
 	timeoutArgs := launchArgs(sleeperTemplate, "timeout test", repo, baseBranch)
 	timeoutArgs["max_runtime_seconds"] = 5
 	timeoutRun := structured[launchOutput](callOK(ctx, session, "launch_agent", timeoutArgs))
-	timeoutStatus := waitStatus(ctx, session, timeoutRun.RunID, "stopped", "failed", "timed_out")
+	timeoutStatus := waitStatus(ctx, session, timeoutRun.RunID, "completed", "stopped", "failed", "timed_out")
 	if timeoutStatus.Status != "timed_out" || !strings.Contains(timeoutStatus.Error, "run exceeded deadline") {
 		fatalf("timeout run did not time out with diagnostics: %+v", timeoutStatus)
 	}
@@ -326,7 +326,7 @@ func runFinalizationLive(ctx context.Context, session *mcp.ClientSession, runsDi
 		"/lessons/run-summary.md",
 		"/output/required-never-created.txt",
 	})))
-	failureStatus := waitStatus(ctx, session, failure.RunID, "stopped", "failed", "timed_out")
+	failureStatus := waitStatus(ctx, session, failure.RunID, "completed", "stopped", "failed", "timed_out")
 	if failureStatus.Status != "failed" || failureStatus.ExitCode == nil || *failureStatus.ExitCode != 30 {
 		includeLogsAndFail(ctx, session, failure.RunID, "failure diagnostics run status = %+v, want failed exit 30", failureStatus)
 	}
@@ -341,7 +341,7 @@ func runFinalizationLive(ctx context.Context, session *mcp.ClientSession, runsDi
 	timeoutArgs := launchArgs(sleeperTemplate, "timeout probe", repo, baseBranch)
 	timeoutArgs["max_runtime_seconds"] = 5
 	timeoutRun := structured[launchOutput](callOK(ctx, session, "launch_agent", timeoutArgs))
-	timeoutStatus := waitStatus(ctx, session, timeoutRun.RunID, "stopped", "failed", "timed_out")
+	timeoutStatus := waitStatus(ctx, session, timeoutRun.RunID, "completed", "stopped", "failed", "timed_out")
 	if timeoutStatus.Status != "timed_out" || !strings.Contains(timeoutStatus.Error, "run exceeded deadline") {
 		fatalf("timeout run status = %+v, want timed_out", timeoutStatus)
 	}
@@ -359,9 +359,9 @@ func runFinalizationLive(ctx context.Context, session *mcp.ClientSession, runsDi
 	prArgs := launchArgsWithDeliverables(hermesTaskTemplate, prTask, repo, baseBranch, []string{"/output/final-summary.md", "/lessons/run-summary.md"})
 	prArgs["branch"] = branch
 	prRun := structured[launchOutput](callOK(ctx, session, "launch_agent", prArgs))
-	prStatus := waitStatus(ctx, session, prRun.RunID, "stopped", "failed", "timed_out")
-	if prStatus.Status != "stopped" || prStatus.ExitCode == nil || *prStatus.ExitCode != 0 {
-		includeLogsAndFail(ctx, session, prRun.RunID, "disposable PR run status = %+v, want stopped exit 0", prStatus)
+	prStatus := waitStatus(ctx, session, prRun.RunID, "completed", "stopped", "failed", "timed_out")
+	if prStatus.Status != "completed" || prStatus.ExitCode == nil || *prStatus.ExitCode != 0 {
+		includeLogsAndFail(ctx, session, prRun.RunID, "disposable PR run status = %+v, want completed exit 0", prStatus)
 	}
 	prArtifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": prRun.RunID}))
 	for _, file := range prArtifacts.Files {
@@ -522,8 +522,8 @@ func waitStatus(ctx context.Context, session *mcp.ClientSession, runID string, s
 func launchAndAssertMarker(ctx context.Context, session *mcp.ClientSession, template, repo, baseBranch, marker string, expectedSecrets []string) markerResult {
 	task := fmt.Sprintf("Smoke test the sandbox task contract. Do not create a PR, issue, comment, or push. Write /output/final-summary.md and /lessons/run-summary.md, and include the exact marker %s in both files. Then exit successfully.", marker)
 	worker := structured[launchOutput](callOK(ctx, session, "launch_agent", launchArgsWithDeliverables(template, task, repo, baseBranch, []string{"repo/relative.md"})))
-	status := waitStatus(ctx, session, worker.RunID, "stopped", "failed", "timed_out")
-	if status.Status != "stopped" || status.ExitCode == nil || *status.ExitCode != 0 {
+	status := waitStatus(ctx, session, worker.RunID, "completed", "stopped", "failed", "timed_out")
+	if status.Status != "completed" || status.ExitCode == nil || *status.ExitCode != 0 {
 		logText := ""
 		logs, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "get_agent_logs", Arguments: map[string]any{"run_id": worker.RunID, "max_bytes": 8192}})
 		if err != nil {
@@ -531,7 +531,7 @@ func launchAndAssertMarker(ctx context.Context, session *mcp.ClientSession, temp
 		} else if logs != nil {
 			logText = text(logs)
 		}
-		fatalf("marker worker did not stop cleanly: status=%+v logs=%s", status, logText)
+		fatalf("marker worker did not complete cleanly: status=%+v logs=%s", status, logText)
 	}
 	artifacts := structured[collectionOutput](callOK(ctx, session, "collect_artifacts", map[string]any{"run_id": worker.RunID}))
 	for _, file := range artifacts.Files {
