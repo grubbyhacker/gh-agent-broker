@@ -19,10 +19,11 @@ func TestLaunchAgentBuildsSandboxedRuntimeSpec(t *testing.T) {
 	service := NewService(cfg, runtime, auditLog)
 
 	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
-		Template:   "worker",
-		Task:       "make the change",
-		Repo:       "owner/repo",
-		BaseBranch: "main",
+		Template:         "worker",
+		Task:             "make the change",
+		VerificationTask: "validate",
+		Repo:             "owner/repo",
+		BaseBranch:       "main",
 	})
 	if err != nil {
 		t.Fatalf("LaunchAgent() error = %v", err)
@@ -42,6 +43,11 @@ func TestLaunchAgentBuildsSandboxedRuntimeSpec(t *testing.T) {
 	}
 	if spec.Env["HOME"] != "/work/home" || spec.Env["HERMES_HOME"] != "/work/hermes" {
 		t.Fatalf("task-local homes not configured: HOME=%q HERMES_HOME=%q", spec.Env["HOME"], spec.Env["HERMES_HOME"])
+	}
+	if spec.Env["AGENT_RUN_ID"] != out.RunID || spec.Env["AGENT_REPO"] != "owner/repo" ||
+		spec.Env["AGENT_BASE_BRANCH"] != "main" || spec.Env["AGENT_BRANCH"] != out.Branch ||
+		spec.Env["AGENT_TASK"] != "make the change" || spec.Env["AGENT_VERIFY_TASK"] != "validate" {
+		t.Fatalf("repository task contract not injected into runtime env: %#v", spec.Env)
 	}
 	if spec.Network.Network != "sandbox-net" {
 		t.Fatalf("network = %+v", spec.Network)
@@ -85,12 +91,13 @@ func TestLaunchAgentWritesTaskInputsAndMergesDeliverables(t *testing.T) {
 	service := NewService(cfg, newFakeRuntime(), auditLog)
 
 	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
-		Template:     "worker",
-		Task:         "write marker MARKER-ONE",
-		Repo:         "owner/repo",
-		BaseBranch:   "main",
-		Focus:        "contract test",
-		Deliverables: []string{"/output/extra.md", "/output/final-summary.md"},
+		Template:         "worker",
+		Task:             "write marker MARKER-ONE",
+		VerificationTask: "validate",
+		Repo:             "owner/repo",
+		BaseBranch:       "main",
+		Focus:            "contract test",
+		Deliverables:     []string{"/output/extra.md", "/output/final-summary.md"},
 	})
 	if err != nil {
 		t.Fatalf("LaunchAgent() error = %v", err)
@@ -107,6 +114,9 @@ func TestLaunchAgentWritesTaskInputsAndMergesDeliverables(t *testing.T) {
 	}
 	if contract.Task != "write marker MARKER-ONE" || contract.Focus != "contract test" {
 		t.Fatalf("unexpected task contract text: %+v", contract)
+	}
+	if contract.VerificationTask != "validate" {
+		t.Fatalf("verification task = %q", contract.VerificationTask)
 	}
 	if contract.Repo != "owner/repo" || contract.BaseBranch != "main" || contract.Branch != out.Branch {
 		t.Fatalf("unexpected repo contract: %+v", contract)

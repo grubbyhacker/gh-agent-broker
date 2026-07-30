@@ -92,6 +92,7 @@ type RunMetadata struct {
 	BaseBranch           string         `json:"base_branch"`
 	Branch               string         `json:"branch"`
 	Task                 string         `json:"task"`
+	VerificationTask     string         `json:"verification_task,omitempty"`
 	Focus                string         `json:"focus,omitempty"`
 	WorkerAgentID        string         `json:"worker_agent_id"`
 	BrokerAgentID        string         `json:"broker_agent_id"`
@@ -112,21 +113,23 @@ type RunMetadata struct {
 }
 
 type TaskContract struct {
-	RunID           string         `json:"run_id"`
-	Task            string         `json:"task"`
-	Focus           string         `json:"focus,omitempty"`
-	Repo            string         `json:"repo"`
-	BaseBranch      string         `json:"base_branch"`
-	Branch          string         `json:"branch"`
-	WorkerAgentID   string         `json:"worker_agent_id"`
-	BrokerRemoteURL string         `json:"broker_remote_url"`
-	Deliverables    []string       `json:"deliverables,omitempty"`
-	Parameters      map[string]any `json:"parameters,omitempty"`
+	RunID            string         `json:"run_id"`
+	Task             string         `json:"task"`
+	VerificationTask string         `json:"verification_task,omitempty"`
+	Focus            string         `json:"focus,omitempty"`
+	Repo             string         `json:"repo"`
+	BaseBranch       string         `json:"base_branch"`
+	Branch           string         `json:"branch"`
+	WorkerAgentID    string         `json:"worker_agent_id"`
+	BrokerRemoteURL  string         `json:"broker_remote_url"`
+	Deliverables     []string       `json:"deliverables,omitempty"`
+	Parameters       map[string]any `json:"parameters,omitempty"`
 }
 
 type LaunchAgentInput struct {
 	Template          string         `json:"template" yaml:"template" jsonschema:"sandbox template name"`
 	Task              string         `json:"task" yaml:"task" jsonschema:"worker task description"`
+	VerificationTask  string         `json:"verification_task,omitempty" yaml:"verification_task,omitempty" jsonschema:"optional repository verification task"`
 	Repo              string         `json:"repo" yaml:"repo" jsonschema:"owner/repo repository"`
 	BaseBranch        string         `json:"base_branch" yaml:"base_branch" jsonschema:"base branch"`
 	Branch            string         `json:"branch,omitempty" yaml:"branch,omitempty" jsonschema:"optional branch; generated when omitted"`
@@ -147,6 +150,7 @@ func (in *LaunchAgentInput) UnmarshalJSON(b []byte) error {
 	allowed := map[string]bool{
 		"template":            true,
 		"task":                true,
+		"verification_task":   true,
 		"repo":                true,
 		"base_branch":         true,
 		"branch":              true,
@@ -612,7 +616,7 @@ func (s *Service) LaunchProfile(ctx context.Context, principal, profile, rawKey,
 		RunID: runID, Profile: profile, Principal: principal, IdempotencyKeyDigest: digest,
 		RequestFingerprint: fingerprint, LaunchConfigVersion: s.cfg.ConfigVersion,
 		Template: in.Template, Repo: in.Repo, BaseBranch: in.BaseBranch,
-		Branch: branch, Task: in.Task, Focus: in.Focus, WorkerAgentID: workerAgentID(tmpl, runID),
+		Branch: branch, Task: in.Task, VerificationTask: in.VerificationTask, Focus: in.Focus, WorkerAgentID: workerAgentID(tmpl, runID),
 		BrokerAgentID: tmpl.BrokerAgentID, CredentialBundle: tmpl.CredentialBundle, Image: tmpl.Image,
 		Status: StatusPending, Deliverables: deliverables(in.Deliverables, tmpl.Deliverables),
 		Parameters: cloneParameters(in.Parameters), StartedAt: now, Deadline: now.Add(runtimeLimit),
@@ -1064,6 +1068,9 @@ func (s *Service) validateLaunch(in LaunchAgentInput) (Template, string, string,
 	if len(in.Task) > s.cfg.MaxTaskBytes {
 		return Template{}, "", "", 0, fmt.Errorf("policy denial: task exceeds max size %d bytes; shorten the task request", s.cfg.MaxTaskBytes)
 	}
+	if len(in.VerificationTask) > s.cfg.MaxTaskBytes {
+		return Template{}, "", "", 0, fmt.Errorf("policy denial: verification task exceeds max size %d bytes; shorten the verification task", s.cfg.MaxTaskBytes)
+	}
 	if strings.TrimSpace(in.BaseBranch) == "" {
 		return Template{}, "", "", 0, fmt.Errorf("base_branch is required")
 	}
@@ -1138,6 +1145,12 @@ func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Red
 			env[k] = v
 		}
 	}
+	env["AGENT_RUN_ID"] = meta.RunID
+	env["AGENT_REPO"] = meta.Repo
+	env["AGENT_BASE_BRANCH"] = meta.BaseBranch
+	env["AGENT_BRANCH"] = meta.Branch
+	env["AGENT_TASK"] = meta.Task
+	env["AGENT_VERIFY_TASK"] = meta.VerificationTask
 	labels := map[string]string{
 		"gh-agent-broker.sandbox":  "true",
 		"gh-agent-broker.run_id":   meta.RunID,
@@ -1279,16 +1292,17 @@ func (s *Service) writeTaskInputs(meta RunMetadata) error {
 
 func (s *Service) taskContract(meta RunMetadata) TaskContract {
 	return TaskContract{
-		RunID:           meta.RunID,
-		Task:            meta.Task,
-		Focus:           meta.Focus,
-		Repo:            meta.Repo,
-		BaseBranch:      meta.BaseBranch,
-		Branch:          meta.Branch,
-		WorkerAgentID:   meta.WorkerAgentID,
-		BrokerRemoteURL: strings.TrimRight(s.cfg.BrokerURL, "/") + "/git/" + meta.Repo + ".git",
-		Deliverables:    append([]string{}, meta.Deliverables...),
-		Parameters:      cloneParameters(meta.Parameters),
+		RunID:            meta.RunID,
+		Task:             meta.Task,
+		VerificationTask: meta.VerificationTask,
+		Focus:            meta.Focus,
+		Repo:             meta.Repo,
+		BaseBranch:       meta.BaseBranch,
+		Branch:           meta.Branch,
+		WorkerAgentID:    meta.WorkerAgentID,
+		BrokerRemoteURL:  strings.TrimRight(s.cfg.BrokerURL, "/") + "/git/" + meta.Repo + ".git",
+		Deliverables:     append([]string{}, meta.Deliverables...),
+		Parameters:       cloneParameters(meta.Parameters),
 	}
 }
 

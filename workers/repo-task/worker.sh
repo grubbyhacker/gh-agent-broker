@@ -170,8 +170,7 @@ require_env AGENT_REPO
 require_env AGENT_BASE_BRANCH
 require_env AGENT_RUN_ID
 require_env AGENT_TASK
-AGENT_BRANCH="agent/contributor/${AGENT_RUN_ID}"
-export AGENT_BRANCH
+require_env AGENT_BRANCH
 validate_inputs
 mkdir -p /work/repo /output
 trap on_exit EXIT
