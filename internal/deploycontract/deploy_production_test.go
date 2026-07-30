@@ -34,11 +34,28 @@ func TestProductionDeploySecretExports(t *testing.T) {
 		"VPS_OPS_GH_BROKER_YKM_CURATOR_SANDBOX_STAGING_ADMIN_TOKEN",
 		"VPS_OPS_GH_BROKER_OPENROUTER_CURATOR_API_KEY",
 		"VPS_OPS_GH_BROKER_GH_AGENT_CODEX_PROXY_TOKEN",
+		"VPS_OPS_SIGNAL_PLANE_DISPATCHER_BROKER_TOKEN",
 	} {
 		pattern := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(secretName) + `:\s*\$\{\{\s*secrets\.` + regexp.QuoteMeta(secretName) + `\s*\}\}\s*$`)
 		if !pattern.Match(workflow) {
 			t.Errorf("production deploy workflow must export %s to vps-ops", secretName)
 		}
+	}
+}
+
+func TestProductionDeployPreflightsDispatcherBrokerToken(t *testing.T) {
+	t.Parallel()
+
+	workflow, err := os.ReadFile("../../.github/workflows/deploy-production.yml")
+	if err != nil {
+		t.Fatalf("read production deploy workflow: %v", err)
+	}
+
+	//nolint:gosec // This is a workflow variable name, not a credential value.
+	const secretName = "VPS_OPS_SIGNAL_PLANE_DISPATCHER_BROKER_TOKEN"
+	pattern := regexp.MustCompile(`(?m)^\s*` + secretName + `:\s*\$\{\{\s*secrets\.` + secretName + `\s*\}\}\s*$`)
+	if matches := pattern.FindAll(workflow, -1); len(matches) != 2 {
+		t.Fatalf("dispatcher broker token must be exported to preflight and deploy steps, got %d exports", len(matches))
 	}
 }
 
@@ -91,7 +108,6 @@ func TestProductionDeployOmitsRetiredProofSecrets(t *testing.T) {
 	}
 
 	retiredNames := [][]string{
-		{"VPS_OPS_SIGNAL_PLANE_DISPATCHER", "BROKER", "TOKEN"},
 		{"VPS_OPS_GH_BROKER_CODEX_WORKER", "AUTH", "JSON"},
 		{"VPS_OPS_GH_BROKER_CODEX_WORKER", "OPERATOR", "TOKEN"},
 	}
