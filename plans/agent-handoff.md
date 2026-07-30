@@ -1,5 +1,17 @@
 # Agent handoff
 
+Sandbox-broker now seals a durable `repository-task-terminal-result/v1` at
+terminal finalization. `GET /v1/runs/{run_id}/terminal-result` requires the
+new explicit `terminal_result` operator action and retains existing
+profile/owned-run scoping. The projection contains only bounded,
+redacted `/output/result.json` and `/output/final-summary.md`, plus stable
+run/profile/idempotency/config correlation fields; it never exposes logs or
+arbitrary artifacts. Missing, malformed, unreadable, or oversized worker
+output produces a safe structured fallback (`failed`, `timed_out`, `stopped`,
+or `cancelled` as appropriate) rather than truncation. The worker still does
+not publish or call GitHub. Signal Plane owns comment/outbox delivery in its
+follow-on slice.
+
 `gh-agent-broker-cli reload` calls the broker admin reload endpoint with
 `BROKER_ADMIN_SECRET` (or `-admin-secret`) and prints the server response. A
 restart is still required when changing `server.listen`, `audit.path`,

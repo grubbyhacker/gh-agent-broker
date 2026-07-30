@@ -26,6 +26,7 @@ const (
 	StatusStopped   = "stopped"
 	StatusFailed    = "failed"
 	StatusTimedOut  = "timed_out"
+	StatusCancelled = "cancelled"
 	StatusCleaned   = "cleaned"
 )
 
@@ -546,6 +547,9 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 		meta.TerminalSource = terminalSourceStartupFailure
 		meta.Error = err.Error()
 		meta.EndedAt = time.Now().UTC()
+		if projectionErr := s.persistTerminalResult(meta); projectionErr != nil {
+			return LaunchAgentOutput{}, fmt.Errorf("preserve terminal result: %w", projectionErr)
+		}
 		s.writeCompletionStatus(ctx, meta)
 		if writeErr := s.writeMetadata(meta); writeErr != nil {
 			return LaunchAgentOutput{}, writeErr
@@ -562,6 +566,9 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 		meta.TerminalSource = terminalSourceStartupFailure
 		meta.Error = err.Error()
 		meta.EndedAt = time.Now().UTC()
+		if projectionErr := s.persistTerminalResult(meta); projectionErr != nil {
+			return LaunchAgentOutput{}, fmt.Errorf("preserve terminal result: %w", projectionErr)
+		}
 		s.writeCompletionStatus(ctx, meta)
 		if writeErr := s.writeMetadata(meta); writeErr != nil {
 			return LaunchAgentOutput{}, writeErr
@@ -1544,6 +1551,9 @@ func (s *Service) finalizeTerminalRun(ctx context.Context, runID, reason, source
 	}
 	source = terminalSourceForStatus(next.Status, source)
 	next.TerminalSource = source
+	if err := s.persistTerminalResult(next); err != nil {
+		return next, false, fmt.Errorf("preserve terminal result: %w", err)
+	}
 	s.mu.Lock()
 	current, ok = s.runs[runID]
 	if ok && current.Status != StatusRunning {
