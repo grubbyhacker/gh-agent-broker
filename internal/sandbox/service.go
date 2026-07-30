@@ -342,6 +342,15 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		cp := meta
 		s.runs[meta.RunID] = &cp
 		s.mu.Unlock()
+		if isTerminalStatus(meta.Status) {
+			if _, err := os.Stat(s.terminalResultPath(meta.RunID)); os.IsNotExist(err) {
+				if err := s.persistTerminalResult(meta); err != nil {
+					return fmt.Errorf("backfill terminal result for run %q: %w", meta.RunID, err)
+				}
+			} else if err != nil {
+				return fmt.Errorf("inspect terminal result for run %q: %w", meta.RunID, err)
+			}
+		}
 		if meta.Status == StatusRunning {
 			durable := false
 			if s.launchIntents != nil {

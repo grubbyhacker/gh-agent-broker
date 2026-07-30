@@ -65,6 +65,75 @@ func TestTerminalResultPreservesBoundedRedactedWorkerOutputAcrossRestart(t *test
 	}
 }
 
+func TestReconcileBackfillsAndNormalizesLegacyTerminalResult(t *testing.T) {
+	cfg := baseTestConfig(t)
+	cfg.TerminalResultByteLimit = 1024
+	meta := terminalTestMetadata("legacy-terminal", StatusCompleted)
+	runDir := filepath.Join(cfg.RunsDir, meta.RunID)
+	if err := os.MkdirAll(filepath.Join(runDir, "output"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result := `{"outcome":"no_change_required","detail":"task completed successfully; repository is unchanged","stage":"change detection","run_id":"legacy-terminal","repository":"owner/repo","base_branch":"main","branch":"agent/test/terminal","task":"optimize-images","verify_task":"validate","dependency_manifest":"match","nested":{"note":"bundle-secret"}}`
+	if err := os.WriteFile(filepath.Join(runDir, "output", "result.json"), []byte(result), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "output", "final-summary.md"), []byte("No change required; bundle-secret was not published."), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	if err := service.writeMetadataFile(meta); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(service.terminalResultPath(meta.RunID)); !os.IsNotExist(err) {
+		t.Fatalf("terminal projection should begin absent: %v", err)
+	}
+
+	restarted := NewService(cfg, newFakeRuntime(), testAudit(t))
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := restarted.GetTerminalResult(context.Background(), RunInput{RunID: meta.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Outcome != "no_change_required" || got.RunID != meta.RunID || got.Repo != meta.Repo || got.Branch != meta.Branch {
+		t.Fatalf("terminal correlation = %+v", got)
+	}
+	if got.Result["version"] != workerResultVersion || got.Result["detail"] != "task completed successfully; repository is unchanged" {
+		t.Fatalf("legacy worker result was not preserved and versioned: %#v", got.Result)
+	}
+	verification, ok := got.Result["verification"].(map[string]any)
+	if !ok || verification["status"] != "passed" {
+		t.Fatalf("legacy verification = %#v", got.Result["verification"])
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "bundle-secret") || !strings.Contains(got.FinalSummary, "[REDACTED]") {
+		t.Fatalf("legacy terminal result leaked canary: %s", encoded)
+	}
+
+	before, err := os.ReadFile(restarted.terminalResultPath(meta.RunID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "output", "result.json"), []byte(`{"outcome":"failed"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	again := NewService(cfg, newFakeRuntime(), testAudit(t))
+	if err := again.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(again.terminalResultPath(meta.RunID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatal("reconciliation overwrote an existing terminal projection")
+	}
+}
+
 func TestTerminalResultFallbacksAreDeterministicAndNeverUseLogs(t *testing.T) {
 	for _, status := range []string{StatusCompleted, StatusFailed, StatusTimedOut, StatusStopped, StatusCancelled} {
 		t.Run(status, func(t *testing.T) {
@@ -93,16 +162,17 @@ func TestTerminalResultFallbacksAreDeterministicAndNeverUseLogs(t *testing.T) {
 
 func TestTerminalResultRejectsOversizeFinalSummary(t *testing.T) {
 	cfg := baseTestConfig(t)
-	cfg.TerminalResultByteLimit = 32
+	cfg.TerminalResultByteLimit = 256
 	service := NewService(cfg, newFakeRuntime(), testAudit(t))
 	meta := terminalTestMetadata("terminal-oversize", StatusCompleted)
 	if err := os.MkdirAll(filepath.Join(cfg.RunsDir, meta.RunID, "output"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(cfg.RunsDir, meta.RunID, "output", "result.json"), []byte(`{"outcome":"ready_for_review"}`), 0o600); err != nil {
+	result := `{"version":"repository-task-worker-result/v1","outcome":"no_change_required","run_id":"terminal-oversize","repository":"owner/repo","branch":"agent/test/terminal","verification":{"status":"passed"}}`
+	if err := os.WriteFile(filepath.Join(cfg.RunsDir, meta.RunID, "output", "result.json"), []byte(result), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(cfg.RunsDir, meta.RunID, "output", "final-summary.md"), []byte(strings.Repeat("x", 33)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.RunsDir, meta.RunID, "output", "final-summary.md"), []byte(strings.Repeat("x", 257)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.persistTerminalResult(meta); err != nil {
@@ -128,7 +198,7 @@ func TestRESTTerminalResultIsProfileScopedAndDoesNotBroadenExistingPrincipals(t 
 	handler := NewRESTHandler(service)
 	launched := performLaunch(t, handler, "terminal-read", nil)
 	output := filepath.Join(cfg.RunsDir, launched.RunID, "output")
-	if err := os.WriteFile(filepath.Join(output, "result.json"), []byte(`{"outcome":"ready_for_review"}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(output, "result.json"), []byte(`{"version":"repository-task-worker-result/v1","outcome":"ready_for_review"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(output, "final-summary.md"), []byte("The complete final work product."), 0o600); err != nil {
@@ -151,5 +221,5 @@ func TestRESTTerminalResultIsProfileScopedAndDoesNotBroadenExistingPrincipals(t 
 }
 
 func terminalTestMetadata(runID, status string) RunMetadata {
-	return RunMetadata{RunID: runID, Profile: "nightly", Template: "worker", Repo: "owner/repo", Branch: "agent/test/terminal", CredentialBundle: "codex", Status: status, StartedAt: time.Now().UTC(), EndedAt: time.Now().UTC(), IdempotencyKeyDigest: "idem-digest", RequestFingerprint: "request-fingerprint", LaunchConfigVersion: "config-version"}
+	return RunMetadata{RunID: runID, Profile: "nightly", Template: "worker", Repo: "owner/repo", BaseBranch: "main", Branch: "agent/test/terminal", CredentialBundle: "codex", Status: status, StartedAt: time.Now().UTC(), EndedAt: time.Now().UTC(), IdempotencyKeyDigest: "idem-digest", RequestFingerprint: "request-fingerprint", LaunchConfigVersion: "config-version"}
 }

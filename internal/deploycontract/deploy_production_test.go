@@ -35,6 +35,7 @@ func TestProductionDeploySecretExports(t *testing.T) {
 		"VPS_OPS_GH_BROKER_OPENROUTER_CURATOR_API_KEY",
 		"VPS_OPS_GH_BROKER_GH_AGENT_CODEX_PROXY_TOKEN",
 		"VPS_OPS_SIGNAL_PLANE_DISPATCHER_BROKER_TOKEN",
+		"VPS_OPS_SIGNAL_PLANE_TERMINAL_REPORTER_BROKER_TOKEN",
 	} {
 		pattern := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(secretName) + `:\s*\$\{\{\s*secrets\.` + regexp.QuoteMeta(secretName) + `\s*\}\}\s*$`)
 		if !pattern.Match(workflow) {
