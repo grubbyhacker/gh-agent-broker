@@ -14,7 +14,7 @@ func TestPruneRunsDeletesOldTerminalRunsAndSkipsActive(t *testing.T) {
 	service := NewService(cfg, newFakeRuntime(), testAudit(t))
 
 	now := time.Now().UTC()
-	writePruneRunMetadata(t, cfg, "run-old-1", StatusStopped, now.Add(-5*time.Hour), now.Add(-5*time.Hour), nil)
+	writePruneRunMetadata(t, cfg, "run-old-1", StatusCompleted, now.Add(-5*time.Hour), now.Add(-5*time.Hour), nil)
 	writePruneRunMetadata(t, cfg, "run-old-2", StatusStopped, now.Add(-6*time.Hour), now.Add(-6*time.Hour), nil)
 	writePruneRunMetadata(t, cfg, "run-new", StatusStopped, now.Add(-30*time.Minute), now.Add(-30*time.Minute), nil)
 	writePruneRunMetadata(t, cfg, "run-running", StatusRunning, now.Add(-6*time.Hour), time.Time{}, nil)

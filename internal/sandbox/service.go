@@ -20,12 +20,13 @@ import (
 )
 
 const (
-	StatusPending  = "pending"
-	StatusRunning  = "running"
-	StatusStopped  = "stopped"
-	StatusFailed   = "failed"
-	StatusTimedOut = "timed_out"
-	StatusCleaned  = "cleaned"
+	StatusPending   = "pending"
+	StatusRunning   = "running"
+	StatusCompleted = "completed"
+	StatusStopped   = "stopped"
+	StatusFailed    = "failed"
+	StatusTimedOut  = "timed_out"
+	StatusCleaned   = "cleaned"
 )
 
 const (
@@ -1441,7 +1442,7 @@ func terminalSourceForStatus(status, fallback string) string {
 	switch status {
 	case StatusTimedOut:
 		return terminalSourceTimedOut
-	case StatusStopped, StatusFailed:
+	case StatusCompleted, StatusStopped, StatusFailed:
 		if fallback != "" {
 			return fallback
 		}
@@ -1618,7 +1619,7 @@ func (s *Service) finalizeExitedRun(ctx context.Context, meta RunMetadata, statu
 		meta.EndedAt = time.Now().UTC()
 	}
 	if status.ExitCode != nil && *status.ExitCode == 0 {
-		meta.Status = StatusStopped
+		meta.Status = StatusCompleted
 		meta.Error = ""
 		return meta
 	}
@@ -1716,7 +1717,7 @@ func (s *Service) writeCompletionStatus(ctx context.Context, meta RunMetadata) {
 
 func completionStatus(meta RunMetadata) (string, bool) {
 	switch meta.Status {
-	case StatusStopped:
+	case StatusCompleted:
 		return "success", true
 	case StatusFailed:
 		return StatusFailed, true
