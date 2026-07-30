@@ -977,15 +977,13 @@ func (s *Service) StopAgent(ctx context.Context, in RunInput) (StatusOutput, err
 		return StatusOutput{}, err
 	}
 	redactor := s.redactor(meta)
-	if meta.ContainerID != "" && meta.Status == StatusRunning {
-		if err := s.runtime.Stop(ctx, meta.ContainerID, s.cfg.StopGrace.Duration); err != nil {
-			s.audit.Log(s.auditEvent("stop_agent", meta, "deny", err), redactor)
-			return StatusOutput{}, err
-		}
-	}
 	if meta.Status == StatusRunning {
+		var stopErr error
 		finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonManualStop, terminalSourceManualStop, func(current RunMetadata) RunMetadata {
 			if current.ContainerID != "" {
+				if stopErr = s.runtime.Stop(ctx, current.ContainerID, s.cfg.StopGrace.Duration); stopErr != nil {
+					return current
+				}
 				if status, inspectErr := s.runtime.Inspect(ctx, current.ContainerID); inspectErr == nil && status.ExitCode != nil {
 					current.ExitCode = status.ExitCode
 					current.EndedAt = status.EndedAt
@@ -1002,6 +1000,10 @@ func (s *Service) StopAgent(ctx context.Context, in RunInput) (StatusOutput, err
 		})
 		if err != nil {
 			return StatusOutput{}, err
+		}
+		if stopErr != nil {
+			s.audit.Log(s.auditEvent("stop_agent", meta, "deny", stopErr), redactor)
+			return StatusOutput{}, stopErr
 		}
 		meta = finalized
 	}
