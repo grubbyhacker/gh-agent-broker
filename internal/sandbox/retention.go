@@ -345,7 +345,7 @@ func hasActiveStatus(status string) bool {
 
 func isTerminalStatus(status string) bool {
 	switch status {
-	case StatusCompleted, StatusStopped, StatusFailed, StatusTimedOut, StatusCleaned:
+	case StatusCompleted, StatusStopped, StatusFailed, StatusTimedOut, StatusCancelled, StatusCleaned:
 		return true
 	default:
 		return false

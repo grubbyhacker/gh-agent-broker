@@ -17,37 +17,39 @@ import (
 )
 
 const (
-	defaultListen        = "127.0.0.1:8091"
-	defaultMCPPath       = "/mcp"
-	defaultRunsDir       = "/srv/hermes-sandbox-broker/runs"
-	defaultMaxTaskBytes  = 64 * 1024
-	defaultMaxParamBytes = 16 * 1024
-	defaultLogByteLimit  = 128 * 1024
+	defaultListen                  = "127.0.0.1:8091"
+	defaultMCPPath                 = "/mcp"
+	defaultRunsDir                 = "/srv/hermes-sandbox-broker/runs"
+	defaultMaxTaskBytes            = 64 * 1024
+	defaultMaxParamBytes           = 16 * 1024
+	defaultLogByteLimit            = 128 * 1024
+	defaultTerminalResultByteLimit = 32 * 1024
 )
 
 type Config struct {
-	Listen             string                       `yaml:"listen"`
-	MCPPath            string                       `yaml:"mcp_path"`
-	AuthToken          string                       `yaml:"auth_token"`
-	AuthTokenEnv       string                       `yaml:"auth_token_env"`
-	RunsDir            string                       `yaml:"runs_dir"`
-	LaunchIntentStore  string                       `yaml:"launch_intent_store_path"`
-	BrokerURL          string                       `yaml:"broker_url"`
-	Production         bool                         `yaml:"production"`
-	Repositories       []string                     `yaml:"repositories"`
-	Networks           map[string]NetworkPolicy     `yaml:"network_policies"`
-	Bundles            map[string]CredentialBundle  `yaml:"credential_bundles"`
-	Templates          map[string]Template          `yaml:"templates"`
-	LaunchProfiles     map[string]LaunchProfile     `yaml:"launch_profiles"`
-	OperatorPrincipals map[string]OperatorPrincipal `yaml:"operator_principals"`
-	Audit              SandboxAuditConfig           `yaml:"audit"`
-	MaxTaskBytes       int                          `yaml:"max_task_bytes"`
-	MaxParameterBytes  int                          `yaml:"max_parameter_bytes"`
-	LogByteLimit       int                          `yaml:"log_byte_limit"`
-	StopGrace          Duration                     `yaml:"stop_grace"`
-	ResolvedPaths      map[string]CredentialBundle  `yaml:"-"`
-	ConfigLoadedAt     time.Time                    `yaml:"-"`
-	ConfigVersion      string                       `yaml:"-"`
+	Listen                  string                       `yaml:"listen"`
+	MCPPath                 string                       `yaml:"mcp_path"`
+	AuthToken               string                       `yaml:"auth_token"`
+	AuthTokenEnv            string                       `yaml:"auth_token_env"`
+	RunsDir                 string                       `yaml:"runs_dir"`
+	LaunchIntentStore       string                       `yaml:"launch_intent_store_path"`
+	BrokerURL               string                       `yaml:"broker_url"`
+	Production              bool                         `yaml:"production"`
+	Repositories            []string                     `yaml:"repositories"`
+	Networks                map[string]NetworkPolicy     `yaml:"network_policies"`
+	Bundles                 map[string]CredentialBundle  `yaml:"credential_bundles"`
+	Templates               map[string]Template          `yaml:"templates"`
+	LaunchProfiles          map[string]LaunchProfile     `yaml:"launch_profiles"`
+	OperatorPrincipals      map[string]OperatorPrincipal `yaml:"operator_principals"`
+	Audit                   SandboxAuditConfig           `yaml:"audit"`
+	MaxTaskBytes            int                          `yaml:"max_task_bytes"`
+	MaxParameterBytes       int                          `yaml:"max_parameter_bytes"`
+	LogByteLimit            int                          `yaml:"log_byte_limit"`
+	TerminalResultByteLimit int                          `yaml:"terminal_result_byte_limit"`
+	StopGrace               Duration                     `yaml:"stop_grace"`
+	ResolvedPaths           map[string]CredentialBundle  `yaml:"-"`
+	ConfigLoadedAt          time.Time                    `yaml:"-"`
+	ConfigVersion           string                       `yaml:"-"`
 }
 
 type SandboxAuditConfig struct {
@@ -201,6 +203,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.LogByteLimit == 0 {
 		c.LogByteLimit = defaultLogByteLimit
+	}
+	if c.TerminalResultByteLimit == 0 {
+		c.TerminalResultByteLimit = defaultTerminalResultByteLimit
 	}
 	if c.StopGrace.Duration == 0 {
 		c.StopGrace.Duration = 10 * time.Second
@@ -551,7 +556,7 @@ func (c Config) validateOperatorPrincipal(name string, principal OperatorPrincip
 
 func validOperatorAction(action string) bool {
 	switch action {
-	case "launch", "dry_run", "status", "logs", "artifacts", "stop", "cleanup":
+	case "launch", "dry_run", "status", "logs", "artifacts", "terminal_result", "stop", "cleanup":
 		return true
 	default:
 		return false

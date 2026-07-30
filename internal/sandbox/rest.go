@@ -238,6 +238,8 @@ func (h *restHandler) handleRunAction(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	switch parts[1] {
+	case "terminal-result":
+		h.runTerminalResult(w, r, runID)
 	case "logs":
 		h.runLogs(w, r, runID)
 	case "artifacts":
@@ -251,6 +253,31 @@ func (h *restHandler) handleRunAction(w http.ResponseWriter, r *http.Request, re
 	default:
 		writeRESTError(w, http.StatusNotFound, "not_found")
 	}
+}
+
+func (h *restHandler) runTerminalResult(w http.ResponseWriter, r *http.Request, runID string) {
+	if r.Method != http.MethodGet {
+		writeRESTError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	identity, ok := h.authenticate(w, r, "runs.terminal_result")
+	if !ok {
+		return
+	}
+	if !h.authorizeAction(w, identity, "terminal_result", "runs.terminal_result") {
+		return
+	}
+	if !h.authorizeRunProfile(w, identity, runID, "runs.terminal_result") {
+		return
+	}
+	out, err := h.service.GetTerminalResult(r.Context(), RunInput{RunID: runID})
+	if err != nil {
+		h.audit("runs.terminal_result", identity.Name, "", runID, "", "", "", "deny", err, nil)
+		writeRESTError(w, http.StatusNotFound, "not_found")
+		return
+	}
+	h.audit("runs.terminal_result", identity.Name, out.Profile, runID, "", out.Repo, out.Branch, "allow", nil, nil)
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *restHandler) runStatus(w http.ResponseWriter, r *http.Request, runID string) {

@@ -8,6 +8,9 @@ production: false
 max_task_bytes: 65536
 max_parameter_bytes: 16384
 log_byte_limit: 131072
+# Each terminal worker file is complete-or-rejected at this bound; terminal
+# reporting never serves logs or silently truncates work-product text.
+terminal_result_byte_limit: 32768
 stop_grace: "10s"
 
 audit:
