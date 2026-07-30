@@ -538,6 +538,14 @@ func TestManualStopRemainsStopped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LaunchAgent() error = %v", err)
 	}
+	runtime.stopHook = func() {
+		service.mu.Lock()
+		_, claimed := service.finalizing[out.RunID]
+		service.mu.Unlock()
+		if !claimed {
+			t.Error("manual stop did not reserve terminal finalization before stopping the container")
+		}
+	}
 
 	status, err := service.StopAgent(context.Background(), RunInput{RunID: out.RunID})
 	if err != nil {
@@ -752,6 +760,7 @@ type fakeRuntime struct {
 	waitClosed   map[string]bool
 	stopErr      error
 	stopExitCode *int
+	stopHook     func()
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -817,6 +826,9 @@ func (f *fakeRuntime) Logs(ctx context.Context, containerID string, limitBytes i
 
 func (f *fakeRuntime) Stop(ctx context.Context, containerID string, grace time.Duration) error {
 	_, _ = ctx, grace
+	if f.stopHook != nil {
+		f.stopHook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.stopErr != nil {

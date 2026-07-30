@@ -59,6 +59,15 @@ func TestRepoTaskWorkerSubmoduleHandling(t *testing.T) {
 	}
 }
 
+func TestRepoTaskWorkerTerminalResult(t *testing.T) {
+	cmd := exec.Command("bash", "workers/result_test.sh", "workers/repo-task/worker.sh")
+	cmd.Dir = "../.."
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run repository task worker terminal result regression test: %v\n%s", err, output)
+	}
+}
+
 func TestPublishedBrokerImageCarriesRepoTaskWorker(t *testing.T) {
 	t.Parallel()
 
@@ -68,5 +77,17 @@ func TestPublishedBrokerImageCarriesRepoTaskWorker(t *testing.T) {
 	}
 	if !strings.Contains(string(dockerfile), "COPY --chmod=0755 workers/repo-task/worker.sh /usr/local/bin/agent-repo-task-worker") {
 		t.Error("published broker image must install agent-repo-task-worker as executable")
+	}
+}
+
+func TestPublishedBrokerImageCarriesWorkerResultLibrary(t *testing.T) {
+	t.Parallel()
+
+	dockerfile, err := os.ReadFile("../../Dockerfile")
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	if !strings.Contains(string(dockerfile), "COPY --chmod=0755 workers/result.sh /usr/local/lib/agent-worker-result.sh") {
+		t.Error("published broker image must install the shared agent worker result library")
 	}
 }

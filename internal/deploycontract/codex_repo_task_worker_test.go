@@ -110,6 +110,15 @@ func TestCodexRepoTaskWorkerSubmoduleHandling(t *testing.T) {
 	}
 }
 
+func TestCodexRepoTaskWorkerTerminalResult(t *testing.T) {
+	cmd := exec.Command("bash", "workers/result_test.sh", "workers/codex-repo-task/worker.sh")
+	cmd.Dir = "../.."
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run Codex repository task worker terminal result regression test: %v\n%s", err, output)
+	}
+}
+
 func TestPublishedBrokerImageCarriesCodexRepoTaskWorker(t *testing.T) {
 	t.Parallel()
 

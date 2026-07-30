@@ -12,6 +12,27 @@ or `cancelled` as appropriate) rather than truncation. The worker still does
 not publish or call GitHub. Signal Plane owns comment/outbox delivery in its
 follow-on slice.
 
+Both deterministic repository workers now produce the shared bounded
+`repository-task-worker-result/v1` contract. It preserves the generic
+worker's `task` field and the Codex worker's `worker: "codex"` field, always
+includes a structured `verification.status` (`passed`, `failed`, or `not_run`), and a
+`ready_for_review` outcome includes only the broker-created pull request's
+validated `number`, `html_url`, and `url`. The worker validates that identity
+before publishing readiness; malformed or absent broker output fails closed
+with the same bounded, log-free failure result. Workers never publish final
+issue comments; Signal Plane remains the terminal-comment owner.
+
+The result writer creates a complete JSON document in a same-directory
+temporary file and atomically renames it only when it is at most 32,768 bytes;
+oversized results are rejected without truncation. Per-repository agent image
+builders must copy both worker binaries and
+`/usr/local/lib/agent-worker-result.sh` from the pinned broker image. The
+required downstream `agent-workflows/.github/workflows/publish-agent-image.yml`
+update is to change its v1 agent-image workflow from the old `c176...` broker
+digest and copy the shared library as well as `/usr/local/bin` worker scripts;
+otherwise newly built agent images fail at startup with an explicit packaging
+error.
+
 `gh-agent-broker-cli reload` calls the broker admin reload endpoint with
 `BROKER_ADMIN_SECRET` (or `-admin-secret`) and prints the server response. A
 restart is still required when changing `server.listen`, `audit.path`,

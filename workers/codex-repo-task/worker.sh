@@ -9,20 +9,23 @@ readonly baked_workspace_path="${AGENT_IMAGE_WORKSPACE:-/workspace}"
 readonly credential_bundle_path='/credentials/codex/auth.json'
 readonly codex_home_base='/dev/shm/codex-home'
 readonly token_expiry_margin_seconds=300
+readonly worker_result_lib_path="${WORKER_RESULT_LIB_PATH:-/usr/local/lib/agent-worker-result.sh}"
+readonly worker_result_worker='codex'
 stage='initializing'
+verification_status='not_run'
+
+if [[ -r "$worker_result_lib_path" ]]; then
+  source "$worker_result_lib_path"
+elif [[ -r "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/result.sh" ]]; then
+  # shellcheck source=../result.sh
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/result.sh"
+else
+  printf '%s: missing shared result library %s; agent image packaging must copy /usr/local/lib/agent-worker-result.sh with the worker binary\n' "$worker_name" "$worker_result_lib_path" >&2
+  exit 1
+fi
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
 require_env() { [[ -n "${!1:-}" ]] || fail "missing required environment variable: $1"; }
-
-write_result() {
-  local outcome="$1" detail="$2"
-  mise exec -- jq -n --arg outcome "$outcome" --arg detail "$detail" --arg stage "$stage" \
-    --arg run_id "$AGENT_RUN_ID" --arg repository "$AGENT_REPO" --arg base_branch "$AGENT_BASE_BRANCH" \
-    --arg branch "$AGENT_BRANCH" --arg verify_task "${AGENT_VERIFY_TASK:-}" \
-    --arg manifest_status "${manifest_status:-not_checked}" \
-    '{outcome: $outcome, detail: $detail, stage: $stage, run_id: $run_id, repository: $repository, base_branch: $base_branch, branch: $branch, worker: "codex", verify_task: $verify_task, dependency_manifest: $manifest_status}' \
-    > /output/result.json
-}
 
 on_exit() {
   local status=$?
@@ -291,6 +294,7 @@ mise exec -- codex exec \
 if [[ -n "${AGENT_VERIFY_TASK:-}" ]]; then
   stage='repository verification task'
   mise run "$AGENT_VERIFY_TASK" > /output/verify.txt 2>&1
+  verification_status='passed'
 fi
 
 stage='change detection'
@@ -309,7 +313,10 @@ pr_body="${AGENT_PR_BODY:-Codex repository task completed for run ${AGENT_RUN_ID
 mise exec -- /usr/local/bin/gh-agent-broker-cli pr -broker "$BROKER_URL" -repo "$AGENT_REPO" -title "$pr_title" -head "$AGENT_BRANCH" -base "$AGENT_BASE_BRANCH" -body "$pr_body" \
   -metadata "Agent-Id=${BROKER_AGENT_ID:?BROKER_AGENT_ID is required for pull request metadata}" -metadata "Run-Id=${AGENT_RUN_ID}" > /output/pull-request.json
 
+stage='pull request result validation'
+pull_request=$(read_pull_request) || fail 'broker pull request response did not contain a valid pull request identity'
+
 stage='completed'
-write_result ready_for_review 'Codex changed the repository and a pull request was created'
+write_result ready_for_review 'Codex changed the repository and a pull request was created' "$pull_request"
 printf 'Codex repository task completed on %s and opened a ready-for-review pull request.\n' "$AGENT_BRANCH" > /output/final-summary.md
 fi
