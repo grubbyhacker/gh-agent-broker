@@ -440,6 +440,9 @@ func (c Config) validateLaunchProfile(name string, profile LaunchProfile) []stri
 	} else if len(profile.Task) > c.MaxTaskBytes {
 		errs = append(errs, fmt.Sprintf("launch profile %q task exceeds max_task_bytes", name))
 	}
+	if len(profile.VerificationTask) > c.MaxTaskBytes {
+		errs = append(errs, fmt.Sprintf("launch profile %q verification_task exceeds max_task_bytes", name))
+	}
 	if strings.TrimSpace(profile.BaseBranch) == "" {
 		errs = append(errs, fmt.Sprintf("launch profile %q base_branch is required", name))
 	}

@@ -23,7 +23,7 @@ func TestRepoTaskWorkerContract(t *testing.T) {
 		"require_env AGENT_BASE_BRANCH",
 		"require_env AGENT_RUN_ID",
 		"require_env AGENT_TASK",
-		"AGENT_BRANCH=\"agent/contributor/${AGENT_RUN_ID}\"",
+		"require_env AGENT_BRANCH",
 		"gh-agent-broker-cli health -broker \"$BROKER_URL\"",
 		"gh-agent-broker-cli probe -broker \"$BROKER_URL\" -repo \"$AGENT_REPO\"",
 		"git remote add origin placeholder",
