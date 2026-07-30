@@ -79,3 +79,15 @@ func TestPublishedBrokerImageCarriesRepoTaskWorker(t *testing.T) {
 		t.Error("published broker image must install agent-repo-task-worker as executable")
 	}
 }
+
+func TestPublishedBrokerImageCarriesWorkerResultLibrary(t *testing.T) {
+	t.Parallel()
+
+	dockerfile, err := os.ReadFile("../../Dockerfile")
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	if !strings.Contains(string(dockerfile), "COPY --chmod=0755 workers/result.sh /usr/local/lib/agent-worker-result.sh") {
+		t.Error("published broker image must install the shared agent worker result library")
+	}
+}

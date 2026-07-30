@@ -5,6 +5,7 @@ readonly worker_result_schema_version='repository-task-worker-result/v1'
 readonly worker_result_path="${AGENT_RESULT_OUTPUT_PATH:-/output/result.json}"
 readonly worker_pull_request_path="${AGENT_PULL_REQUEST_OUTPUT_PATH:-/output/pull-request.json}"
 readonly worker_pull_request_max_bytes=16384
+readonly worker_result_max_bytes=32768
 
 read_pull_request() {
   local size
@@ -22,7 +23,7 @@ read_pull_request() {
 }
 
 write_result() {
-  local outcome="$1" detail="$2" pull_request="${3:-}" verification="$verification_status"
+  local outcome="$1" detail="$2" pull_request="${3:-}" verification="$verification_status" result_dir result_tmp size
   if [[ "$outcome" == 'failed' && "$stage" == 'repository verification task' ]]; then
     verification='failed'
   fi
@@ -31,10 +32,22 @@ write_result() {
   else
     pull_request='null'
   fi
-  mise exec -- jq -n --arg version "$worker_result_schema_version" --arg outcome "$outcome" --arg detail "$detail" --arg stage "$stage" \
+  result_dir=$(dirname "$worker_result_path") || return 1
+  result_tmp=$(mktemp "$result_dir/.result.json.XXXXXX") || return 1
+  if ! mise exec -- jq -n --arg version "$worker_result_schema_version" --arg outcome "$outcome" --arg detail "$detail" --arg stage "$stage" \
     --arg run_id "$AGENT_RUN_ID" --arg repository "$AGENT_REPO" --arg base_branch "$AGENT_BASE_BRANCH" \
     --arg branch "$AGENT_BRANCH" --arg verification "$verification" --arg verify_task "${AGENT_VERIFY_TASK:-}" \
-    --arg manifest_status "${manifest_status:-not_checked}" --argjson pull_request "$pull_request" \
-    '{version: $version, outcome: $outcome, detail: $detail, stage: $stage, run_id: $run_id, repository: $repository, base_branch: $base_branch, branch: $branch, verification: {status: $verification}, verify_task: $verify_task, dependency_manifest: $manifest_status} + if $outcome == "ready_for_review" then {pull_request: $pull_request} else {} end' \
-    > "$worker_result_path"
+    --arg manifest_status "${manifest_status:-not_checked}" --arg task "${worker_result_task:-}" --arg worker "${worker_result_worker:-}" \
+    --argjson pull_request "$pull_request" \
+    '{version: $version, outcome: $outcome, detail: $detail, stage: $stage, run_id: $run_id, repository: $repository, base_branch: $base_branch, branch: $branch, verification: {status: $verification}, verify_task: $verify_task, dependency_manifest: $manifest_status} + if $task == "" then {} else {task: $task} end + if $worker == "" then {} else {worker: $worker} end + if $outcome == "ready_for_review" then {pull_request: $pull_request} else {} end' \
+    > "$result_tmp"; then
+    rm -f -- "$result_tmp"
+    return 1
+  fi
+  size=$(wc -c < "$result_tmp") || { rm -f -- "$result_tmp"; return 1; }
+  if (( size > worker_result_max_bytes )); then
+    rm -f -- "$result_tmp"
+    return 1
+  fi
+  mv -f -- "$result_tmp" "$worker_result_path"
 }

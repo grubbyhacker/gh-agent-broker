@@ -10,14 +10,18 @@ readonly credential_bundle_path='/credentials/codex/auth.json'
 readonly codex_home_base='/dev/shm/codex-home'
 readonly token_expiry_margin_seconds=300
 readonly worker_result_lib_path="${WORKER_RESULT_LIB_PATH:-/usr/local/lib/agent-worker-result.sh}"
+readonly worker_result_worker='codex'
 stage='initializing'
 verification_status='not_run'
 
-if [[ ! -r "$worker_result_lib_path" ]]; then
+if [[ -r "$worker_result_lib_path" ]]; then
+  source "$worker_result_lib_path"
+elif [[ -r "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/result.sh" ]]; then
   # shellcheck source=../result.sh
   source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/result.sh"
 else
-  source "$worker_result_lib_path"
+  printf '%s: missing shared result library %s; agent image packaging must copy /usr/local/lib/agent-worker-result.sh with the worker binary\n' "$worker_name" "$worker_result_lib_path" >&2
+  exit 1
 fi
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
