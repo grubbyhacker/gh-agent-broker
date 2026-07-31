@@ -83,6 +83,13 @@ The staged `repository_transport_stage` audit events remain on the real Git
 path. No local repository backend, registered green-PR endpoint, agentd
 authority lifecycle, or agentd-issued Git credential path remains.
 
+Durable idempotent launch intents now terminalize container-create and
+container-start failures instead of returning an indefinitely replayable
+`create_pending` or `start_pending` intent. The broker persists a bounded,
+redacted `sandbox_startup` fallback result and returns the stable run identity
+with terminal `failed` status. Replaying the launch key returns that same
+terminal run without another runtime create or start.
+
 Receive-pack command-prefix parse rejections now emit a dedicated transport
 stage with a named failure reason, bytes consumed, request content framing,
 and at most the first 128 bytes hex-encoded. Successful upstream Git requests

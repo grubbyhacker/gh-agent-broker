@@ -749,7 +749,9 @@ func (s *Service) resumeLaunchIntent(ctx context.Context, intent *launchIntent, 
 		info, err = s.runtime.Create(ctx, spec)
 		s.logSandboxCreation(meta, time.Since(createStarted), err)
 		if err != nil {
-			return LaunchAgentOutput{}, err
+			return s.commitStartupFailureIntent(
+				ctx, intent, meta, redactor, finalizeReasonLaunchCreateFailed, err,
+			)
 		}
 		meta.ContainerID = info.ID
 		meta.ImageDigest = info.ImageDigest
@@ -778,7 +780,9 @@ func (s *Service) resumeLaunchIntent(ctx context.Context, intent *launchIntent, 
 		if inspectErr == nil && !status.StartedAt.IsZero() {
 			return s.commitExitedIntent(ctx, intent, meta, status)
 		}
-		return LaunchAgentOutput{}, err
+		return s.commitStartupFailureIntent(
+			ctx, intent, meta, redactor, finalizeReasonLaunchStartFailed, err,
+		)
 	}
 	return s.commitRunningIntent(ctx, intent, meta, redactor)
 }
@@ -845,6 +849,40 @@ func (s *Service) commitExitedIntent(ctx context.Context, intent *launchIntent, 
 		err = saveErr
 	}
 	return launchOutput(finalized), err
+}
+
+func (s *Service) commitStartupFailureIntent(
+	ctx context.Context,
+	intent *launchIntent,
+	meta RunMetadata,
+	redactor Redactor,
+	reason string,
+	cause error,
+) (LaunchAgentOutput, error) {
+	meta.Status = StatusFailed
+	meta.FinalizeReason = reason
+	meta.TerminalSource = terminalSourceStartupFailure
+	meta.Error = abbreviate(redactor.Redact(cause.Error()), 500)
+	meta.EndedAt = time.Now().UTC()
+	if err := s.persistTerminalResult(meta); err != nil {
+		return LaunchAgentOutput{}, fmt.Errorf("preserve startup failure terminal result: %w", err)
+	}
+	s.writeCompletionStatus(ctx, meta)
+	if err := s.writeMetadata(meta); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	intent.Metadata = meta
+	intent.State = intentStateTerminal
+	if err := s.launchIntents.Save(ctx, *intent); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	s.mu.Lock()
+	cp := meta
+	s.runs[meta.RunID] = &cp
+	s.mu.Unlock()
+	s.audit.Log(s.auditEvent("launch_agent", meta, "deny", cause), redactor)
+	s.auditTerminalEvent(meta, reason, terminalSourceStartupFailure, cause)
+	return launchOutput(meta), nil
 }
 
 func launchOutput(meta RunMetadata) LaunchAgentOutput {
