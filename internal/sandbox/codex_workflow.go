@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"time"
 )
@@ -557,6 +558,9 @@ func (s *Service) failCodexIntent(
 	stage string,
 	cause error,
 ) (LaunchAgentOutput, error) {
+	if stopErr := s.stopCurrentCodexPhase(ctx, meta); stopErr != nil {
+		cause = errors.Join(cause, stopErr)
+	}
 	meta.Status = StatusFailed
 	meta.FinalizeReason = "codex_" + stage + "_failed"
 	meta.TerminalSource = "codex_" + stage
@@ -580,7 +584,63 @@ func (s *Service) failCodexIntent(
 	cp := meta
 	s.runs[meta.RunID] = &cp
 	s.mu.Unlock()
+	s.auditTerminalEvent(meta, meta.FinalizeReason, meta.TerminalSource, cause)
 	return launchOutput(meta), nil
+}
+
+func (s *Service) stopCurrentCodexPhase(ctx context.Context, meta RunMetadata) error {
+	containerID, phase := currentCodexPhaseContainer(meta)
+	if containerID == "" {
+		return nil
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.StopGrace.Duration+5*time.Second)
+	defer cancel()
+
+	status, inspectErr := s.runtime.Inspect(stopCtx, containerID)
+	if inspectErr == nil && !status.Running {
+		return nil
+	}
+
+	stopErr := s.runtime.Stop(stopCtx, containerID, s.cfg.StopGrace.Duration)
+	verified, verifyErr := s.runtime.Inspect(stopCtx, containerID)
+	if stopErr != nil {
+		if code, ok := DockerStatusCode(stopErr); ok && code == http.StatusNotModified &&
+			verifyErr == nil && !verified.Running {
+			return nil
+		}
+		err := fmt.Errorf("stop current Codex %s container %q: %w", phase, containerID, stopErr)
+		if verifyErr != nil {
+			return errors.Join(err, fmt.Errorf("verify current Codex %s container stopped: %w", phase, verifyErr))
+		}
+		if verified.Running {
+			return errors.Join(err, fmt.Errorf("current Codex %s container remains running", phase))
+		}
+		return err
+	}
+	if verifyErr != nil {
+		return fmt.Errorf("verify current Codex %s container %q stopped: %w", phase, containerID, verifyErr)
+	}
+	if verified.Running {
+		return fmt.Errorf("verify current Codex %s container %q stopped: container remains running", phase, containerID)
+	}
+	return nil
+}
+
+func currentCodexPhaseContainer(meta RunMetadata) (string, string) {
+	switch meta.Phase {
+	case codexPhasePreparationStart, codexPhasePreparationRunning, codexPhasePreparationRecon,
+		codexPhasePreparationTerm:
+		return meta.PreparationContainerID, "preparation"
+	case codexPhaseExecutionStart, codexPhaseBundleInject, codexPhaseBundleAccept,
+		codexPhaseExecutionRunning, codexPhaseExecutionRecon, codexPhaseExecutionTerm:
+		return meta.ExecutionContainerID, "execution"
+	case codexPhaseDeliveryStart, codexPhaseDeliveryRunning, codexPhaseDeliveryRecon,
+		codexPhaseDeliveryTerm:
+		return meta.DeliveryContainerID, "delivery"
+	default:
+		return "", ""
+	}
 }
 
 func (s *Service) persistCodexIntent(

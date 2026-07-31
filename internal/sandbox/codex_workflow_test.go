@@ -14,16 +14,22 @@ import (
 )
 
 type fakeCodexIssuer struct {
-	mu       sync.Mutex
-	issues   int
-	consumes int
-	cleanups int
-	consumed bool
+	mu         sync.Mutex
+	issues     int
+	consumes   int
+	cleanups   int
+	consumed   bool
+	issueErr   error
+	consumeErr error
+	cleanupErr error
 }
 
 func (f *fakeCodexIssuer) Issue(_ context.Context, _, _ string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.issueErr != nil {
+		return nil, f.issueErr
+	}
 	if f.consumed {
 		return nil, errors.New("issuance already consumed")
 	}
@@ -35,6 +41,9 @@ func (f *fakeCodexIssuer) Consume(_ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.consumes++
+	if f.consumeErr != nil {
+		return f.consumeErr
+	}
 	f.consumed = true
 	return nil
 }
@@ -43,7 +52,7 @@ func (f *fakeCodexIssuer) Cleanup(_ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cleanups++
-	return nil
+	return f.cleanupErr
 }
 
 func TestCodexIssueWorkflowSeparatesPreparationIssuanceAndExecution(t *testing.T) {
@@ -318,6 +327,209 @@ func TestCodexExecutionContaminationFailurePreventsDeliveryAndLeavesNoHostCreden
 	}
 }
 
+func TestCodexPostStartCredentialFailuresStopExecutionBeforeTerminalizing(t *testing.T) {
+	tests := []struct {
+		name      string
+		stage     string
+		configure func(*fakeRuntime, *fakeCodexIssuer)
+	}{
+		{
+			name:  "issuance",
+			stage: "credential_issuance",
+			configure: func(_ *fakeRuntime, issuer *fakeCodexIssuer) {
+				issuer.issueErr = errors.New("issue capability")
+			},
+		},
+		{
+			name:  "injection",
+			stage: "credential_injection",
+			configure: func(runtime *fakeRuntime, _ *fakeCodexIssuer) {
+				runtime.injectionErr = errors.New("inject capability")
+			},
+		},
+		{
+			name:  "acceptance",
+			stage: "credential_acceptance",
+			configure: func(runtime *fakeRuntime, _ *fakeCodexIssuer) {
+				runtime.acceptInjected = false
+				runtime.waitForPathErr = errors.New("accept capability")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := codexWorkflowTestConfig(t)
+			cfg.ApplyDefaults()
+			cfg.StampLoaded(time.Now().UTC())
+			runtime := newFakeRuntime()
+			issuer := &fakeCodexIssuer{}
+			tt.configure(runtime, issuer)
+			store, err := OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if closeErr := store.Close(); closeErr != nil {
+					t.Errorf("close launch intent store: %v", closeErr)
+				}
+			})
+			auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+			auditLog, err := NewAuditLogger(auditPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { closeTestAudit(t, auditLog) })
+			service := NewServiceWithLaunchIntents(cfg, runtime, auditLog, store)
+			service.SetCodexCredentialIssuer(issuer)
+
+			in := cfg.LaunchProfiles["terra-medium-v1"].LaunchAgentInput
+			in.Profile = "terra-medium-v1"
+			in.Parameters = map[string]any{"issue_number": 42, "source_delivery_id": "delivery-42"}
+			out, err := service.LaunchProfile(
+				context.Background(), "signal-plane", "terra-medium-v1", "failure-"+tt.name, "fp", in,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writePreparationFixture(t, cfg, out.RunID, out.Branch)
+			runtime.finish(out.RunID+"-prep", 0, "")
+			waitFor(t, func() bool {
+				_, terminalErr := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
+				return terminalErr == nil
+			})
+			intent, found, err := store.LookupRun(context.Background(), out.RunID)
+			if err != nil || !found || intent.State != intentStateTerminal {
+				t.Fatalf("durable intent found=%t state=%q err=%v", found, intent.State, err)
+			}
+
+			executionID := "container-" + out.RunID + "-exec"
+			runtime.mu.Lock()
+			running := runtime.started[executionID]
+			stopCalls := append([]string(nil), runtime.stopCalls...)
+			specCount := len(runtime.specs)
+			injected := runtime.injections[executionID+":"+filepath.Join(codexInjectionDir, codexInjectionName)]
+			accepted := runtime.paths[executionID+":"+codexAcceptanceMarker]
+			runtime.mu.Unlock()
+			if running || !reflect.DeepEqual(stopCalls, []string{executionID}) {
+				t.Fatalf("execution running=%t stop calls=%v, want one execution stop", running, stopCalls)
+			}
+			if len(injected) != 0 || accepted {
+				t.Fatalf("execution tmpfs survived stop: bundle=%q accepted=%t", injected, accepted)
+			}
+			if specCount != 2 {
+				t.Fatalf("credential failure launched delivery; runtime specs=%d", specCount)
+			}
+
+			terminal, err := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if terminal.Status != StatusFailed || terminal.Outcome != StatusFailed ||
+				terminal.FailureStage != tt.stage || terminal.FailureReason == "" {
+				t.Fatalf("terminal=%+v", terminal)
+			}
+			again, err := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
+			if err != nil || !reflect.DeepEqual(terminal, again) {
+				t.Fatalf("durable terminal changed: first=%+v second=%+v err=%v", terminal, again, err)
+			}
+			events := readAuditEvents(t, auditPath)
+			finalized := 0
+			for _, event := range events {
+				if event.Operation == "run_finalized" && event.RunID == out.RunID && event.Terminal {
+					finalized++
+					if event.Status != StatusFailed || event.TerminalSource != "codex_"+tt.stage {
+						t.Fatalf("terminal audit=%+v", event)
+					}
+				}
+			}
+			if finalized != 1 {
+				t.Fatalf("terminal audit events=%d, want one; events=%+v", finalized, events)
+			}
+		})
+	}
+}
+
+func TestCodexPostStartStopFailureIsBoundedAndVisible(t *testing.T) {
+	cfg := codexWorkflowTestConfig(t)
+	cfg.ApplyDefaults()
+	cfg.StampLoaded(time.Now().UTC())
+	runtime := newFakeRuntime()
+	runtime.stopErr = errors.New("runtime stop unavailable")
+	runtime.stopLeavesRunning = true
+	issuer := &fakeCodexIssuer{issueErr: errors.New("issue capability")}
+	store, err := OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("close launch intent store: %v", closeErr)
+		}
+	})
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := NewAuditLogger(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeTestAudit(t, auditLog) })
+	service := NewServiceWithLaunchIntents(cfg, runtime, auditLog, store)
+	service.SetCodexCredentialIssuer(issuer)
+	in := cfg.LaunchProfiles["terra-medium-v1"].LaunchAgentInput
+	in.Profile = "terra-medium-v1"
+	in.Parameters = map[string]any{"issue_number": 42, "source_delivery_id": "delivery-42"}
+	out, err := service.LaunchProfile(
+		context.Background(), "signal-plane", "terra-medium-v1", "stop-failure", "fp", in,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writePreparationFixture(t, cfg, out.RunID, out.Branch)
+	runtime.finish(out.RunID+"-prep", 0, "")
+	waitFor(t, func() bool {
+		_, terminalErr := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
+		return terminalErr == nil
+	})
+
+	executionID := "container-" + out.RunID + "-exec"
+	runtime.mu.Lock()
+	running := runtime.started[executionID]
+	stopCalls := append([]string(nil), runtime.stopCalls...)
+	stopGraces := append([]time.Duration(nil), runtime.stopGraces...)
+	stopDeadline := runtime.stopDeadline
+	runtime.mu.Unlock()
+	if !running || !reflect.DeepEqual(stopCalls, []string{executionID}) {
+		t.Fatalf("execution running=%t stop calls=%v", running, stopCalls)
+	}
+	if !reflect.DeepEqual(stopGraces, []time.Duration{cfg.StopGrace.Duration}) {
+		t.Fatalf("stop graces=%v, want %s", stopGraces, cfg.StopGrace.Duration)
+	}
+	remaining := time.Until(stopDeadline)
+	if stopDeadline.IsZero() || remaining <= 0 || remaining > cfg.StopGrace.Duration+5*time.Second {
+		t.Fatalf("stop deadline=%s remaining=%s", stopDeadline, remaining)
+	}
+	terminal, err := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.Status != StatusFailed ||
+		!strings.Contains(terminal.FailureReason, "runtime stop unavailable") ||
+		!strings.Contains(terminal.FailureReason, "container remains running") {
+		t.Fatalf("stop failure is not visible in terminal result: %+v", terminal)
+	}
+	events := readAuditEvents(t, auditPath)
+	for _, event := range events {
+		if event.Operation == "run_finalized" && event.RunID == out.RunID && event.Terminal {
+			if !strings.Contains(event.Error, "runtime stop unavailable") ||
+				!strings.Contains(event.Error, "container remains running") {
+				t.Fatalf("stop failure is not visible in audit: %+v", event)
+			}
+			return
+		}
+	}
+	t.Fatalf("terminal audit missing: %+v", events)
+}
+
 func TestCodexWorkflowRestartAdoptsAcceptedExecutionWithoutReinjection(t *testing.T) {
 	cfg := codexWorkflowTestConfig(t)
 	cfg.ApplyDefaults()
@@ -536,4 +748,24 @@ func waitFor(t *testing.T, condition func() bool) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func readAuditEvents(t *testing.T, path string) []AuditEvent {
+	t.Helper()
+	data, err := os.ReadFile(path) // #nosec G304 -- the test passes its own temporary audit path.
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []AuditEvent
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var event AuditEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode audit event: %v", err)
+		}
+		events = append(events, event)
+	}
+	return events
 }

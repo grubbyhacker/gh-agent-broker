@@ -150,6 +150,16 @@ or re-inject an accepted bundle; only a still-unaccepted, unconsumed issuance
 may be projected again. Preparation and delivery adoption likewise inspect
 without overwriting their durable phase with a transient reconcile phase.
 
+Codex workflow failures stop and verify the current durable phase container
+before persisting terminal failure. Container selection comes from the
+phase-specific preparation, execution, or delivery identity rather than the
+generic last-container field, so cleanup cannot target a prior phase or launch
+work. Stop uses the configured grace under a bounded context, reconciles a
+verified already-exited/not-modified race, and preserves stop or verification
+failure in both the terminal failure reason and audit. Stopping execution also
+destroys its access-only credential and injection paths with the container
+tmpfs before the one durable terminal result is published.
+
 The staged `repository_transport_stage` audit events remain on the real Git
 path. No local repository backend, registered green-PR endpoint, agentd
 authority lifecycle, or agentd-issued Git credential path remains.

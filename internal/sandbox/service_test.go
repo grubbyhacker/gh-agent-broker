@@ -759,27 +759,34 @@ func assertMount(t *testing.T, mounts []Mount, source, target string, readonly b
 }
 
 type fakeRuntime struct {
-	mu             sync.Mutex
-	specs          []RuntimeSpec
-	logs           string
-	started        map[string]bool
-	exits          map[string]ContainerStatus
-	writes         map[string][]byte
-	injections     map[string][]byte
-	injectionCalls map[string]int
-	paths          map[string]bool
-	waiters        map[string]chan struct{}
-	waitClosed     map[string]bool
-	stopErr        error
-	stopExitCode   *int
-	stopHook       func()
+	mu                sync.Mutex
+	specs             []RuntimeSpec
+	logs              string
+	started           map[string]bool
+	exits             map[string]ContainerStatus
+	writes            map[string][]byte
+	injections        map[string][]byte
+	injectionCalls    map[string]int
+	paths             map[string]bool
+	waiters           map[string]chan struct{}
+	waitClosed        map[string]bool
+	injectionErr      error
+	waitForPathErr    error
+	acceptInjected    bool
+	stopErr           error
+	stopExitCode      *int
+	stopHook          func()
+	stopCalls         []string
+	stopGraces        []time.Duration
+	stopDeadline      time.Time
+	stopLeavesRunning bool
 }
 
 func newFakeRuntime() *fakeRuntime {
 	return &fakeRuntime{
 		started: map[string]bool{}, exits: map[string]ContainerStatus{}, writes: map[string][]byte{},
 		injections: map[string][]byte{}, injectionCalls: map[string]int{}, paths: map[string]bool{},
-		waiters: map[string]chan struct{}{}, waitClosed: map[string]bool{},
+		waiters: map[string]chan struct{}{}, waitClosed: map[string]bool{}, acceptInjected: true,
 	}
 }
 
@@ -826,9 +833,14 @@ func (f *fakeRuntime) InjectSecret(
 		return errors.New("container is not running")
 	}
 	key := containerID + ":" + filepath.Join(targetDir, name)
+	if f.injectionErr != nil {
+		return f.injectionErr
+	}
 	f.injections[key] = append([]byte(nil), contents...)
 	f.injectionCalls[containerID]++
-	f.paths[containerID+":"+codexAcceptanceMarker] = true
+	if f.acceptInjected {
+		f.paths[containerID+":"+codexAcceptanceMarker] = true
+	}
 	return nil
 }
 
@@ -837,6 +849,9 @@ func (f *fakeRuntime) WaitForPath(
 	containerID, targetPath string,
 	timeout time.Duration,
 ) error {
+	if f.waitForPathErr != nil {
+		return f.waitForPathErr
+	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for {
@@ -903,23 +918,25 @@ func (f *fakeRuntime) Logs(ctx context.Context, containerID string, limitBytes i
 }
 
 func (f *fakeRuntime) Stop(ctx context.Context, containerID string, grace time.Duration) error {
-	_, _ = ctx, grace
 	if f.stopHook != nil {
 		f.stopHook()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.stopCalls = append(f.stopCalls, containerID)
+	f.stopGraces = append(f.stopGraces, grace)
+	f.stopDeadline, _ = ctx.Deadline()
 	if f.stopErr != nil {
 		if f.stopExitCode != nil {
 			code := *f.stopExitCode
 			f.exits[containerID] = ContainerStatus{ID: containerID, Running: false, ExitCode: &code, EndedAt: time.Now().UTC()}
 		}
-		f.started[containerID] = false
-		f.closeWaiterLocked(containerID)
+		if !f.stopLeavesRunning {
+			f.stopContainerLocked(containerID)
+		}
 		return f.stopErr
 	}
-	f.started[containerID] = false
-	f.closeWaiterLocked(containerID)
+	f.stopContainerLocked(containerID)
 	return nil
 }
 
@@ -980,4 +997,19 @@ func (f *fakeRuntime) closeWaiterLocked(containerID string) {
 	}
 	close(ch)
 	f.waitClosed[containerID] = true
+}
+
+func (f *fakeRuntime) stopContainerLocked(containerID string) {
+	f.started[containerID] = false
+	for key := range f.injections {
+		if strings.HasPrefix(key, containerID+":") {
+			delete(f.injections, key)
+		}
+	}
+	for key := range f.paths {
+		if strings.HasPrefix(key, containerID+":") {
+			delete(f.paths, key)
+		}
+	}
+	f.closeWaiterLocked(containerID)
 }
