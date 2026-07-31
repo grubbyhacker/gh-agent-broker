@@ -130,10 +130,10 @@ ingest_issue() {
       (.body == null or (.body | type == "string")) and
       (.author == null or (.author | type == "string")))
   ' /work/prepared/comments.json >/dev/null || fail 'typed issue comments exceed the current bounded DTO contract'
-  jq -nr --argfile issue /work/prepared/issue.json --slurpfile comments /work/prepared/comments.json '
+  jq -nr --slurpfile issue /work/prepared/issue.json --slurpfile comments /work/prepared/comments.json '
     ["# Authoritative GitHub Issue", "",
-     ("Issue: #" + ($issue.number|tostring) + " — " + $issue.title), "",
-     "## Body", "", ($issue.body // "[no issue body]")] +
+     ("Issue: #" + ($issue[0].number|tostring) + " — " + $issue[0].title), "",
+     "## Body", "", ($issue[0].body // "[no issue body]")] +
     [ $comments[0][] | "", ("## Comment from " + (.author // "unknown")), "", (.body // "") ] |
     join("\n") + "\n"
   ' > /work/prepared/issue-context.md
