@@ -1,11 +1,13 @@
 package sandbox
 
 import (
-	"archive/tar"
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -138,42 +140,71 @@ func TestDockerAdoptRequiresExactDurableLaunchIdentity(t *testing.T) {
 	}
 }
 
-func TestDockerInjectSecretStreamsMode0600ArchiveOnlyAfterContainerStart(t *testing.T) {
-	t.Parallel()
-	var archiveName string
-	var archiveMode int64
-	var archiveBody string
-	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		switch {
-		case req.Method == http.MethodGet && req.URL.Path == "/containers/container-id/json":
-			return jsonResponse(`{"Id":"container-id","State":{"Running":true,"StartedAt":"2026-07-30T12:00:00Z"}}`), nil
-		case req.Method == http.MethodPut && req.URL.Path == "/containers/container-id/archive":
-			if req.URL.Query().Get("path") != codexInjectionDir || req.Header.Get("Content-Type") != "application/x-tar" {
-				t.Fatalf("archive request=%s headers=%v", req.URL, req.Header)
-			}
-			reader := tar.NewReader(req.Body)
-			header, err := reader.Next()
-			if err != nil {
-				t.Fatal(err)
-			}
-			archiveName, archiveMode = header.Name, header.Mode
-			body, err := io.ReadAll(reader)
-			if err != nil {
-				t.Fatal(err)
-			}
-			archiveBody = string(body)
-			return jsonResponse(""), nil
-		default:
-			t.Fatalf("unexpected request %s %s", req.Method, req.URL)
-			return nil, errors.New("unexpected request")
+func TestDockerInjectSecretStreamsOnlyOnExecStdinAfterContainerStart(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	payload := make(chan []byte, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		//nolint:errcheck // The pipe is test-only and its payload is asserted below.
+		defer serverConn.Close()
+		req, readErr := http.ReadRequest(bufio.NewReader(serverConn))
+		if readErr != nil {
+			serverErr <- readErr
+			return
 		}
-	})}}
+		if req.Method != http.MethodPost || req.URL.Path != "/exec/exec-id/start" {
+			serverErr <- errors.New("unexpected exec start request")
+			return
+		}
+		if _, readErr = io.ReadAll(req.Body); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if _, writeErr := io.WriteString(serverConn, "HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"); writeErr != nil {
+			serverErr <- writeErr
+			return
+		}
+		body, readErr := io.ReadAll(serverConn)
+		if readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		payload <- body
+		serverErr <- nil
+	}()
+
+	var create dockerExecCreateRequest
+	backend := &DockerBackend{
+		dialContext: func(context.Context, string, string) (net.Conn, error) { return clientConn, nil },
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/containers/container-id/json":
+				return jsonResponse(`{"Id":"container-id","State":{"Running":true,"StartedAt":"2026-07-30T12:00:00Z"}}`), nil
+			case req.Method == http.MethodPost && req.URL.Path == "/containers/container-id/exec":
+				if err := json.NewDecoder(req.Body).Decode(&create); err != nil {
+					t.Fatal(err)
+				}
+				return jsonResponse(`{"Id":"exec-id"}`), nil
+			case req.Method == http.MethodGet && req.URL.Path == "/exec/exec-id/json":
+				return jsonResponse(`{"Running":false,"ExitCode":0}`), nil
+			default:
+				t.Fatalf("unexpected request %s %s", req.Method, req.URL)
+				return nil, errors.New("unexpected request")
+			}
+		})},
+	}
 	bundle := `{"tokens":{"access_token":"access-only","refresh_token":""}}`
 	if err := backend.InjectSecret(context.Background(), "container-id", codexInjectionDir, codexInjectionName, []byte(bundle)); err != nil {
 		t.Fatal(err)
 	}
-	if archiveName != codexInjectionName || archiveMode != 0o600 || archiveBody != bundle {
-		t.Fatalf("archive name=%q mode=%o body=%q", archiveName, archiveMode, archiveBody)
+	if !create.AttachStdin || create.AttachStdout || create.AttachStderr || strings.Contains(strings.Join(create.Cmd, " "), "access-only") {
+		t.Fatalf("unsafe secret injection exec=%+v", create)
+	}
+	if got := string(<-payload); got != bundle {
+		t.Fatalf("exec stdin=%q, want access-only bundle", got)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
 	}
 
 	backend.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -187,19 +218,33 @@ func TestDockerInjectSecretStreamsMode0600ArchiveOnlyAfterContainerStart(t *test
 	}
 }
 
-func TestDockerWaitForPathUsesBoundedInContainerArchiveProbe(t *testing.T) {
+func TestDockerWaitForPathUsesBoundedInContainerExecProbe(t *testing.T) {
 	t.Parallel()
 	var probes int
 	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		probes++
-		if req.Method != http.MethodHead || req.URL.Query().Get("path") != codexAcceptanceMarker {
-			t.Fatalf("probe=%s %s", req.Method, req.URL)
+		switch {
+		case req.Method == http.MethodPost && req.URL.Path == "/containers/container-id/exec":
+			probes++
+			var create dockerExecCreateRequest
+			if err := json.NewDecoder(req.Body).Decode(&create); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(create.Cmd, " ") != "test -e "+codexAcceptanceMarker {
+				t.Fatalf("path probe command=%v", create.Cmd)
+			}
+			return jsonResponse(`{"Id":"exec-id"}`), nil
+		case req.Method == http.MethodPost && req.URL.Path == "/exec/exec-id/start":
+			return jsonResponse(""), nil
+		case req.Method == http.MethodGet && req.URL.Path == "/exec/exec-id/json":
+			exitCode := 1
+			if probes == 2 {
+				exitCode = 0
+			}
+			return jsonResponse(fmt.Sprintf(`{"Running":false,"ExitCode":%d}`, exitCode)), nil
+		default:
+			t.Fatalf("unexpected path probe request=%s %s", req.Method, req.URL)
+			return nil, errors.New("unexpected request")
 		}
-		status := http.StatusNotFound
-		if probes == 2 {
-			status = http.StatusOK
-		}
-		return &http.Response{StatusCode: status, Header: make(http.Header), Body: http.NoBody}, nil
 	})}}
 	if err := backend.WaitForPath(context.Background(), "container-id", codexAcceptanceMarker, time.Second); err != nil {
 		t.Fatal(err)
@@ -211,12 +256,19 @@ func TestDockerWaitForPathUsesBoundedInContainerArchiveProbe(t *testing.T) {
 
 func TestDockerPathExistsDistinguishesMissingAcceptanceMarker(t *testing.T) {
 	t.Parallel()
-	status := http.StatusNotFound
+	exitCode := 1
 	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.Method != http.MethodHead || req.URL.Query().Get("path") != codexAcceptanceMarker {
-			t.Fatalf("probe=%s %s", req.Method, req.URL)
+		switch {
+		case req.Method == http.MethodPost && req.URL.Path == "/containers/container-id/exec":
+			return jsonResponse(`{"Id":"exec-id"}`), nil
+		case req.Method == http.MethodPost && req.URL.Path == "/exec/exec-id/start":
+			return jsonResponse(""), nil
+		case req.Method == http.MethodGet && req.URL.Path == "/exec/exec-id/json":
+			return jsonResponse(fmt.Sprintf(`{"Running":false,"ExitCode":%d}`, exitCode)), nil
+		default:
+			t.Fatalf("unexpected path probe request=%s %s", req.Method, req.URL)
+			return nil, errors.New("unexpected request")
 		}
-		return &http.Response{StatusCode: status, Header: make(http.Header), Body: http.NoBody}, nil
 	})}}
 	exists, err := backend.PathExists(context.Background(), "container-id", codexAcceptanceMarker)
 	if err != nil {
@@ -225,7 +277,7 @@ func TestDockerPathExistsDistinguishesMissingAcceptanceMarker(t *testing.T) {
 	if exists {
 		t.Fatal("missing marker reported as present")
 	}
-	status = http.StatusOK
+	exitCode = 0
 	exists, err = backend.PathExists(context.Background(), "container-id", codexAcceptanceMarker)
 	if err != nil {
 		t.Fatal(err)
