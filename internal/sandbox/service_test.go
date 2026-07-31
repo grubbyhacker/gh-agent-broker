@@ -820,7 +820,7 @@ func (f *fakeRuntime) Start(ctx context.Context, containerID string) error {
 	defer f.mu.Unlock()
 	f.started[containerID] = true
 	if strings.HasSuffix(containerID, "-exec") {
-		f.paths[containerID+":"+codexInjectionDir] = true
+		f.paths[containerID+":"+codexInjectionReadyMarker] = true
 	}
 	return nil
 }
@@ -853,7 +853,7 @@ func (f *fakeRuntime) WaitForPath(
 	containerID, targetPath string,
 	timeout time.Duration,
 ) error {
-	if targetPath == codexInjectionDir {
+	if targetPath == codexInjectionReadyMarker {
 		if f.injectionReadyErr != nil {
 			return f.injectionReadyErr
 		}

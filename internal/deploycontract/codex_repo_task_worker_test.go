@@ -18,9 +18,11 @@ func TestCodexRepoTaskWorkerContract(t *testing.T) {
 
 	for _, required := range []string{
 		"readonly injection_dir='/dev/shm/codex-credential-injection'",
+		"readonly injection_ready_marker='/dev/shm/codex-credential-injection-ready'",
 		"readonly acceptance_marker='/dev/shm/codex-credential-accepted'",
 		"readonly codex_home_base='/dev/shm/codex-home'",
 		"/dev/shm must be tmpfs",
+		": > \"$injection_ready_marker\"",
 		"timed out waiting for in-memory Codex credential injection",
 		"mv -f -- \"$temp_auth\" \"$CODEX_HOME/auth.json\"",
 		"rm -f -- \"$capability_path\"",
