@@ -4,6 +4,7 @@ set -euo pipefail
 readonly worker_name='agent-codex-repo-task-worker'
 readonly injection_dir='/dev/shm/codex-credential-injection'
 readonly capability_path="${injection_dir}/auth.json"
+readonly injection_ready_marker='/dev/shm/codex-credential-injection-ready'
 readonly acceptance_marker='/dev/shm/codex-credential-accepted'
 readonly codex_home_base='/dev/shm/codex-home'
 readonly scan_base='/dev/shm/codex-scan'
@@ -42,7 +43,9 @@ execution_git() {
 }
 
 cleanup_credentials() {
-  rm -f -- "$capability_path" "$acceptance_marker" "$events_path" "$stderr_path" "$prompt_path" 2>/dev/null || true
+  rm -f -- \
+    "$capability_path" "$injection_ready_marker" "$acceptance_marker" \
+    "$events_path" "$stderr_path" "$prompt_path" 2>/dev/null || true
   rmdir -- "$injection_dir" 2>/dev/null || true
   [[ -z "$CODEX_HOME" ]] || rm -rf -- "$CODEX_HOME" 2>/dev/null || true
   [[ -z "$scan_dir" ]] || rm -rf -- "$scan_dir" 2>/dev/null || true
@@ -206,6 +209,8 @@ consume_capability() {
   local deadline temp_auth
   [[ "$(stat -f -c %T /dev/shm)" == 'tmpfs' ]] || fail '/dev/shm must be tmpfs'
   install -d -m 0700 "$injection_dir"
+  : > "$injection_ready_marker"
+  chmod 0600 "$injection_ready_marker"
   deadline=$((SECONDS + credential_wait_seconds))
   while [[ ! -f "$capability_path" ]]; do
     (( SECONDS < deadline )) || fail 'timed out waiting for in-memory Codex credential injection'
