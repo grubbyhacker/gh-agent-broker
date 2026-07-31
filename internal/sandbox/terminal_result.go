@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -19,22 +20,51 @@ const (
 // TerminalResult is the only worker-produced output available to the terminal
 // reporter. It intentionally excludes logs and arbitrary artifacts.
 type TerminalResult struct {
-	Version              string         `json:"version"`
-	RunID                string         `json:"run_id"`
-	Profile              string         `json:"profile"`
-	Repo                 string         `json:"repo"`
-	Branch               string         `json:"branch,omitempty"`
-	Status               string         `json:"status"`
-	Outcome              string         `json:"outcome"`
-	FinalizeReason       string         `json:"finalize_reason,omitempty"`
-	TerminalSource       string         `json:"terminal_source,omitempty"`
-	IdempotencyKeyDigest string         `json:"idempotency_key_digest,omitempty"`
-	RequestFingerprint   string         `json:"request_fingerprint,omitempty"`
-	LaunchConfigVersion  string         `json:"launch_config_version,omitempty"`
-	Result               map[string]any `json:"result,omitempty"`
-	FinalSummary         string         `json:"final_summary"`
-	FailureStage         string         `json:"failure_stage,omitempty"`
-	FailureReason        string         `json:"failure_reason,omitempty"`
+	Version              string              `json:"version"`
+	RunID                string              `json:"run_id"`
+	Profile              string              `json:"profile"`
+	Repo                 string              `json:"repo"`
+	Branch               string              `json:"branch,omitempty"`
+	Status               string              `json:"status"`
+	Outcome              string              `json:"outcome"`
+	FinalizeReason       string              `json:"finalize_reason,omitempty"`
+	TerminalSource       string              `json:"terminal_source,omitempty"`
+	IdempotencyKeyDigest string              `json:"idempotency_key_digest,omitempty"`
+	RequestFingerprint   string              `json:"request_fingerprint,omitempty"`
+	LaunchConfigVersion  string              `json:"launch_config_version,omitempty"`
+	Result               map[string]any      `json:"result,omitempty"`
+	FinalSummary         string              `json:"final_summary"`
+	FailureStage         string              `json:"failure_stage,omitempty"`
+	FailureReason        string              `json:"failure_reason,omitempty"`
+	Provenance           *TerminalProvenance `json:"provenance,omitempty"`
+}
+
+type TerminalProvenance struct {
+	ModelPolicy            string         `json:"model_policy"`
+	ModelPolicyVersion     string         `json:"model_policy_version"`
+	Model                  string         `json:"model"`
+	Effort                 string         `json:"effort"`
+	CodexVersion           string         `json:"codex_version"`
+	PromptRevision         string         `json:"prompt_revision"`
+	WorkerImageDigest      string         `json:"worker_image_digest"`
+	WorkerPlatform         string         `json:"worker_platform"`
+	PreparationImageDigest string         `json:"preparation_image_digest"`
+	PreparationPlatform    string         `json:"preparation_platform"`
+	WorkspaceHead          string         `json:"workspace_head"`
+	ManifestSHA256         string         `json:"manifest_sha256"`
+	IssueNumber            int            `json:"issue_number"`
+	SourceDeliveryID       string         `json:"source_delivery_id"`
+	PreparationStartedAt   string         `json:"preparation_started_at,omitempty"`
+	PreparationEndedAt     string         `json:"preparation_ended_at,omitempty"`
+	ExecutionStartedAt     string         `json:"execution_started_at,omitempty"`
+	ExecutionEndedAt       string         `json:"execution_ended_at,omitempty"`
+	DeliveryImageDigest    string         `json:"delivery_image_digest,omitempty"`
+	DeliveryPlatform       string         `json:"delivery_platform,omitempty"`
+	DeliveryStartedAt      string         `json:"delivery_started_at,omitempty"`
+	DeliveryEndedAt        string         `json:"delivery_ended_at,omitempty"`
+	VerificationTask       string         `json:"verification_task,omitempty"`
+	VerificationResult     string         `json:"verification_result,omitempty"`
+	Usage                  map[string]any `json:"usage,omitempty"`
 }
 
 func (s *Service) terminalResultPath(runID string) string {
@@ -77,6 +107,25 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 		IdempotencyKeyDigest: meta.IdempotencyKeyDigest, RequestFingerprint: meta.RequestFingerprint,
 		LaunchConfigVersion: meta.LaunchConfigVersion,
 	}
+	if meta.Provenance != nil {
+		result.Provenance = s.terminalProvenance(meta)
+	}
+	if meta.Provenance != nil && meta.Error != "" && strings.HasPrefix(meta.TerminalSource, "codex_") {
+		result.Outcome = StatusFailed
+		result.FailureStage = strings.TrimPrefix(meta.TerminalSource, "codex_")
+		reason := s.redactor(meta).Redact(meta.Error)
+		if !meta.ExecutionStartedAt.IsZero() {
+			if scanFailure := s.codexTokenScanFailure(meta); scanFailure != "" {
+				reason = scanFailure
+			} else if summary, outputFailure := s.readCodexFinalOutput(meta); outputFailure != "" {
+				reason += "; " + outputFailure
+			} else {
+				result.FinalSummary = summary
+			}
+		}
+		result.FailureReason = abbreviate(reason, 500)
+		return result
+	}
 	if meta.TerminalSource == terminalSourceStartupFailure && meta.Error != "" {
 		result.Outcome = StatusFailed
 		result.FailureStage = "sandbox_startup"
@@ -90,6 +139,14 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 		return result
 	}
 	result.Result, result.FinalSummary = workerResult, summary
+	if result.Provenance != nil {
+		if verification, ok := workerResult["verification"].(map[string]any); ok {
+			if status, ok := verification["status"].(string); ok &&
+				(status == "passed" || status == "failed" || status == "not_run") {
+				result.Provenance.VerificationResult = status
+			}
+		}
+	}
 	if outcome, ok := workerResult["outcome"].(string); ok && outcome != "" {
 		result.Outcome = outcome
 	} else {
@@ -98,6 +155,108 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 		result.Result, result.FinalSummary = nil, ""
 	}
 	return result
+}
+
+func (s *Service) readCodexFinalOutput(meta RunMetadata) (string, string) {
+	data, err := boundedRegularFile(
+		filepath.Join(s.runDir(meta.RunID), "output", "codex-final.txt"),
+		s.cfg.TerminalResultByteLimit,
+	)
+	if err != nil {
+		return "", terminalOutputError("codex-final.txt", err) + " after Codex execution began"
+	}
+	if len(data) == 0 {
+		return "", "codex-final.txt is empty after Codex execution began"
+	}
+	if !utf8.Valid(data) {
+		return "", "codex-final.txt is not valid UTF-8 after Codex execution began"
+	}
+	return string(data), ""
+}
+
+func (s *Service) codexTokenScanFailure(meta RunMetadata) string {
+	runDir := s.runDir(meta.RunID)
+	marker, err := boundedRegularFile(filepath.Join(runDir, "output", "codex-token-scan-failure"), 32)
+	if err != nil {
+		return ""
+	}
+	if string(marker) == "purge_failed\n" {
+		return "credential contamination cleanup could not be verified; host-backed artifacts remain quarantined and delivery is blocked"
+	}
+	for _, relative := range []string{"work", "lessons"} {
+		entries, readErr := os.ReadDir(filepath.Join(runDir, relative))
+		if readErr != nil || len(entries) != 0 {
+			return ""
+		}
+	}
+	outputEntries, err := os.ReadDir(filepath.Join(runDir, "output"))
+	if err != nil || len(outputEntries) != 1 || outputEntries[0].Name() != "codex-token-scan-failure" {
+		return ""
+	}
+	switch string(marker) {
+	case "contamination\n":
+		return "exact access-token contamination detected; disposable execution artifacts were purged"
+	case "incomplete\n":
+		return "access-token scan was incomplete; disposable execution artifacts were purged"
+	default:
+		return ""
+	}
+}
+
+func (s *Service) terminalProvenance(meta RunMetadata) *TerminalProvenance {
+	provenance := &TerminalProvenance{
+		ModelPolicy: meta.Provenance.ModelPolicy, ModelPolicyVersion: meta.Provenance.ModelPolicyVersion,
+		Model: meta.Provenance.Model, Effort: meta.Provenance.Effort, CodexVersion: meta.Provenance.CodexVersion,
+		PromptRevision: meta.Provenance.PromptRevision, WorkerImageDigest: meta.ImageDigest,
+		WorkerPlatform: meta.ExecutionPlatform, PreparationImageDigest: meta.PreparationImageDigest,
+		PreparationPlatform: meta.PreparationPlatform, WorkspaceHead: meta.Provenance.WorkspaceHead,
+		ManifestSHA256: meta.Provenance.ManifestSHA256, IssueNumber: meta.Provenance.IssueNumber,
+		SourceDeliveryID: meta.Provenance.SourceDeliveryID, VerificationTask: meta.VerificationTask,
+		DeliveryImageDigest: meta.DeliveryImageDigest, DeliveryPlatform: meta.DeliveryPlatform,
+	}
+	for value, target := range map[time.Time]*string{
+		meta.PreparationStartedAt: &provenance.PreparationStartedAt,
+		meta.PreparationEndedAt:   &provenance.PreparationEndedAt,
+		meta.ExecutionStartedAt:   &provenance.ExecutionStartedAt,
+		meta.ExecutionEndedAt:     &provenance.ExecutionEndedAt,
+		meta.DeliveryStartedAt:    &provenance.DeliveryStartedAt,
+		meta.DeliveryEndedAt:      &provenance.DeliveryEndedAt,
+	} {
+		if !value.IsZero() {
+			*target = value.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	path := filepath.Join(s.runDir(meta.RunID), "output", "codex-usage.json")
+	if data, err := boundedRegularFile(path, 4096); err == nil {
+		var usage map[string]any
+		if json.Unmarshal(data, &usage) == nil && boundedUsage(usage) {
+			provenance.Usage = usage
+		}
+	}
+	return provenance
+}
+
+func boundedUsage(usage map[string]any) bool {
+	if len(usage) > 4 {
+		return false
+	}
+	for key, value := range usage {
+		switch key {
+		case "input_tokens", "cached_input_tokens", "output_tokens":
+			number, ok := value.(float64)
+			if !ok || number < 0 || number > 1_000_000_000 || number != math.Trunc(number) {
+				return false
+			}
+		case "status":
+			text, ok := value.(string)
+			if !ok || len(text) > 32 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) readWorkerTerminalOutput(meta RunMetadata) (map[string]any, string, string, string) {
@@ -113,6 +272,11 @@ func (s *Service) readWorkerTerminalOutput(meta RunMetadata) (map[string]any, st
 	redactJSON(result, redactor)
 	if err := s.normalizeLegacyWorkerResult(meta, result, redactor); err != nil {
 		return nil, "", "terminal_result", err.Error()
+	}
+	if meta.Provenance != nil {
+		if err := validateCodexWorkerResult(meta, result); err != nil {
+			return nil, "", "terminal_result", err.Error()
+		}
 	}
 	redactedResult, err := json.Marshal(result)
 	if err != nil || len(redactedResult) > s.cfg.TerminalResultByteLimit {
@@ -130,6 +294,44 @@ func (s *Service) readWorkerTerminalOutput(meta RunMetadata) (map[string]any, st
 		return nil, "", "terminal_result", "final-summary.md exceeds terminal_result_byte_limit after redaction"
 	}
 	return result, summary, "", ""
+}
+
+func validateCodexWorkerResult(meta RunMetadata, result map[string]any) error {
+	for field, expected := range map[string]string{
+		"version": workerResultVersion, "run_id": meta.RunID, "repository": meta.Repo,
+		"base_branch": meta.BaseBranch, "branch": meta.Branch,
+	} {
+		if actual, ok := result[field].(string); !ok || actual != expected {
+			return fmt.Errorf("codex result.json %s does not match broker metadata", field)
+		}
+	}
+	outcome, ok := result["outcome"].(string)
+	if !ok || outcome != "no_change_required" && outcome != "ready_for_review" && outcome != StatusFailed {
+		return fmt.Errorf("codex result.json outcome is unsupported")
+	}
+	verification, ok := result["verification"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("codex result.json verification is missing")
+	}
+	status, ok := verification["status"].(string)
+	if !ok || status != "passed" && status != "failed" && status != "not_run" {
+		return fmt.Errorf("codex result.json verification status is unsupported")
+	}
+	if outcome != "ready_for_review" {
+		return nil
+	}
+	pullRequest, ok := result["pull_request"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("codex ready_for_review result is missing pull request identity")
+	}
+	number, numberOK := pullRequest["number"].(float64)
+	htmlURL, htmlURLOK := pullRequest["html_url"].(string)
+	apiURL, apiURLOK := pullRequest["url"].(string)
+	if !numberOK || number < 1 || number != math.Trunc(number) ||
+		!htmlURLOK || htmlURL == "" || !apiURLOK || apiURL == "" {
+		return fmt.Errorf("codex ready_for_review pull request identity is invalid")
+	}
+	return nil
 }
 
 func (s *Service) normalizeLegacyWorkerResult(meta RunMetadata, result map[string]any, redactor Redactor) error {

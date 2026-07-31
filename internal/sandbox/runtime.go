@@ -21,6 +21,9 @@ import (
 type RuntimeBackend interface {
 	Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error)
 	Start(ctx context.Context, containerID string) error
+	InjectSecret(ctx context.Context, containerID, targetDir, name string, contents []byte) error
+	PathExists(ctx context.Context, containerID, targetPath string) (bool, error)
+	WaitForPath(ctx context.Context, containerID, targetPath string, timeout time.Duration) error
 	Wait(ctx context.Context, containerID string) (ContainerStatus, error)
 	Inspect(ctx context.Context, containerID string) (ContainerStatus, error)
 	Logs(ctx context.Context, containerID string, limitBytes int) (string, error)
@@ -29,17 +32,19 @@ type RuntimeBackend interface {
 }
 
 type RuntimeSpec struct {
-	RunID      string
-	Image      string
-	Command    []string
-	User       string
-	Env        map[string]string
-	Labels     map[string]string
-	Mounts     []Mount
-	Network    NetworkPolicy
-	Resources  Resources
-	WorkingDir string
-	Timeout    time.Duration
+	RunID          string
+	Image          string
+	Command        []string
+	User           string
+	Env            map[string]string
+	Labels         map[string]string
+	Mounts         []Mount
+	Network        NetworkPolicy
+	Resources      Resources
+	WorkingDir     string
+	Timeout        time.Duration
+	Tmpfs          map[string]int64
+	StorageLimitMB int64
 }
 
 type Mount struct {
@@ -51,6 +56,7 @@ type Mount struct {
 type ContainerInfo struct {
 	ID          string
 	ImageDigest string
+	Platform    string
 	Existing    bool
 	Lifecycle   ContainerLifecycle
 	Status      ContainerStatus
@@ -98,7 +104,7 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 		return ContainerInfo{}, fmt.Errorf("fingerprint sandbox runtime spec: %w", err)
 	}
 	spec.Labels["gh-agent-broker.launch_spec"] = specDigest
-	imageDigest, err := d.imageDigest(ctx, spec.Image)
+	imageDigest, platform, err := d.imageIdentity(ctx, spec.Image)
 	if err != nil {
 		imageDigest = spec.Image
 	}
@@ -121,6 +127,8 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 			AutoRemove:      false,
 			Privileged:      false,
 			PublishAllPorts: false,
+			Tmpfs:           tmpfsOptions(spec.Tmpfs),
+			StorageOpt:      storageOptions(spec.StorageLimitMB),
 		},
 	}
 	var out struct {
@@ -134,7 +142,7 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 		}
 		return ContainerInfo{}, err
 	}
-	return ContainerInfo{ID: out.ID, ImageDigest: imageDigest, Lifecycle: ContainerNeverStarted}, nil
+	return ContainerInfo{ID: out.ID, ImageDigest: imageDigest, Platform: platform, Lifecycle: ContainerNeverStarted}, nil
 }
 
 func (d *DockerBackend) adopt(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
@@ -158,11 +166,95 @@ func (d *DockerBackend) adopt(ctx context.Context, spec RuntimeSpec) (ContainerI
 	} else if status.Running {
 		lifecycle = ContainerRunning
 	}
-	return ContainerInfo{ID: out.ID, ImageDigest: out.Image, Existing: true, Lifecycle: lifecycle, Status: status}, nil
+	return ContainerInfo{ID: out.ID, ImageDigest: out.Image, Platform: out.Platform, Existing: true, Lifecycle: lifecycle, Status: status}, nil
 }
 
 func (d *DockerBackend) Start(ctx context.Context, containerID string) error {
 	return d.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerID)+"/start", nil, nil)
+}
+
+func (d *DockerBackend) InjectSecret(
+	ctx context.Context,
+	containerID, targetDir, name string,
+	contents []byte,
+) error {
+	cleanDir := path.Clean(targetDir)
+	if cleanDir != "/dev/shm" && !strings.HasPrefix(cleanDir, "/dev/shm/") {
+		return fmt.Errorf("secret injection target must be within /dev/shm")
+	}
+	if path.Base(name) != name || name == "." || name == "/" {
+		return fmt.Errorf("invalid secret injection name")
+	}
+	if len(contents) == 0 || len(contents) > 64*1024 {
+		return fmt.Errorf("secret injection payload must be between 1 and 65536 bytes")
+	}
+	status, err := d.Inspect(ctx, containerID)
+	if err != nil {
+		return fmt.Errorf("inspect secret injection target: %w", err)
+	}
+	if !status.Running || status.StartedAt.IsZero() {
+		return fmt.Errorf("secret injection target is not running")
+	}
+
+	reader, writer := io.Pipe()
+	go func() {
+		tarWriter := tar.NewWriter(writer)
+		writeErr := tarWriter.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o600, Size: int64(len(contents)), Typeflag: tar.TypeReg,
+		})
+		if writeErr == nil {
+			_, writeErr = tarWriter.Write(contents)
+		}
+		writeErr = errors.Join(writeErr, tarWriter.Close())
+		_ = writer.CloseWithError(writeErr)
+	}()
+	archivePath := "/containers/" + url.PathEscape(containerID) + "/archive?path=" + url.QueryEscape(cleanDir)
+	return d.doWithContentType(ctx, http.MethodPut, archivePath, reader, nil, "application/x-tar")
+}
+
+func (d *DockerBackend) WaitForPath(
+	ctx context.Context,
+	containerID, targetPath string,
+	timeout time.Duration,
+) error {
+	if timeout <= 0 || timeout > time.Minute {
+		return fmt.Errorf("wait timeout must be positive and at most one minute")
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		exists, err := d.PathExists(waitCtx, containerID, targetPath)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("wait for in-container acceptance marker: %w", waitCtx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func (d *DockerBackend) PathExists(
+	ctx context.Context,
+	containerID, targetPath string,
+) (bool, error) {
+	cleanPath := path.Clean(targetPath)
+	if cleanPath != "/dev/shm" && !strings.HasPrefix(cleanPath, "/dev/shm/") {
+		return false, fmt.Errorf("path target must be within /dev/shm")
+	}
+	archivePath := "/containers/" + url.PathEscape(containerID) + "/archive?path=" + url.QueryEscape(cleanPath)
+	err := d.do(ctx, http.MethodHead, archivePath, nil, nil)
+	if err == nil {
+		return true, nil
+	}
+	if code, ok := DockerStatusCode(err); ok && code == http.StatusNotFound {
+		return false, nil
+	}
+	return false, err
 }
 
 func (d *DockerBackend) Wait(ctx context.Context, containerID string) (ContainerStatus, error) {
@@ -360,21 +452,24 @@ func (d *DockerBackend) MakeRemovable(ctx context.Context, image, path string) e
 	}
 }
 
-func (d *DockerBackend) imageDigest(ctx context.Context, image string) (string, error) {
+func (d *DockerBackend) imageIdentity(ctx context.Context, image string) (string, string, error) {
 	var out struct {
-		ID          string   `json:"Id"`
-		RepoDigests []string `json:"RepoDigests"`
+		ID           string   `json:"Id"`
+		RepoDigests  []string `json:"RepoDigests"`
+		Architecture string   `json:"Architecture"`
+		OS           string   `json:"Os"`
 	}
 	if err := d.doJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(image)+"/json", nil, &out); err != nil {
-		return "", err
+		return "", "", err
 	}
+	platform := strings.Trim(strings.TrimSpace(out.OS)+"/"+strings.TrimSpace(out.Architecture), "/")
 	if len(out.RepoDigests) > 0 {
-		return out.RepoDigests[0], nil
+		return out.RepoDigests[0], platform, nil
 	}
 	if out.ID != "" {
-		return out.ID, nil
+		return out.ID, platform, nil
 	}
-	return image, nil
+	return image, platform, nil
 }
 
 func (d *DockerBackend) doJSON(ctx context.Context, method, path string, in, out interface{}) error {
@@ -487,24 +582,27 @@ type dockerCreateRequest struct {
 }
 
 type dockerHostConfig struct {
-	ReadonlyRootfs  bool     `json:"ReadonlyRootfs"`
-	SecurityOpt     []string `json:"SecurityOpt"`
-	CapDrop         []string `json:"CapDrop"`
-	NetworkMode     string   `json:"NetworkMode"`
-	Binds           []string `json:"Binds"`
-	PidsLimit       int64    `json:"PidsLimit,omitempty"`
-	Memory          int64    `json:"Memory,omitempty"`
-	CPUWeight       int      `json:"CpuShares,omitempty"`
-	AutoRemove      bool     `json:"AutoRemove"`
-	Privileged      bool     `json:"Privileged"`
-	PublishAllPorts bool     `json:"PublishAllPorts"`
+	ReadonlyRootfs  bool              `json:"ReadonlyRootfs"`
+	SecurityOpt     []string          `json:"SecurityOpt"`
+	CapDrop         []string          `json:"CapDrop"`
+	NetworkMode     string            `json:"NetworkMode"`
+	Binds           []string          `json:"Binds"`
+	PidsLimit       int64             `json:"PidsLimit,omitempty"`
+	Memory          int64             `json:"Memory,omitempty"`
+	CPUWeight       int               `json:"CpuShares,omitempty"`
+	AutoRemove      bool              `json:"AutoRemove"`
+	Privileged      bool              `json:"Privileged"`
+	PublishAllPorts bool              `json:"PublishAllPorts"`
+	Tmpfs           map[string]string `json:"Tmpfs,omitempty"`
+	StorageOpt      map[string]string `json:"StorageOpt,omitempty"`
 }
 
 type dockerInspectResponse struct {
-	ID     string `json:"Id"`
-	Name   string `json:"Name"`
-	Image  string `json:"Image"`
-	Config struct {
+	ID       string `json:"Id"`
+	Name     string `json:"Name"`
+	Image    string `json:"Image"`
+	Platform string `json:"Platform"`
+	Config   struct {
 		Image  string            `json:"Image"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
@@ -562,6 +660,24 @@ func binds(mounts []Mount) []string {
 		out = append(out, filepath.Clean(mount.Source)+":"+mount.Target+":"+mode)
 	}
 	return out
+}
+
+func tmpfsOptions(entries map[string]int64) map[string]string {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(entries))
+	for target, sizeMB := range entries {
+		out[target] = fmt.Sprintf("rw,noexec,nosuid,nodev,size=%dm,mode=0700", sizeMB)
+	}
+	return out
+}
+
+func storageOptions(sizeMB int64) map[string]string {
+	if sizeMB < 1 {
+		return nil
+	}
+	return map[string]string{"size": fmt.Sprintf("%dM", sizeMB)}
 }
 
 func networkMode(network NetworkPolicy) string {

@@ -1,12 +1,61 @@
 package sandbox
 
 import (
+	"archive/tar"
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestDockerCreateAppliesTmpfsStorageAndPrivateNetworkContract(t *testing.T) {
+	var create dockerCreateRequest
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/images/"):
+			return jsonResponse(`{"Id":"sha256:image","RepoDigests":["worker@sha256:digest"],"Architecture":"amd64","Os":"linux"}`), nil
+		case req.Method == http.MethodPost && req.URL.Path == "/containers/create":
+			if err := json.NewDecoder(req.Body).Decode(&create); err != nil {
+				t.Fatal(err)
+			}
+			return jsonResponse(`{"Id":"container-id"}`), nil
+		default:
+			t.Fatalf("unexpected request %s %s", req.Method, req.URL)
+			return nil, errors.New("unexpected request")
+		}
+	})}}
+	info, err := backend.Create(context.Background(), RuntimeSpec{
+		RunID: "run-exec", Image: "worker@sha256:digest", User: "1000:1000",
+		Network: NetworkPolicy{
+			Network: "codex-execution-internal", PrivateBroker: true,
+			CodexRelay: true,
+		},
+		Tmpfs: map[string]int64{"/dev/shm": 64}, StorageLimitMB: 8192,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ImageDigest != "worker@sha256:digest" || info.Platform != "linux/amd64" {
+		t.Fatalf("image identity=%+v", info)
+	}
+	if create.HostConfig.NetworkMode != "codex-execution-internal" ||
+		create.HostConfig.Tmpfs["/dev/shm"] != "rw,noexec,nosuid,nodev,size=64m,mode=0700" ||
+		create.HostConfig.StorageOpt["size"] != "8192M" ||
+		create.HostConfig.Privileged || create.HostConfig.PublishAllPorts {
+		t.Fatalf("host config=%+v", create.HostConfig)
+	}
+}
+
+func jsonResponse(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK, Header: make(http.Header),
+		Body: io.NopCloser(strings.NewReader(body)),
+	}
+}
 
 func TestDockerAdoptRequiresExactDurableLaunchIdentity(t *testing.T) {
 	spec := RuntimeSpec{
@@ -69,6 +118,103 @@ func TestDockerAdoptRequiresExactDurableLaunchIdentity(t *testing.T) {
 				t.Fatalf("adopted container=%+v", info)
 			}
 		})
+	}
+}
+
+func TestDockerInjectSecretStreamsMode0600ArchiveOnlyAfterContainerStart(t *testing.T) {
+	t.Parallel()
+	var archiveName string
+	var archiveMode int64
+	var archiveBody string
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/containers/container-id/json":
+			return jsonResponse(`{"Id":"container-id","State":{"Running":true,"StartedAt":"2026-07-30T12:00:00Z"}}`), nil
+		case req.Method == http.MethodPut && req.URL.Path == "/containers/container-id/archive":
+			if req.URL.Query().Get("path") != codexInjectionDir || req.Header.Get("Content-Type") != "application/x-tar" {
+				t.Fatalf("archive request=%s headers=%v", req.URL, req.Header)
+			}
+			reader := tar.NewReader(req.Body)
+			header, err := reader.Next()
+			if err != nil {
+				t.Fatal(err)
+			}
+			archiveName, archiveMode = header.Name, header.Mode
+			body, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			archiveBody = string(body)
+			return jsonResponse(""), nil
+		default:
+			t.Fatalf("unexpected request %s %s", req.Method, req.URL)
+			return nil, errors.New("unexpected request")
+		}
+	})}}
+	bundle := `{"tokens":{"access_token":"access-only","refresh_token":""}}`
+	if err := backend.InjectSecret(context.Background(), "container-id", codexInjectionDir, codexInjectionName, []byte(bundle)); err != nil {
+		t.Fatal(err)
+	}
+	if archiveName != codexInjectionName || archiveMode != 0o600 || archiveBody != bundle {
+		t.Fatalf("archive name=%q mode=%o body=%q", archiveName, archiveMode, archiveBody)
+	}
+
+	backend.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(`{"Id":"container-id","State":{"Running":false}}`), nil
+	})}
+	if err := backend.InjectSecret(context.Background(), "container-id", codexInjectionDir, codexInjectionName, []byte(bundle)); err == nil {
+		t.Fatal("injected into a container that was not running")
+	}
+	if err := backend.InjectSecret(context.Background(), "container-id", "/work", codexInjectionName, []byte(bundle)); err == nil {
+		t.Fatal("accepted a non-tmpfs injection target")
+	}
+}
+
+func TestDockerWaitForPathUsesBoundedInContainerArchiveProbe(t *testing.T) {
+	t.Parallel()
+	var probes int
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		probes++
+		if req.Method != http.MethodHead || req.URL.Query().Get("path") != codexAcceptanceMarker {
+			t.Fatalf("probe=%s %s", req.Method, req.URL)
+		}
+		status := http.StatusNotFound
+		if probes == 2 {
+			status = http.StatusOK
+		}
+		return &http.Response{StatusCode: status, Header: make(http.Header), Body: http.NoBody}, nil
+	})}}
+	if err := backend.WaitForPath(context.Background(), "container-id", codexAcceptanceMarker, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if probes != 2 {
+		t.Fatalf("probes=%d", probes)
+	}
+}
+
+func TestDockerPathExistsDistinguishesMissingAcceptanceMarker(t *testing.T) {
+	t.Parallel()
+	status := http.StatusNotFound
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodHead || req.URL.Query().Get("path") != codexAcceptanceMarker {
+			t.Fatalf("probe=%s %s", req.Method, req.URL)
+		}
+		return &http.Response{StatusCode: status, Header: make(http.Header), Body: http.NoBody}, nil
+	})}}
+	exists, err := backend.PathExists(context.Background(), "container-id", codexAcceptanceMarker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("missing marker reported as present")
+	}
+	status = http.StatusOK
+	exists, err = backend.PathExists(context.Background(), "container-id", codexAcceptanceMarker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("acceptance marker reported as missing")
 	}
 }
 

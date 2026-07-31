@@ -1,5 +1,43 @@
 # Agent handoff
 
+The durable architectural invariant is: **“The broker owns durable side
+effects. The agent owns reasoning.”** This is a mechanical trust boundary, not
+prompt guidance. Codex interprets, edits, validates without broker authority,
+and emits bounded output; broker-controlled deterministic code alone advances
+durable state, pushes branches, creates or updates PRs, and posts comments.
+
+The first secure Codex issue-to-ready-PR slice is implemented behind the
+`codex_issue_workflow` launch-profile contract. It uses distinct durable
+preparation, execution, and delivery container identities under one broker run.
+Preparation has no Codex
+credential and fails stale unless checkout dependency/submodule identity
+exactly matches the baked manifest. The sandbox-broker-owned holder performs a
+bounded refresh before startup completes, then maintains the full credential
+master on a fixed 30-minute interval; periodic failures are bounded and logged
+with static redacted text. Run admission never refreshes. It only projects the
+current persisted access token and account ID into an access-only `auth.json`
+in memory with an explicitly empty refresh token. Token-free issuance state
+records only run/idempotency identity and issued/consumed times, independent of
+OAuth host, token lineage, and Codex version. After the fresh execution
+container starts, sandbox-broker
+streams it through Docker's archive API into bounded `/dev/shm`; no host
+capability file or issuance mount exists. The wrapper atomically accepts it
+into a mode-0600 tmpfs `CODEX_HOME`, removes the injection source, and records
+a token-free acceptance marker. Execution has no general proxy; its explicit
+Responses provider reaches only the broker-owned exact-path subscription
+relay, which alone forwards to fixed `https://chatgpt.com` through a separate
+origin-only edge.
+
+The only initial profile interface is `terra-medium-v1`, resolved through an
+exact reviewed five-entry `codex-model-policy/v1` table to
+`gpt-5.6-terra + medium`; unsupported combinations have no fallback. Codex
+events and credentials remain on tmpfs and are cleaned, and logs/arbitrary
+artifacts are unavailable for this workflow. The terminal projection includes
+bounded broker-owned provenance and preserves complete bounded final output.
+The vps-ops and Signal Plane schema/network handoff is
+`docs/codex-issue-ready-pr-contract.md`. No production or vps-ops change is
+included.
+
 Sandbox-broker now seals a durable `repository-task-terminal-result/v1` at
 terminal finalization. `GET /v1/runs/{run_id}/terminal-result` requires the
 new explicit `terminal_result` operator action and retains existing
@@ -12,9 +50,10 @@ or `cancelled` as appropriate) rather than truncation. The worker still does
 not publish or call GitHub. Signal Plane owns comment/outbox delivery in its
 follow-on slice.
 
-Both deterministic repository workers now produce the shared bounded
+The generic repository worker and the new deterministic Codex delivery worker
+produce the shared bounded
 `repository-task-worker-result/v1` contract. It preserves the generic
-worker's `task` field and the Codex worker's `worker: "codex"` field, always
+worker's `task` field and the delivery worker's `worker: "codex"` field, always
 includes a structured `verification.status` (`passed`, `failed`, or `not_run`), and a
 `ready_for_review` outcome includes only the broker-created pull request's
 validated `number`, `html_url`, and `url`. The worker validates that identity
@@ -62,22 +101,64 @@ content into the fresh checkout. A mismatch fails loudly as a stale image;
 the worker never initializes a submodule through a direct GitHub remote.
 
 `/usr/local/bin/agent-codex-repo-task-worker` is the Codex counterpart for a
-repository image that supplies Codex CLI. It copies only
-`/credentials/codex/auth.json` into a mode-0600 `CODEX_HOME` below `/dev/shm`,
-after broker checkout, dependency-manifest verification, baked-submodule
-hydration, and any dependency installation. This ordering is defense in depth
-only: the raw credential bundle remains readable at `/credentials/codex` during
-preparation, which violates design section 4.3 and is a known defect. Required
-follow-up work is a credential-free preparation container that produces a
-workspace and provenance record, followed by a fresh coding container that
-receives that workspace and the credential. It uses the same broker-mediated checkout,
-commit, push, and pull-request flow as the model-free worker. Its task prompt
-is supplied by `AGENT_CODEX_PROMPT` or `AGENT_CODEX_PROMPT_FILE`; the wrapper
-instructs Codex not to read credentials or perform GitHub delivery actions.
-Its JWT expiry check decodes the base64url payload (including restored padding)
-with `jq`; a shell regression test uses a synthetic, unpadded payload that
-contains a base64url underscore and verifies accepted future tokens plus
-rejected expired and safety-margin tokens.
+repository image that supplies Codex CLI. It begins in a bounded credential
+wait, accepts only the broker's mode-0600 `/dev/shm` injection after
+credential-free preparation, configures the fixed internal subscription relay,
+and removes credential material on exit. It uses the broker-mediated checkout,
+commit, push, and pull-request flow; Codex never receives a direct GitHub or
+general-internet route.
+
+Codex delivery is now a third deterministic phase, not wrapper-owned state in
+the same UID boundary. Preparation has private broker credentials and no OpenAI
+auth. Execution has access-only Codex auth streamed into tmpfs, the exact-path
+relay, no broker agent ID/secret/bundle, no private-broker route, and exactly
+one `codex exec`. It rejects created commits/refs, runs the required validation,
+and seals bounded `codex-execution-result/v1`, binary
+diff, validation output, final output, and usage projection artifacts only
+after exact token scanning across every host-backed work,
+output, lessons, symlink, filename, and Git object. Codex and validation
+statuses are captured so their scans run even after nonzero exits. Once the
+token FD exists, the EXIT trap scans before closing it; contamination or an
+incomplete scan purges all disposable host paths, exits nonzero, and prevents
+delivery. Purge first restores owner `rwX` without following symlinks, deletes,
+and verifies `/work`, `/output`, and `/lessons` before claiming removal. Any
+cleanup or verification failure emits `purge_failed`, keeps host artifacts
+quarantined, and leaves delivery blocked. Clean complete bounded valid-UTF-8
+final output remains verbatim in
+terminal projections for Codex, validation, and delivery failures; unusable
+output is reported explicitly and never truncated.
+
+The fresh `/usr/local/bin/agent-codex-delivery-worker` has private broker
+credentials and no Codex auth, holder, relay, or proxy. It verifies preparation
+and execution identity/digests, HEAD/ref invariants, and the sealed successful
+validation digest, removes and recreates a fixed minimal local Git config
+before Git use, reconstructs a trusted hook/filter/fsmonitor-free index and
+broker remote under a scrubbed no-pager/no-editor environment, then commits and
+pushes without running repository-controlled subprocesses, and
+reconciles exactly one ready PR by repository, base, head, and the durable run
+body marker before create. Ambiguous create performs the same exact
+reconciliation. The durable launch intent uses `-prep`, `-exec`, and
+`-deliver` identities and adopts phase containers across restart; it never
+launches a second execution or delivery container.
+
+Execution restart reconciliation preserves the durable phase observed before
+container inspection. A running `execution_running` container is watch-only.
+`bundle_accept_pending` waits for the in-container acceptance marker and
+idempotently consumes issuance before adoption. `bundle_inject_pending` first
+probes that marker, so a crash after injection or consumption cannot re-issue
+or re-inject an accepted bundle; only a still-unaccepted, unconsumed issuance
+may be projected again. Preparation and delivery adoption likewise inspect
+without overwriting their durable phase with a transient reconcile phase.
+
+Codex workflow failures stop and verify the current durable phase container
+before persisting terminal failure. Container selection comes from the
+phase-specific preparation, execution, or delivery identity rather than the
+generic last-container field, so cleanup cannot target a prior phase or launch
+work. Stop uses the configured grace under a bounded context, reconciles a
+verified already-exited/not-modified race, and preserves stop or verification
+failure in both the terminal failure reason and audit. Stopping execution also
+destroys its access-only credential and injection paths with the container
+tmpfs before the one durable terminal result is published.
 
 The staged `repository_transport_stage` audit events remain on the real Git
 path. No local repository backend, registered green-PR endpoint, agentd

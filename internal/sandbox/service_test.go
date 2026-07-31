@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -306,6 +307,14 @@ func TestRedactorReadsJSONSecretValues(t *testing.T) {
 		if strings.Contains(got, leaked) {
 			t.Fatalf("Redact() leaked %q in %q", leaked, got)
 		}
+	}
+}
+
+func TestRedactorRemovesBareJWTShapedAccessToken(t *testing.T) {
+	//nolint:gosec // G101: synthetic token-shaped fixture verifies generic redaction.
+	token := "eyJhbGciOiJub25lIn0.eyJleHAiOjQ3NjAwMDAwMDB9.synthetic-signature"
+	if got := NewRedactor(nil).Redact("accidental output " + token); strings.Contains(got, token) {
+		t.Fatalf("bare JWT was not redacted: %q", got)
 	}
 }
 
@@ -750,27 +759,54 @@ func assertMount(t *testing.T, mounts []Mount, source, target string, readonly b
 }
 
 type fakeRuntime struct {
-	mu           sync.Mutex
-	specs        []RuntimeSpec
-	logs         string
-	started      map[string]bool
-	exits        map[string]ContainerStatus
-	writes       map[string][]byte
-	waiters      map[string]chan struct{}
-	waitClosed   map[string]bool
-	stopErr      error
-	stopExitCode *int
-	stopHook     func()
+	mu                sync.Mutex
+	specs             []RuntimeSpec
+	logs              string
+	started           map[string]bool
+	exits             map[string]ContainerStatus
+	writes            map[string][]byte
+	injections        map[string][]byte
+	injectionCalls    map[string]int
+	paths             map[string]bool
+	waiters           map[string]chan struct{}
+	waitClosed        map[string]bool
+	injectionErr      error
+	waitForPathErr    error
+	acceptInjected    bool
+	stopErr           error
+	stopExitCode      *int
+	stopHook          func()
+	stopCalls         []string
+	stopGraces        []time.Duration
+	stopDeadline      time.Time
+	stopLeavesRunning bool
 }
 
 func newFakeRuntime() *fakeRuntime {
-	return &fakeRuntime{started: map[string]bool{}, exits: map[string]ContainerStatus{}, writes: map[string][]byte{}, waiters: map[string]chan struct{}{}, waitClosed: map[string]bool{}}
+	return &fakeRuntime{
+		started: map[string]bool{}, exits: map[string]ContainerStatus{}, writes: map[string][]byte{},
+		injections: map[string][]byte{}, injectionCalls: map[string]int{}, paths: map[string]bool{},
+		waiters: map[string]chan struct{}{}, waitClosed: map[string]bool{}, acceptInjected: true,
+	}
 }
 
 func (f *fakeRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
 	_ = ctx
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for _, existing := range f.specs {
+		if existing.RunID == spec.RunID {
+			containerID := "container-" + spec.RunID
+			if status, ok := f.exits[containerID]; ok {
+				return ContainerInfo{ID: containerID, ImageDigest: spec.Image, Existing: true, Lifecycle: ContainerExited, Status: status}, nil
+			}
+			lifecycle := ContainerNeverStarted
+			if f.started[containerID] {
+				lifecycle = ContainerRunning
+			}
+			return ContainerInfo{ID: containerID, ImageDigest: spec.Image, Existing: true, Lifecycle: lifecycle}, nil
+		}
+	}
 	f.specs = append(f.specs, spec)
 	containerID := "container-" + spec.RunID
 	f.waiters[containerID] = make(chan struct{})
@@ -783,6 +819,63 @@ func (f *fakeRuntime) Start(ctx context.Context, containerID string) error {
 	defer f.mu.Unlock()
 	f.started[containerID] = true
 	return nil
+}
+
+func (f *fakeRuntime) InjectSecret(
+	ctx context.Context,
+	containerID, targetDir, name string,
+	contents []byte,
+) error {
+	_ = ctx
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.started[containerID] {
+		return errors.New("container is not running")
+	}
+	key := containerID + ":" + filepath.Join(targetDir, name)
+	if f.injectionErr != nil {
+		return f.injectionErr
+	}
+	f.injections[key] = append([]byte(nil), contents...)
+	f.injectionCalls[containerID]++
+	if f.acceptInjected {
+		f.paths[containerID+":"+codexAcceptanceMarker] = true
+	}
+	return nil
+}
+
+func (f *fakeRuntime) WaitForPath(
+	ctx context.Context,
+	containerID, targetPath string,
+	timeout time.Duration,
+) error {
+	if f.waitForPathErr != nil {
+		return f.waitForPathErr
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		f.mu.Lock()
+		exists := f.paths[containerID+":"+targetPath]
+		f.mu.Unlock()
+		if exists {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func (f *fakeRuntime) PathExists(
+	_ context.Context,
+	containerID, targetPath string,
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paths[containerID+":"+targetPath], nil
 }
 
 func (f *fakeRuntime) Wait(ctx context.Context, containerID string) (ContainerStatus, error) {
@@ -825,23 +918,25 @@ func (f *fakeRuntime) Logs(ctx context.Context, containerID string, limitBytes i
 }
 
 func (f *fakeRuntime) Stop(ctx context.Context, containerID string, grace time.Duration) error {
-	_, _ = ctx, grace
 	if f.stopHook != nil {
 		f.stopHook()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.stopCalls = append(f.stopCalls, containerID)
+	f.stopGraces = append(f.stopGraces, grace)
+	f.stopDeadline, _ = ctx.Deadline()
 	if f.stopErr != nil {
 		if f.stopExitCode != nil {
 			code := *f.stopExitCode
 			f.exits[containerID] = ContainerStatus{ID: containerID, Running: false, ExitCode: &code, EndedAt: time.Now().UTC()}
 		}
-		f.started[containerID] = false
-		f.closeWaiterLocked(containerID)
+		if !f.stopLeavesRunning {
+			f.stopContainerLocked(containerID)
+		}
 		return f.stopErr
 	}
-	f.started[containerID] = false
-	f.closeWaiterLocked(containerID)
+	f.stopContainerLocked(containerID)
 	return nil
 }
 
@@ -902,4 +997,19 @@ func (f *fakeRuntime) closeWaiterLocked(containerID string) {
 	}
 	close(ch)
 	f.waitClosed[containerID] = true
+}
+
+func (f *fakeRuntime) stopContainerLocked(containerID string) {
+	f.started[containerID] = false
+	for key := range f.injections {
+		if strings.HasPrefix(key, containerID+":") {
+			delete(f.injections, key)
+		}
+	}
+	for key := range f.paths {
+		if strings.HasPrefix(key, containerID+":") {
+			delete(f.paths, key)
+		}
+	}
+	f.closeWaiterLocked(containerID)
 }

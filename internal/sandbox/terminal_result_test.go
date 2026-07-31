@@ -190,6 +190,130 @@ func TestTerminalResultRejectsOversizeFinalSummary(t *testing.T) {
 	}
 }
 
+func TestCodexFailurePreservesExactCompleteFinalOutput(t *testing.T) {
+	for _, terminalSource := range []string{"codex_execution", "codex_execution_verification", "codex_delivery"} {
+		t.Run(terminalSource, func(t *testing.T) {
+			cfg := baseTestConfig(t)
+			cfg.TerminalResultByteLimit = 256
+			service := NewService(cfg, newFakeRuntime(), testAudit(t))
+			meta := codexFailureTerminalMetadata("codex-final-"+terminalSource, terminalSource)
+			output := filepath.Join(cfg.RunsDir, meta.RunID, "output")
+			if err := os.MkdirAll(output, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			final := "Exact complete Codex final output.\nSecond line.\n"
+			if err := os.WriteFile(filepath.Join(output, "codex-final.txt"), []byte(final), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			got := service.projectTerminalResult(meta)
+			if got.Outcome != StatusFailed || got.FinalSummary != final ||
+				got.FailureReason != "phase failed" {
+				t.Fatalf("Codex failure projection = %+v", got)
+			}
+		})
+	}
+}
+
+func TestCodexFailureCallsOutUnusableFinalOutputWithoutTruncation(t *testing.T) {
+	tests := []struct {
+		name    string
+		content []byte
+		write   bool
+		reason  string
+	}{
+		{name: "missing", reason: "phase failed; codex-final.txt is absent after Codex execution began"},
+		{name: "empty", write: true, reason: "phase failed; codex-final.txt is empty after Codex execution began"},
+		{
+			name: "oversized", write: true, content: []byte(strings.Repeat("x", 65)),
+			reason: "phase failed; codex-final.txt exceeds terminal_result_byte_limit after Codex execution began",
+		},
+		{
+			name: "invalid UTF-8", write: true, content: []byte{0xff, 0xfe},
+			reason: "phase failed; codex-final.txt is not valid UTF-8 after Codex execution began",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := baseTestConfig(t)
+			cfg.TerminalResultByteLimit = 64
+			service := NewService(cfg, newFakeRuntime(), testAudit(t))
+			meta := codexFailureTerminalMetadata("codex-unusable-"+strings.ReplaceAll(test.name, " ", "-"), "codex_execution")
+			output := filepath.Join(cfg.RunsDir, meta.RunID, "output")
+			if err := os.MkdirAll(output, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if test.write {
+				if err := os.WriteFile(filepath.Join(output, "codex-final.txt"), test.content, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			got := service.projectTerminalResult(meta)
+			if got.FailureReason != test.reason || got.FinalSummary != "" {
+				t.Fatalf("Codex unusable-output projection = %+v", got)
+			}
+		})
+	}
+}
+
+func TestCodexContaminationFailureReportsPurgeInsteadOfMissingOutput(t *testing.T) {
+	cfg := baseTestConfig(t)
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	meta := codexFailureTerminalMetadata("codex-contamination", "codex_execution")
+	runDir := filepath.Join(cfg.RunsDir, meta.RunID)
+	for _, relative := range []string{"work", "lessons", "output"} {
+		if err := os.MkdirAll(filepath.Join(runDir, relative), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(
+		filepath.Join(runDir, "output", "codex-token-scan-failure"),
+		[]byte("contamination\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	got := service.projectTerminalResult(meta)
+	if got.FailureReason != "exact access-token contamination detected; disposable execution artifacts were purged" ||
+		got.FinalSummary != "" {
+		t.Fatalf("Codex contamination projection = %+v", got)
+	}
+}
+
+func TestCodexContaminationPurgeFailureKeepsRunBlockedWithoutRemovalClaim(t *testing.T) {
+	cfg := baseTestConfig(t)
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	meta := codexFailureTerminalMetadata("codex-purge-failed", "codex_execution")
+	runDir := filepath.Join(cfg.RunsDir, meta.RunID)
+	for _, relative := range []string{"work", "lessons", "output"} {
+		if err := os.MkdirAll(filepath.Join(runDir, relative), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(
+		filepath.Join(runDir, "work", "quarantined"),
+		[]byte("unreadable credential-bearing artifact"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(runDir, "output", "codex-token-scan-failure"),
+		[]byte("purge_failed\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	got := service.projectTerminalResult(meta)
+	if got.FailureReason != "credential contamination cleanup could not be verified; host-backed artifacts remain quarantined and delivery is blocked" ||
+		got.FinalSummary != "" {
+		t.Fatalf("Codex purge failure projection = %+v", got)
+	}
+}
+
 func TestRESTTerminalResultIsProfileScopedAndDoesNotBroadenExistingPrincipals(t *testing.T) {
 	cfg := restTestConfig(t)
 	cfg.OperatorPrincipals["reporter"] = OperatorPrincipal{Token: "reporter-secret", AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"terminal_result"}, RunScope: "profile"}
@@ -222,4 +346,13 @@ func TestRESTTerminalResultIsProfileScopedAndDoesNotBroadenExistingPrincipals(t 
 
 func terminalTestMetadata(runID, status string) RunMetadata {
 	return RunMetadata{RunID: runID, Profile: "nightly", Template: "worker", Repo: "owner/repo", BaseBranch: "main", Branch: "agent/test/terminal", CredentialBundle: "codex", Status: status, StartedAt: time.Now().UTC(), EndedAt: time.Now().UTC(), IdempotencyKeyDigest: "idem-digest", RequestFingerprint: "request-fingerprint", LaunchConfigVersion: "config-version"}
+}
+
+func codexFailureTerminalMetadata(runID, terminalSource string) RunMetadata {
+	meta := terminalTestMetadata(runID, StatusFailed)
+	meta.Error = "phase failed"
+	meta.TerminalSource = terminalSource
+	meta.ExecutionStartedAt = time.Now().UTC()
+	meta.Provenance = &CodexProvenance{}
+	return meta
 }

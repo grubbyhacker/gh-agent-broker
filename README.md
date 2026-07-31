@@ -24,6 +24,8 @@ audit events.
 - `gh-agent-proxy`: a narrow self-hosted model-call facade for sandboxed
   workers. It keeps provider keys in the proxy/LiteLLM service, enforces
   per-run budgets, and avoids prompt-body logging by default.
+- `codex-subscription-relay`: a fixed-origin relay exposing only the three
+  pinned Codex 0.146.0 ChatGPT subscription methods and paths.
 
 GitHub App installation tokens stay inside the broker. Agents receive only
 broker credentials or MCP access to a host-side service.
@@ -273,11 +275,11 @@ a SHA or semver tag, not `main` or `latest`.
 
 Semver tag builds also publish Linux amd64 binaries for `gh-agent-broker`,
 `gh-agent-broker-cli`, `broker-issue-reporter`, `sandbox-broker`, and
-`gh-agent-proxy`, plus `SHA256SUMS`.
+`gh-agent-proxy`, `codex-subscription-relay`, plus `SHA256SUMS`.
 
-Use the OCI image for the broker, reporter, sandbox-broker, and gh-agent-proxy
-services. Use the CLI binary as an agent runtime artifact when an agent
-container should call stable broker commands.
+Use the OCI image for the broker, reporter, sandbox-broker, gh-agent-proxy, and
+Codex subscription relay services. Use the CLI binary as an agent runtime
+artifact when an agent container should call stable broker commands.
 
 For production deployment, keep private config, `.env`, and PEM files outside
 git. Use `.env.example` only as a variable-name template, then deploy with the

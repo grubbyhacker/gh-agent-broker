@@ -13,10 +13,16 @@ import (
 	"strings"
 	"time"
 
+	"gh-agent-broker/internal/codexauth"
 	"gh-agent-broker/internal/sandbox"
 	"gh-agent-broker/internal/server"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+const (
+	codexRefreshInterval = 30 * time.Minute
+	codexRefreshTimeout  = 30 * time.Second
 )
 
 func main() {
@@ -95,6 +101,23 @@ func runServerCommand(args []string) {
 		}
 	}()
 	service := sandbox.NewServiceWithLaunchIntents(cfg, sandbox.NewDockerBackend(*dockerSocket), auditLog, intentStore)
+	if cfg.CodexHolder.MasterAuthPath != "" {
+		holder, holderErr := codexauth.New(codexauth.Config{
+			MasterAuthPath: cfg.CodexHolder.MasterAuthPath,
+			IssuanceRoot:   cfg.CodexHolder.IssuanceRoot,
+		})
+		if holderErr != nil {
+			log.Fatalf("initialize Codex credential holder: %v", holderErr)
+		}
+		refreshCtx, cancelRefresh := context.WithTimeout(context.Background(), codexRefreshTimeout)
+		holderErr = holder.Refresh(refreshCtx)
+		cancelRefresh()
+		if holderErr != nil {
+			log.Fatal("refresh Codex credential holder at startup")
+		}
+		go runCodexRefreshLoop(context.Background(), holder)
+		service.SetCodexCredentialIssuer(holder)
+	}
 	if err := service.Reconcile(context.Background()); err != nil {
 		log.Fatalf("reconcile runs: %v", err)
 	}
@@ -134,6 +157,24 @@ func runServerCommand(args []string) {
 	}
 	if err := httpServer.ListenAndServe(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func runCodexRefreshLoop(ctx context.Context, holder *codexauth.Holder) {
+	ticker := time.NewTicker(codexRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refreshCtx, cancel := context.WithTimeout(ctx, codexRefreshTimeout)
+			err := holder.Refresh(refreshCtx)
+			cancel()
+			if err != nil {
+				log.Print("periodic Codex credential refresh failed")
+			}
+		}
 	}
 }
 

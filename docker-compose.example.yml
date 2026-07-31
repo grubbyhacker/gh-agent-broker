@@ -17,6 +17,8 @@ services:
     networks:
       - default
       - sandbox-workers
+      - codex-preparation
+      - codex-delivery
     healthcheck:
       test: ["CMD", "/usr/local/bin/gh-agent-broker-cli", "health", "-broker", "http://127.0.0.1:8080"]
       interval: 30s
@@ -87,10 +89,37 @@ services:
     depends_on:
       - litellm
 
+  codex-subscription-relay:
+    build: .
+    entrypoint: ["/usr/local/bin/codex-subscription-relay"]
+    command: ["-listen", "0.0.0.0:8093"]
+    profiles: ["codex-subscription"]
+    environment:
+      HTTPS_PROXY: "http://codex-subscription-edge:3128"
+      HTTP_PROXY: ""
+      ALL_PROXY: ""
+      NO_PROXY: ""
+    networks:
+      codex-execution:
+        aliases: ["codex-subscription-relay"]
+      codex-relay-egress:
+
 volumes:
   broker-audit:
 
 networks:
   sandbox-workers:
     name: hermes-sandbox-workers
+    external: true
+  codex-execution:
+    name: codex-execution-internal
+    external: true
+  codex-preparation:
+    name: codex-preparation-internal
+    external: true
+  codex-delivery:
+    name: codex-delivery-internal
+    external: true
+  codex-relay-egress:
+    name: codex-relay-egress-internal
     external: true
