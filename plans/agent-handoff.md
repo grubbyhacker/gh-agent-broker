@@ -1,8 +1,15 @@
 # Agent handoff
 
+The durable architectural invariant is: **“The broker owns durable side
+effects. The agent owns reasoning.”** This is a mechanical trust boundary, not
+prompt guidance. Codex interprets, edits, validates without broker authority,
+and emits bounded output; broker-controlled deterministic code alone advances
+durable state, pushes branches, creates or updates PRs, and posts comments.
+
 The first secure Codex issue-to-ready-PR slice is implemented behind the
 `codex_issue_workflow` launch-profile contract. It uses distinct durable
-preparation and execution container identities. Preparation has no Codex
+preparation, execution, and delivery container identities under one broker run.
+Preparation has no Codex
 credential and fails stale unless checkout dependency/submodule identity
 exactly matches the baked manifest. The sandbox-broker-owned holder performs a
 bounded refresh before startup completes, then maintains the full credential
@@ -43,9 +50,10 @@ or `cancelled` as appropriate) rather than truncation. The worker still does
 not publish or call GitHub. Signal Plane owns comment/outbox delivery in its
 follow-on slice.
 
-Both deterministic repository workers now produce the shared bounded
+The generic repository worker and the new deterministic Codex delivery worker
+produce the shared bounded
 `repository-task-worker-result/v1` contract. It preserves the generic
-worker's `task` field and the Codex worker's `worker: "codex"` field, always
+worker's `task` field and the delivery worker's `worker: "codex"` field, always
 includes a structured `verification.status` (`passed`, `failed`, or `not_run`), and a
 `ready_for_review` outcome includes only the broker-created pull request's
 validated `number`, `html_url`, and `url`. The worker validates that identity
@@ -99,6 +107,28 @@ credential-free preparation, configures the fixed internal subscription relay,
 and removes credential material on exit. It uses the broker-mediated checkout,
 commit, push, and pull-request flow; Codex never receives a direct GitHub or
 general-internet route.
+
+Codex delivery is now a third deterministic phase, not wrapper-owned state in
+the same UID boundary. Preparation has private broker credentials and no OpenAI
+auth. Execution has access-only Codex auth streamed into tmpfs, the exact-path
+relay, no broker agent ID/secret/bundle, no private-broker route, and exactly
+one `codex exec`. It rejects created commits/refs and seals bounded
+the required validation and seals bounded `codex-execution-result/v1`, binary
+diff, validation output, final output, and usage projection artifacts only
+after exact token scanning across every host-backed work,
+output, lessons, symlink, filename, and Git object. Contamination purges those
+host paths, exits nonzero, and prevents delivery.
+
+The fresh `/usr/local/bin/agent-codex-delivery-worker` has private broker
+credentials and no Codex auth, holder, relay, or proxy. It verifies preparation
+and execution identity/digests, HEAD/ref invariants, and the sealed successful
+validation digest, reconstructs a trusted hook-free index and broker remote,
+then commits and pushes without running repository-controlled subprocesses, and
+reconciles exactly one ready PR by repository, base, head, and the durable run
+body marker before create. Ambiguous create performs the same exact
+reconciliation. The durable launch intent uses `-prep`, `-exec`, and
+`-deliver` identities and adopts phase containers across restart; it never
+launches a second execution or delivery container.
 
 The staged `repository_transport_stage` audit events remain on the real Git
 path. No local repository backend, registered green-PR endpoint, agentd

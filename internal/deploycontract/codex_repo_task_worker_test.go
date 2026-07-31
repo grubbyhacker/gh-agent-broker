@@ -33,13 +33,13 @@ func TestCodexRepoTaskWorkerContract(t *testing.T) {
 		"--model \"$AGENT_MODEL\"",
 		"model_reasoning_effort",
 		"--skip-git-repo-check",
-		"-C /work/repo",
-		"-o /output/codex-final.txt",
-		"Do not push, create a pull request, or contact GitHub directly",
-		"no_change_required",
+		"-C \"$repo_path\"",
+		"-o \"$output_path/codex-final.txt\"",
+		"Do not push, create a pull request, or contact GitHub;",
+		"reject_broker_authority",
+		"codex-execution-result/v1",
+		"diff_sha256",
 		"mise run \"$AGENT_VERIFY_TASK\"",
-		"gh-agent-broker-cli pr -broker \"$BROKER_URL\"",
-		"-metadata \"Agent-Id=${BROKER_AGENT_ID:?BROKER_AGENT_ID is required}\"",
 		"CODEX_DISABLE_ANALYTICS=1",
 		"model_provider = \"codex-subscription-relay\"",
 		"wire_api = \"responses\"",
@@ -48,6 +48,12 @@ func TestCodexRepoTaskWorkerContract(t *testing.T) {
 		"web_search = \"disabled\"",
 		"enable_mcp_apps = false",
 		"final output exceeds",
+		"snapshot_git_identity",
+		"verify_git_identity",
+		"no-broker-access://codex-execution",
+		"GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null",
+		"scan_for_token_contamination",
+		"purge_contaminated_artifacts",
 	} {
 		if !strings.Contains(text, required) {
 			t.Errorf("Codex repository task worker must contain %q", required)
@@ -88,10 +94,26 @@ func TestCodexRepoTaskWorkerSubmoduleHandling(t *testing.T) {
 }
 
 func TestCodexRepoTaskWorkerTerminalResult(t *testing.T) {
-	cmd := exec.Command("bash", "workers/result_test.sh", "workers/codex-repo-task/worker.sh")
+	cmd := exec.Command("bash", "workers/result_test.sh", "workers/codex-delivery/worker.sh")
 	cmd.Dir = "../.."
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("run Codex result regression test: %v\n%s", err, output)
+	}
+}
+
+func TestCodexRepoTaskWorkerSecurityBoundaries(t *testing.T) {
+	cmd := exec.Command("bash", "-n", "workers/codex-repo-task/worker.sh", "workers/codex-delivery/worker.sh")
+	cmd.Dir = "../.."
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run Codex security boundary regression test: %v\n%s", err, output)
+	}
+}
+
+func TestCodexDeliveryReconcilesOneExactPullRequest(t *testing.T) {
+	cmd := exec.Command("bash", "workers/codex_delivery_reconcile_test.sh")
+	cmd.Dir = "../.."
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run Codex delivery reconciliation regression: %v\n%s", err, output)
 	}
 }
 
@@ -107,6 +129,35 @@ func TestPublishedBrokerImageCarriesCodexRepoTaskWorker(t *testing.T) {
 	}
 	if !strings.Contains(string(dockerfile), "COPY --chmod=0755 workers/codex-repo-prep/worker.sh /usr/local/bin/agent-codex-repo-prep-worker") {
 		t.Error("published broker image must install agent-codex-repo-prep-worker as executable")
+	}
+	if !strings.Contains(string(dockerfile), "COPY --chmod=0755 workers/codex-delivery/worker.sh /usr/local/bin/agent-codex-delivery-worker") {
+		t.Error("published broker image must install agent-codex-delivery-worker as executable")
+	}
+}
+
+func TestCodexDeliveryWorkerOwnsOnlyDeterministicDelivery(t *testing.T) {
+	t.Parallel()
+	worker, err := os.ReadFile("../../workers/codex-delivery/worker.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(worker)
+	for _, required := range []string{
+		"reject_codex_authority", "validate_results", "restore_repository_authority",
+		"gh-agent-broker-cli pr -broker \"$BROKER_URL\"",
+		"gh-agent-broker-cli pulls", "gh-agent-broker-codex-run:", "ready_for_review",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("delivery worker must contain %q", required)
+		}
+	}
+	for _, forbidden := range []string{"codex exec", "CODEX_SUBSCRIPTION_RELAY_BASE_URL", "refresh_token"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("delivery worker contains Codex execution authority %q", forbidden)
+		}
+	}
+	if strings.Contains(text, "mise run") {
+		t.Error("delivery worker must not run repository-controlled validation with broker credentials")
 	}
 }
 

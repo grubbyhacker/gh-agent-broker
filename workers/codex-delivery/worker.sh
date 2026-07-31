@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly worker_name='agent-codex-delivery-worker'
+readonly worker_result_lib_path="${WORKER_RESULT_LIB_PATH:-/usr/local/lib/agent-worker-result.sh}"
+readonly worker_result_worker='codex'
+readonly delivery_output_path="${CODEX_DELIVERY_OUTPUT_PATH:-/output}"
+stage='initializing'
+verification_status='not_run'
+manifest_status='match'
+
+if [[ -r "$worker_result_lib_path" ]]; then
+  source "$worker_result_lib_path"
+else
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/result.sh"
+fi
+fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
+require_env() { [[ -n "${!1:-}" ]] || fail "missing required environment variable: $1"; }
+trusted_git() { GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -c core.hooksPath=/dev/null "$@"; }
+
+on_exit() {
+  local status=$?
+  trap - EXIT
+  if (( status != 0 )); then
+    write_result failed "delivery failed during $stage" || true
+    printf 'Deterministic Codex delivery failed during %s.\n' "$stage" > /output/final-summary.md
+  fi
+  exit "$status"
+}
+
+reject_codex_authority() {
+  local name _
+  while IFS='=' read -r name _; do
+    case "$name" in
+      OPENAI_*|CODEX_*|AGENT_MODEL|AGENT_REASONING_EFFORT)
+        fail "Codex authority is forbidden during delivery: $name" ;;
+    esac
+  done < <(env)
+  for path in /run/codex-issuance /dev/shm/codex-credential-injection; do
+    [[ ! -e "$path" ]] || fail "Codex holder or relay artifact is visible during delivery: $path"
+  done
+}
+
+validate_results() {
+  jq -e --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" '
+    .version == "codex-preparation-result/v1" and .status == "prepared" and
+    .run_id == $run and .repository == $repo and .branch == $branch and
+    (.workspace_head | test("^[a-f0-9]{40}$")) and (.refs_sha256 | test("^[a-f0-9]{64}$"))
+  ' /work/prepared/preparation.json >/dev/null || fail 'preparation result is invalid'
+  jq -e --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" \
+    --arg head "$(jq -r .workspace_head /work/prepared/preparation.json)" '
+    .version == "codex-execution-result/v1" and .status == "executed" and
+    .run_id == $run and .repository == $repo and .branch == $branch and .workspace_head == $head and
+    (.refs_sha256 | test("^[a-f0-9]{64}$")) and
+    (.diff_sha256 | test("^[a-f0-9]{64}$")) and (.final_sha256 | test("^[a-f0-9]{64}$")) and
+    .verification == "passed" and (.verify_sha256 | test("^[a-f0-9]{64}$")) and
+    (.final_size_bytes | type == "number" and . > 0 and . <= 1048576)
+  ' /work/execution/execution.json >/dev/null || fail 'execution result is invalid'
+  [[ "$(sha256sum /work/execution/diff.patch | cut -d' ' -f1)" == "$(jq -r .diff_sha256 /work/execution/execution.json)" ]] ||
+    fail 'execution diff digest mismatch'
+  [[ "$(sha256sum /output/codex-final.txt | cut -d' ' -f1)" == "$(jq -r .final_sha256 /work/execution/execution.json)" ]] ||
+    fail 'execution final-output digest mismatch'
+  [[ "$(sha256sum /work/execution/verify.txt | cut -d' ' -f1)" == "$(jq -r .verify_sha256 /work/execution/execution.json)" ]] ||
+    fail 'execution validation digest mismatch'
+}
+
+restore_repository_authority() {
+  local expected_head git_dir expected_git_dir current_refs
+  expected_head=$(jq -r .workspace_head /work/prepared/preparation.json)
+  git_dir=$(trusted_git -C /work/repo rev-parse --absolute-git-dir)
+  expected_git_dir="$(cd /work/repo && pwd -P)/.git"
+  [[ "$git_dir" == "$expected_git_dir" && -d "$git_dir" && ! -L "$git_dir" &&
+    -f "$git_dir/HEAD" && ! -L "$git_dir/HEAD" ]] ||
+    fail 'workspace Git directory or HEAD is not an ordinary trusted path'
+  [[ "$(trusted_git -C /work/repo rev-parse HEAD)" == "$expected_head" ]] || fail 'workspace HEAD changed after preparation'
+  [[ "$(trusted_git -C /work/repo symbolic-ref --short HEAD)" == "$AGENT_BRANCH" ]] || fail 'workspace branch changed after preparation'
+  current_refs=$(git -C /work/repo for-each-ref --format='%(refname) %(objectname) %(symref)' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+  [[ "$current_refs" == "$(jq -r .refs_sha256 /work/prepared/preparation.json)" &&
+    "$current_refs" == "$(jq -r .refs_sha256 /work/execution/execution.json)" ]] ||
+    fail 'workspace refs changed after preparation'
+  rm -rf -- /work/repo/.git/hooks
+  install -d -m 0700 /work/repo/.git/hooks
+  rm -f -- /work/repo/.git/index /work/repo/.git/index.lock
+  trusted_git -C /work/repo read-tree "$expected_head"
+  rm -f -- /work/repo/.git/config
+  trusted_git -C /work/repo config core.repositoryformatversion 0
+  trusted_git -C /work/repo config core.filemode true
+  trusted_git -C /work/repo config core.bare false
+  trusted_git -C /work/repo config core.logallrefupdates true
+  trusted_git -C /work/repo remote add origin placeholder
+  gh-agent-broker-cli configure -broker "$BROKER_URL" -repo "$AGENT_REPO" -remote origin >/output/broker-remote.txt
+  [[ "$(git -C /work/repo rev-parse HEAD)" == "$expected_head" ]] || fail 'broker configuration changed workspace HEAD'
+  local regenerated=/work/execution/delivery-diff.patch
+  local temp_index=/tmp/codex-delivery-index
+  GIT_INDEX_FILE="$temp_index" trusted_git -C /work/repo read-tree HEAD
+  GIT_INDEX_FILE="$temp_index" trusted_git -C /work/repo add --all
+  GIT_INDEX_FILE="$temp_index" trusted_git -C /work/repo diff --cached --binary HEAD > "$regenerated"
+  cmp -s "$regenerated" /work/execution/diff.patch || fail 'workspace diff no longer matches execution result'
+  rm -f -- "$regenerated" "$temp_index"
+}
+
+reconcile_pull_request() {
+  local marker=$1 list="$delivery_output_path/pull-request-reconcile.json" count
+  gh-agent-broker-cli pulls -broker "$BROKER_URL" -repo "$AGENT_REPO" -state all \
+    -head-prefix "$AGENT_BRANCH" -body-marker "$marker" > "$list"
+  jq --arg head "$AGENT_BRANCH" --arg base "$AGENT_BASE_BRANCH" --arg marker "$marker" \
+    '[.[] | select(.head_ref == $head and .base_ref == $base and (.body | contains($marker)))]' \
+    "$list" > "$list.exact"
+  mv -f -- "$list.exact" "$list"
+  count=$(jq 'length' "$list")
+  (( count <= 1 )) || fail 'multiple pull requests match the exact run marker and head branch'
+  if (( count == 1 )); then
+    jq '.[0]' "$list" > "$delivery_output_path/pull-request.json"
+    return 0
+  fi
+  return 1
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  for name in BROKER_URL BROKER_AGENT_ID BROKER_AGENT_SECRET AGENT_REPO AGENT_BASE_BRANCH \
+    AGENT_BRANCH AGENT_RUN_ID; do require_env "$name"; done
+  trap on_exit EXIT
+  [[ "$delivery_output_path" == /output ]] || fail 'delivery output path is fixed by the reviewed template'
+  reject_codex_authority
+  validate_results
+  restore_repository_authority
+  verification_status='passed'
+  cd /work/repo
+  if git diff --quiet && git diff --cached --quiet && [[ -z "$(git status --porcelain)" ]]; then
+    stage='completed without changes'
+    write_result no_change_required 'Codex determined that the issue requires no repository change'
+    cp /output/codex-final.txt /output/final-summary.md
+    exit 0
+  fi
+  stage='commit and push'
+  trusted_git add --all
+  trusted_git commit --quiet -m "Implement Codex issue task ${AGENT_RUN_ID}"
+  trusted_git push --quiet origin "HEAD:${AGENT_BRANCH}"
+  marker="<!-- gh-agent-broker-codex-run:${AGENT_RUN_ID} -->"
+  stage='pull request reconciliation'
+  if ! reconcile_pull_request "$marker"; then
+    pr_title="${AGENT_PR_TITLE:-Codex issue implementation}"
+    pr_body="${AGENT_PR_BODY:-Codex issue task completed for run ${AGENT_RUN_ID}.}"
+    pr_body="${pr_body}"$'\n\n'"${marker}"
+    stage='pull request creation'
+    if ! gh-agent-broker-cli pr -broker "$BROKER_URL" -repo "$AGENT_REPO" -title "$pr_title" \
+      -head "$AGENT_BRANCH" -base "$AGENT_BASE_BRANCH" -body "$pr_body" \
+      -metadata "Agent-Id=${BROKER_AGENT_ID}" -metadata "Run-Id=${AGENT_RUN_ID}" \
+      > /output/pull-request.json; then
+      stage='ambiguous pull request reconciliation'
+      reconcile_pull_request "$marker" || fail 'pull request creation failed and exact reconciliation found no match'
+    fi
+  fi
+  pull_request=$(read_pull_request) || fail 'broker pull request response is invalid'
+  stage='completed'
+  write_result ready_for_review 'Codex changes were deterministically delivered in a ready pull request' "$pull_request"
+  cp /output/codex-final.txt /output/final-summary.md
+fi

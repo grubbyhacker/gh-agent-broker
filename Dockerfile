@@ -22,6 +22,7 @@ COPY --chmod=0755 workers/result.sh /usr/local/lib/agent-worker-result.sh
 COPY --chmod=0755 workers/repo-task/worker.sh /usr/local/bin/agent-repo-task-worker
 COPY --chmod=0755 workers/codex-repo-task/worker.sh /usr/local/bin/agent-codex-repo-task-worker
 COPY --chmod=0755 workers/codex-repo-prep/worker.sh /usr/local/bin/agent-codex-repo-prep-worker
+COPY --chmod=0755 workers/codex-delivery/worker.sh /usr/local/bin/agent-codex-delivery-worker
 COPY --from=build --chown=65532:65532 /out/audit /var/log/gh-agent-broker
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/gh-agent-broker"]

@@ -18,11 +18,20 @@ const (
 	codexPhasePreparationCreate  = "preparation_create_pending"
 	codexPhasePreparationStart   = "preparation_start_pending"
 	codexPhasePreparationRunning = "preparation_running"
+	codexPhasePreparationRecon   = "preparation_reconcile_pending"
+	codexPhasePreparationTerm    = "preparation_terminal"
 	codexPhaseExecutionCreate    = "execution_create_pending"
 	codexPhaseExecutionStart     = "execution_start_pending"
 	codexPhaseBundleInject       = "bundle_inject_pending"
 	codexPhaseBundleAccept       = "bundle_accept_pending"
 	codexPhaseExecutionRunning   = "execution_running"
+	codexPhaseExecutionRecon     = "execution_reconcile_pending"
+	codexPhaseExecutionTerm      = "execution_terminal"
+	codexPhaseDeliveryCreate     = "delivery_create_pending"
+	codexPhaseDeliveryStart      = "delivery_start_pending"
+	codexPhaseDeliveryRunning    = "delivery_running"
+	codexPhaseDeliveryRecon      = "delivery_reconcile_pending"
+	codexPhaseDeliveryTerm       = "delivery_terminal"
 )
 
 type preparationResult struct {
@@ -32,9 +41,25 @@ type preparationResult struct {
 	Repository       string `json:"repository"`
 	Branch           string `json:"branch"`
 	WorkspaceHead    string `json:"workspace_head"`
+	RefsSHA256       string `json:"refs_sha256"`
 	ManifestSHA256   string `json:"manifest_sha256"`
 	IssueNumber      int    `json:"issue_number"`
 	SourceDeliveryID string `json:"source_delivery_id"`
+}
+
+type executionResult struct {
+	Version        string `json:"version"`
+	Status         string `json:"status"`
+	RunID          string `json:"run_id"`
+	Repository     string `json:"repository"`
+	Branch         string `json:"branch"`
+	WorkspaceHead  string `json:"workspace_head"`
+	RefsSHA256     string `json:"refs_sha256"`
+	DiffSHA256     string `json:"diff_sha256"`
+	FinalSHA256    string `json:"final_sha256"`
+	VerifySHA256   string `json:"verify_sha256"`
+	Verification   string `json:"verification"`
+	FinalSizeBytes int64  `json:"final_size_bytes"`
 }
 
 func (s *Service) resumeCodexIssueWorkflow(
@@ -70,11 +95,17 @@ func (s *Service) resumeCodexIssueWorkflow(
 	}
 
 	switch meta.Phase {
-	case codexPhasePreparationCreate, codexPhasePreparationStart, codexPhasePreparationRunning:
+	case codexPhasePreparationCreate, codexPhasePreparationStart, codexPhasePreparationRunning,
+		codexPhasePreparationRecon, codexPhasePreparationTerm:
 		return s.resumePreparation(ctx, intent, meta, *workflow)
 	case codexPhaseExecutionCreate, codexPhaseExecutionStart, codexPhaseBundleInject,
 		codexPhaseBundleAccept, codexPhaseExecutionRunning:
+		fallthrough
+	case codexPhaseExecutionRecon, codexPhaseExecutionTerm:
 		return s.resumeExecution(ctx, intent, meta, *workflow)
+	case codexPhaseDeliveryCreate, codexPhaseDeliveryStart, codexPhaseDeliveryRunning,
+		codexPhaseDeliveryRecon, codexPhaseDeliveryTerm:
+		return s.resumeDelivery(ctx, intent, meta, *workflow)
 	default:
 		return s.failCodexIntent(ctx, intent, meta, "state_reconciliation", fmt.Errorf("unsupported Codex workflow phase %q", meta.Phase))
 	}
@@ -94,6 +125,8 @@ func (s *Service) resumePreparation(
 	spec.RunID = meta.RunID + "-prep"
 	spec.Labels["gh-agent-broker.parent_run_id"] = meta.RunID
 	spec.Labels["gh-agent-broker.run_id"] = spec.RunID
+	spec.Labels["gh-agent-broker.template"] = workflow.PreparationTemplate
+	spec.Labels["gh-agent-broker.phase"] = "preparation"
 	var info ContainerInfo
 	if meta.PreparationContainerID == "" {
 		meta.Phase = codexPhasePreparationCreate
@@ -116,6 +149,10 @@ func (s *Service) resumePreparation(
 			info.Lifecycle = ContainerNeverStarted
 		}
 	} else {
+		meta.Phase = codexPhasePreparationRecon
+		if err := s.persistCodexIntent(ctx, intent, meta, intent.State); err != nil {
+			return LaunchAgentOutput{}, err
+		}
 		status, inspectErr := s.runtime.Inspect(ctx, meta.PreparationContainerID)
 		if inspectErr != nil {
 			return s.failCodexIntent(ctx, intent, meta, "preparation_reconcile", inspectErr)
@@ -167,6 +204,10 @@ func (s *Service) completePreparation(
 	status ContainerStatus,
 ) (LaunchAgentOutput, error) {
 	meta.PreparationEndedAt = terminalTime(status)
+	meta.Phase = codexPhasePreparationTerm
+	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
+		return LaunchAgentOutput{}, err
+	}
 	if status.ExitCode == nil || *status.ExitCode != 0 {
 		return s.failCodexIntent(ctx, intent, meta, "preparation", fmt.Errorf("credential-free preparation failed"))
 	}
@@ -198,6 +239,8 @@ func (s *Service) resumeExecution(
 	spec.RunID = meta.RunID + "-exec"
 	spec.Labels["gh-agent-broker.parent_run_id"] = meta.RunID
 	spec.Labels["gh-agent-broker.run_id"] = spec.RunID
+	spec.Labels["gh-agent-broker.template"] = workflow.ExecutionTemplate
+	spec.Labels["gh-agent-broker.phase"] = "execution"
 	spec.Env["AGENT_MODEL"] = meta.Provenance.Model
 	spec.Env["AGENT_REASONING_EFFORT"] = meta.Provenance.Effort
 	spec.Env["AGENT_MODEL_POLICY_VERSION"] = meta.Provenance.ModelPolicyVersion
@@ -223,11 +266,21 @@ func (s *Service) resumeExecution(
 			info.Lifecycle = ContainerNeverStarted
 		}
 	} else {
+		meta.Phase = codexPhaseExecutionRecon
+		if err := s.persistCodexIntent(ctx, intent, meta, intent.State); err != nil {
+			return LaunchAgentOutput{}, err
+		}
 		status, inspectErr := s.runtime.Inspect(ctx, meta.ExecutionContainerID)
 		if inspectErr != nil {
 			return s.failCodexIntent(ctx, intent, meta, "execution_reconcile", inspectErr)
 		}
 		info = ContainerInfo{ID: meta.ExecutionContainerID, Status: status, Lifecycle: lifecycleForStatus(status)}
+		if info.Lifecycle == ContainerRunning {
+			// A running execution container is adopted, never restarted. A
+			// fresh access-only projection is safe because acceptance is
+			// idempotent and issuance state contains no token.
+			meta.Phase = codexPhaseBundleInject
+		}
 	}
 	if info.Lifecycle == ContainerExited {
 		return s.completeExecution(ctx, intent, meta, info.Status)
@@ -311,6 +364,114 @@ func (s *Service) completeExecution(
 	status ContainerStatus,
 ) (LaunchAgentOutput, error) {
 	meta.ExecutionEndedAt = terminalTime(status)
+	meta.Phase = codexPhaseExecutionTerm
+	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	if status.ExitCode == nil || *status.ExitCode != 0 {
+		return s.failCodexIntent(ctx, intent, meta, "execution", fmt.Errorf("codex execution failed"))
+	}
+	if _, err := s.readExecutionResult(meta); err != nil {
+		return s.failCodexIntent(ctx, intent, meta, "execution_verification", err)
+	}
+	meta.Phase = codexPhaseDeliveryCreate
+	meta.ContainerID = ""
+	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	profile := s.cfg.LaunchProfiles[meta.Profile]
+	return s.resumeDelivery(ctx, intent, meta, *profile.CodexIssueWorkflow)
+}
+
+func (s *Service) resumeDelivery(
+	ctx context.Context,
+	intent *launchIntent,
+	meta RunMetadata,
+	workflow CodexIssueWorkflow,
+) (LaunchAgentOutput, error) {
+	template := s.cfg.Templates[workflow.DeliveryTemplate]
+	spec, _, err := s.runtimeSpec(meta, template)
+	if err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	spec.RunID = meta.RunID + "-deliver"
+	spec.Labels["gh-agent-broker.parent_run_id"] = meta.RunID
+	spec.Labels["gh-agent-broker.run_id"] = spec.RunID
+	spec.Labels["gh-agent-broker.template"] = workflow.DeliveryTemplate
+	spec.Labels["gh-agent-broker.phase"] = "delivery"
+	var info ContainerInfo
+	if meta.DeliveryContainerID == "" {
+		meta.Phase = codexPhaseDeliveryCreate
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateCreatePending); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		info, err = s.runtime.Create(ctx, spec)
+		if err != nil {
+			return s.failCodexIntent(ctx, intent, meta, "delivery_create", err)
+		}
+		meta.DeliveryContainerID = info.ID
+		meta.ContainerID = info.ID
+		meta.DeliveryImageDigest = info.ImageDigest
+		meta.DeliveryPlatform = info.Platform
+		meta.Phase = codexPhaseDeliveryStart
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateContainerMade); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		if info.Lifecycle == "" {
+			info.Lifecycle = ContainerNeverStarted
+		}
+	} else {
+		meta.Phase = codexPhaseDeliveryRecon
+		if err := s.persistCodexIntent(ctx, intent, meta, intent.State); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		status, inspectErr := s.runtime.Inspect(ctx, meta.DeliveryContainerID)
+		if inspectErr != nil {
+			return s.failCodexIntent(ctx, intent, meta, "delivery_reconcile", inspectErr)
+		}
+		info = ContainerInfo{ID: meta.DeliveryContainerID, Status: status, Lifecycle: lifecycleForStatus(status)}
+	}
+	if info.Lifecycle == ContainerExited {
+		return s.completeDelivery(ctx, intent, meta, info.Status)
+	}
+	if info.Lifecycle == ContainerNeverStarted {
+		meta.Phase = codexPhaseDeliveryStart
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateStartPending); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		if err := s.runtime.Start(ctx, meta.DeliveryContainerID); err != nil {
+			status, inspectErr := s.runtime.Inspect(ctx, meta.DeliveryContainerID)
+			if inspectErr == nil && !status.StartedAt.IsZero() {
+				if status.Running {
+					info.Status = status
+				} else {
+					return s.completeDelivery(ctx, intent, meta, status)
+				}
+			} else {
+				return s.failCodexIntent(ctx, intent, meta, "delivery_start", err)
+			}
+		}
+	}
+	meta.Status = StatusRunning
+	meta.Phase = codexPhaseDeliveryRunning
+	if meta.DeliveryStartedAt.IsZero() {
+		meta.DeliveryStartedAt = time.Now().UTC()
+	}
+	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	s.watchCodexPhase(meta.RunID, meta.DeliveryContainerID)
+	return launchOutput(meta), nil
+}
+
+func (s *Service) completeDelivery(
+	ctx context.Context,
+	intent *launchIntent,
+	meta RunMetadata,
+	status ContainerStatus,
+) (LaunchAgentOutput, error) {
+	meta.DeliveryEndedAt = terminalTime(status)
+	meta.Phase = codexPhaseDeliveryTerm
 	meta.Status = StatusRunning
 	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
 		return LaunchAgentOutput{}, err
@@ -346,6 +507,12 @@ func (s *Service) watchCodexPhase(runID, containerID string) {
 		if intent.Metadata.Phase == codexPhaseExecutionRunning {
 			if _, completeErr := s.completeExecution(context.Background(), &intent, intent.Metadata, status); completeErr != nil {
 				s.auditFinalizeFailure(runID, "codex_execution_failed", "codex_execution", completeErr)
+			}
+			return
+		}
+		if intent.Metadata.Phase == codexPhaseDeliveryRunning {
+			if _, completeErr := s.completeDelivery(context.Background(), &intent, intent.Metadata, status); completeErr != nil {
+				s.auditFinalizeFailure(runID, "codex_delivery_failed", "codex_delivery", completeErr)
 			}
 		}
 	}()
@@ -419,8 +586,31 @@ func (s *Service) readPreparationResult(meta RunMetadata) (preparationResult, er
 		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
 		result.IssueNumber != meta.Provenance.IssueNumber ||
 		result.SourceDeliveryID != meta.Provenance.SourceDeliveryID ||
-		!regexpSHA(result.WorkspaceHead, 40) || !regexpSHA(result.ManifestSHA256, 64) {
+		!regexpSHA(result.WorkspaceHead, 40) || !regexpSHA(result.RefsSHA256, 64) ||
+		!regexpSHA(result.ManifestSHA256, 64) {
 		return preparationResult{}, fmt.Errorf("preparation result does not match broker launch identity")
+	}
+	return result, nil
+}
+
+func (s *Service) readExecutionResult(meta RunMetadata) (executionResult, error) {
+	path := filepath.Join(s.runDir(meta.RunID), "work", "execution", "execution.json")
+	data, err := boundedRegularFile(path, 4096)
+	if err != nil {
+		return executionResult{}, fmt.Errorf("bounded execution result is unavailable")
+	}
+	var result executionResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return executionResult{}, fmt.Errorf("execution result is invalid")
+	}
+	if result.Version != "codex-execution-result/v1" || result.Status != "executed" ||
+		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
+		result.WorkspaceHead != meta.Provenance.WorkspaceHead || !regexpSHA(result.RefsSHA256, 64) ||
+		!regexpSHA(result.DiffSHA256, 64) ||
+		!regexpSHA(result.FinalSHA256, 64) || !regexpSHA(result.VerifySHA256, 64) ||
+		result.Verification != "passed" || result.FinalSizeBytes < 1 ||
+		result.FinalSizeBytes > int64(s.cfg.TerminalResultByteLimit) {
+		return executionResult{}, fmt.Errorf("execution result does not match broker launch identity or bounds")
 	}
 	return result, nil
 }

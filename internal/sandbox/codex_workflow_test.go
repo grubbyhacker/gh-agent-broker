@@ -114,7 +114,8 @@ func TestCodexIssueWorkflowSeparatesPreparationIssuanceAndExecution(t *testing.T
 		t.Fatalf("execution env=%+v", execSpec.Env)
 	}
 	for name, value := range execSpec.Env {
-		if strings.Contains(strings.ToUpper(name), "PROXY") || strings.Contains(value, "access-only") {
+		if strings.Contains(strings.ToUpper(name), "PROXY") || strings.Contains(value, "access-only") ||
+			strings.HasPrefix(name, "BROKER_") {
 			t.Fatalf("execution contains forbidden secret/proxy environment %q=%q", name, value)
 		}
 	}
@@ -151,6 +152,30 @@ func TestCodexIssueWorkflowSeparatesPreparationIssuanceAndExecution(t *testing.T
 		t.Fatalf("run metadata contains credential material: %s", metadata)
 	}
 
+	writeExecutionFixture(t, cfg, out.RunID, out.Branch)
+	runtime.finish(out.RunID+"-exec", 0, "")
+	waitFor(t, func() bool {
+		runtime.mu.Lock()
+		defer runtime.mu.Unlock()
+		return len(runtime.specs) == 3 && runtime.started["container-"+out.RunID+"-deliver"]
+	})
+	runtime.mu.Lock()
+	deliverySpec := runtime.specs[2]
+	runtime.mu.Unlock()
+	if deliverySpec.RunID != out.RunID+"-deliver" ||
+		!reflect.DeepEqual(deliverySpec.Network, cfg.Networks["delivery"]) {
+		t.Fatalf("delivery spec=%+v", deliverySpec)
+	}
+	for name := range deliverySpec.Env {
+		if strings.HasPrefix(name, "OPENAI_") || strings.HasPrefix(name, "CODEX_") ||
+			name == "AGENT_MODEL" || name == "AGENT_REASONING_EFFORT" {
+			t.Fatalf("delivery contains Codex authority %q", name)
+		}
+	}
+	if deliverySpec.Env["BROKER_AGENT_SECRET"] == "" {
+		t.Fatal("delivery is missing its private broker credential")
+	}
+
 	outputDir := filepath.Join(cfg.RunsDir, out.RunID, "output")
 	result := map[string]any{
 		"version": workerResultVersion, "outcome": "no_change_required", "run_id": out.RunID,
@@ -164,7 +189,7 @@ func TestCodexIssueWorkflowSeparatesPreparationIssuanceAndExecution(t *testing.T
 	if err := os.WriteFile(filepath.Join(outputDir, "codex-usage.json"), []byte(`{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runtime.finish(out.RunID+"-exec", 0, "")
+	runtime.finish(out.RunID+"-deliver", 0, "")
 	waitFor(t, func() bool {
 		_, terminalErr := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
 		return terminalErr == nil
@@ -183,6 +208,23 @@ func TestCodexIssueWorkflowSeparatesPreparationIssuanceAndExecution(t *testing.T
 	if _, statErr := os.Stat(filepath.Join(cfg.CodexHolder.IssuanceRoot, out.RunID, "capability", "auth.json")); !os.IsNotExist(statErr) {
 		t.Fatalf("host capability exists: %v", statErr)
 	}
+}
+
+func writeExecutionFixture(t *testing.T, cfg Config, runID, branch string) {
+	t.Helper()
+	path := filepath.Join(cfg.RunsDir, runID, "work", "execution", "execution.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFileForTest(t, path, executionResult{
+		Version: "codex-execution-result/v1", Status: "executed", RunID: runID,
+		Repository: "owner/repo", Branch: branch,
+		WorkspaceHead: "1111111111111111111111111111111111111111",
+		RefsSHA256:    strings.Repeat("5", 64),
+		DiffSHA256:    strings.Repeat("3", 64), FinalSHA256: strings.Repeat("4", 64),
+		VerifySHA256: strings.Repeat("6", 64), Verification: "passed",
+		FinalSizeBytes: 10,
+	})
 }
 
 func TestCodexWorkflowReplayDoesNotDuplicatePreparation(t *testing.T) {
@@ -219,6 +261,54 @@ func TestCodexWorkflowReplayDoesNotDuplicatePreparation(t *testing.T) {
 	defer runtime.mu.Unlock()
 	if len(runtime.specs) != 1 {
 		t.Fatalf("preparation containers=%d, want one", len(runtime.specs))
+	}
+}
+
+func TestCodexExecutionContaminationFailurePreventsDeliveryAndLeavesNoHostCredential(t *testing.T) {
+	cfg := codexWorkflowTestConfig(t)
+	cfg.ApplyDefaults()
+	cfg.StampLoaded(time.Now().UTC())
+	runtime := newFakeRuntime()
+	store, err := OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("close launch intent store: %v", closeErr)
+		}
+	})
+	service := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	service.SetCodexCredentialIssuer(&fakeCodexIssuer{})
+	in := cfg.LaunchProfiles["terra-medium-v1"].LaunchAgentInput
+	in.Profile = "terra-medium-v1"
+	in.Parameters = map[string]any{"issue_number": 42, "source_delivery_id": "delivery-42"}
+	out, err := service.LaunchProfile(context.Background(), "signal-plane", "terra-medium-v1", "contamination", "fp", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writePreparationFixture(t, cfg, out.RunID, out.Branch)
+	runtime.finish(out.RunID+"-prep", 0, "")
+	waitFor(t, func() bool {
+		runtime.mu.Lock()
+		defer runtime.mu.Unlock()
+		return len(runtime.specs) == 2 && runtime.started["container-"+out.RunID+"-exec"]
+	})
+	// The execution worker reports contamination by failing after purging its
+	// host-backed work/output, so no valid bounded execution result exists.
+	runtime.finish(out.RunID+"-exec", 71, "credential contamination")
+	waitFor(t, func() bool {
+		intent, found, lookupErr := store.LookupRun(context.Background(), out.RunID)
+		return lookupErr == nil && found && intent.State == intentStateTerminal
+	})
+	runtime.mu.Lock()
+	specCount := len(runtime.specs)
+	runtime.mu.Unlock()
+	if specCount != 2 {
+		t.Fatalf("contamination launched delivery; runtime specs=%d", specCount)
+	}
+	if _, statErr := os.Stat(filepath.Join(cfg.CodexHolder.IssuanceRoot, out.RunID, "capability", "auth.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("host credential copy exists after contamination failure: %v", statErr)
 	}
 }
 
@@ -287,6 +377,26 @@ func TestCodexWorkflowRestartReinjectsWithoutDuplicateExecution(t *testing.T) {
 	if specCount != 2 {
 		t.Fatalf("restart created %d containers, want one preparation and one execution", specCount)
 	}
+	writeExecutionFixture(t, cfg, out.RunID, out.Branch)
+	runtime.finish(out.RunID+"-exec", 0, "")
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		runtime.mu.Lock()
+		defer runtime.mu.Unlock()
+		return len(runtime.specs) >= 3
+	})
+	restartedAgain := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	restartedAgain.SetCodexCredentialIssuer(issuer)
+	if err := restartedAgain.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if len(runtime.specs) != 3 {
+		t.Fatalf("restart created %d containers, want exactly one preparation, execution, and delivery", len(runtime.specs))
+	}
 }
 
 func writePreparationFixture(t *testing.T, cfg Config, runID, branch string) {
@@ -299,6 +409,7 @@ func writePreparationFixture(t *testing.T, cfg Config, runID, branch string) {
 		Version: "codex-preparation-result/v1", Status: "prepared", RunID: runID,
 		Repository: "owner/repo", Branch: branch,
 		WorkspaceHead:  "1111111111111111111111111111111111111111",
+		RefsSHA256:     strings.Repeat("5", 64),
 		ManifestSHA256: "2222222222222222222222222222222222222222222222222222222222222222",
 		IssueNumber:    42, SourceDeliveryID: "delivery-42",
 	})

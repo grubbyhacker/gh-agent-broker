@@ -170,14 +170,15 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   stage='baked dependency and submodule verification'
   manifest=$(verify_baked_manifest)
   workspace_head=$(git rev-parse HEAD)
+  refs_sha256=$(git for-each-ref --format='%(refname) %(objectname) %(symref)' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
   source_delivery_id=$(jq -r '.parameters.source_delivery_id' /input/task.json)
   issue_number=$(jq -r '.parameters.issue_number' /input/task.json)
   jq -n \
     --arg run_id "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" \
-    --arg head "$workspace_head" --arg manifest "$manifest" --arg source_delivery_id "$source_delivery_id" \
+    --arg head "$workspace_head" --arg refs "$refs_sha256" --arg manifest "$manifest" --arg source_delivery_id "$source_delivery_id" \
     --argjson issue_number "$issue_number" \
     '{version:"codex-preparation-result/v1",status:"prepared",run_id:$run_id,repository:$repo,
-      branch:$branch,workspace_head:$head,manifest_sha256:$manifest,issue_number:$issue_number,
+      branch:$branch,workspace_head:$head,refs_sha256:$refs,manifest_sha256:$manifest,issue_number:$issue_number,
       source_delivery_id:$source_delivery_id}' > /work/prepared/preparation.json
   chmod 0444 /work/prepared/preparation.json /work/prepared/issue-context.md
   stage='prepared'

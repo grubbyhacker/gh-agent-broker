@@ -58,6 +58,10 @@ type TerminalProvenance struct {
 	PreparationEndedAt     string         `json:"preparation_ended_at,omitempty"`
 	ExecutionStartedAt     string         `json:"execution_started_at,omitempty"`
 	ExecutionEndedAt       string         `json:"execution_ended_at,omitempty"`
+	DeliveryImageDigest    string         `json:"delivery_image_digest,omitempty"`
+	DeliveryPlatform       string         `json:"delivery_platform,omitempty"`
+	DeliveryStartedAt      string         `json:"delivery_started_at,omitempty"`
+	DeliveryEndedAt        string         `json:"delivery_ended_at,omitempty"`
 	VerificationTask       string         `json:"verification_task,omitempty"`
 	VerificationResult     string         `json:"verification_result,omitempty"`
 	Usage                  map[string]any `json:"usage,omitempty"`
@@ -152,12 +156,15 @@ func (s *Service) terminalProvenance(meta RunMetadata) *TerminalProvenance {
 		PreparationPlatform: meta.PreparationPlatform, WorkspaceHead: meta.Provenance.WorkspaceHead,
 		ManifestSHA256: meta.Provenance.ManifestSHA256, IssueNumber: meta.Provenance.IssueNumber,
 		SourceDeliveryID: meta.Provenance.SourceDeliveryID, VerificationTask: meta.VerificationTask,
+		DeliveryImageDigest: meta.DeliveryImageDigest, DeliveryPlatform: meta.DeliveryPlatform,
 	}
 	for value, target := range map[time.Time]*string{
 		meta.PreparationStartedAt: &provenance.PreparationStartedAt,
 		meta.PreparationEndedAt:   &provenance.PreparationEndedAt,
 		meta.ExecutionStartedAt:   &provenance.ExecutionStartedAt,
 		meta.ExecutionEndedAt:     &provenance.ExecutionEndedAt,
+		meta.DeliveryStartedAt:    &provenance.DeliveryStartedAt,
+		meta.DeliveryEndedAt:      &provenance.DeliveryEndedAt,
 	} {
 		if !value.IsZero() {
 			*target = value.UTC().Format(time.RFC3339Nano)

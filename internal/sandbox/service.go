@@ -122,13 +122,18 @@ type RunMetadata struct {
 	Phase                  string           `json:"phase,omitempty"`
 	PreparationContainerID string           `json:"preparation_container_id,omitempty"`
 	ExecutionContainerID   string           `json:"execution_container_id,omitempty"`
+	DeliveryContainerID    string           `json:"delivery_container_id,omitempty"`
 	PreparationImageDigest string           `json:"preparation_image_digest,omitempty"`
 	PreparationPlatform    string           `json:"preparation_platform,omitempty"`
 	ExecutionPlatform      string           `json:"execution_platform,omitempty"`
+	DeliveryImageDigest    string           `json:"delivery_image_digest,omitempty"`
+	DeliveryPlatform       string           `json:"delivery_platform,omitempty"`
 	PreparationStartedAt   time.Time        `json:"preparation_started_at,omitempty"`
 	PreparationEndedAt     time.Time        `json:"preparation_ended_at,omitempty"`
 	ExecutionStartedAt     time.Time        `json:"execution_started_at,omitempty"`
 	ExecutionEndedAt       time.Time        `json:"execution_ended_at,omitempty"`
+	DeliveryStartedAt      time.Time        `json:"delivery_started_at,omitempty"`
+	DeliveryEndedAt        time.Time        `json:"delivery_ended_at,omitempty"`
 	Provenance             *CodexProvenance `json:"provenance,omitempty"`
 }
 
@@ -681,6 +686,9 @@ func (s *Service) LaunchProfile(ctx context.Context, principal, profile, rawKey,
 		Parameters: cloneParameters(in.Parameters), StartedAt: now, Deadline: now.Add(runtimeLimit),
 	}
 	if workflow := s.cfg.LaunchProfiles[profile].CodexIssueWorkflow; workflow != nil {
+		deliveryTemplate := s.cfg.Templates[workflow.DeliveryTemplate]
+		meta.WorkerAgentID = workerAgentID(deliveryTemplate, runID)
+		meta.BrokerAgentID = deliveryTemplate.BrokerAgentID
 		mapping := s.cfg.ModelPolicies[workflow.ModelPolicy].Mappings[workflow.ModelProfile]
 		issueNumber := 0
 		if value, ok := integerValue(meta.Parameters["issue_number"]); ok {
@@ -1226,10 +1234,14 @@ func (s *Service) validateLaunch(in LaunchAgentInput) (Template, string, string,
 	branch := strings.TrimSpace(in.Branch)
 	if branch == "" {
 		prefix := tmpl.BranchPolicy.GeneratePrefix
+		branchAgentID := tmpl.BrokerAgentID
+		if profile, ok := s.cfg.LaunchProfiles[in.Profile]; ok && profile.CodexIssueWorkflow != nil {
+			branchAgentID = s.cfg.Templates[profile.CodexIssueWorkflow.DeliveryTemplate].BrokerAgentID
+		}
 		if prefix == "" {
 			prefix = "agent"
 		}
-		branch = strings.TrimRight(prefix, "/") + "/" + tmpl.BrokerAgentID + "/" + runID
+		branch = strings.TrimRight(prefix, "/") + "/" + branchAgentID + "/" + runID
 	}
 	if !safeBranch(branch) {
 		return Template{}, "", "", 0, fmt.Errorf("policy denial: branch %q is unsafe; use a normal Git branch name without traversal, locks, spaces, or ref metacharacters", branch)
@@ -1272,15 +1284,17 @@ func runtimeLimit(in LaunchAgentInput, tmpl Template) (time.Duration, error) {
 func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Redactor, error) {
 	runDir := s.runDir(meta.RunID)
 	env := map[string]string{
-		"BROKER_URL":          s.cfg.BrokerURL,
-		"BROKER_AGENT_ID":     tmpl.BrokerAgentID,
-		"BROKER_AGENT_SECRET": tmpl.BrokerAgentSecret,
 		"SANDBOX_RUN_ID":      meta.RunID,
 		"SANDBOX_REPO":        meta.Repo,
 		"SANDBOX_BRANCH":      meta.Branch,
 		"SANDBOX_BASE_BRANCH": meta.BaseBranch,
 		"HOME":                "/work/home",
 		"HERMES_HOME":         "/work/hermes",
+	}
+	if tmpl.BrokerAgentID != "" && tmpl.BrokerAgentSecret != "" {
+		env["BROKER_URL"] = s.cfg.BrokerURL
+		env["BROKER_AGENT_ID"] = tmpl.BrokerAgentID
+		env["BROKER_AGENT_SECRET"] = tmpl.BrokerAgentSecret
 	}
 	for k, v := range tmpl.Environment {
 		if safeEnvKey(k) {

@@ -279,7 +279,7 @@ func TestCodexIssueWorkflowConfigIsExactAndDenyByDefault(t *testing.T) {
 			network := c.Networks["prep"]
 			network.EgressProxy = "http://proxy:8080"
 			c.Networks["prep"] = network
-		}, want: "private-broker-only"},
+		}, want: "private broker credentials only"},
 		{name: "execution general internet", mutate: func(c *Config) {
 			network := c.Networks["execution"]
 			network.AllowInternet = true
@@ -289,12 +289,33 @@ func TestCodexIssueWorkflowConfigIsExactAndDenyByDefault(t *testing.T) {
 			network := c.Networks["execution"]
 			network.EgressProxy = "http://proxy:8080"
 			c.Networks["execution"] = network
-		}, want: "only the private broker and Codex subscription relay"},
+		}, want: "Codex subscription relay only"},
 		{name: "execution relay missing", mutate: func(c *Config) {
 			network := c.Networks["execution"]
 			network.CodexRelay = false
 			c.Networks["execution"] = network
-		}, want: "only the private broker and Codex subscription relay"},
+		}, want: "Codex subscription relay only"},
+		{name: "execution broker credential", mutate: func(c *Config) {
+			template := c.Templates["execution"]
+			template.BrokerAgentID = "forbidden"
+			template.BrokerAgentSecret = "forbidden"
+			c.Templates["execution"] = template
+		}, want: "no broker agent credential"},
+		{name: "execution private broker route", mutate: func(c *Config) {
+			network := c.Networks["execution"]
+			network.PrivateBroker = true
+			c.Networks["execution"] = network
+		}, want: "Codex subscription relay only"},
+		{name: "delivery relay", mutate: func(c *Config) {
+			network := c.Networks["delivery"]
+			network.CodexRelay = true
+			c.Networks["delivery"] = network
+		}, want: "no Codex holder, relay, or proxy"},
+		{name: "delivery missing broker credential", mutate: func(c *Config) {
+			template := c.Templates["delivery"]
+			template.BrokerAgentSecret = ""
+			c.Templates["delivery"] = template
+		}, want: "private broker credentials only"},
 		{name: "missing tmpfs", mutate: func(c *Config) {
 			template := c.Templates["execution"]
 			template.Tmpfs = nil
@@ -347,8 +368,10 @@ func codexWorkflowTestConfig(t *testing.T) Config {
 			Network: "prep-net", PrivateBroker: true,
 		},
 		"execution": {
-			Network: "execution-net", PrivateBroker: true,
-			CodexRelay: true,
+			Network: "execution-net", CodexRelay: true,
+		},
+		"delivery": {
+			Network: "delivery-net", PrivateBroker: true,
 		},
 	}
 	prep := testTemplate("example.com/prep@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -358,10 +381,16 @@ func codexWorkflowTestConfig(t *testing.T) Config {
 	execution := testTemplate("example.com/exec@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 	execution.NetworkPolicy = "execution"
 	execution.CredentialBundle = ""
+	execution.BrokerAgentID = ""
+	execution.BrokerAgentSecret = ""
 	execution.Command = []string{"/usr/local/bin/agent-codex-repo-task-worker"}
 	execution.StorageLimitMB = 8192
 	execution.Tmpfs = map[string]int64{"/dev/shm": 64}
-	cfg.Templates = map[string]Template{"prep": prep, "execution": execution}
+	delivery := testTemplate("example.com/delivery@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	delivery.NetworkPolicy = "delivery"
+	delivery.CredentialBundle = ""
+	delivery.Command = []string{"/usr/local/bin/agent-codex-delivery-worker"}
+	cfg.Templates = map[string]Template{"prep": prep, "execution": execution, "delivery": delivery}
 	cfg.ModelPolicies = map[string]ModelPolicy{"reviewed": reviewedModelPolicy()}
 	cfg.CodexHolder = CodexHolderConfig{
 		MasterAuthPath: filepath.Join(t.TempDir(), "master", "auth.json"),
@@ -381,7 +410,7 @@ func codexWorkflowTestConfig(t *testing.T) Config {
 				"source_delivery_id": {Type: "string", Required: true, MaxLength: 128, Pattern: `^[A-Za-z0-9-]+$`},
 			},
 			CodexIssueWorkflow: &CodexIssueWorkflow{
-				PreparationTemplate: "prep", ExecutionTemplate: "execution",
+				PreparationTemplate: "prep", ExecutionTemplate: "execution", DeliveryTemplate: "delivery",
 				ModelPolicy: "reviewed", ModelProfile: "terra-medium-v1", PromptRevision: "issue-ready-pr/v1",
 			},
 		},

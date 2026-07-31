@@ -144,6 +144,7 @@ type LaunchProfile struct {
 type CodexIssueWorkflow struct {
 	PreparationTemplate string `yaml:"preparation_template"`
 	ExecutionTemplate   string `yaml:"execution_template"`
+	DeliveryTemplate    string `yaml:"delivery_template"`
 	ModelPolicy         string `yaml:"model_policy"`
 	ModelProfile        string `yaml:"model_profile"`
 	PromptRevision      string `yaml:"prompt_revision"`
@@ -421,10 +422,10 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 	if tmpl.MaxRuntimeMinutes < 1 {
 		errs = append(errs, fmt.Sprintf("template %q max_runtime_minutes must be positive", name))
 	}
-	if strings.TrimSpace(tmpl.BrokerAgentID) == "" {
+	if strings.TrimSpace(tmpl.BrokerAgentID) == "" && !c.isCodexExecutionTemplate(name) {
 		errs = append(errs, fmt.Sprintf("template %q broker_agent_id is required", name))
 	}
-	if tmpl.BrokerAgentSecret == "" {
+	if tmpl.BrokerAgentSecret == "" && !c.isCodexExecutionTemplate(name) {
 		errs = append(errs, fmt.Sprintf("template %q broker_agent_secret or broker_agent_secret_env is required", name))
 	}
 	if tmpl.CredentialBundle != "" {
@@ -575,14 +576,20 @@ func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, w
 	}
 	prep, prepOK := c.Templates[workflow.PreparationTemplate]
 	exec, execOK := c.Templates[workflow.ExecutionTemplate]
+	delivery, deliveryOK := c.Templates[workflow.DeliveryTemplate]
 	if !prepOK {
 		errs = append(errs, fmt.Sprintf("launch profile %q references unknown preparation_template %q", name, workflow.PreparationTemplate))
 	}
 	if !execOK {
 		errs = append(errs, fmt.Sprintf("launch profile %q references unknown execution_template %q", name, workflow.ExecutionTemplate))
 	}
-	if workflow.PreparationTemplate == workflow.ExecutionTemplate {
-		errs = append(errs, fmt.Sprintf("launch profile %q requires distinct preparation and execution templates", name))
+	if !deliveryOK {
+		errs = append(errs, fmt.Sprintf("launch profile %q references unknown delivery_template %q", name, workflow.DeliveryTemplate))
+	}
+	if workflow.PreparationTemplate == workflow.ExecutionTemplate ||
+		workflow.PreparationTemplate == workflow.DeliveryTemplate ||
+		workflow.ExecutionTemplate == workflow.DeliveryTemplate {
+		errs = append(errs, fmt.Sprintf("launch profile %q requires distinct preparation, execution, and delivery templates", name))
 	}
 	if profile.Template != workflow.ExecutionTemplate {
 		errs = append(errs, fmt.Sprintf("launch profile %q template must equal its execution_template", name))
@@ -599,24 +606,38 @@ func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, w
 	if workflow.PromptRevision == "" {
 		errs = append(errs, fmt.Sprintf("launch profile %q prompt_revision is required", name))
 	}
+	if strings.TrimSpace(profile.VerificationTask) == "" {
+		errs = append(errs, fmt.Sprintf("launch profile %q codex_issue_workflow requires a verification_task", name))
+	}
 	if prepOK {
 		network := c.Networks[prep.NetworkPolicy]
-		if prep.CredentialBundle != "" || network.EgressProxy != "" || network.CodexRelay ||
-			!network.PrivateBroker || len(network.AllowedTLSHosts) != 0 {
-			errs = append(errs, fmt.Sprintf("launch profile %q preparation template must be credential-free and private-broker-only", name))
+		if prep.CredentialBundle != "" || prep.BrokerAgentID == "" || prep.BrokerAgentSecret == "" ||
+			network.EgressProxy != "" || network.CodexRelay || !network.PrivateBroker ||
+			len(network.AllowedTLSHosts) != 0 {
+			errs = append(errs, fmt.Sprintf("launch profile %q preparation template must use private broker credentials only and no Codex auth", name))
 		}
 		errs = append(errs, validateCodexTemplateSurface(name, "preparation", prep)...)
 	}
 	if execOK {
 		network := c.Networks[exec.NetworkPolicy]
-		if exec.CredentialBundle != "" || !network.PrivateBroker || !network.CodexRelay ||
+		if exec.CredentialBundle != "" || exec.BrokerAgentID != "" || exec.BrokerAgentSecret != "" ||
+			network.PrivateBroker || !network.CodexRelay ||
 			network.EgressProxy != "" || len(network.AllowedTLSHosts) != 0 {
-			errs = append(errs, fmt.Sprintf("launch profile %q execution template must use only the private broker and Codex subscription relay", name))
+			errs = append(errs, fmt.Sprintf("launch profile %q execution template must have no broker agent credential and use the Codex subscription relay only", name))
 		}
 		if exec.Tmpfs["/dev/shm"] < 1 || exec.StorageLimitMB < 1 {
 			errs = append(errs, fmt.Sprintf("launch profile %q execution template requires bounded /dev/shm tmpfs and storage", name))
 		}
 		errs = append(errs, validateCodexTemplateSurface(name, "execution", exec)...)
+	}
+	if deliveryOK {
+		network := c.Networks[delivery.NetworkPolicy]
+		if delivery.CredentialBundle != "" || delivery.BrokerAgentID == "" || delivery.BrokerAgentSecret == "" ||
+			!network.PrivateBroker || network.CodexRelay || network.EgressProxy != "" ||
+			len(network.AllowedTLSHosts) != 0 {
+			errs = append(errs, fmt.Sprintf("launch profile %q delivery template must use private broker credentials only and no Codex holder, relay, or proxy", name))
+		}
+		errs = append(errs, validateCodexTemplateSurface(name, "delivery", delivery)...)
 	}
 	for _, required := range []string{"issue_number", "source_delivery_id"} {
 		decl, ok := profile.Parameters[required]
@@ -625,6 +646,15 @@ func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, w
 		}
 	}
 	return errs
+}
+
+func (c Config) isCodexExecutionTemplate(name string) bool {
+	for _, profile := range c.LaunchProfiles {
+		if profile.CodexIssueWorkflow != nil && profile.CodexIssueWorkflow.ExecutionTemplate == name {
+			return true
+		}
+	}
+	return false
 }
 
 func validateCodexTemplateSurface(profile, phase string, template Template) []string {

@@ -3,6 +3,18 @@
 This document is the configuration handoff for the first secure Codex
 issue-to-ready-PR milestone. It does not authorize production deployment.
 
+## Mechanical trust boundary
+
+> **The broker owns durable side effects. The agent owns reasoning.**
+
+This is an enforced architecture invariant, not prompt guidance. Codex may
+interpret the task, edit the prepared workspace, run validation without broker
+authority, and emit only bounded execution outputs. Broker-controlled
+deterministic code alone may advance durable workflow state, push branches,
+create or update pull requests, and post comments. A route that lets agent
+reasoning directly perform any of those durable side effects violates this
+contract even if a prompt tells the agent not to do so.
+
 ## Signal Plane launch contract
 
 Signal Plane launches only the reviewed `terra-medium-v1` launch profile via
@@ -30,7 +42,7 @@ arbitrary artifacts.
 
 ## sandbox-broker configuration
 
-The profile is a durable two-container workflow:
+The profile is a durable three-container workflow under one broker run:
 
 ```yaml
 codex_holder:
@@ -53,8 +65,10 @@ network_policies:
     private_broker: true
   codex-execution:
     network: codex-execution-internal
-    private_broker: true
     codex_subscription_relay: true
+  codex-delivery:
+    network: codex-delivery-internal
+    private_broker: true
 
 launch_profiles:
   terra-medium-v1:
@@ -73,18 +87,23 @@ launch_profiles:
     codex_issue_workflow:
       preparation_template: codex-preparation
       execution_template: codex-execution
+      delivery_template: codex-delivery
       model_policy: reviewed-codex-v1
       model_profile: terra-medium-v1
       prompt_revision: issue-ready-pr/v1
 ```
 
-Both templates use digest-pinned versions of the same reviewed repository
+All three templates use digest-pinned versions of the same reviewed repository
 worker image. `codex-preparation` runs
 `/usr/local/bin/agent-codex-repo-prep-worker`, has no credential bundle, uses
 the private-broker-only preparation network, and has bounded resources and
 storage. `codex-execution` runs
-`/usr/local/bin/agent-codex-repo-task-worker`, also has no configured
-credential bundle, uses the execution network, and includes:
+`/usr/local/bin/agent-codex-repo-task-worker`, has no broker agent ID, secret,
+credential bundle, private-broker route, proxy, or GitHub route, and uses only
+the exact-path relay network. `codex-delivery` runs the new
+`/usr/local/bin/agent-codex-delivery-worker`, has private broker credentials,
+and has no Codex holder mount, access auth, relay, proxy, or public route.
+Execution includes:
 
 ```yaml
 storage_limit_mb: 8192
@@ -100,6 +119,35 @@ Docker's archive API into the container's bounded `/dev/shm` tmpfs. The worker
 atomically accepts the file into its run-local tmpfs `CODEX_HOME`, removes the
 injection source, and creates a token-free acceptance marker. Operator mounts
 and credential bundles are rejected if they overlap holder paths or `/dev/shm`.
+
+Before `codex exec`, the execution worker proves that broker/GitHub authority
+is absent and replaces the local remote with an unreachable credential-free
+URL. It invokes Codex exactly once. After Codex exits, HEAD, refs, and commit
+objects must be unchanged. With no broker authority present, the worker runs
+the required reviewed validation task, then creates a bounded binary diff,
+bounded validation output, bounded final output, and a bounded execution result
+containing their digests and the prepared HEAD. It performs exact access-token
+contamination scanning before publishing those artifacts.
+
+The execution worker keeps an exact access-token match pattern only in
+`/dev/shm`. It scans Codex-controlled paths, file and symlink contents, Git
+objects, final output, events, stderr, and the bounded diff without emitting
+matched content. An
+exact match terminally fails the run and deletes the disposable prepared
+repository and output tree; contaminated artifacts are never redacted and
+delivered. Missing, empty, malformed, mismatched, or oversized execution
+artifacts are likewise terminal visible failures and prevent delivery launch.
+
+The fresh deterministic delivery container revalidates the preparation and
+execution results, HEAD/branch identity, exact diff digest, final-output
+digest, and the sealed successful validation result/digest. It runs no
+repository-controlled subprocess with broker authority. It removes hooks,
+rebuilds the index from the prepared HEAD, and reconstructs the broker remote
+using its own private credential. It then commits and pushes. Before creating
+a non-draft PR it reconciles the broker `pulls` API by the exact repository
+endpoint, base branch, head branch, and
+`<!-- gh-agent-broker-codex-run:RUN_ID -->` marker. A failed or ambiguous
+create performs the same exact reconciliation; multiple matches fail closed.
 
 The holder master file and its parent directory must be mode `0600` and `0700`
 respectively. The master file is a Codex `auth.json` containing non-empty
@@ -123,10 +171,11 @@ semantics. Codex version remains ordinary execution provenance.
 
 ## Network/deployment requirements for vps-ops
 
-The named Docker networks are separate internal networks. Preparation reaches
-only the broker service. Execution reaches only the broker and
-`http://codex-subscription-relay:8093`; it has no outbound proxy, public route,
-general DNS, GitHub, `auth.openai.com`, or direct ChatGPT path. Its pinned
+The named Docker networks are separate internal networks. Preparation and
+delivery reach only the broker service. Execution reaches only
+`http://codex-subscription-relay:8093`; it has no private broker, credential
+helper-capable route, outbound proxy, public route, general DNS, GitHub,
+`auth.openai.com`, or direct ChatGPT path. Its pinned
 custom provider base is
 `http://codex-subscription-relay:8093/backend-api/codex`, with
 `requires_openai_auth=true` and the Responses wire API.
@@ -164,10 +213,13 @@ without fallback.
 
 ## Durable and retained data
 
-Preparation and execution have distinct deterministic container identities.
-The launch intent persists before create, start, injection, and acceptance
-boundaries, so replay adopts the exact matching execution container rather
-than creating another one. An ambiguous injection replay may project the
+Preparation, execution, and delivery have distinct deterministic `-prep`,
+`-exec`, and `-deliver` container identities under the same durable broker run.
+The launch intent persists explicit create-pending, start-pending, running,
+terminal, and reconcile boundaries for every phase, so replay adopts the exact
+matching container. Once execution has started or exited, recovery never
+launches another execution container; delivery similarly has one deterministic
+identity. An ambiguous injection replay may project the
 current persisted access fields again using the token-free issuance state. No
 credential is recoverable from the issuance tree, run
 directory, launch intent, metadata, checkpoint, environment, labels, mounts,

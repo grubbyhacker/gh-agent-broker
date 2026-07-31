@@ -786,6 +786,19 @@ func (f *fakeRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerIn
 	_ = ctx
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for _, existing := range f.specs {
+		if existing.RunID == spec.RunID {
+			containerID := "container-" + spec.RunID
+			if status, ok := f.exits[containerID]; ok {
+				return ContainerInfo{ID: containerID, ImageDigest: spec.Image, Existing: true, Lifecycle: ContainerExited, Status: status}, nil
+			}
+			lifecycle := ContainerNeverStarted
+			if f.started[containerID] {
+				lifecycle = ContainerRunning
+			}
+			return ContainerInfo{ID: containerID, ImageDigest: spec.Image, Existing: true, Lifecycle: lifecycle}, nil
+		}
+	}
 	f.specs = append(f.specs, spec)
 	containerID := "container-" + spec.RunID
 	f.waiters[containerID] = make(chan struct{})
