@@ -342,6 +342,14 @@ func (s *Service) resumeExecution(
 			return s.failCodexIntent(ctx, intent, meta, "credential_acceptance_reconcile", markerErr)
 		}
 		if !accepted {
+			if readyErr := s.runtime.WaitForPath(
+				ctx,
+				meta.ExecutionContainerID,
+				codexInjectionDir,
+				codexCredentialWaitTimeout,
+			); readyErr != nil {
+				return s.failCodexIntent(ctx, intent, meta, "credential_injection_ready", readyErr)
+			}
 			bundle, issueErr := s.codexIssuer.Issue(ctx, meta.RunID, meta.IdempotencyKeyDigest)
 			if issueErr != nil {
 				return s.failCodexIntent(ctx, intent, meta, "credential_issuance", issueErr)
