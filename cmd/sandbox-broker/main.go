@@ -113,7 +113,7 @@ func runServerCommand(args []string) {
 		holderErr = holder.Refresh(refreshCtx)
 		cancelRefresh()
 		if holderErr != nil {
-			log.Fatal("refresh Codex credential holder at startup")
+			log.Fatalf("refresh Codex credential holder at startup: %v", holderErr)
 		}
 		go runCodexRefreshLoop(context.Background(), holder)
 		service.SetCodexCredentialIssuer(holder)
@@ -172,7 +172,7 @@ func runCodexRefreshLoop(ctx context.Context, holder *codexauth.Holder) {
 			err := holder.Refresh(refreshCtx)
 			cancel()
 			if err != nil {
-				log.Print("periodic Codex credential refresh failed")
+				log.Printf("periodic Codex credential refresh failed: %v", err)
 			}
 		}
 	}
