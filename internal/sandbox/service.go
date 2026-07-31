@@ -66,7 +66,7 @@ type Service struct {
 }
 
 type CodexCredentialIssuer interface {
-	Issue(context.Context, string) ([]byte, error)
+	Issue(context.Context, string, string) ([]byte, error)
 	Consume(string) error
 	Cleanup(string) error
 }

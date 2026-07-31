@@ -94,8 +94,8 @@ tmpfs:
 
 The broker never creates or mounts a run-scoped credential file. After
 successful preparation it creates and starts the deterministic execution
-container in a bounded credential-wait bootstrap, asks the holder for an
-access-only bundle in memory, and streams a mode-`0600` tar entry through
+container in a bounded credential-wait bootstrap, asks the holder to project
+the current access fields in memory, and streams a mode-`0600` tar entry through
 Docker's archive API into the container's bounded `/dev/shm` tmpfs. The worker
 atomically accepts the file into its run-local tmpfs `CODEX_HOME`, removes the
 injection source, and creates a token-free acceptance marker. Operator mounts
@@ -104,9 +104,22 @@ and credential bundles are rejected if they overlap holder paths or `/dev/shm`.
 The holder master file and its parent directory must be mode `0600` and `0700`
 respectively. The master file is a Codex `auth.json` containing non-empty
 `tokens.access_token` and `tokens.refresh_token`. It is readable only by
-sandbox-broker. It is never a Docker mount. The holder posts refresh requests
-only to `https://auth.openai.com/oauth/token`, with the reviewed Codex 0.146.0
-client ID compiled into the broker.
+sandbox-broker. It is never a Docker mount. Before accepting work,
+sandbox-broker performs one refresh bounded to 30 seconds and fails startup if
+that refresh fails. It then refreshes the full master every fixed 30 minutes,
+well below the normal access-token lifetime, with each attempt bounded to 30
+seconds. Periodic failure logs are static and redacted. Refresh preserves
+unknown master fields and atomically replaces the mode-`0600` file. The holder
+posts refresh requests only to `https://auth.openai.com/oauth/token`, with the
+reviewed Codex 0.146.0 client ID compiled into the broker.
+
+Run admission never refreshes credentials. `Holder.Issue` only projects the
+current persisted `access_token` and `account_id` into an access-only in-memory
+bundle with an empty refresh token. Distinct runs admitted between maintenance
+refreshes therefore receive the same current access token. Token-free durable
+issuance state contains only run ID, idempotency key digest, issued time, and
+consumed time; it has no OAuth host, token lineage, or Codex-version credential
+semantics. Codex version remains ordinary execution provenance.
 
 ## Network/deployment requirements for vps-ops
 
@@ -154,9 +167,9 @@ without fallback.
 Preparation and execution have distinct deterministic container identities.
 The launch intent persists before create, start, injection, and acceptance
 boundaries, so replay adopts the exact matching execution container rather
-than creating another one. An ambiguous injection replay may reissue the same
-current run-scoped bundle from the persisted master lineage and token-free
-issuance state. No credential is recoverable from the issuance tree, run
+than creating another one. An ambiguous injection replay may project the
+current persisted access fields again using the token-free issuance state. No
+credential is recoverable from the issuance tree, run
 directory, launch intent, metadata, checkpoint, environment, labels, mounts,
 or container configuration.
 

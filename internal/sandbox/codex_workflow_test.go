@@ -19,7 +19,7 @@ type fakeCodexIssuer struct {
 	cleanups int
 }
 
-func (f *fakeCodexIssuer) Issue(_ context.Context, _ string) ([]byte, error) {
+func (f *fakeCodexIssuer) Issue(_ context.Context, _, _ string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.issues++

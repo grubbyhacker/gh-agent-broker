@@ -4,10 +4,15 @@ The first secure Codex issue-to-ready-PR slice is implemented behind the
 `codex_issue_workflow` launch-profile contract. It uses distinct durable
 preparation and execution container identities. Preparation has no Codex
 credential and fails stale unless checkout dependency/submodule identity
-exactly matches the baked manifest. Only then does the sandbox-broker-owned
-holder rotates the pinned Codex 0.146.0 OAuth master lineage and returns a
-one-time access-token-only `auth.json` in memory with an explicitly empty
-refresh token. After the fresh execution container starts, sandbox-broker
+exactly matches the baked manifest. The sandbox-broker-owned holder performs a
+bounded refresh before startup completes, then maintains the full credential
+master on a fixed 30-minute interval; periodic failures are bounded and logged
+with static redacted text. Run admission never refreshes. It only projects the
+current persisted access token and account ID into an access-only `auth.json`
+in memory with an explicitly empty refresh token. Token-free issuance state
+records only run/idempotency identity and issued/consumed times, independent of
+OAuth host, token lineage, and Codex version. After the fresh execution
+container starts, sandbox-broker
 streams it through Docker's archive API into bounded `/dev/shm`; no host
 capability file or issuance mount exists. The wrapper atomically accepts it
 into a mode-0600 tmpfs `CODEX_HOME`, removes the injection source, and records

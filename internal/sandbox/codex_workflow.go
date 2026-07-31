@@ -261,7 +261,7 @@ func (s *Service) resumeExecution(
 		}
 	}
 	if meta.Phase == codexPhaseBundleInject {
-		bundle, issueErr := s.codexIssuer.Issue(ctx, meta.RunID)
+		bundle, issueErr := s.codexIssuer.Issue(ctx, meta.RunID, meta.IdempotencyKeyDigest)
 		if issueErr != nil {
 			return s.failCodexIntent(ctx, intent, meta, "credential_issuance", issueErr)
 		}

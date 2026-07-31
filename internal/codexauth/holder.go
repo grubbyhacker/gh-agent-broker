@@ -1,5 +1,5 @@
-// Package codexauth owns the subscription credential used to mint short-lived,
-// access-token-only Codex authentication bundles for sandbox runs.
+// Package codexauth maintains the subscription credential master and projects
+// its current access fields into authentication bundles for sandbox runs.
 package codexauth
 
 import (
@@ -42,15 +42,10 @@ type Holder struct {
 }
 
 type issuanceRecord struct {
-	Version         string    `json:"version"`
-	RunID           string    `json:"run_id"`
-	CodexVersion    string    `json:"codex_version"`
-	OAuthHost       string    `json:"token_host"`
-	IssuedAt        time.Time `json:"issued_at"`
-	ConsumedAt      time.Time `json:"consumed_at,omitempty"`
-	State           string    `json:"state"`
-	PreviousLineage string    `json:"previous_lineage,omitempty"`
-	CurrentLineage  string    `json:"current_lineage,omitempty"`
+	RunID          string    `json:"run_id"`
+	IdempotencyKey string    `json:"idempotency_key"`
+	IssuedAt       time.Time `json:"issued_at"`
+	ConsumedAt     time.Time `json:"consumed_at,omitempty"`
 }
 
 type authFile struct {
@@ -60,10 +55,11 @@ type authFile struct {
 }
 
 type authTokens struct {
-	IDToken      string `json:"id_token,omitempty"`
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	AccountID    string `json:"account_id,omitempty"`
+	IDToken      string                     `json:"id_token,omitempty"`
+	AccessToken  string                     `json:"access_token"`
+	RefreshToken string                     `json:"refresh_token"`
+	AccountID    string                     `json:"account_id,omitempty"`
+	Extra        map[string]json.RawMessage `json:"-"`
 }
 
 type refreshResponse struct {
@@ -113,6 +109,54 @@ func (a authFile) MarshalJSON() ([]byte, error) {
 	return json.Marshal(fields)
 }
 
+func (a *authTokens) UnmarshalJSON(data []byte) error {
+	type knownAuthTokens struct {
+		IDToken      string `json:"id_token,omitempty"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		AccountID    string `json:"account_id,omitempty"`
+	}
+	var known knownAuthTokens
+	if err := json.Unmarshal(data, &known); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	delete(fields, "id_token")
+	delete(fields, "access_token")
+	delete(fields, "refresh_token")
+	delete(fields, "account_id")
+	a.IDToken = known.IDToken
+	a.AccessToken = known.AccessToken
+	a.RefreshToken = known.RefreshToken
+	a.AccountID = known.AccountID
+	a.Extra = fields
+	return nil
+}
+
+func (a authTokens) MarshalJSON() ([]byte, error) {
+	fields := make(map[string]json.RawMessage, len(a.Extra)+4)
+	for key, value := range a.Extra {
+		fields[key] = value
+	}
+	for key, value := range map[string]string{
+		"id_token": a.IDToken, "access_token": a.AccessToken,
+		"refresh_token": a.RefreshToken, "account_id": a.AccountID,
+	} {
+		if value == "" && key != "access_token" && key != "refresh_token" {
+			continue
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		fields[key] = encoded
+	}
+	return json.Marshal(fields)
+}
+
 func New(cfg Config) (*Holder, error) {
 	if !filepath.IsAbs(cfg.MasterAuthPath) || !filepath.IsAbs(cfg.IssuanceRoot) {
 		return nil, fmt.Errorf("codex holder paths must be absolute")
@@ -140,16 +184,55 @@ func New(cfg Config) (*Holder, error) {
 	return &Holder{cfg: cfg}, nil
 }
 
-// Issue returns a bounded access-only bundle in memory. Only token-free lineage
-// state is durable, so credentials never enter the issuance tree.
-func (h *Holder) Issue(ctx context.Context, runID string) ([]byte, error) {
-	if !safeRunID(runID) {
-		return nil, fmt.Errorf("invalid run ID")
+// Refresh rotates and atomically persists the full credential master. It is
+// deliberately separate from run admission and access projection.
+func (h *Holder) Refresh(ctx context.Context) error {
+	if err := lockMutex(ctx, &h.mu); err != nil {
+		return fmt.Errorf("wait for Codex credential holder: %w", err)
 	}
-	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	lock, err := lockFile(h.cfg.MasterAuthPath + ".lock")
+	lock, err := lockFile(ctx, h.cfg.MasterAuthPath+".lock")
+	if err != nil {
+		return err
+	}
+	defer unlockFile(lock)
+
+	master, err := readMaster(h.cfg.MasterAuthPath)
+	if err != nil {
+		return err
+	}
+	refreshed, err := h.refresh(ctx, master.Tokens.RefreshToken)
+	if err != nil {
+		return err
+	}
+	if refreshed.RefreshToken == "" {
+		refreshed.RefreshToken = master.Tokens.RefreshToken
+	}
+	master.Tokens.AccessToken = refreshed.AccessToken
+	master.Tokens.RefreshToken = refreshed.RefreshToken
+	if refreshed.IDToken != "" {
+		master.Tokens.IDToken = refreshed.IDToken
+	}
+	master.LastRefresh = h.cfg.Now().Format(time.RFC3339Nano)
+	if err := writeJSONAtomic(h.cfg.MasterAuthPath, master, 0o600); err != nil {
+		return fmt.Errorf("persist refreshed Codex credential master: %w", err)
+	}
+	return nil
+}
+
+// Issue returns a bounded projection of the currently persisted access fields
+// in memory. It never refreshes the master or calls an OAuth endpoint.
+func (h *Holder) Issue(ctx context.Context, runID, idempotencyKey string) ([]byte, error) {
+	if !safeRunID(runID) || strings.TrimSpace(idempotencyKey) == "" || len(idempotencyKey) > 256 {
+		return nil, fmt.Errorf("invalid run issuance identity")
+	}
+	if err := lockMutex(ctx, &h.mu); err != nil {
+		return nil, fmt.Errorf("wait for Codex credential holder: %w", err)
+	}
+	defer h.mu.Unlock()
+
+	lock, err := lockFile(ctx, h.cfg.MasterAuthPath+".lock")
 	if err != nil {
 		return nil, err
 	}
@@ -162,9 +245,7 @@ func (h *Holder) Issue(ctx context.Context, runID string) ([]byte, error) {
 		return nil, err
 	}
 	if found {
-		if record.Version != "codex-run-issuance/v1" || record.RunID != runID ||
-			record.CodexVersion != CodexVersion || record.OAuthHost != "auth.openai.com" ||
-			record.State != "refresh_pending" && record.State != "issued" {
+		if record.RunID != runID || record.IdempotencyKey != idempotencyKey || record.IssuedAt.IsZero() {
 			return nil, fmt.Errorf("codex issuance state for run %q is invalid", runID)
 		}
 		if !record.ConsumedAt.IsZero() {
@@ -178,33 +259,11 @@ func (h *Holder) Issue(ctx context.Context, runID string) ([]byte, error) {
 	}
 	if !found {
 		record = issuanceRecord{
-			Version: "codex-run-issuance/v1", RunID: runID, CodexVersion: CodexVersion,
-			OAuthHost: "auth.openai.com", State: "refresh_pending", PreviousLineage: master.LastRefresh,
+			RunID: runID, IdempotencyKey: idempotencyKey, IssuedAt: h.cfg.Now(),
 		}
 		if err := writeJSONAtomic(recordPath, record, 0o600); err != nil {
 			return nil, err
 		}
-	}
-	if record.State == "refresh_pending" && master.LastRefresh == record.PreviousLineage {
-		refreshed, refreshErr := h.refresh(ctx, master.Tokens.RefreshToken)
-		if refreshErr != nil {
-			return nil, refreshErr
-		}
-		if refreshed.RefreshToken == "" {
-			refreshed.RefreshToken = master.Tokens.RefreshToken
-		}
-		master.Tokens.AccessToken = refreshed.AccessToken
-		master.Tokens.RefreshToken = refreshed.RefreshToken
-		if refreshed.IDToken != "" {
-			master.Tokens.IDToken = refreshed.IDToken
-		}
-		master.LastRefresh = h.cfg.Now().Format(time.RFC3339Nano)
-		if err := writeJSONAtomic(h.cfg.MasterAuthPath, master, 0o600); err != nil {
-			return nil, fmt.Errorf("persist rotated Codex master lineage: %w", err)
-		}
-	}
-	if record.State == "issued" && record.CurrentLineage != master.LastRefresh {
-		return nil, fmt.Errorf("codex issuance lineage for run %q is no longer current", runID)
 	}
 
 	bundle := authFile{
@@ -214,15 +273,6 @@ func (h *Holder) Issue(ctx context.Context, runID string) ([]byte, error) {
 			AccountID:    master.Tokens.AccountID,
 		},
 		LastRefresh: master.LastRefresh,
-	}
-	if record.State != "issued" {
-		record.State = "issued"
-		record.IssuedAt = h.cfg.Now()
-		record.PreviousLineage = ""
-		record.CurrentLineage = master.LastRefresh
-		if err := writeJSONAtomic(recordPath, record, 0o600); err != nil {
-			return nil, err
-		}
 	}
 	data, err := json.Marshal(bundle)
 	if err != nil {
@@ -401,7 +451,22 @@ func writeJSONAtomic(path string, value any, mode os.FileMode) error {
 	return dir.Close()
 }
 
-func lockFile(path string) (*os.File, error) {
+func lockMutex(ctx context.Context, mutex *sync.Mutex) error {
+	for {
+		if mutex.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func lockFile(ctx context.Context, path string) (*os.File, error) {
 	// #nosec G304 -- fixed sibling of the configured master path.
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -410,10 +475,22 @@ func lockFile(path string) (*os.File, error) {
 	if err := file.Chmod(0o600); err != nil {
 		return nil, errors.Join(err, file.Close())
 	}
-	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX); err != nil {
-		return nil, errors.Join(err, file.Close())
+	for {
+		err = unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return file, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, errors.Join(err, file.Close())
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, errors.Join(ctx.Err(), file.Close())
+		case <-timer.C:
+		}
 	}
-	return file, nil
 }
 
 func unlockFile(file *os.File) {
