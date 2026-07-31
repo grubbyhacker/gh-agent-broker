@@ -334,13 +334,6 @@ func TestCodexPostStartCredentialFailuresStopExecutionBeforeTerminalizing(t *tes
 		configure func(*fakeRuntime, *fakeCodexIssuer)
 	}{
 		{
-			name:  "injection-directory-readiness",
-			stage: "credential_injection_ready",
-			configure: func(runtime *fakeRuntime, _ *fakeCodexIssuer) {
-				runtime.injectionReadyErr = errors.New("injection directory not ready")
-			},
-		},
-		{
 			name:  "issuance",
 			stage: "credential_issuance",
 			configure: func(_ *fakeRuntime, issuer *fakeCodexIssuer) {
@@ -435,14 +428,6 @@ func TestCodexPostStartCredentialFailuresStopExecutionBeforeTerminalizing(t *tes
 			if terminal.Status != StatusFailed || terminal.Outcome != StatusFailed ||
 				terminal.FailureStage != tt.stage || terminal.FailureReason == "" {
 				t.Fatalf("terminal=%+v", terminal)
-			}
-			if tt.stage == "credential_injection_ready" {
-				issuer.mu.Lock()
-				issueCount := issuer.issues
-				issuer.mu.Unlock()
-				if issueCount != 0 {
-					t.Fatalf("issued %d credential bundle(s) before the tmpfs injection directory was ready", issueCount)
-				}
 			}
 			again, err := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
 			if err != nil || !reflect.DeepEqual(terminal, again) {

@@ -114,8 +114,9 @@ tmpfs:
 The broker never creates or mounts a run-scoped credential file. After
 successful preparation it creates and starts the deterministic execution
 container in a bounded credential-wait bootstrap, asks the holder to project
-the current access fields in memory, and streams a mode-`0600` tar entry through
-Docker's archive API into the container's bounded `/dev/shm` tmpfs. The worker
+the current access fields in memory, and streams them only on Docker exec stdin
+to a fixed command that creates a mode-`0600` file in the container's bounded
+`/dev/shm` tmpfs. The worker
 atomically accepts the file into its run-local tmpfs `CODEX_HOME`, removes the
 injection source, and creates a token-free acceptance marker. Operator mounts
 and credential bundles are rejected if they overlap holder paths or `/dev/shm`.

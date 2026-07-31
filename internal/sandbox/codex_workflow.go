@@ -14,7 +14,6 @@ const (
 	codexRelayBaseURL            = "http://codex-subscription-relay:8093/backend-api/codex"
 	codexInjectionDir            = "/dev/shm/codex-credential-injection"
 	codexInjectionName           = "auth.json"
-	codexInjectionReadyMarker    = "/dev/shm/codex-credential-injection-ready"
 	codexAcceptanceMarker        = "/dev/shm/codex-credential-accepted"
 	codexCredentialWaitTimeout   = 45 * time.Second
 	codexPhasePreparationCreate  = "preparation_create_pending"
@@ -343,14 +342,6 @@ func (s *Service) resumeExecution(
 			return s.failCodexIntent(ctx, intent, meta, "credential_acceptance_reconcile", markerErr)
 		}
 		if !accepted {
-			if readyErr := s.runtime.WaitForPath(
-				ctx,
-				meta.ExecutionContainerID,
-				codexInjectionReadyMarker,
-				codexCredentialWaitTimeout,
-			); readyErr != nil {
-				return s.failCodexIntent(ctx, intent, meta, "credential_injection_ready", readyErr)
-			}
 			bundle, issueErr := s.codexIssuer.Issue(ctx, meta.RunID, meta.IdempotencyKeyDigest)
 			if issueErr != nil {
 				return s.failCodexIntent(ctx, intent, meta, "credential_issuance", issueErr)

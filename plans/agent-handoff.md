@@ -19,8 +19,8 @@ current persisted access token and account ID into an access-only `auth.json`
 in memory with an explicitly empty refresh token. Token-free issuance state
 records only run/idempotency identity and issued/consumed times, independent of
 OAuth host, token lineage, and Codex version. After the fresh execution
-container starts, sandbox-broker
-streams it through Docker's archive API into bounded `/dev/shm`; no host
+container starts, sandbox-broker streams it only on Docker exec stdin to a
+fixed command that writes into bounded `/dev/shm`; no host
 capability file or issuance mount exists. The wrapper atomically accepts it
 into a mode-0600 tmpfs `CODEX_HOME`, removes the injection source, and records
 a token-free acceptance marker. Execution has no general proxy; its explicit

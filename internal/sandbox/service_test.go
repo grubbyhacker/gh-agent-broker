@@ -771,7 +771,6 @@ type fakeRuntime struct {
 	waiters           map[string]chan struct{}
 	waitClosed        map[string]bool
 	injectionErr      error
-	injectionReadyErr error
 	waitForPathErr    error
 	acceptInjected    bool
 	stopErr           error
@@ -819,9 +818,6 @@ func (f *fakeRuntime) Start(ctx context.Context, containerID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.started[containerID] = true
-	if strings.HasSuffix(containerID, "-exec") {
-		f.paths[containerID+":"+codexInjectionReadyMarker] = true
-	}
 	return nil
 }
 
@@ -853,11 +849,7 @@ func (f *fakeRuntime) WaitForPath(
 	containerID, targetPath string,
 	timeout time.Duration,
 ) error {
-	if targetPath == codexInjectionReadyMarker {
-		if f.injectionReadyErr != nil {
-			return f.injectionReadyErr
-		}
-	} else if f.waitForPathErr != nil {
+	if f.waitForPathErr != nil {
 		return f.waitForPathErr
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)

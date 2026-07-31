@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -80,8 +81,9 @@ type ContainerStatus struct {
 }
 
 type DockerBackend struct {
-	socket string
-	client *http.Client
+	socket      string
+	client      *http.Client
+	dialContext func(context.Context, string, string) (net.Conn, error)
 }
 
 func NewDockerBackend(socket string) *DockerBackend {
@@ -94,7 +96,10 @@ func NewDockerBackend(socket string) *DockerBackend {
 			return d.DialContext(ctx, "unix", socket)
 		},
 	}
-	return &DockerBackend{socket: socket, client: &http.Client{Transport: transport, Timeout: 30 * time.Second}}
+	return &DockerBackend{
+		socket: socket, client: &http.Client{Transport: transport, Timeout: 30 * time.Second},
+		dialContext: (&net.Dialer{}).DialContext,
+	}
 }
 
 func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
@@ -200,20 +205,28 @@ func (d *DockerBackend) InjectSecret(
 		return fmt.Errorf("secret injection target is not running")
 	}
 
-	reader, writer := io.Pipe()
-	go func() {
-		tarWriter := tar.NewWriter(writer)
-		writeErr := tarWriter.WriteHeader(&tar.Header{
-			Name: name, Mode: 0o600, Size: int64(len(contents)), Typeflag: tar.TypeReg,
-		})
-		if writeErr == nil {
-			_, writeErr = tarWriter.Write(contents)
-		}
-		writeErr = errors.Join(writeErr, tarWriter.Close())
-		_ = writer.CloseWithError(writeErr)
-	}()
-	archivePath := "/containers/" + url.PathEscape(containerID) + "/archive?path=" + url.QueryEscape(cleanDir)
-	return d.doWithContentType(ctx, http.MethodPut, archivePath, reader, nil, "application/x-tar")
+	execID, err := d.createExec(ctx, containerID, dockerExecCreateRequest{
+		AttachStdin: true,
+		Cmd: []string{
+			"sh", "-c",
+			`set -eu; umask 077; mkdir -p "$1"; chmod 0700 "$1"; cat > "$1/$2"; chmod 0600 "$1/$2"`,
+			"codex-secret-injector", cleanDir, name,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create secret injection exec: %w", err)
+	}
+	if err := d.startExecWithInput(ctx, execID, contents); err != nil {
+		return fmt.Errorf("stream secret injection stdin: %w", err)
+	}
+	exitCode, err := d.waitExec(ctx, execID, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("wait for secret injection exec: %w", err)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("secret injection exec exited with status %d", exitCode)
+	}
+	return nil
 }
 
 func (d *DockerBackend) WaitForPath(
@@ -250,15 +263,126 @@ func (d *DockerBackend) PathExists(
 	if cleanPath != "/dev/shm" && !strings.HasPrefix(cleanPath, "/dev/shm/") {
 		return false, fmt.Errorf("path target must be within /dev/shm")
 	}
-	archivePath := "/containers/" + url.PathEscape(containerID) + "/archive?path=" + url.QueryEscape(cleanPath)
-	err := d.do(ctx, http.MethodHead, archivePath, nil, nil)
-	if err == nil {
+	execID, err := d.createExec(ctx, containerID, dockerExecCreateRequest{
+		Cmd: []string{"test", "-e", cleanPath},
+	})
+	if err != nil {
+		return false, fmt.Errorf("create in-container path probe: %w", err)
+	}
+	if err := d.startExec(ctx, execID); err != nil {
+		return false, fmt.Errorf("start in-container path probe: %w", err)
+	}
+	exitCode, err := d.waitExec(ctx, execID, 10*time.Second)
+	if err != nil {
+		return false, fmt.Errorf("wait for in-container path probe: %w", err)
+	}
+	switch exitCode {
+	case 0:
 		return true, nil
-	}
-	if code, ok := DockerStatusCode(err); ok && code == http.StatusNotFound {
+	case 1:
 		return false, nil
+	default:
+		return false, fmt.Errorf("in-container path probe exited with status %d", exitCode)
 	}
-	return false, err
+}
+
+func (d *DockerBackend) createExec(
+	ctx context.Context,
+	containerID string,
+	req dockerExecCreateRequest,
+) (string, error) {
+	var out struct {
+		ID string `json:"Id"`
+	}
+	if err := d.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerID)+"/exec", req, &out); err != nil {
+		return "", err
+	}
+	if out.ID == "" {
+		return "", fmt.Errorf("docker exec create returned no id")
+	}
+	return out.ID, nil
+}
+
+func (d *DockerBackend) startExec(ctx context.Context, execID string) error {
+	return d.doJSON(ctx, http.MethodPost, "/exec/"+url.PathEscape(execID)+"/start", dockerExecStartRequest{}, nil)
+}
+
+func (d *DockerBackend) startExecWithInput(ctx context.Context, execID string, contents []byte) error {
+	dialContext := d.dialContext
+	if dialContext == nil {
+		dialContext = (&net.Dialer{}).DialContext
+	}
+	conn, err := dialContext(ctx, "unix", d.socket)
+	if err != nil {
+		return err
+	}
+	//nolint:errcheck // The exec result is verified separately after stdin has been sent.
+	defer conn.Close()
+	deadline := time.Now().Add(30 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	body, err := json.Marshal(dockerExecStartRequest{})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		"http://docker/exec/"+url.PathEscape(execID)+"/start",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "tcp")
+	if err := req.Write(conn); err != nil {
+		return err
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, req)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		defer closeBody(resp.Body)
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if readErr != nil {
+			return readErr
+		}
+		return DockerError{
+			Method: http.MethodPost, Path: req.URL.Path,
+			StatusCode: resp.StatusCode, Body: string(responseBody),
+		}
+	}
+	if _, err := conn.Write(contents); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *DockerBackend) waitExec(ctx context.Context, execID string, timeout time.Duration) (int, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		var inspect dockerExecInspectResponse
+		if err := d.doJSON(waitCtx, http.MethodGet, "/exec/"+url.PathEscape(execID)+"/json", nil, &inspect); err != nil {
+			return 0, err
+		}
+		if !inspect.Running {
+			return inspect.ExitCode, nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return 0, waitCtx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
 }
 
 func (d *DockerBackend) Wait(ctx context.Context, containerID string) (ContainerStatus, error) {
@@ -583,6 +707,23 @@ type dockerCreateRequest struct {
 	Labels     map[string]string `json:"Labels,omitempty"`
 	WorkingDir string            `json:"WorkingDir,omitempty"`
 	HostConfig dockerHostConfig  `json:"HostConfig"`
+}
+
+type dockerExecCreateRequest struct {
+	AttachStdin  bool     `json:"AttachStdin"`
+	AttachStdout bool     `json:"AttachStdout"`
+	AttachStderr bool     `json:"AttachStderr"`
+	Cmd          []string `json:"Cmd"`
+}
+
+type dockerExecStartRequest struct {
+	Detach bool `json:"Detach"`
+	Tty    bool `json:"Tty"`
+}
+
+type dockerExecInspectResponse struct {
+	Running  bool `json:"Running"`
+	ExitCode int  `json:"ExitCode"`
 }
 
 type dockerHostConfig struct {
