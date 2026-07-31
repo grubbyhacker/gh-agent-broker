@@ -188,3 +188,10 @@ inputs named `VPS_OPS_GH_BROKER_STATE_BACKUP_*` into the existing vps-ops
 env-source boundary. The master Codex `auth.json` is not a GitHub or Doppler
 secret and is never projected by this workflow; it remains exclusively in the
 managed broker-side holder installed through the separate one-shot bootstrap.
+
+Manual managed deployments may pair `image_sha` with an exact `image_digest`.
+The workflow validates the digest shape and passes
+`ghcr.io/grubbyhacker/gh-agent-broker:sha-<revision>@sha256:<digest>` to
+vps-ops. This is required for reviewed activation pins; omitting the digest
+retains the ordinary tag-only behavior for deployment paths whose Ansible
+contract does not require an immutable application image.
