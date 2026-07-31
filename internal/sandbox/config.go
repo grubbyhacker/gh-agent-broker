@@ -601,7 +601,7 @@ func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, w
 		errs = append(errs, fmt.Sprintf("launch profile %q model_profile %q is not in its reviewed policy", name, workflow.ModelProfile))
 	}
 	if name != "terra-medium-v1" || workflow.ModelProfile != "terra-medium-v1" {
-		errs = append(errs, fmt.Sprintf("launch profile %q is unsupported; first milestone exposes only terra-medium-v1", name))
+		errs = append(errs, fmt.Sprintf("launch profile %q is unsupported; the only enabled reviewed launch profile is terra-medium-v1", name))
 	}
 	if workflow.PromptRevision == "" {
 		errs = append(errs, fmt.Sprintf("launch profile %q prompt_revision is required", name))
@@ -690,7 +690,7 @@ func validateModelPolicy(name string, policy ModelPolicy) []string {
 		"sol-high-v1":     {Model: "gpt-5.6-sol", Effort: "high"},
 	}
 	if len(policy.Mappings) != len(expected) {
-		errs = append(errs, fmt.Sprintf("model policy %q must contain exactly the five reviewed milestone mappings", name))
+		errs = append(errs, fmt.Sprintf("model policy %q must contain exactly the current reviewed Codex policy mappings", name))
 	}
 	for profile, want := range expected {
 		if got, ok := policy.Mappings[profile]; !ok || got != want {

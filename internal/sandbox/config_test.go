@@ -274,7 +274,7 @@ func TestCodexIssueWorkflowConfigIsExactAndDenyByDefault(t *testing.T) {
 			policy := c.ModelPolicies["reviewed"]
 			policy.Mappings["fallback"] = ModelMapping{Model: "gpt-5.6-terra", Effort: "medium"}
 			c.ModelPolicies["reviewed"] = policy
-		}, want: "exactly the five"},
+		}, want: "current reviewed Codex policy mappings"},
 		{name: "prep egress", mutate: func(c *Config) {
 			network := c.Networks["prep"]
 			network.EgressProxy = "http://proxy:8080"
