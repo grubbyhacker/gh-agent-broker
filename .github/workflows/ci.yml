@@ -195,6 +195,7 @@ jobs:
             type=semver,pattern={{version}}
 
       - name: Build and publish image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -203,6 +204,30 @@ jobs:
           sbom: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Write broker release manifest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          cat > broker-release-manifest.json <<EOF
+          {
+            "version": "broker-runtime-release/v1",
+            "source_revision": "${GITHUB_SHA}",
+            "image": "ghcr.io/grubbyhacker/gh-agent-broker:sha-${GITHUB_SHA}@${IMAGE_DIGEST}",
+            "image_digest": "${IMAGE_DIGEST}",
+            "platform": "linux/amd64"
+          }
+          EOF
+
+      - name: Persist broker release manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: broker-runtime-release-manifest
+          path: broker-release-manifest.json
+          if-no-files-found: error
+          retention-days: 30
 
   publish-codex-worker-image:
     runs-on: ubuntu-latest
