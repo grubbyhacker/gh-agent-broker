@@ -193,6 +193,26 @@ func (s *LaunchIntentStore) Lookup(ctx context.Context, principal, profile, dige
 	return scanLaunchIntent(row, principal, profile, digest)
 }
 
+func (s *LaunchIntentStore) LookupRun(ctx context.Context, runID string) (launchIntent, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT principal, profile, key_digest, request_fingerprint, state, plan_json, metadata_json
+		FROM launch_intents WHERE run_id=?`, runID)
+	var intent launchIntent
+	var planJSON, metadataJSON []byte
+	err := row.Scan(&intent.Principal, &intent.Profile, &intent.KeyDigest, &intent.RequestFingerprint,
+		&intent.State, &planJSON, &metadataJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return launchIntent{}, false, nil
+	}
+	if err != nil {
+		return launchIntent{}, false, err
+	}
+	intent.RunID = runID
+	if err := decodeLaunchIntent(&intent, planJSON, metadataJSON); err != nil {
+		return launchIntent{}, false, err
+	}
+	return intent, true, nil
+}
+
 func (s *LaunchIntentStore) Create(ctx context.Context, intent launchIntent, maxConcurrent int) (launchIntent, bool, error) {
 	planJSON, err := json.Marshal(intent.Plan)
 	if err != nil {

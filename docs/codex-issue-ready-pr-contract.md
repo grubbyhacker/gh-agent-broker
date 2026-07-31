@@ -1,0 +1,170 @@
+# Secure Codex issue-to-ready-PR contract
+
+This document is the configuration handoff for the first secure Codex
+issue-to-ready-PR milestone. It does not authorize production deployment.
+
+## Signal Plane launch contract
+
+Signal Plane launches only the reviewed `terra-medium-v1` launch profile via
+`POST /v1/launch-profiles/terra-medium-v1/launch`. It must send a stable
+`Idempotency-Key` and exactly these typed parameters:
+
+```json
+{
+  "parameters": {
+    "issue_number": 123,
+    "source_delivery_id": "stable-source-delivery-id"
+  }
+}
+```
+
+`issue_number` is a positive integer. `source_delivery_id` matches
+`^[A-Za-z0-9-]{1,128}$`. Existing canonical request fingerprinting and
+principal/profile/idempotency namespaces remain authoritative.
+
+Terminal delivery reads
+`GET /v1/runs/{run_id}/terminal-result`. Successful outcomes are
+`no_change_required` or `ready_for_review`. Signal Plane must treat missing or
+oversized final output as an explicit failure and must not fall back to logs or
+arbitrary artifacts.
+
+## sandbox-broker configuration
+
+The profile is a durable two-container workflow:
+
+```yaml
+codex_holder:
+  master_auth_path: /srv/hermes-sandbox-broker/codex-holder/master/auth.json
+  issuance_root: /srv/hermes-sandbox-broker/codex-holder/issuance
+
+model_policies:
+  reviewed-codex-v1:
+    version: codex-model-policy/v1
+    mappings:
+      luna-medium-v1:  {model: gpt-5.6-luna,  effort: medium}
+      luna-high-v1:    {model: gpt-5.6-luna,  effort: high}
+      terra-medium-v1: {model: gpt-5.6-terra, effort: medium}
+      terra-high-v1:   {model: gpt-5.6-terra, effort: high}
+      sol-high-v1:     {model: gpt-5.6-sol,   effort: high}
+
+network_policies:
+  codex-preparation:
+    network: codex-preparation-internal
+    private_broker: true
+  codex-execution:
+    network: codex-execution-internal
+    private_broker: true
+    codex_subscription_relay: true
+
+launch_profiles:
+  terra-medium-v1:
+    template: codex-execution
+    repo: OWNER/REPOSITORY
+    base_branch: main
+    task: Implement the authoritative issue supplied by the typed task contract.
+    verification_task: verify
+    max_runtime_minutes: 60
+    max_concurrent_runs: 1
+    require_idempotency_key: true
+    parameters:
+      issue_number: {type: integer, required: true, min: 1}
+      source_delivery_id:
+        {type: string, required: true, max_length: 128, pattern: "^[A-Za-z0-9-]+$"}
+    codex_issue_workflow:
+      preparation_template: codex-preparation
+      execution_template: codex-execution
+      model_policy: reviewed-codex-v1
+      model_profile: terra-medium-v1
+      prompt_revision: issue-ready-pr/v1
+```
+
+Both templates use digest-pinned versions of the same reviewed repository
+worker image. `codex-preparation` runs
+`/usr/local/bin/agent-codex-repo-prep-worker`, has no credential bundle, uses
+the private-broker-only preparation network, and has bounded resources and
+storage. `codex-execution` runs
+`/usr/local/bin/agent-codex-repo-task-worker`, also has no configured
+credential bundle, uses the execution network, and includes:
+
+```yaml
+storage_limit_mb: 8192
+tmpfs:
+  /dev/shm: 64
+```
+
+The broker never creates or mounts a run-scoped credential file. After
+successful preparation it creates and starts the deterministic execution
+container in a bounded credential-wait bootstrap, asks the holder for an
+access-only bundle in memory, and streams a mode-`0600` tar entry through
+Docker's archive API into the container's bounded `/dev/shm` tmpfs. The worker
+atomically accepts the file into its run-local tmpfs `CODEX_HOME`, removes the
+injection source, and creates a token-free acceptance marker. Operator mounts
+and credential bundles are rejected if they overlap holder paths or `/dev/shm`.
+
+The holder master file and its parent directory must be mode `0600` and `0700`
+respectively. The master file is a Codex `auth.json` containing non-empty
+`tokens.access_token` and `tokens.refresh_token`. It is readable only by
+sandbox-broker. It is never a Docker mount. The holder posts refresh requests
+only to `https://auth.openai.com/oauth/token`, with the reviewed Codex 0.146.0
+client ID compiled into the broker.
+
+## Network/deployment requirements for vps-ops
+
+The named Docker networks are separate internal networks. Preparation reaches
+only the broker service. Execution reaches only the broker and
+`http://codex-subscription-relay:8093`; it has no outbound proxy, public route,
+general DNS, GitHub, `auth.openai.com`, or direct ChatGPT path. Its pinned
+custom provider base is
+`http://codex-subscription-relay:8093/backend-api/codex`, with
+`requires_openai_auth=true` and the Responses wire API.
+
+The broker-owned relay accepts exactly:
+
+- `GET /backend-api/codex/models?client_version=0.146.0`
+- `POST /backend-api/codex/responses` with no query
+- `POST /backend-api/codex/responses/compact` with no query
+
+It constructs the fixed `https://chatgpt.com` upstream itself, rejects
+redirects, forwards only bounded reviewed headers and bodies, preserves
+streaming, and emits no application logs containing Authorization, prompts,
+responses, or hidden reasoning. Every other method, path, query, encoded path,
+or caller-selected host fails closed.
+
+vps-ops must attach the relay to both `codex-execution-internal` and a distinct
+`codex-relay-egress-internal` network. Only the separate
+`codex-subscription-edge` Squid service joins that egress network and an
+outbound network. The relay has
+`HTTPS_PROXY=http://codex-subscription-edge:3128`; Squid allows only
+`CONNECT chatgpt.com:443` and denies all other destinations. The execution
+container is not joined to either the relay-egress or outbound network.
+
+The sandbox-broker/holder process may reach `auth.openai.com:443`. No worker
+network may reach that host. Worker images must not include a runtime
+dependency download fallback; a missing or mismatched baked
+dependency/submodule manifest is a stale-image failure.
+
+The execution image must contain exactly `@openai/codex@0.146.0`. Web search,
+MCP/apps/plugins, update checks, and analytics are disabled in the run-local
+configuration. The wrapper passes `--model gpt-5.6-terra` and
+`model_reasoning_effort="medium"` explicitly. Unsupported policy mappings fail
+without fallback.
+
+## Durable and retained data
+
+Preparation and execution have distinct deterministic container identities.
+The launch intent persists before create, start, injection, and acceptance
+boundaries, so replay adopts the exact matching execution container rather
+than creating another one. An ambiguous injection replay may reissue the same
+current run-scoped bundle from the persisted master lineage and token-free
+issuance state. No credential is recoverable from the issuance tree, run
+directory, launch intent, metadata, checkpoint, environment, labels, mounts,
+or container configuration.
+
+The broker-owned terminal provenance contains only bounded operational facts:
+policy/version, resolved model/effort, Codex version, prompt revision, observed
+image digest/platform, workspace HEAD/manifest identity, issue/source IDs,
+phase timings, run/profile, verification task/result, bounded token counts,
+branch, and validated PR identity. It never contains prompts, event streams,
+credentials, or hidden reasoning. Codex JSON events exist only temporarily on
+execution tmpfs and are removed after bounded usage extraction. Logs and
+arbitrary artifact endpoints are disabled for these runs.

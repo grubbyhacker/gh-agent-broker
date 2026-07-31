@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -306,6 +307,14 @@ func TestRedactorReadsJSONSecretValues(t *testing.T) {
 		if strings.Contains(got, leaked) {
 			t.Fatalf("Redact() leaked %q in %q", leaked, got)
 		}
+	}
+}
+
+func TestRedactorRemovesBareJWTShapedAccessToken(t *testing.T) {
+	//nolint:gosec // G101: synthetic token-shaped fixture verifies generic redaction.
+	token := "eyJhbGciOiJub25lIn0.eyJleHAiOjQ3NjAwMDAwMDB9.synthetic-signature"
+	if got := NewRedactor(nil).Redact("accidental output " + token); strings.Contains(got, token) {
+		t.Fatalf("bare JWT was not redacted: %q", got)
 	}
 }
 
@@ -756,6 +765,8 @@ type fakeRuntime struct {
 	started      map[string]bool
 	exits        map[string]ContainerStatus
 	writes       map[string][]byte
+	injections   map[string][]byte
+	paths        map[string]bool
 	waiters      map[string]chan struct{}
 	waitClosed   map[string]bool
 	stopErr      error
@@ -764,7 +775,11 @@ type fakeRuntime struct {
 }
 
 func newFakeRuntime() *fakeRuntime {
-	return &fakeRuntime{started: map[string]bool{}, exits: map[string]ContainerStatus{}, writes: map[string][]byte{}, waiters: map[string]chan struct{}{}, waitClosed: map[string]bool{}}
+	return &fakeRuntime{
+		started: map[string]bool{}, exits: map[string]ContainerStatus{}, writes: map[string][]byte{},
+		injections: map[string][]byte{}, paths: map[string]bool{},
+		waiters: map[string]chan struct{}{}, waitClosed: map[string]bool{},
+	}
 }
 
 func (f *fakeRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
@@ -783,6 +798,45 @@ func (f *fakeRuntime) Start(ctx context.Context, containerID string) error {
 	defer f.mu.Unlock()
 	f.started[containerID] = true
 	return nil
+}
+
+func (f *fakeRuntime) InjectSecret(
+	ctx context.Context,
+	containerID, targetDir, name string,
+	contents []byte,
+) error {
+	_ = ctx
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.started[containerID] {
+		return errors.New("container is not running")
+	}
+	key := containerID + ":" + filepath.Join(targetDir, name)
+	f.injections[key] = append([]byte(nil), contents...)
+	f.paths[containerID+":"+codexAcceptanceMarker] = true
+	return nil
+}
+
+func (f *fakeRuntime) WaitForPath(
+	ctx context.Context,
+	containerID, targetPath string,
+	timeout time.Duration,
+) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		f.mu.Lock()
+		exists := f.paths[containerID+":"+targetPath]
+		f.mu.Unlock()
+		if exists {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
 }
 
 func (f *fakeRuntime) Wait(ctx context.Context, containerID string) (ContainerStatus, error) {

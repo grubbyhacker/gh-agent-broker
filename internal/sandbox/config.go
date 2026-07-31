@@ -40,6 +40,8 @@ type Config struct {
 	Bundles                 map[string]CredentialBundle  `yaml:"credential_bundles"`
 	Templates               map[string]Template          `yaml:"templates"`
 	LaunchProfiles          map[string]LaunchProfile     `yaml:"launch_profiles"`
+	ModelPolicies           map[string]ModelPolicy       `yaml:"model_policies"`
+	CodexHolder             CodexHolderConfig            `yaml:"codex_holder"`
 	OperatorPrincipals      map[string]OperatorPrincipal `yaml:"operator_principals"`
 	Audit                   SandboxAuditConfig           `yaml:"audit"`
 	MaxTaskBytes            int                          `yaml:"max_task_bytes"`
@@ -57,8 +59,29 @@ type SandboxAuditConfig struct {
 }
 
 type NetworkPolicy struct {
-	Network string `yaml:"network"`
-	None    bool   `yaml:"none"`
+	Network         string   `yaml:"network"`
+	None            bool     `yaml:"none"`
+	PrivateBroker   bool     `yaml:"private_broker"`
+	EgressProxy     string   `yaml:"egress_proxy"`
+	AllowedTLSHosts []string `yaml:"allowed_tls_hosts"`
+	CodexRelay      bool     `yaml:"codex_subscription_relay"`
+	AllowGeneralDNS bool     `yaml:"allow_general_dns"`
+	AllowInternet   bool     `yaml:"allow_internet"`
+}
+
+type CodexHolderConfig struct {
+	MasterAuthPath string `yaml:"master_auth_path"`
+	IssuanceRoot   string `yaml:"issuance_root"`
+}
+
+type ModelPolicy struct {
+	Version  string                  `yaml:"version"`
+	Mappings map[string]ModelMapping `yaml:"mappings"`
+}
+
+type ModelMapping struct {
+	Model  string `yaml:"model"`
+	Effort string `yaml:"effort"`
 }
 
 type CredentialBundle struct {
@@ -87,6 +110,8 @@ type Template struct {
 	Environment          map[string]string `yaml:"environment"`
 	ExtraMounts          []ExtraMount      `yaml:"extra_mounts"`
 	CompletionStatusPath string            `yaml:"completion_status_path"`
+	StorageLimitMB       int64             `yaml:"storage_limit_mb"`
+	Tmpfs                map[string]int64  `yaml:"tmpfs"`
 }
 
 type ExtraMount struct {
@@ -113,6 +138,15 @@ type LaunchProfile struct {
 	Parameters            map[string]ParameterDeclaration `yaml:"parameters"`
 	MaxConcurrentRuns     int                             `yaml:"max_concurrent_runs"`
 	RequireIdempotencyKey bool                            `yaml:"require_idempotency_key"`
+	CodexIssueWorkflow    *CodexIssueWorkflow             `yaml:"codex_issue_workflow,omitempty"`
+}
+
+type CodexIssueWorkflow struct {
+	PreparationTemplate string `yaml:"preparation_template"`
+	ExecutionTemplate   string `yaml:"execution_template"`
+	ModelPolicy         string `yaml:"model_policy"`
+	ModelProfile        string `yaml:"model_profile"`
+	PromptRevision      string `yaml:"prompt_revision"`
 }
 
 type ParameterDeclaration struct {
@@ -277,6 +311,12 @@ func (c *Config) Validate() error {
 		if strings.EqualFold(network.Network, "host") || strings.HasPrefix(network.Network, "container:") {
 			errs = append(errs, fmt.Sprintf("network policy %q cannot use host or container network namespace", name))
 		}
+		if network.AllowGeneralDNS || network.AllowInternet {
+			errs = append(errs, fmt.Sprintf("network policy %q cannot allow general DNS or internet", name))
+		}
+		if network.EgressProxy != "" && !strings.HasPrefix(network.EgressProxy, "http://") {
+			errs = append(errs, fmt.Sprintf("network policy %q egress_proxy must be an internal http URL", name))
+		}
 	}
 	for name, bundle := range c.Bundles {
 		errs = append(errs, validateBundle(name, bundle)...)
@@ -289,6 +329,34 @@ func (c *Config) Validate() error {
 	}
 	for name, profile := range c.LaunchProfiles {
 		errs = append(errs, c.validateLaunchProfile(name, profile)...)
+	}
+	for name, policy := range c.ModelPolicies {
+		errs = append(errs, validateModelPolicy(name, policy)...)
+	}
+	if hasCodexWorkflow(c.LaunchProfiles) {
+		if !filepath.IsAbs(c.CodexHolder.MasterAuthPath) || !filepath.IsAbs(c.CodexHolder.IssuanceRoot) {
+			errs = append(errs, "codex_holder master_auth_path and issuance_root must be absolute")
+		}
+		master := filepath.Clean(c.CodexHolder.MasterAuthPath)
+		issuance := filepath.Clean(c.CodexHolder.IssuanceRoot)
+		runs := filepath.Clean(c.RunsDir)
+		if pathWithin(master, runs) || pathWithin(issuance, runs) || pathWithin(master, issuance) || pathWithin(issuance, master) {
+			errs = append(errs, "codex_holder master, issuance, and runs paths must be strictly separated")
+		}
+		for name, bundle := range c.Bundles {
+			if pathWithin(master, filepath.Clean(bundle.SourcePath)) || pathWithin(filepath.Clean(bundle.SourcePath), master) {
+				errs = append(errs, fmt.Sprintf("credential bundle %q cannot expose the Codex master lineage", name))
+			}
+		}
+		for name, template := range c.Templates {
+			for _, mount := range template.ExtraMounts {
+				source := filepath.Clean(mount.SourcePath)
+				if pathWithin(master, source) || pathWithin(source, master) ||
+					pathWithin(issuance, source) || pathWithin(source, issuance) {
+					errs = append(errs, fmt.Sprintf("template %q extra_mounts cannot expose Codex holder paths", name))
+				}
+			}
+		}
 	}
 	for name, principal := range c.OperatorPrincipals {
 		errs = append(errs, c.validateOperatorPrincipal(name, principal)...)
@@ -382,6 +450,14 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 	}
 	if tmpl.CompletionStatusPath != "" {
 		errs = append(errs, validateCompletionStatusPath(name, tmpl)...)
+	}
+	if tmpl.StorageLimitMB < 0 {
+		errs = append(errs, fmt.Sprintf("template %q storage_limit_mb must not be negative", name))
+	}
+	for target, sizeMB := range tmpl.Tmpfs {
+		if !filepath.IsAbs(target) || target == "/" || sizeMB < 1 {
+			errs = append(errs, fmt.Sprintf("template %q tmpfs entry %q must be an absolute non-root path with a positive MiB bound", name, target))
+		}
 	}
 	return errs
 }
@@ -483,7 +559,134 @@ func (c Config) validateLaunchProfile(name string, profile LaunchProfile) []stri
 	for paramName, decl := range profile.Parameters {
 		errs = append(errs, validateParameterDeclaration(name, paramName, decl)...)
 	}
+	if workflow := profile.CodexIssueWorkflow; workflow != nil {
+		errs = append(errs, c.validateCodexIssueWorkflow(name, profile, *workflow)...)
+	}
 	return errs
+}
+
+func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, workflow CodexIssueWorkflow) []string {
+	var errs []string
+	if !profile.RequireIdempotencyKey {
+		errs = append(errs, fmt.Sprintf("launch profile %q codex_issue_workflow requires idempotency", name))
+	}
+	if profile.MaxConcurrentRuns != 1 {
+		errs = append(errs, fmt.Sprintf("launch profile %q codex_issue_workflow requires max_concurrent_runs: 1", name))
+	}
+	prep, prepOK := c.Templates[workflow.PreparationTemplate]
+	exec, execOK := c.Templates[workflow.ExecutionTemplate]
+	if !prepOK {
+		errs = append(errs, fmt.Sprintf("launch profile %q references unknown preparation_template %q", name, workflow.PreparationTemplate))
+	}
+	if !execOK {
+		errs = append(errs, fmt.Sprintf("launch profile %q references unknown execution_template %q", name, workflow.ExecutionTemplate))
+	}
+	if workflow.PreparationTemplate == workflow.ExecutionTemplate {
+		errs = append(errs, fmt.Sprintf("launch profile %q requires distinct preparation and execution templates", name))
+	}
+	if profile.Template != workflow.ExecutionTemplate {
+		errs = append(errs, fmt.Sprintf("launch profile %q template must equal its execution_template", name))
+	}
+	policy, policyOK := c.ModelPolicies[workflow.ModelPolicy]
+	if !policyOK {
+		errs = append(errs, fmt.Sprintf("launch profile %q references unknown model_policy %q", name, workflow.ModelPolicy))
+	} else if _, ok := policy.Mappings[workflow.ModelProfile]; !ok {
+		errs = append(errs, fmt.Sprintf("launch profile %q model_profile %q is not in its reviewed policy", name, workflow.ModelProfile))
+	}
+	if name != "terra-medium-v1" || workflow.ModelProfile != "terra-medium-v1" {
+		errs = append(errs, fmt.Sprintf("launch profile %q is unsupported; first milestone exposes only terra-medium-v1", name))
+	}
+	if workflow.PromptRevision == "" {
+		errs = append(errs, fmt.Sprintf("launch profile %q prompt_revision is required", name))
+	}
+	if prepOK {
+		network := c.Networks[prep.NetworkPolicy]
+		if prep.CredentialBundle != "" || network.EgressProxy != "" || network.CodexRelay ||
+			!network.PrivateBroker || len(network.AllowedTLSHosts) != 0 {
+			errs = append(errs, fmt.Sprintf("launch profile %q preparation template must be credential-free and private-broker-only", name))
+		}
+		errs = append(errs, validateCodexTemplateSurface(name, "preparation", prep)...)
+	}
+	if execOK {
+		network := c.Networks[exec.NetworkPolicy]
+		if exec.CredentialBundle != "" || !network.PrivateBroker || !network.CodexRelay ||
+			network.EgressProxy != "" || len(network.AllowedTLSHosts) != 0 {
+			errs = append(errs, fmt.Sprintf("launch profile %q execution template must use only the private broker and Codex subscription relay", name))
+		}
+		if exec.Tmpfs["/dev/shm"] < 1 || exec.StorageLimitMB < 1 {
+			errs = append(errs, fmt.Sprintf("launch profile %q execution template requires bounded /dev/shm tmpfs and storage", name))
+		}
+		errs = append(errs, validateCodexTemplateSurface(name, "execution", exec)...)
+	}
+	for _, required := range []string{"issue_number", "source_delivery_id"} {
+		decl, ok := profile.Parameters[required]
+		if !ok || required == "issue_number" && decl.Type != "integer" || required == "source_delivery_id" && decl.Type != "string" {
+			errs = append(errs, fmt.Sprintf("launch profile %q requires typed parameter %q", name, required))
+		}
+	}
+	return errs
+}
+
+func validateCodexTemplateSurface(profile, phase string, template Template) []string {
+	var errs []string
+	for key := range template.Environment {
+		upper := strings.ToUpper(key)
+		if strings.HasPrefix(upper, "OPENAI_") || strings.HasPrefix(upper, "CODEX_") ||
+			upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY" {
+			errs = append(errs, fmt.Sprintf("launch profile %q %s template cannot configure credential or proxy environment %q", profile, phase, key))
+		}
+	}
+	for _, mount := range template.ExtraMounts {
+		target := filepath.Clean(mount.MountPath)
+		for _, forbidden := range []string{"/credentials", "/run/codex-issuance", "/dev/shm"} {
+			if pathWithin(target, forbidden) {
+				errs = append(errs, fmt.Sprintf("launch profile %q %s template cannot configure mount target %q", profile, phase, target))
+			}
+		}
+	}
+	return errs
+}
+
+func validateModelPolicy(name string, policy ModelPolicy) []string {
+	var errs []string
+	if name == "" || policy.Version != "codex-model-policy/v1" {
+		errs = append(errs, fmt.Sprintf("model policy %q must use version codex-model-policy/v1", name))
+	}
+	expected := map[string]ModelMapping{
+		"luna-medium-v1":  {Model: "gpt-5.6-luna", Effort: "medium"},
+		"luna-high-v1":    {Model: "gpt-5.6-luna", Effort: "high"},
+		"terra-medium-v1": {Model: "gpt-5.6-terra", Effort: "medium"},
+		"terra-high-v1":   {Model: "gpt-5.6-terra", Effort: "high"},
+		"sol-high-v1":     {Model: "gpt-5.6-sol", Effort: "high"},
+	}
+	if len(policy.Mappings) != len(expected) {
+		errs = append(errs, fmt.Sprintf("model policy %q must contain exactly the five reviewed milestone mappings", name))
+	}
+	for profile, want := range expected {
+		if got, ok := policy.Mappings[profile]; !ok || got != want {
+			errs = append(errs, fmt.Sprintf("model policy %q mapping %q must resolve exactly to %s + %s", name, profile, want.Model, want.Effort))
+		}
+	}
+	for profile := range policy.Mappings {
+		if _, ok := expected[profile]; !ok {
+			errs = append(errs, fmt.Sprintf("model policy %q contains unsupported mapping %q", name, profile))
+		}
+	}
+	return errs
+}
+
+func hasCodexWorkflow(profiles map[string]LaunchProfile) bool {
+	for _, profile := range profiles {
+		if profile.CodexIssueWorkflow != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func pathWithin(path, base string) bool {
+	rel, err := filepath.Rel(base, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func validateParameterDeclaration(profileName, name string, decl ParameterDeclaration) []string {
@@ -732,6 +935,8 @@ func (c Config) versionDigest() string {
 			"knowledge_snapshots": tmpl.KnowledgeSnapshots,
 			"environment":         tmpl.Environment,
 			"extra_mounts":        tmpl.ExtraMounts,
+			"storage_limit_mb":    tmpl.StorageLimitMB,
+			"tmpfs":               tmpl.Tmpfs,
 		}
 	}
 	principals := make(map[string]any, len(c.OperatorPrincipals))
@@ -744,17 +949,22 @@ func (c Config) versionDigest() string {
 		}
 	}
 	view := map[string]any{
-		"listen":              c.Listen,
-		"mcp_path":            c.MCPPath,
-		"auth_token_env":      c.AuthTokenEnv,
-		"runs_dir":            c.RunsDir,
-		"broker_url":          c.BrokerURL,
-		"production":          c.Production,
-		"repositories":        c.Repositories,
-		"network_policies":    c.Networks,
-		"credential_bundles":  c.Bundles,
-		"templates":           templates,
-		"launch_profiles":     c.LaunchProfiles,
+		"listen":             c.Listen,
+		"mcp_path":           c.MCPPath,
+		"auth_token_env":     c.AuthTokenEnv,
+		"runs_dir":           c.RunsDir,
+		"broker_url":         c.BrokerURL,
+		"production":         c.Production,
+		"repositories":       c.Repositories,
+		"network_policies":   c.Networks,
+		"credential_bundles": c.Bundles,
+		"templates":          templates,
+		"launch_profiles":    c.LaunchProfiles,
+		"model_policies":     c.ModelPolicies,
+		"codex_holder": map[string]string{
+			"master_auth_path": c.CodexHolder.MasterAuthPath,
+			"issuance_root":    c.CodexHolder.IssuanceRoot,
+		},
 		"operator_principals": principals,
 		"audit":               c.Audit,
 		"max_task_bytes":      c.MaxTaskBytes,

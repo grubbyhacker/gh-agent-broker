@@ -248,3 +248,149 @@ func TestConfigValidateLaunchProfileParameters(t *testing.T) {
 func intPtr(v int) *int {
 	return &v
 }
+
+func TestCodexIssueWorkflowConfigIsExactAndDenyByDefault(t *testing.T) {
+	cfg := codexWorkflowTestConfig(t)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid secure Codex config: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{name: "lower luna effort", mutate: func(c *Config) {
+			policy := c.ModelPolicies["reviewed"]
+			policy.Mappings["luna-medium-v1"] = ModelMapping{Model: "gpt-5.6-luna", Effort: "low"}
+			c.ModelPolicies["reviewed"] = policy
+		}, want: "resolve exactly"},
+		{name: "sol xhigh", mutate: func(c *Config) {
+			policy := c.ModelPolicies["reviewed"]
+			policy.Mappings["sol-high-v1"] = ModelMapping{Model: "gpt-5.6-sol", Effort: "xhigh"}
+			c.ModelPolicies["reviewed"] = policy
+		}, want: "resolve exactly"},
+		{name: "extra fallback", mutate: func(c *Config) {
+			policy := c.ModelPolicies["reviewed"]
+			policy.Mappings["fallback"] = ModelMapping{Model: "gpt-5.6-terra", Effort: "medium"}
+			c.ModelPolicies["reviewed"] = policy
+		}, want: "exactly the five"},
+		{name: "prep egress", mutate: func(c *Config) {
+			network := c.Networks["prep"]
+			network.EgressProxy = "http://proxy:8080"
+			c.Networks["prep"] = network
+		}, want: "private-broker-only"},
+		{name: "execution general internet", mutate: func(c *Config) {
+			network := c.Networks["execution"]
+			network.AllowInternet = true
+			c.Networks["execution"] = network
+		}, want: "cannot allow general DNS or internet"},
+		{name: "execution proxy bypass", mutate: func(c *Config) {
+			network := c.Networks["execution"]
+			network.EgressProxy = "http://proxy:8080"
+			c.Networks["execution"] = network
+		}, want: "only the private broker and Codex subscription relay"},
+		{name: "execution relay missing", mutate: func(c *Config) {
+			network := c.Networks["execution"]
+			network.CodexRelay = false
+			c.Networks["execution"] = network
+		}, want: "only the private broker and Codex subscription relay"},
+		{name: "missing tmpfs", mutate: func(c *Config) {
+			template := c.Templates["execution"]
+			template.Tmpfs = nil
+			c.Templates["execution"] = template
+		}, want: "bounded /dev/shm tmpfs"},
+		{name: "master mounted", mutate: func(c *Config) {
+			template := c.Templates["prep"]
+			template.ExtraMounts = append(template.ExtraMounts, ExtraMount{
+				SourcePath: c.CodexHolder.MasterAuthPath, MountPath: "/data/master", ReadOnly: true,
+			})
+			c.Templates["prep"] = template
+		}, want: "cannot expose Codex holder paths"},
+		{name: "prep credential env", mutate: func(c *Config) {
+			template := c.Templates["prep"]
+			template.Environment = map[string]string{"OPENAI_API_KEY": "forbidden"}
+			c.Templates["prep"] = template
+		}, want: "cannot configure credential or proxy environment"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := codexWorkflowTestConfig(t)
+			tt.mutate(&candidate)
+			err := candidate.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Validate() error=%v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func reviewedModelPolicy() ModelPolicy {
+	return ModelPolicy{
+		Version: "codex-model-policy/v1",
+		Mappings: map[string]ModelMapping{
+			"luna-medium-v1":  {Model: "gpt-5.6-luna", Effort: "medium"},
+			"luna-high-v1":    {Model: "gpt-5.6-luna", Effort: "high"},
+			"terra-medium-v1": {Model: "gpt-5.6-terra", Effort: "medium"},
+			"terra-high-v1":   {Model: "gpt-5.6-terra", Effort: "high"},
+			"sol-high-v1":     {Model: "gpt-5.6-sol", Effort: "high"},
+		},
+	}
+}
+
+func codexWorkflowTestConfig(t *testing.T) Config {
+	t.Helper()
+	cfg := baseTestConfig(t)
+	cfg.Bundles = map[string]CredentialBundle{}
+	cfg.Networks = map[string]NetworkPolicy{
+		"prep": {
+			Network: "prep-net", PrivateBroker: true,
+		},
+		"execution": {
+			Network: "execution-net", PrivateBroker: true,
+			CodexRelay: true,
+		},
+	}
+	prep := testTemplate("example.com/prep@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	prep.NetworkPolicy = "prep"
+	prep.CredentialBundle = ""
+	prep.Command = []string{"/usr/local/bin/agent-codex-repo-prep-worker"}
+	execution := testTemplate("example.com/exec@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	execution.NetworkPolicy = "execution"
+	execution.CredentialBundle = ""
+	execution.Command = []string{"/usr/local/bin/agent-codex-repo-task-worker"}
+	execution.StorageLimitMB = 8192
+	execution.Tmpfs = map[string]int64{"/dev/shm": 64}
+	cfg.Templates = map[string]Template{"prep": prep, "execution": execution}
+	cfg.ModelPolicies = map[string]ModelPolicy{"reviewed": reviewedModelPolicy()}
+	cfg.CodexHolder = CodexHolderConfig{
+		MasterAuthPath: filepath.Join(t.TempDir(), "master", "auth.json"),
+		IssuanceRoot:   filepath.Join(t.TempDir(), "issuance"),
+	}
+	cfg.LaunchProfiles = map[string]LaunchProfile{
+		"terra-medium-v1": {
+			LaunchAgentInput: LaunchAgentInput{
+				Template: "execution", Task: "Implement the issue", Repo: "owner/repo",
+				BaseBranch: "main", MaxRuntimeMinutes: 5,
+				VerificationTask: "verify",
+			},
+			RequireIdempotencyKey: true,
+			MaxConcurrentRuns:     1,
+			Parameters: map[string]ParameterDeclaration{
+				"issue_number":       {Type: "integer", Required: true, Min: intPtr(1)},
+				"source_delivery_id": {Type: "string", Required: true, MaxLength: 128, Pattern: `^[A-Za-z0-9-]+$`},
+			},
+			CodexIssueWorkflow: &CodexIssueWorkflow{
+				PreparationTemplate: "prep", ExecutionTemplate: "execution",
+				ModelPolicy: "reviewed", ModelProfile: "terra-medium-v1", PromptRevision: "issue-ready-pr/v1",
+			},
+		},
+	}
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"signal-plane": {
+			Token: "signal-secret", AllowedProfiles: []string{"terra-medium-v1"},
+			AllowedActions: []string{"launch", "status", "terminal_result"}, RunScope: "owned",
+		},
+	}
+	return cfg
+}

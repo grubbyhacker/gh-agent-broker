@@ -1,5 +1,31 @@
 # Agent handoff
 
+The first secure Codex issue-to-ready-PR slice is implemented behind the
+`codex_issue_workflow` launch-profile contract. It uses distinct durable
+preparation and execution container identities. Preparation has no Codex
+credential and fails stale unless checkout dependency/submodule identity
+exactly matches the baked manifest. Only then does the sandbox-broker-owned
+holder rotates the pinned Codex 0.146.0 OAuth master lineage and returns a
+one-time access-token-only `auth.json` in memory with an explicitly empty
+refresh token. After the fresh execution container starts, sandbox-broker
+streams it through Docker's archive API into bounded `/dev/shm`; no host
+capability file or issuance mount exists. The wrapper atomically accepts it
+into a mode-0600 tmpfs `CODEX_HOME`, removes the injection source, and records
+a token-free acceptance marker. Execution has no general proxy; its explicit
+Responses provider reaches only the broker-owned exact-path subscription
+relay, which alone forwards to fixed `https://chatgpt.com` through a separate
+origin-only edge.
+
+The only initial profile interface is `terra-medium-v1`, resolved through an
+exact reviewed five-entry `codex-model-policy/v1` table to
+`gpt-5.6-terra + medium`; unsupported combinations have no fallback. Codex
+events and credentials remain on tmpfs and are cleaned, and logs/arbitrary
+artifacts are unavailable for this workflow. The terminal projection includes
+bounded broker-owned provenance and preserves complete bounded final output.
+The vps-ops and Signal Plane schema/network handoff is
+`docs/codex-issue-ready-pr-contract.md`. No production or vps-ops change is
+included.
+
 Sandbox-broker now seals a durable `repository-task-terminal-result/v1` at
 terminal finalization. `GET /v1/runs/{run_id}/terminal-result` requires the
 new explicit `terminal_result` operator action and retains existing
@@ -62,22 +88,12 @@ content into the fresh checkout. A mismatch fails loudly as a stale image;
 the worker never initializes a submodule through a direct GitHub remote.
 
 `/usr/local/bin/agent-codex-repo-task-worker` is the Codex counterpart for a
-repository image that supplies Codex CLI. It copies only
-`/credentials/codex/auth.json` into a mode-0600 `CODEX_HOME` below `/dev/shm`,
-after broker checkout, dependency-manifest verification, baked-submodule
-hydration, and any dependency installation. This ordering is defense in depth
-only: the raw credential bundle remains readable at `/credentials/codex` during
-preparation, which violates design section 4.3 and is a known defect. Required
-follow-up work is a credential-free preparation container that produces a
-workspace and provenance record, followed by a fresh coding container that
-receives that workspace and the credential. It uses the same broker-mediated checkout,
-commit, push, and pull-request flow as the model-free worker. Its task prompt
-is supplied by `AGENT_CODEX_PROMPT` or `AGENT_CODEX_PROMPT_FILE`; the wrapper
-instructs Codex not to read credentials or perform GitHub delivery actions.
-Its JWT expiry check decodes the base64url payload (including restored padding)
-with `jq`; a shell regression test uses a synthetic, unpadded payload that
-contains a base64url underscore and verifies accepted future tokens plus
-rejected expired and safety-margin tokens.
+repository image that supplies Codex CLI. It begins in a bounded credential
+wait, accepts only the broker's mode-0600 `/dev/shm` injection after
+credential-free preparation, configures the fixed internal subscription relay,
+and removes credential material on exit. It uses the broker-mediated checkout,
+commit, push, and pull-request flow; Codex never receives a direct GitHub or
+general-internet route.
 
 The staged `repository_transport_stage` audit events remain on the real Git
 path. No local repository backend, registered green-PR endpoint, agentd

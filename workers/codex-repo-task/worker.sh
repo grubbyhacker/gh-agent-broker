@@ -2,321 +2,230 @@
 set -euo pipefail
 
 readonly worker_name='agent-codex-repo-task-worker'
-readonly dependency_manifest_path="${AGENT_IMAGE_DEPENDENCY_MANIFEST_PATH:-/usr/local/share/agent-image/dependency-manifest.sha256}"
-readonly dependency_manifest_output_path="${AGENT_IMAGE_DEPENDENCY_MANIFEST_OUTPUT_PATH:-/output/dependency-manifest.txt}"
-# publish-agent-image.yml copies initialized submodule content to /workspace.
-readonly baked_workspace_path="${AGENT_IMAGE_WORKSPACE:-/workspace}"
-readonly credential_bundle_path='/credentials/codex/auth.json'
+readonly injection_dir='/dev/shm/codex-credential-injection'
+readonly capability_path="${injection_dir}/auth.json"
+readonly acceptance_marker='/dev/shm/codex-credential-accepted'
 readonly codex_home_base='/dev/shm/codex-home'
-readonly token_expiry_margin_seconds=300
+readonly credential_wait_seconds=45
+readonly codex_events_limit=$((8 * 1024 * 1024))
+readonly final_output_limit="${AGENT_FINAL_OUTPUT_LIMIT:-32768}"
 readonly worker_result_lib_path="${WORKER_RESULT_LIB_PATH:-/usr/local/lib/agent-worker-result.sh}"
 readonly worker_result_worker='codex'
 stage='initializing'
 verification_status='not_run'
+CODEX_HOME=''
 
 if [[ -r "$worker_result_lib_path" ]]; then
   source "$worker_result_lib_path"
 elif [[ -r "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/result.sh" ]]; then
-  # shellcheck source=../result.sh
   source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/result.sh"
 else
-  printf '%s: missing shared result library %s; agent image packaging must copy /usr/local/lib/agent-worker-result.sh with the worker binary\n' "$worker_name" "$worker_result_lib_path" >&2
+  printf '%s: missing shared result library %s\n' "$worker_name" "$worker_result_lib_path" >&2
   exit 1
 fi
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
 require_env() { [[ -n "${!1:-}" ]] || fail "missing required environment variable: $1"; }
 
+cleanup_credentials() {
+  rm -f -- "$capability_path" 2>/dev/null || true
+  rm -f -- "$acceptance_marker" 2>/dev/null || true
+  rmdir -- "$injection_dir" 2>/dev/null || true
+  rm -f -- /dev/shm/codex-events.jsonl /dev/shm/codex-stderr.log /dev/shm/codex-prompt.md 2>/dev/null || true
+  [[ -z "$CODEX_HOME" ]] || rm -rf -- "$CODEX_HOME" 2>/dev/null || true
+}
+
 on_exit() {
   local status=$?
   trap - EXIT
+  cleanup_credentials
   if (( status != 0 )); then
     write_result failed "worker failed during $stage" || true
-    printf 'Codex repository task worker failed during %s. See worker logs and /output/result.json.\n' "$stage" > /output/final-summary.md
+    printf 'Codex repository task worker failed during %s. See /output/result.json.\n' "$stage" > /output/final-summary.md
   fi
   exit "$status"
 }
 
 validate_inputs() {
-  local value
-  for value in "$AGENT_REPO" "$AGENT_BASE_BRANCH" "$AGENT_RUN_ID"; do
-    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || fail 'configuration values must not contain line breaks'
-  done
   [[ "$AGENT_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail 'AGENT_REPO must be owner/name'
-  [[ "$AGENT_RUN_ID" =~ ^[A-Za-z0-9_.:-]+$ ]] || fail 'AGENT_RUN_ID must contain only letters, numbers, dot, underscore, colon, or hyphen'
-  if [[ -n "${AGENT_VERIFY_TASK:-}" ]]; then
-    [[ "$AGENT_VERIFY_TASK" =~ ^[A-Za-z0-9_.:-]+$ ]] || fail 'AGENT_VERIFY_TASK must be a single mise task name'
-  fi
+  [[ "$AGENT_RUN_ID" =~ ^[A-Za-z0-9_.:-]+$ ]] || fail 'AGENT_RUN_ID is invalid'
+  [[ "$AGENT_CODEX_VERSION" == '0.146.0' ]] || fail 'worker requires pinned Codex 0.146.0'
+  [[ "$AGENT_MODEL" == 'gpt-5.6-terra' && "$AGENT_REASONING_EFFORT" == 'medium' ]] ||
+    fail 'unsupported model policy resolution; no fallback is permitted'
+  [[ "$AGENT_MODEL_POLICY_VERSION" == 'codex-model-policy/v1' ]] || fail 'unreviewed model policy version'
+  [[ "$CODEX_SUBSCRIPTION_RELAY_BASE_URL" == 'http://codex-subscription-relay:8093/backend-api/codex' ]] ||
+    fail 'Codex subscription relay base URL is not the pinned internal endpoint'
+  [[ "$final_output_limit" =~ ^[1-9][0-9]*$ ]] && (( final_output_limit <= 1048576 )) ||
+    fail 'AGENT_FINAL_OUTPUT_LIMIT must be a positive bounded integer'
+  [[ -z "${AGENT_VERIFY_TASK:-}" || "$AGENT_VERIFY_TASK" =~ ^[A-Za-z0-9_.:-]+$ ]] ||
+    fail 'AGENT_VERIFY_TASK must be a single mise task name'
 }
 
-validate_credential_sources() {
-  local name value path
-  while IFS='=' read -r name value; do
-    [[ "$name" == OPENAI_* ]] && fail "alternate credential environment variable is visible: $name"
-  done < <(mise exec -- env)
+validate_preparation() {
+  jq -e --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" '
+    .version == "codex-preparation-result/v1" and .status == "prepared" and
+    .run_id == $run and .repository == $repo and .branch == $branch and
+    (.workspace_head | test("^[a-f0-9]{40}$")) and (.manifest_sha256 | test("^[a-f0-9]{64}$")) and
+    (.issue_number | type == "number" and . > 0) and
+    (.source_delivery_id | type == "string" and test("^[A-Za-z0-9-]{1,128}$"))
+  ' /work/prepared/preparation.json >/dev/null || fail 'broker-prepared workspace identity is missing or invalid'
+  [[ "$(git -C /work/repo rev-parse HEAD)" == "$(jq -r .workspace_head /work/prepared/preparation.json)" ]] ||
+    fail 'prepared workspace changed before execution'
+}
 
-  [[ -f "$credential_bundle_path" ]] || fail "missing required credential bundle: $credential_bundle_path"
-  if bash -c 'echo should-not-write > /credentials/codex/write-test' 2>/tmp/codex-credential-write.err; then
-    fail 'credential bundle is writable'
-  fi
-  for path in /credentials/auth.json /input/auth.json /opt/data/auth.json; do
-    [[ ! -e "$path" ]] || fail "alternate credential material is visible: $path"
+consume_capability() {
+  local deadline fs mode temp_auth
+  fs=$(stat -f -c %T /dev/shm) || fail '/dev/shm is required'
+  [[ "$fs" == 'tmpfs' ]] || fail "/dev/shm must be tmpfs, found $fs"
+  install -d -m 0700 "$injection_dir"
+  deadline=$((SECONDS + credential_wait_seconds))
+  while [[ ! -f "$capability_path" ]]; do
+    (( SECONDS < deadline )) || fail 'timed out waiting for in-memory Codex credential injection'
+    sleep 0.1
   done
-  while IFS= read -r path; do
-    [[ "$path" == "$credential_bundle_path" ]] || fail "credential bundle is visible at unexpected path: $path"
-  done < <(mise exec -- find /credentials -xdev -type f -name auth.json -print)
-}
-
-prepare_codex_home() {
-  local filesystem_type mode
-  filesystem_type=$(mise exec -- stat -f -c %T /dev/shm) || fail '/dev/shm is required for tmpfs-only CODEX_HOME'
-  [[ "$filesystem_type" == 'tmpfs' ]] || fail "/dev/shm must be tmpfs, found $filesystem_type"
+  [[ ! -L "$capability_path" && "$(stat -c %a "$capability_path")" == 600 ]] ||
+    fail 'injected Codex auth.json must be a mode-0600 regular file'
   CODEX_HOME="${codex_home_base}-${AGENT_RUN_ID}"
   export CODEX_HOME
-  mise exec -- mkdir -p "$CODEX_HOME"
-  mise exec -- cp "$credential_bundle_path" "$CODEX_HOME/auth.json"
-  mise exec -- chmod 0600 "$CODEX_HOME/auth.json"
-  mode=$(mise exec -- stat -c %a "$CODEX_HOME/auth.json")
-  [[ "$mode" == 600 ]] || fail 'copied Codex credential bundle must have mode 0600'
+  install -d -m 0700 "$CODEX_HOME"
+  temp_auth="$CODEX_HOME/.auth.json.accepting"
+  install -m 0600 "$capability_path" "$temp_auth"
+  mv -f -- "$temp_auth" "$CODEX_HOME/auth.json"
+  rm -f -- "$capability_path"
+  : > "$acceptance_marker"
+  chmod 0600 "$acceptance_marker"
+  mode=$(stat -c %a "$CODEX_HOME/auth.json")
+  [[ "$mode" == 600 ]] || fail 'Codex auth.json must be mode 0600'
+  jq -e '.tokens.access_token | type == "string" and length > 0' "$CODEX_HOME/auth.json" >/dev/null ||
+    fail 'access token is missing'
+  jq -e '.tokens.refresh_token | type == "string" and . == ""' "$CODEX_HOME/auth.json" >/dev/null ||
+    fail 'refresh_token must be explicitly empty'
   export HOME="$CODEX_HOME/home"
-  mise exec -- mkdir -p "$HOME"
+  install -d -m 0700 "$HOME"
+  cat > "$CODEX_HOME/config.toml" <<EOF
+model = "$AGENT_MODEL"
+model_provider = "codex-subscription-relay"
+model_reasoning_effort = "$AGENT_REASONING_EFFORT"
+check_for_update_on_startup = false
+web_search = "disabled"
+
+[model_providers.codex-subscription-relay]
+name = "Broker-owned Codex subscription relay"
+base_url = "$CODEX_SUBSCRIPTION_RELAY_BASE_URL"
+wire_api = "responses"
+requires_openai_auth = true
+
+[features]
+web_search_request = false
+web_search_cached = false
+standalone_web_search = false
+enable_mcp_apps = false
+remote_plugin = false
+plugin_sharing = false
+runtime_metrics = false
+EOF
+  chmod 0600 "$CODEX_HOME/config.toml"
 }
 
-decode_access_token_payload() {
-  mise exec -- jq -er '.tokens.access_token | select(type == "string" and length > 0) | split(".") | if length == 3 then .[1] else error("access token is not a JWT") end | gsub("-"; "+") | gsub("_"; "/") | . + ("=" * ((4 - (length % 4)) % 4)) | @base64d' "$1"
-}
-
-validate_access_token_expiry() {
-  local payload exp now issued_at refresh_token
-  refresh_token=$(mise exec -- jq -er '.tokens.refresh_token | if type == "string" and . == "" then . else error("refresh token must be present and empty") end' "$CODEX_HOME/auth.json") || fail 'credential bundle must be access-token-only with an empty refresh token'
-  payload=$(decode_access_token_payload "$CODEX_HOME/auth.json") || fail 'credential bundle does not contain a decodable access token'
-  exp=$(printf '%s' "$payload" | mise exec -- jq -er '.exp | if type == "number" and floor == . then . else error("JWT exp must be an integer") end') || fail 'access token JWT is missing a valid exp claim'
-  issued_at=$(printf '%s' "$payload" | mise exec -- jq -er 'if .iat == null then empty elif (.iat | type) == "number" and (.iat | floor) == .iat then .iat else error("JWT iat must be an integer") end') || fail 'access token JWT has an invalid iat claim'
-  now=$(mise exec -- date +%s)
-  (( exp > now + token_expiry_margin_seconds )) || fail 'access token is expired or expires too soon to start work'
-  printf 'Codex access token current time: %s\n' "$(mise exec -- date -u -d "@$now" '+%Y-%m-%dT%H:%M:%SZ')"
-  printf 'Codex access token expiration: %s\n' "$(mise exec -- date -u -d "@$exp" '+%Y-%m-%dT%H:%M:%SZ')"
-  if [[ -n "$issued_at" ]]; then
-    printf 'Codex access token issued at: %s\n' "$(mise exec -- date -u -d "@$issued_at" '+%Y-%m-%dT%H:%M:%SZ')"
-  fi
-}
-
-load_prompt() {
-  local supplied=0
-  [[ -n "${AGENT_CODEX_PROMPT:-}" ]] && ((supplied += 1))
-  [[ -n "${AGENT_CODEX_PROMPT_FILE:-}" ]] && ((supplied += 1))
-  (( supplied == 1 )) || fail 'set exactly one of AGENT_CODEX_PROMPT or AGENT_CODEX_PROMPT_FILE'
-  if [[ -n "${AGENT_CODEX_PROMPT_FILE:-}" ]]; then
-    [[ -f "$AGENT_CODEX_PROMPT_FILE" ]] || fail 'AGENT_CODEX_PROMPT_FILE must name a readable regular file'
-    codex_task_prompt=$(mise exec -- cat "$AGENT_CODEX_PROMPT_FILE")
-  else
-    codex_task_prompt="$AGENT_CODEX_PROMPT"
-  fi
-  [[ -n "$codex_task_prompt" ]] || fail 'Codex task prompt must not be empty'
-}
-
-# publish-agent-image.yml records these gitlinks as
-# "submodule <sha> <path>" in dependency-manifest.inputs.  Comparing the
-# resulting manifest before copying from the image proves the baked content was
-# built for the same submodule pointers as this checkout.
-has_submodules() {
-  local entry metadata
-  while IFS= read -r -d '' entry; do
-    metadata="${entry%%$'\t'*}"
-    [[ "${metadata%% *}" == '160000' ]] && return 0
-  done < <(mise exec -- git ls-files --stage -z)
-  return 1
-}
-
-collect_submodule_manifest_entries() {
-  local entry metadata path mode sha
-  while IFS= read -r -d '' entry; do
-    metadata="${entry%%$'\t'*}"
-    path="${entry#*$'\t'}"
-    mode="${metadata%% *}"
-    [[ "$mode" == '160000' ]] || continue
-    sha="${metadata#* }"
-    sha="${sha%% *}"
-    printf 'submodule %s %s\n' "$sha" "$path"
-  done < <(mise exec -- git ls-files --stage -z)
-}
-
-hydrate_baked_submodules() {
-  local entry metadata path mode baked_path
-  while IFS= read -r -d '' entry; do
-    metadata="${entry%%$'\t'*}"
-    path="${entry#*$'\t'}"
-    mode="${metadata%% *}"
-    [[ "$mode" == '160000' ]] || continue
-    [[ "$path" != /* && "$path" != *'..'* ]] || fail "invalid submodule path in checkout: $path"
-    baked_path="$baked_workspace_path/$path"
-    if [[ ! -d "$baked_path" ]]; then
-      manifest_status="mismatch: baked submodule content is missing at $baked_path"
-      fail "baked submodule content is missing for $path"
-    fi
-    mise exec -- rm -rf -- "$path"
-    mise exec -- mkdir -p "$path"
-    mise exec -- cp -a "$baked_path/." "$path/"
-  done < <(mise exec -- git ls-files --stage -z)
-}
-
-collect_lockfiles() {
-  local path
-  lockfiles=()
-  while IFS= read -r path; do
-    case "$path" in
-      package-lock.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|uv.lock|poetry.lock|Pipfile.lock|go.sum|Cargo.lock|Gemfile.lock|requirements*.txt) lockfiles+=("$path") ;;
-      */*lock*|*lock*.json|*lock*.yaml|*lock*.yml|*Lock*|*requirements*.txt) fail "unsupported dependency lockfile: $path; extend publish-agent-image.yml before using this worker" ;;
-    esac
-  done < <(mise exec -- git ls-files)
-}
-
-compute_dependency_manifest() {
-  local manifest_file
-  collect_lockfiles
-  manifest_files=()
-  for manifest_file in package.json go.mod pyproject.toml Cargo.toml; do
-    mise exec -- git ls-files --error-unmatch -- "$manifest_file" >/dev/null 2>&1 && manifest_files+=("$manifest_file")
-  done
+build_prompt() {
   {
-    mise exec -- sha256sum mise.toml
-    for manifest_file in "${lockfiles[@]}"; do mise exec -- sha256sum "$manifest_file"; done
-    for manifest_file in "${manifest_files[@]}"; do mise exec -- sha256sum "$manifest_file"; done
-    collect_submodule_manifest_entries
-  } | LC_ALL=C mise exec -- sort | mise exec -- sha256sum | {
-    IFS=' ' read -r manifest_sha _
-    printf '%s\n' "$manifest_sha"
-  }
+    printf '# Implementation Task\n\n'
+    cat /input/task.md
+    printf '\n# Authoritative Issue Context\n\n'
+    cat /work/prepared/issue-context.md
+    printf '\n# Execution Contract\n\n'
+    printf '%s\n' '- Work only in this prepared repository checkout.'
+    printf '%s\n' '- Keep the diff focused on the requested issue.'
+    printf '%s\n' '- Do not read, print, or store credentials or authorization headers.'
+    printf '%s\n' '- Do not push, create a pull request, or contact GitHub directly; the wrapper owns delivery.'
+    printf '%s\n' '- Web search, plugins, MCP, updates, analytics, and general internet are disabled.'
+  } > /dev/shm/codex-prompt.md
 }
 
-check_dependency_manifest() {
-  local baked_manifest current_manifest
-  manifest_status='missing baked manifest'
-  [[ -f "$dependency_manifest_path" ]] || return
-  IFS= read -r baked_manifest < "$dependency_manifest_path" || true
-  [[ "$baked_manifest" =~ ^[a-fA-F0-9]{64}$ ]] || fail "invalid baked dependency manifest hash: $dependency_manifest_path"
-  current_manifest=$(compute_dependency_manifest)
-  if [[ "$current_manifest" == "$baked_manifest" ]]; then
-    manifest_status='match'
-    hydrate_baked_submodules
-    printf 'manifest match, using baked dependencies\n' | mise exec -- tee "$dependency_manifest_output_path"
-    return
-  fi
-  manifest_status="mismatch: baked=$baked_manifest checkout=$current_manifest"
-  if has_submodules; then
-    fail 'baked submodule SHA does not match the checkout; rebuild the agent image before running this worker'
-  fi
-}
-
-install_repository_dependencies() {
-  local lockfile package_locks=0
-  collect_lockfiles
-  mise trust --yes mise.toml
-  mise install --yes
-  for lockfile in package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb; do [[ -f "$lockfile" ]] && ((package_locks += 1)); done
-  (( package_locks <= 1 )) || fail 'more than one JavaScript lockfile is present'
-  if [[ -f package-lock.json ]]; then
-    [[ -f package.json ]] || fail 'package-lock.json requires package.json'; mise exec -- npm ci
-  elif [[ -f pnpm-lock.yaml ]]; then
-    [[ -f package.json ]] || fail 'pnpm-lock.yaml requires package.json'; mise exec -- corepack pnpm install --frozen-lockfile
-  elif [[ -f bun.lock || -f bun.lockb ]]; then
-    [[ -f package.json ]] || fail 'bun lockfiles require package.json'; mise exec -- bun install --frozen-lockfile
-  elif [[ -f yarn.lock ]]; then
-    fail 'yarn.lock is not supported by publish-agent-image.yml'
-  fi
-  if [[ -f uv.lock ]]; then [[ -f pyproject.toml ]] || fail 'uv.lock requires pyproject.toml'; mise exec -- uv sync --frozen --no-install-project; fi
-  [[ ! -f poetry.lock && ! -f Pipfile.lock && ! -f Gemfile.lock ]] || fail 'unsupported dependency manager lockfile'
-  for lockfile in "${lockfiles[@]}"; do
-    [[ "$lockfile" == requirements*.txt ]] || continue
-    mise exec -- grep -Eq -- '--hash=' "$lockfile" || fail "$lockfile must use pip hashes"
-    mise exec -- python -m pip install --require-hashes -r "$lockfile"
-  done
-  if [[ -f go.sum ]]; then [[ -f go.mod ]] || fail 'go.sum requires go.mod'; mise exec -- go mod download; fi
-  if [[ -f Cargo.lock ]]; then [[ -f Cargo.toml ]] || fail 'Cargo.lock requires Cargo.toml'; mise exec -- cargo fetch --locked; fi
+extract_usage() {
+  local events=$1 size
+  size=$(stat -c %s "$events")
+  (( size <= codex_events_limit )) || fail 'Codex event stream exceeded bounded usage-processing limit'
+  jq -s '
+    [.. | objects | select(has("usage")) | .usage] | last //
+    {input_tokens:0,cached_input_tokens:0,output_tokens:0,status:"not_reported"} |
+    with_entries(select(.key == "input_tokens" or .key == "cached_input_tokens" or
+      .key == "output_tokens" or .key == "status"))
+  ' "$events" > /output/codex-usage.json
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-require_env BROKER_URL
-require_env AGENT_REPO
-require_env AGENT_BASE_BRANCH
-require_env AGENT_RUN_ID
-AGENT_BRANCH="agent/contributor/${AGENT_RUN_ID}"
-export AGENT_BRANCH
-validate_inputs
-mise exec -- mkdir -p /work/repo /output
-trap on_exit EXIT
+  for name in BROKER_URL AGENT_REPO AGENT_BASE_BRANCH AGENT_BRANCH AGENT_RUN_ID \
+    AGENT_MODEL AGENT_REASONING_EFFORT AGENT_MODEL_POLICY_VERSION AGENT_CODEX_VERSION; do require_env "$name"; done
+  trap on_exit EXIT
+  validate_inputs
+  validate_preparation
+  consume_capability
+  build_prompt
+  export CODEX_DISABLE_ANALYTICS=1 DO_NOT_TRACK=1
+  unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
 
-stage='credential safety checks'
-validate_credential_sources
-load_prompt
+  stage='Codex repository task'
+  codex exec \
+    --ephemeral \
+    --json \
+    --model "$AGENT_MODEL" \
+    -c "model_reasoning_effort=\"$AGENT_REASONING_EFFORT\"" \
+    --dangerously-bypass-approvals-and-sandbox \
+    --skip-git-repo-check \
+    -C /work/repo \
+    -o /output/codex-final.txt \
+    "$(cat /dev/shm/codex-prompt.md)" \
+    > /dev/shm/codex-events.jsonl \
+    2> /dev/shm/codex-stderr.log
+  stage='Codex final output validation'
+  if [[ ! -f /output/codex-final.txt ]]; then
+    stage='Codex final output missing'
+    fail 'Codex final output is missing'
+  fi
+  final_size=$(stat -c %s /output/codex-final.txt)
+  if (( final_size == 0 )); then
+    stage='Codex final output missing'
+    fail 'Codex final output is empty'
+  fi
+  (( final_size <= final_output_limit )) || {
+    stage='Codex final output oversized'
+    rm -f /output/codex-final.txt
+    fail "Codex final output exceeds ${final_output_limit}-byte complete-output limit"
+  }
+  stage='bounded usage extraction'
+  extract_usage /dev/shm/codex-events.jsonl
+  rm -f /dev/shm/codex-events.jsonl /dev/shm/codex-stderr.log /dev/shm/codex-prompt.md
 
-stage='broker health check'
-mise exec -- /usr/local/bin/gh-agent-broker-cli health -broker "$BROKER_URL" > /output/broker-health.txt
-mise exec -- /usr/local/bin/gh-agent-broker-cli probe -broker "$BROKER_URL" -repo "$AGENT_REPO" > /output/broker-repo-probe.json
+  if [[ -n "${AGENT_VERIFY_TASK:-}" ]]; then
+    stage='repository verification task'
+    mise run "$AGENT_VERIFY_TASK" > /output/verify.txt 2>&1
+    verification_status='passed'
+  fi
 
-stage='broker-mediated checkout'
-cd /work/repo
-mise exec -- git init --quiet
-mise exec -- git check-ref-format --branch "$AGENT_BASE_BRANCH" >/dev/null || fail 'AGENT_BASE_BRANCH must be a valid Git branch name'
-mise exec -- git remote add origin placeholder
-mise exec -- /usr/local/bin/gh-agent-broker-cli configure -broker "$BROKER_URL" -repo "$AGENT_REPO" -remote origin > /output/broker-remote.txt
-mise exec -- git fetch --quiet origin "$AGENT_BASE_BRANCH"
-mise exec -- git checkout --quiet -B "$AGENT_BRANCH" FETCH_HEAD
-mise exec -- git config user.name "${GIT_AUTHOR_NAME:-Codex Repository Task Worker}"
-mise exec -- git config user.email "${GIT_AUTHOR_EMAIL:-codex-repo-task-worker@users.noreply.github.com}"
+  cd /work/repo
+  stage='change detection'
+  if git diff --quiet && git diff --cached --quiet && [[ -z "$(git status --porcelain)" ]]; then
+    stage='completed without changes'
+    write_result no_change_required 'Codex determined that the issue requires no repository change'
+    cp /output/codex-final.txt /output/final-summary.md
+    exit 0
+  fi
 
-stage='dependency manifest check'
-check_dependency_manifest
-if [[ "$manifest_status" != 'match' ]]; then
-  printf 'DEPENDENCY MANIFEST %s\n' "$manifest_status" | mise exec -- tee "$dependency_manifest_output_path"
-  stage='dependency installation after manifest mismatch'
-  install_repository_dependencies
-fi
+  stage='commit and push'
+  git add --all
+  git commit --quiet -m "Implement Codex issue task ${AGENT_RUN_ID}"
+  git push --quiet origin "HEAD:${AGENT_BRANCH}"
 
-stage='Codex credential preparation'
-prepare_codex_home
-validate_access_token_expiry
-
-stage='Codex repository task'
-codex_prompt=$(printf '%s\n\n%s\n' "$codex_task_prompt" '- Work only in this repository checkout.
-- Keep the diff focused on the requested work.
-- Do not read, print, or store credentials or authorization headers.
-- Do not push, create a pull request, or contact GitHub directly; the wrapper owns all broker-mediated actions.')
-mise exec -- codex exec \
-  --ephemeral \
-  --dangerously-bypass-approvals-and-sandbox \
-  --skip-git-repo-check \
-  -C /work/repo \
-  -o /output/codex-final.txt \
-  "$codex_prompt" \
-  > /output/codex-events.jsonl
-
-if [[ -n "${AGENT_VERIFY_TASK:-}" ]]; then
-  stage='repository verification task'
-  mise run "$AGENT_VERIFY_TASK" > /output/verify.txt 2>&1
-  verification_status='passed'
-fi
-
-stage='change detection'
-if mise exec -- git diff --quiet && mise exec -- git diff --cached --quiet && [[ -z "$(mise exec -- git status --porcelain)" ]]; then
-  fail 'Codex completed without a repository change'
-fi
-
-stage='commit and push'
-mise exec -- git add --all
-mise exec -- git commit --quiet -m "Implement Codex repository task ${AGENT_RUN_ID}"
-mise exec -- git push --quiet origin "HEAD:${AGENT_BRANCH}"
-
-stage='pull request creation'
-pr_title="${AGENT_PR_TITLE:-Codex repository task}"
-pr_body="${AGENT_PR_BODY:-Codex repository task completed for run ${AGENT_RUN_ID}.}"
-mise exec -- /usr/local/bin/gh-agent-broker-cli pr -broker "$BROKER_URL" -repo "$AGENT_REPO" -title "$pr_title" -head "$AGENT_BRANCH" -base "$AGENT_BASE_BRANCH" -body "$pr_body" \
-  -metadata "Agent-Id=${BROKER_AGENT_ID:?BROKER_AGENT_ID is required for pull request metadata}" -metadata "Run-Id=${AGENT_RUN_ID}" > /output/pull-request.json
-
-stage='pull request result validation'
-pull_request=$(read_pull_request) || fail 'broker pull request response did not contain a valid pull request identity'
-
-stage='completed'
-write_result ready_for_review 'Codex changed the repository and a pull request was created' "$pull_request"
-printf 'Codex repository task completed on %s and opened a ready-for-review pull request.\n' "$AGENT_BRANCH" > /output/final-summary.md
+  stage='pull request creation'
+  pr_title="${AGENT_PR_TITLE:-Codex issue implementation}"
+  pr_body="${AGENT_PR_BODY:-Codex issue task completed for run ${AGENT_RUN_ID}.}"
+  gh-agent-broker-cli pr -broker "$BROKER_URL" -repo "$AGENT_REPO" -title "$pr_title" \
+    -head "$AGENT_BRANCH" -base "$AGENT_BASE_BRANCH" -body "$pr_body" \
+    -metadata "Agent-Id=${BROKER_AGENT_ID:?BROKER_AGENT_ID is required}" \
+    -metadata "Run-Id=${AGENT_RUN_ID}" > /output/pull-request.json
+  pull_request=$(read_pull_request) || fail 'broker pull request response is invalid'
+  stage='completed'
+  write_result ready_for_review 'Codex changed the repository and opened a ready-for-review pull request' "$pull_request"
+  cp /output/codex-final.txt /output/final-summary.md
 fi

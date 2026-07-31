@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"gh-agent-broker/internal/codexauth"
 	"gh-agent-broker/internal/sandbox"
 	"gh-agent-broker/internal/server"
 
@@ -95,6 +96,16 @@ func runServerCommand(args []string) {
 		}
 	}()
 	service := sandbox.NewServiceWithLaunchIntents(cfg, sandbox.NewDockerBackend(*dockerSocket), auditLog, intentStore)
+	if cfg.CodexHolder.MasterAuthPath != "" {
+		holder, holderErr := codexauth.New(codexauth.Config{
+			MasterAuthPath: cfg.CodexHolder.MasterAuthPath,
+			IssuanceRoot:   cfg.CodexHolder.IssuanceRoot,
+		})
+		if holderErr != nil {
+			log.Fatalf("initialize Codex credential holder: %v", holderErr)
+		}
+		service.SetCodexCredentialIssuer(holder)
+	}
 	if err := service.Reconcile(context.Background()); err != nil {
 		log.Fatalf("reconcile runs: %v", err)
 	}

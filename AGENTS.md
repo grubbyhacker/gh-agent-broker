@@ -71,6 +71,7 @@ Build a GitHub Agent Access Broker that lets agent containers use GitHub App acc
 - `broker` on port `8080`: main REST and health API.
 - `issue-reporter` on port `8090` internal, published locally: MCP endpoint.
 - `gh-agent-proxy` on port `8092`: token proxy.
+- `codex-subscription-relay` on port `8093` internal: exact-path ChatGPT subscription relay.
 - `litellm` on port `4000` internal: model proxy.
 - `sandbox-broker`: sandbox orchestrator, production only.
 

@@ -62,6 +62,13 @@ type Service struct {
 	launchIntents       *LaunchIntentStore
 	intentLocksMu       sync.Mutex
 	intentLocks         map[string]*intentLock
+	codexIssuer         CodexCredentialIssuer
+}
+
+type CodexCredentialIssuer interface {
+	Issue(context.Context, string) ([]byte, error)
+	Consume(string) error
+	Cleanup(string) error
 }
 
 type intentLock struct {
@@ -83,35 +90,59 @@ type runtimeFileWriter interface {
 }
 
 type RunMetadata struct {
-	RunID                string         `json:"run_id"`
-	Profile              string         `json:"profile,omitempty"`
-	Principal            string         `json:"principal,omitempty"`
-	IdempotencyKeyDigest string         `json:"idempotency_key_digest,omitempty"`
-	RequestFingerprint   string         `json:"request_fingerprint,omitempty"`
-	LaunchConfigVersion  string         `json:"launch_config_version,omitempty"`
-	Template             string         `json:"template"`
-	Repo                 string         `json:"repo"`
-	BaseBranch           string         `json:"base_branch"`
-	Branch               string         `json:"branch"`
-	Task                 string         `json:"task"`
-	VerificationTask     string         `json:"verification_task,omitempty"`
-	Focus                string         `json:"focus,omitempty"`
-	WorkerAgentID        string         `json:"worker_agent_id"`
-	BrokerAgentID        string         `json:"broker_agent_id"`
-	CredentialBundle     string         `json:"credential_bundle,omitempty"`
-	ContainerID          string         `json:"container_id,omitempty"`
-	Image                string         `json:"image"`
-	ImageDigest          string         `json:"image_digest,omitempty"`
-	Status               string         `json:"status"`
-	ExitCode             *int           `json:"exit_code,omitempty"`
-	FinalizeReason       string         `json:"finalize_reason,omitempty"`
-	TerminalSource       string         `json:"terminal_source,omitempty"`
-	Error                string         `json:"error,omitempty"`
-	Deliverables         []string       `json:"deliverables,omitempty"`
-	Parameters           map[string]any `json:"parameters,omitempty"`
-	StartedAt            time.Time      `json:"started_at"`
-	Deadline             time.Time      `json:"deadline"`
-	EndedAt              time.Time      `json:"ended_at,omitempty"`
+	RunID                  string           `json:"run_id"`
+	Profile                string           `json:"profile,omitempty"`
+	Principal              string           `json:"principal,omitempty"`
+	IdempotencyKeyDigest   string           `json:"idempotency_key_digest,omitempty"`
+	RequestFingerprint     string           `json:"request_fingerprint,omitempty"`
+	LaunchConfigVersion    string           `json:"launch_config_version,omitempty"`
+	Template               string           `json:"template"`
+	Repo                   string           `json:"repo"`
+	BaseBranch             string           `json:"base_branch"`
+	Branch                 string           `json:"branch"`
+	Task                   string           `json:"task"`
+	VerificationTask       string           `json:"verification_task,omitempty"`
+	Focus                  string           `json:"focus,omitempty"`
+	WorkerAgentID          string           `json:"worker_agent_id"`
+	BrokerAgentID          string           `json:"broker_agent_id"`
+	CredentialBundle       string           `json:"credential_bundle,omitempty"`
+	ContainerID            string           `json:"container_id,omitempty"`
+	Image                  string           `json:"image"`
+	ImageDigest            string           `json:"image_digest,omitempty"`
+	Status                 string           `json:"status"`
+	ExitCode               *int             `json:"exit_code,omitempty"`
+	FinalizeReason         string           `json:"finalize_reason,omitempty"`
+	TerminalSource         string           `json:"terminal_source,omitempty"`
+	Error                  string           `json:"error,omitempty"`
+	Deliverables           []string         `json:"deliverables,omitempty"`
+	Parameters             map[string]any   `json:"parameters,omitempty"`
+	StartedAt              time.Time        `json:"started_at"`
+	Deadline               time.Time        `json:"deadline"`
+	EndedAt                time.Time        `json:"ended_at,omitempty"`
+	Phase                  string           `json:"phase,omitempty"`
+	PreparationContainerID string           `json:"preparation_container_id,omitempty"`
+	ExecutionContainerID   string           `json:"execution_container_id,omitempty"`
+	PreparationImageDigest string           `json:"preparation_image_digest,omitempty"`
+	PreparationPlatform    string           `json:"preparation_platform,omitempty"`
+	ExecutionPlatform      string           `json:"execution_platform,omitempty"`
+	PreparationStartedAt   time.Time        `json:"preparation_started_at,omitempty"`
+	PreparationEndedAt     time.Time        `json:"preparation_ended_at,omitempty"`
+	ExecutionStartedAt     time.Time        `json:"execution_started_at,omitempty"`
+	ExecutionEndedAt       time.Time        `json:"execution_ended_at,omitempty"`
+	Provenance             *CodexProvenance `json:"provenance,omitempty"`
+}
+
+type CodexProvenance struct {
+	ModelPolicy        string `json:"model_policy"`
+	ModelPolicyVersion string `json:"model_policy_version"`
+	Model              string `json:"model"`
+	Effort             string `json:"effort"`
+	CodexVersion       string `json:"codex_version"`
+	PromptRevision     string `json:"prompt_revision"`
+	WorkspaceHead      string `json:"workspace_head,omitempty"`
+	ManifestSHA256     string `json:"manifest_sha256,omitempty"`
+	IssueNumber        int    `json:"issue_number"`
+	SourceDeliveryID   string `json:"source_delivery_id"`
 }
 
 type TaskContract struct {
@@ -281,6 +312,10 @@ func NewServiceWithLaunchIntents(cfg Config, runtime RuntimeBackend, auditLog *A
 	}
 }
 
+func (s *Service) SetCodexCredentialIssuer(issuer CodexCredentialIssuer) {
+	s.codexIssuer = issuer
+}
+
 func (s *Service) Reconcile(ctx context.Context) error {
 	entries, err := os.ReadDir(s.cfg.RunsDir)
 	if err != nil {
@@ -301,12 +336,17 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		if err != nil {
 			continue
 		}
+		if meta.Provenance != nil && s.codexIssuer != nil {
+			if err := s.codexIssuer.Cleanup(meta.RunID); err != nil {
+				return fmt.Errorf("clean Codex issuance state while reconciling run %q: %w", meta.RunID, err)
+			}
+		}
 		if s.launchIntents != nil {
 			if err := s.launchIntents.RestoreMetadata(ctx, meta); err != nil {
 				return fmt.Errorf("reconstruct launch intent index from run %q: %w", meta.RunID, err)
 			}
 		}
-		if meta.ContainerID != "" && meta.Status == StatusRunning {
+		if meta.Provenance == nil && meta.ContainerID != "" && meta.Status == StatusRunning {
 			status, err := s.runtime.Inspect(ctx, meta.ContainerID)
 			if err != nil {
 				finalized, _, finalizeErr := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonReconcileMissing, terminalSourceStartupFailure, func(current RunMetadata) RunMetadata {
@@ -351,7 +391,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				return fmt.Errorf("inspect terminal result for run %q: %w", meta.RunID, err)
 			}
 		}
-		if meta.Status == StatusRunning {
+		if meta.Status == StatusRunning && meta.Provenance == nil {
 			durable := false
 			if s.launchIntents != nil {
 				durable, err = s.launchIntents.IsNonterminalRun(ctx, meta.RunID)
@@ -640,6 +680,23 @@ func (s *Service) LaunchProfile(ctx context.Context, principal, profile, rawKey,
 		Status: StatusPending, Deliverables: deliverables(in.Deliverables, tmpl.Deliverables),
 		Parameters: cloneParameters(in.Parameters), StartedAt: now, Deadline: now.Add(runtimeLimit),
 	}
+	if workflow := s.cfg.LaunchProfiles[profile].CodexIssueWorkflow; workflow != nil {
+		mapping := s.cfg.ModelPolicies[workflow.ModelPolicy].Mappings[workflow.ModelProfile]
+		issueNumber := 0
+		if value, ok := integerValue(meta.Parameters["issue_number"]); ok {
+			issueNumber = value
+		}
+		sourceDeliveryID := ""
+		if value, ok := meta.Parameters["source_delivery_id"].(string); ok {
+			sourceDeliveryID = value
+		}
+		meta.Phase = codexPhasePreparationCreate
+		meta.Provenance = &CodexProvenance{
+			ModelPolicy: workflow.ModelPolicy, ModelPolicyVersion: s.cfg.ModelPolicies[workflow.ModelPolicy].Version,
+			Model: mapping.Model, Effort: mapping.Effort, CodexVersion: "0.146.0",
+			PromptRevision: workflow.PromptRevision, IssueNumber: issueNumber, SourceDeliveryID: sourceDeliveryID,
+		}
+	}
 	if err := s.validateTaskContract(s.taskContract(meta)); err != nil {
 		return LaunchAgentOutput{}, &launchValidationError{err: err}
 	}
@@ -688,6 +745,9 @@ func (s *Service) resumeLaunchIntent(ctx context.Context, intent *launchIntent, 
 		return LaunchAgentOutput{}, fmt.Errorf("launch intent config version mismatch")
 	}
 	meta := intent.Metadata
+	if profile, ok := s.cfg.LaunchProfiles[intent.Profile]; ok && profile.CodexIssueWorkflow != nil {
+		return s.resumeCodexIssueWorkflow(ctx, intent, profile, recovering)
+	}
 	if isTerminalStatus(meta.Status) || intent.State == intentStateTerminal {
 		return launchOutput(meta), nil
 	}
@@ -979,7 +1039,7 @@ func (s *Service) GetAgentStatus(ctx context.Context, in RunInput) (StatusOutput
 	if err != nil {
 		return StatusOutput{}, err
 	}
-	if meta.ContainerID != "" && meta.Status == StatusRunning {
+	if meta.Provenance == nil && meta.ContainerID != "" && meta.Status == StatusRunning {
 		status, err := s.runtime.Inspect(ctx, meta.ContainerID)
 		if err == nil && status.Running && time.Now().UTC().After(meta.Deadline) {
 			finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonStatusPollDeadline, terminalSourceTimedOut, func(current RunMetadata) RunMetadata {
@@ -1006,6 +1066,9 @@ func (s *Service) GetAgentLogs(ctx context.Context, in LogsInput) (LogsOutput, e
 	meta, err := s.lookupRun(in.RunID)
 	if err != nil {
 		return LogsOutput{}, err
+	}
+	if meta.Provenance != nil {
+		return LogsOutput{}, fmt.Errorf("logs are unavailable for Codex issue workflow runs")
 	}
 	limit := in.MaxBytes
 	if limit <= 0 || limit > s.cfg.LogByteLimit {
@@ -1064,6 +1127,9 @@ func (s *Service) CollectArtifacts(ctx context.Context, in RunInput) (Collection
 	if err != nil {
 		return CollectionOutput{}, err
 	}
+	if meta.Provenance != nil {
+		return CollectionOutput{}, fmt.Errorf("arbitrary artifacts are unavailable for Codex issue workflow runs; use terminal_result")
+	}
 	return collectFiles(filepath.Join(s.runDir(meta.RunID), "output"), meta.RunID, s.redactor(meta), defaultInlineLimit)
 }
 
@@ -1072,6 +1138,9 @@ func (s *Service) CollectLessons(ctx context.Context, in RunInput) (CollectionOu
 	meta, err := s.lookupRun(in.RunID)
 	if err != nil {
 		return CollectionOutput{}, err
+	}
+	if meta.Provenance != nil {
+		return CollectionOutput{}, fmt.Errorf("lessons are unavailable for Codex issue workflow runs")
 	}
 	return collectFiles(filepath.Join(s.runDir(meta.RunID), "lessons"), meta.RunID, s.redactor(meta), defaultInlineLimit)
 }
@@ -1086,8 +1155,22 @@ func (s *Service) CleanupRun(ctx context.Context, in RunInput) (StatusOutput, er
 	if escapesBase(s.cfg.RunsDir, runDir) {
 		return StatusOutput{}, fmt.Errorf("run directory escapes runs_dir")
 	}
-	if meta.ContainerID != "" {
-		if err := s.runtime.Remove(ctx, meta.ContainerID); err != nil {
+	containerIDs := []string{meta.ContainerID}
+	if meta.Provenance != nil {
+		containerIDs = []string{meta.PreparationContainerID, meta.ExecutionContainerID}
+		if s.codexIssuer != nil {
+			if err := s.codexIssuer.Cleanup(meta.RunID); err != nil {
+				return StatusOutput{}, err
+			}
+		}
+	}
+	removed := map[string]bool{}
+	for _, containerID := range containerIDs {
+		if containerID == "" || removed[containerID] {
+			continue
+		}
+		removed[containerID] = true
+		if err := s.runtime.Remove(ctx, containerID); err != nil {
 			return StatusOutput{}, err
 		}
 	}
@@ -1235,17 +1318,19 @@ func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Red
 		mounts = append(mounts, Mount{Source: mount.SourcePath, Target: mount.MountPath, ReadOnly: mount.ReadOnly})
 	}
 	spec := RuntimeSpec{
-		RunID:      meta.RunID,
-		Image:      tmpl.Image,
-		Command:    tmpl.Command,
-		User:       tmpl.User,
-		Env:        env,
-		Labels:     labels,
-		Mounts:     mounts,
-		Network:    s.cfg.Networks[tmpl.NetworkPolicy],
-		Resources:  tmpl.Resources,
-		WorkingDir: "/work",
-		Timeout:    meta.Deadline.Sub(meta.StartedAt),
+		RunID:          meta.RunID,
+		Image:          tmpl.Image,
+		Command:        tmpl.Command,
+		User:           tmpl.User,
+		Env:            env,
+		Labels:         labels,
+		Mounts:         mounts,
+		Network:        s.cfg.Networks[tmpl.NetworkPolicy],
+		Resources:      tmpl.Resources,
+		WorkingDir:     "/work",
+		Timeout:        meta.Deadline.Sub(meta.StartedAt),
+		Tmpfs:          tmpl.Tmpfs,
+		StorageLimitMB: tmpl.StorageLimitMB,
 	}
 	return spec, redactor, nil
 }
@@ -1600,6 +1685,11 @@ func (s *Service) finalizeTerminalRun(ctx context.Context, runID, reason, source
 	}
 	source = terminalSourceForStatus(next.Status, source)
 	next.TerminalSource = source
+	if next.Provenance != nil && s.codexIssuer != nil {
+		if err := s.codexIssuer.Cleanup(next.RunID); err != nil {
+			return next, false, fmt.Errorf("clean terminal Codex issuance state: %w", err)
+		}
+	}
 	if err := s.persistTerminalResult(next); err != nil {
 		return next, false, fmt.Errorf("preserve terminal result: %w", err)
 	}
@@ -1700,6 +1790,9 @@ func (s *Service) workerFailureMessage(ctx context.Context, meta RunMetadata, st
 		}
 	}
 	if meta.ContainerID == "" {
+		return message
+	}
+	if meta.Provenance != nil {
 		return message
 	}
 	logs, err := s.runtime.Logs(ctx, meta.ContainerID, 2048)

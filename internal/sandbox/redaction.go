@@ -94,4 +94,5 @@ var redactionPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(authorization:\s*(?:bearer|token)?\s+)[^\s]+`),
 	regexp.MustCompile(`(?i)((?:bearer|token)\s+)[A-Za-z0-9._~+/=-]+`),
 	regexp.MustCompile(`(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)\s*[:=]\s*)[^\s]+`),
+	regexp.MustCompile(`()(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+)`),
 }
