@@ -13,6 +13,7 @@ readonly codex_events_limit=$((8 * 1024 * 1024))
 readonly execution_diff_limit=$((8 * 1024 * 1024))
 readonly verification_output_limit=$((1024 * 1024))
 readonly final_output_limit="${AGENT_FINAL_OUTPUT_LIMIT:-32768}"
+readonly failure_diagnostic_limit=4096
 readonly repo_path='/work/repo'
 readonly execution_path='/work/execution'
 readonly output_path='/output'
@@ -34,6 +35,7 @@ purge_failed=0
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
 security_fail() { contamination_detected=1; fail "$@"; }
 require_env() { [[ -n "${!1:-}" ]] || fail "missing required environment variable: $1"; }
+file_size() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
 execution_git() {
   env -i PATH="$PATH" HOME=/nonexistent LANG=C LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
     GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_OPTIONAL_LOCKS=0 \
@@ -147,13 +149,13 @@ on_exit() {
   if (( status != 0 && (contamination_detected != 0 || scan_incomplete != 0) )); then
     if (( contamination_detected != 0 )); then
       if record_scan_failure contamination; then
-        printf '%s: exact access-token contamination blocked; disposable host-backed artifacts purged\n' "$worker_name" >&2
+        printf '%s: exact task-credential contamination blocked; disposable host-backed artifacts purged\n' "$worker_name" >&2
       else
         printf '%s: credential contamination cleanup could not be verified; run remains blocked\n' "$worker_name" >&2
       fi
     else
       if record_scan_failure incomplete; then
-        printf '%s: access-token scan incomplete; disposable host-backed artifacts purged\n' "$worker_name" >&2
+        printf '%s: task-credential scan incomplete; disposable host-backed artifacts purged\n' "$worker_name" >&2
       else
         printf '%s: credential contamination cleanup could not be verified; run remains blocked\n' "$worker_name" >&2
       fi
@@ -228,14 +230,16 @@ consume_capability() {
   chmod 0600 "$acceptance_marker"
   jq -e '.tokens.access_token | type == "string" and length > 0' "$CODEX_HOME/auth.json" >/dev/null ||
     fail 'access token is missing'
+  jq -e '.tokens.id_token | type == "string" and length > 0' "$CODEX_HOME/auth.json" >/dev/null ||
+    fail 'ID token is missing'
   jq -e '.tokens.refresh_token | type == "string" and . == ""' "$CODEX_HOME/auth.json" >/dev/null ||
     fail 'refresh_token must be explicitly empty'
   scan_dir="${scan_base}-${AGENT_RUN_ID}"
   install -d -m 0700 "$scan_dir"
-  jq -er '.tokens.access_token' "$CODEX_HOME/auth.json" > "$scan_dir/access-token.pattern"
-  chmod 0400 "$scan_dir/access-token.pattern"
-  exec 9< "$scan_dir/access-token.pattern"
-  rm -f -- "$scan_dir/access-token.pattern"
+  jq -er '.tokens | .access_token, .id_token' "$CODEX_HOME/auth.json" > "$scan_dir/task-credentials.pattern"
+  chmod 0400 "$scan_dir/task-credentials.pattern"
+  exec 9< "$scan_dir/task-credentials.pattern"
+  rm -f -- "$scan_dir/task-credentials.pattern"
   token_pattern_file="/proc/$$/fd/9"
   export CODEX_HOME HOME="$CODEX_HOME/home"
   install -d -m 0700 "$HOME"
@@ -294,7 +298,7 @@ scan_for_token_contamination() {
   local path oid type grep_status
   local found=0 incomplete=0
   local scan_work host_paths git_objects git_object_contents result=0
-  stage='exact access-token contamination scan'
+  stage='exact task-credential contamination scan'
   [[ -r "$token_pattern_file" ]] || return 2
   scan_work=$(mktemp -d "$scan_dir/pass.XXXXXX") || return 2
   host_paths="$scan_work/host-paths"
@@ -392,12 +396,12 @@ require_clean_token_scan() {
   if (( scan_status == 1 )); then
     contamination_detected=1
     record_scan_failure contamination || true
-    fail 'exact access token detected in Codex-controlled work or output'
+    fail 'exact task credential detected in Codex-controlled work or output'
   fi
   if (( scan_status != 0 )); then
     scan_incomplete=1
     record_scan_failure incomplete || true
-    fail 'access-token scan was incomplete'
+    fail 'task-credential scan was incomplete'
   fi
 }
 
@@ -412,11 +416,68 @@ invoke_validation() {
   (cd "$repo_path" && mise run "$AGENT_VERIFY_TASK") > "$execution_path/verify.txt" 2>&1
 }
 
+write_codex_failure_diagnostic() {
+  local codex_status=$1 failure_events_path=$2 failure_stderr_path=$3 failure_path=$4
+  local diagnostic='' diagnostic_size=0 source='none'
+  local events_size=0 stderr_size=0 events_sha stderr_sha result_temp
+  mkdir -p "$(dirname "$failure_path")"
+  result_temp="${failure_path}.tmp"
+  [[ ! -e "$failure_events_path" ]] || events_size=$(file_size "$failure_events_path")
+  [[ ! -e "$failure_stderr_path" ]] || stderr_size=$(file_size "$failure_stderr_path")
+  events_sha=$(sha256sum "$failure_events_path" 2>/dev/null | cut -d' ' -f1 || true)
+  stderr_sha=$(sha256sum "$failure_stderr_path" 2>/dev/null | cut -d' ' -f1 || true)
+  if (( events_size <= codex_events_limit )) && [[ -s "$failure_events_path" ]]; then
+    diagnostic=$(jq -jrs '
+      [ .[] |
+        if .type == "turn.failed" then .error.message?
+        elif .type == "error" then (.message? // .error.message?)
+        else empty end |
+        select(type == "string" and length > 0)
+      ] | last // empty
+    ' "$failure_events_path" 2>/dev/null || true)
+    if [[ -n "$diagnostic" ]]; then source='event'; fi
+  fi
+  if [[ -z "$diagnostic" && -s "$failure_stderr_path" ]] &&
+    (( stderr_size <= failure_diagnostic_limit )) &&
+    iconv -f UTF-8 -t UTF-8 "$failure_stderr_path" >/dev/null 2>&1; then
+    diagnostic=$(sed -e 's/[[:space:]]*$//' "$failure_stderr_path")
+    if [[ -n "$diagnostic" ]]; then source='stderr'; fi
+  fi
+  diagnostic_size=$(printf '%s' "$diagnostic" | wc -c)
+  if (( diagnostic_size > failure_diagnostic_limit )); then
+    diagnostic='Codex emitted an operational failure diagnostic that exceeded the complete-output bound'
+    source='oversize'
+  elif [[ -z "$diagnostic" ]]; then
+    if (( events_size > codex_events_limit || stderr_size > failure_diagnostic_limit )); then
+      diagnostic='Codex failure output exceeded its complete-output bound'
+      source='oversize'
+    else
+      diagnostic='Codex exited without a usable operational failure diagnostic'
+    fi
+  fi
+  jq -n --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" \
+    --arg source "$source" --arg diagnostic "$diagnostic" --arg events_sha "$events_sha" \
+    --arg stderr_sha "$stderr_sha" --argjson exit_code "$codex_status" \
+    --argjson events_size "$events_size" --argjson stderr_size "$stderr_size" \
+    '{version:"codex-execution-failure/v1",status:"failed",run_id:$run,repository:$repo,
+      branch:$branch,stage:"codex",exit_code:$exit_code,diagnostic_source:$source,
+      diagnostic:$diagnostic,events_size_bytes:$events_size,events_sha256:$events_sha,
+      stderr_size_bytes:$stderr_size,stderr_sha256:$stderr_sha}' > "$result_temp"
+  (( $(file_size "$result_temp") <= 8192 )) || fail 'Codex failure projection exceeded bound'
+  mv -f -- "$result_temp" "$failure_path"
+  chmod 0444 "$failure_path"
+}
+
 run_codex_and_scan() {
   local codex_status=0
   invoke_codex || codex_status=$?
   require_clean_token_scan
-  (( codex_status == 0 )) || fail "Codex repository task exited with status ${codex_status}"
+  if (( codex_status != 0 )); then
+    write_codex_failure_diagnostic "$codex_status" "$events_path" "$stderr_path" \
+      "$execution_path/execution-failure.json"
+    require_clean_token_scan
+    fail "Codex repository task exited with status ${codex_status}"
+  fi
 }
 
 run_validation_and_scan() {

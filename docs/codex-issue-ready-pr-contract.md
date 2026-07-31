@@ -127,12 +127,12 @@ URL. It invokes Codex exactly once. After Codex exits, HEAD, refs, and commit
 objects must be unchanged. With no broker authority present, the worker runs
 the required reviewed validation task, then creates a bounded binary diff,
 bounded validation output, bounded final output, and a bounded execution result
-containing their digests and the prepared HEAD. It performs exact access-token
+containing their digests and the prepared HEAD. It performs exact task-credential
 contamination scanning before publishing those artifacts. Codex and validation
 exit statuses are captured explicitly: their scans always complete before a
 nonzero status is acted upon.
 
-The execution worker keeps an exact access-token match pattern only in
+The execution worker keeps exact ID- and access-token match patterns only in
 `/dev/shm`. It scans Codex-controlled paths, file and symlink contents, Git
 objects, final output, events, stderr, and the bounded diff without emitting
 matched content. Once the token descriptor exists, the EXIT trap attempts the
@@ -177,9 +177,12 @@ posts refresh requests only to `https://auth.openai.com/oauth/token`, with the
 reviewed Codex 0.146.0 client ID compiled into the broker.
 
 Run admission never refreshes credentials. `Holder.Issue` only projects the
-current persisted `access_token` and `account_id` into an access-only in-memory
-bundle with an empty refresh token. Distinct runs admitted between maintenance
-refreshes therefore receive the same current access token. Token-free durable
+current persisted `id_token`, `access_token`, and `account_id` into an
+access-only in-memory bundle with an explicitly empty refresh token. Codex
+0.146.0 requires the identity token field when loading ChatGPT auth, but the
+task bundle still contains no refresh capability. Distinct runs admitted
+between maintenance refreshes therefore receive the same current access
+fields. Token-free durable
 issuance state contains only run ID, idempotency key digest, issued time, and
 consumed time; it has no OAuth host, token lineage, or Codex-version credential
 semantics. Codex version remains ordinary execution provenance.
@@ -245,6 +248,10 @@ policy/version, resolved model/effort, Codex version, prompt revision, observed
 image digest/platform, workspace HEAD/manifest identity, issue/source IDs,
 phase timings, run/profile, verification task/result, bounded token counts,
 branch, and validated PR identity. It never contains prompts, event streams,
-credentials, or hidden reasoning. Codex JSON events exist only temporarily on
-execution tmpfs and are removed after bounded usage extraction. Logs and
-arbitrary artifact endpoints are disabled for these runs.
+credentials, or hidden reasoning. Codex JSON events and stderr exist only
+temporarily on execution tmpfs. On a nonzero Codex exit, the worker first scans
+all host-backed artifacts and both raw streams for the task-local ID and access
+tokens, then persists only one bounded operational error projection with its
+source, byte counts, and SHA-256 digests. The raw streams are removed on
+termination. Logs and arbitrary artifact endpoints are disabled for these
+runs.

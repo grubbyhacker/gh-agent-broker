@@ -276,7 +276,7 @@ func TestCodexContaminationFailureReportsPurgeInsteadOfMissingOutput(t *testing.
 	}
 
 	got := service.projectTerminalResult(meta)
-	if got.FailureReason != "exact access-token contamination detected; disposable execution artifacts were purged" ||
+	if got.FailureReason != "exact task-credential contamination detected; disposable execution artifacts were purged" ||
 		got.FinalSummary != "" {
 		t.Fatalf("Codex contamination projection = %+v", got)
 	}

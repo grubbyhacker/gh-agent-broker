@@ -193,7 +193,7 @@ func TestDockerInjectSecretStreamsOnlyOnExecStdinAfterContainerStart(t *testing.
 			}
 		})},
 	}
-	bundle := `{"tokens":{"access_token":"access-only","refresh_token":""}}`
+	bundle := `{"tokens":{"id_token":"identity-only","access_token":"access-only","refresh_token":""}}`
 	if err := backend.InjectSecret(context.Background(), "container-id", codexInjectionDir, codexInjectionName, []byte(bundle)); err != nil {
 		t.Fatal(err)
 	}

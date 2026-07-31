@@ -195,9 +195,9 @@ func (s *Service) codexTokenScanFailure(meta RunMetadata) string {
 	}
 	switch string(marker) {
 	case "contamination\n":
-		return "exact access-token contamination detected; disposable execution artifacts were purged"
+		return "exact task-credential contamination detected; disposable execution artifacts were purged"
 	case "incomplete\n":
-		return "access-token scan was incomplete; disposable execution artifacts were purged"
+		return "task-credential scan was incomplete; disposable execution artifacts were purged"
 	default:
 		return ""
 	}
