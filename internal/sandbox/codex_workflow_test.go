@@ -34,7 +34,7 @@ func (f *fakeCodexIssuer) Issue(_ context.Context, _, _ string) ([]byte, error) 
 		return nil, errors.New("issuance already consumed")
 	}
 	f.issues++
-	return []byte(`{"tokens":{"access_token":"access-only","refresh_token":""}}`), nil
+	return []byte(`{"tokens":{"id_token":"identity-only","access_token":"access-only","refresh_token":""}}`), nil
 }
 
 func (f *fakeCodexIssuer) Consume(_ string) error {
@@ -240,6 +240,80 @@ func writeExecutionFixture(t *testing.T, cfg Config, runID, branch string) {
 		VerifySHA256: strings.Repeat("6", 64), Verification: "passed",
 		FinalSizeBytes: 10,
 	})
+}
+
+func writeExecutionFailureFixture(t *testing.T, cfg Config, runID, branch string, exitCode int, diagnostic string) {
+	t.Helper()
+	path := filepath.Join(cfg.RunsDir, runID, "work", "execution", "execution-failure.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFileForTest(t, path, executionFailure{
+		Version: "codex-execution-failure/v1", Status: "failed", RunID: runID,
+		Repository: "owner/repo", Branch: branch, Stage: "codex", ExitCode: exitCode,
+		DiagnosticSource: "stderr", Diagnostic: diagnostic,
+		EventsSizeBytes: 0, EventsSHA256: strings.Repeat("1", 64),
+		StderrSizeBytes: int64(len(diagnostic)), StderrSHA256: strings.Repeat("2", 64),
+	})
+}
+
+func TestCodexExecutionFailureProjectsBoundedOperationalDiagnostic(t *testing.T) {
+	cfg := codexWorkflowTestConfig(t)
+	cfg.ApplyDefaults()
+	cfg.StampLoaded(time.Now().UTC())
+	runtime := newFakeRuntime()
+	store, err := OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("close launch intent store: %v", closeErr)
+		}
+	})
+	service := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	issuer := &fakeCodexIssuer{}
+	service.SetCodexCredentialIssuer(issuer)
+	in := cfg.LaunchProfiles["terra-medium-v1"].LaunchAgentInput
+	in.Profile = "terra-medium-v1"
+	in.Parameters = map[string]any{"issue_number": 42, "source_delivery_id": "delivery-42"}
+	out, err := service.LaunchProfile(context.Background(), "signal-plane", "terra-medium-v1", "diagnostic", "fp", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writePreparationFixture(t, cfg, out.RunID, out.Branch)
+	runtime.finish(out.RunID+"-prep", 0, "")
+	waitFor(t, func() bool {
+		runtime.mu.Lock()
+		ready := len(runtime.specs) == 2 && runtime.started["container-"+out.RunID+"-exec"]
+		runtime.mu.Unlock()
+		issuer.mu.Lock()
+		consumed := issuer.consumes == 1
+		issuer.mu.Unlock()
+		return ready && consumed
+	})
+	diagnostic := "missing field `id_token` at line 1 column 67"
+	writeExecutionFailureFixture(t, cfg, out.RunID, out.Branch, 1, diagnostic)
+	runtime.finish(out.RunID+"-exec", 1, "raw runtime output must not be projected")
+	waitFor(t, func() bool {
+		_, terminalErr := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
+		return terminalErr == nil
+	})
+	terminal, err := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.Outcome != StatusFailed || terminal.FailureStage != "execution" ||
+		!strings.Contains(terminal.FailureReason, diagnostic) ||
+		strings.Contains(terminal.FailureReason, "raw runtime output") {
+		t.Fatalf("terminal=%+v", terminal)
+	}
+	runtime.mu.Lock()
+	specCount := len(runtime.specs)
+	runtime.mu.Unlock()
+	if specCount != 2 {
+		t.Fatalf("failed execution launched delivery; runtime specs=%d", specCount)
+	}
 }
 
 func TestCodexWorkflowReplayDoesNotDuplicatePreparation(t *testing.T) {

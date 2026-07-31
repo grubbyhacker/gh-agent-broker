@@ -45,7 +45,7 @@ run_failure_case() {
     printf '%s failure unexpectedly succeeded\n' "$phase" >&2
     exit 1
   fi
-  grep -F -q 'exact access token detected' "$log"
+  grep -F -q 'exact task credential detected' "$log"
   [[ "$(cat "$purge_output_root/codex-token-scan-failure")" == contamination ]]
   [[ ! -e "$test_root/delivery-launched" ]]
   if grep -R -F -q -- "$token" "$test_root/host" 2>/dev/null; then
@@ -58,3 +58,23 @@ run_failure_case() {
 
 run_failure_case codex
 run_failure_case validation
+
+AGENT_RUN_ID='projection-run'
+AGENT_REPO='owner/repo'
+AGENT_BRANCH='codex/issue-1'
+projection_root="$test_root/projection"
+install -d -m 0700 "$projection_root"
+: > "$projection_root/events.jsonl"
+printf '%s\n' 'missing field `id_token` at line 1 column 67' > "$projection_root/stderr.log"
+write_codex_failure_diagnostic 1 "$projection_root/events.jsonl" "$projection_root/stderr.log" \
+  "$projection_root/execution-failure.json"
+jq -e '
+  .version == "codex-execution-failure/v1" and .status == "failed" and
+  .run_id == "projection-run" and .repository == "owner/repo" and
+  .branch == "codex/issue-1" and .stage == "codex" and .exit_code == 1 and
+  .diagnostic_source == "stderr" and
+  .diagnostic == "missing field `id_token` at line 1 column 67" and
+  (.events_sha256 | test("^[a-f0-9]{64}$")) and
+  (.stderr_sha256 | test("^[a-f0-9]{64}$"))
+' "$projection_root/execution-failure.json" >/dev/null
+[[ ! -e "$projection_root/execution-failure.json.tmp" ]]

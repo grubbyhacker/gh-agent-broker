@@ -52,6 +52,7 @@ on:
         default: false
 
 permissions:
+  actions: read
   contents: read
   issues: write
   packages: read
@@ -69,6 +70,15 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
 
     steps:
+      - name: Download published release manifest
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: broker-runtime-release-manifest
+          path: release
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
       - name: Resolve deployment inputs
         id: deploy_inputs
         env:
@@ -82,20 +92,24 @@ jobs:
             deploy_branch="${{ github.ref_name }}"
             deploy_source="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           else
-            deploy_sha="${{ github.event.workflow_run.head_sha }}"
-            image_digest=""
+            manifest='release/broker-release-manifest.json'
+            [[ -f "$manifest" ]] || { echo "published broker release manifest is unavailable" >&2; exit 1; }
+            deploy_sha=$(jq -er '.source_revision | select(test("^[0-9a-f]{40}$"))' "$manifest")
+            image_digest=$(jq -er '.image_digest | select(test("^sha256:[0-9a-f]{64}$"))' "$manifest")
+            [[ "$deploy_sha" == "${{ github.event.workflow_run.head_sha }}" ]] || {
+              echo "release manifest source revision does not match the completed CI run" >&2
+              exit 1
+            }
             deploy_branch="${{ github.event.workflow_run.head_branch }}"
             deploy_source="${{ github.event.workflow_run.html_url }}"
           fi
 
           deploy_image="ghcr.io/grubbyhacker/gh-agent-broker:sha-${deploy_sha}"
-          if [[ -n "$image_digest" ]]; then
-            [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
-              echo "image_digest must be sha256 followed by 64 lowercase hex characters" >&2
-              exit 1
-            }
-            deploy_image="${deploy_image}@${image_digest}"
-          fi
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "image_digest must be sha256 followed by 64 lowercase hex characters" >&2
+            exit 1
+          }
+          deploy_image="${deploy_image}@${image_digest}"
 
           echo "deploy_sha=$deploy_sha" >> "$GITHUB_OUTPUT"
           echo "deploy_image=$deploy_image" >> "$GITHUB_OUTPUT"
@@ -109,7 +123,33 @@ jobs:
           token: ${{ secrets.VPS_OPS_READ_TOKEN }}
           path: vps-ops
 
+      - name: Verify reviewed vps-ops promotion
+        id: promotion
+        run: |
+          set -euo pipefail
+          expected='${{ steps.deploy_inputs.outputs.deploy_image }}'
+          if grep -F -- "$expected" vps-ops/config/release-contracts/gh-agent-broker.yml >/dev/null; then
+            echo 'promoted=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'promoted=false' >> "$GITHUB_OUTPUT"
+          {
+            echo '### Broker publication awaits vps-ops promotion'
+            echo
+            echo "Published immutable image: \`$expected\`"
+            echo 'No deployment was attempted. Merge a reviewed vps-ops promotion that pins this exact release, then use the explicit workflow dispatch with the same source SHA and digest.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == 'workflow_dispatch' ]]; then
+            echo 'The requested immutable image is not the reviewed vps-ops promotion.' >&2
+            exit 1
+          fi
+
+      - name: Stop automatic deployment pending promotion
+        if: github.event_name == 'workflow_run' && steps.promotion.outputs.promoted != 'true'
+        run: echo 'Automatic deployment intentionally skipped until vps-ops promotes this immutable release.'
+
       - name: Verify deployment secret prerequisites
+        if: github.event_name == 'workflow_dispatch' || steps.promotion.outputs.promoted == 'true'
         working-directory: vps-ops
         env:
           VPS_OPS_GH_BROKER_ADMIN_SECRET: ${{ secrets.VPS_OPS_GH_BROKER_ADMIN_SECRET }}
@@ -133,6 +173,7 @@ jobs:
         run: python3 scripts/verify-deploy-secret-prerequisites.py --role gh-agent-broker
 
       - name: Connect to Tailnet
+        if: github.event_name == 'workflow_dispatch' || steps.promotion.outputs.promoted == 'true'
         uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -141,15 +182,18 @@ jobs:
           ping: ${{ env.DEPLOY_HOST }}
 
       - name: Install Ansible
+        if: github.event_name == 'workflow_dispatch' || steps.promotion.outputs.promoted == 'true'
         run: |
           python3 -m pip install --user "ansible==10.*"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install Ansible collections
+        if: github.event_name == 'workflow_dispatch' || steps.promotion.outputs.promoted == 'true'
         working-directory: vps-ops
         run: ansible-galaxy collection install -r requirements.yml
 
       - name: Write deploy SSH key
+        if: github.event_name == 'workflow_dispatch' || steps.promotion.outputs.promoted == 'true'
         env:
           DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
         run: |
@@ -157,6 +201,7 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_PRIVATE_KEY" > /tmp/hermes-deploy
 
       - name: Deploy gh-agent-broker
+        if: github.event_name == 'workflow_dispatch' || steps.promotion.outputs.promoted == 'true'
         working-directory: vps-ops
         env:
           VPS_OPS_SECRET_BACKEND: doppler
@@ -196,7 +241,7 @@ jobs:
             -e "ansible_ssh_private_key_file=/tmp/hermes-deploy"
 
       - name: Log successful deploy telemetry
-        if: success()
+        if: success() && (github.event_name == 'workflow_dispatch' || steps.promotion.outputs.promoted == 'true')
         uses: ./vps-ops/.github/actions/deploy-telemetry
         with:
           outcome: success
@@ -204,7 +249,7 @@ jobs:
           github_token: ${{ github.token }}
 
       - name: Capture SSH failure diagnostics
-        if: failure()
+        if: failure() && (github.event_name == 'workflow_dispatch' || steps.promotion.outputs.promoted == 'true')
         uses: ./vps-ops/.github/actions/deploy-telemetry
         with:
           outcome: failure

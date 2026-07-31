@@ -268,6 +268,7 @@ func (h *Holder) Issue(ctx context.Context, runID, idempotencyKey string) ([]byt
 
 	bundle := authFile{
 		Tokens: authTokens{
+			IDToken:      master.Tokens.IDToken,
 			AccessToken:  master.Tokens.AccessToken,
 			RefreshToken: "",
 			AccountID:    master.Tokens.AccountID,
@@ -378,8 +379,8 @@ func readMaster(path string) (authFile, error) {
 	if err := json.Unmarshal(data, &auth); err != nil {
 		return authFile{}, fmt.Errorf("decode Codex master auth: %w", err)
 	}
-	if auth.Tokens.AccessToken == "" || auth.Tokens.RefreshToken == "" {
-		return authFile{}, fmt.Errorf("codex master auth requires access_token and refresh_token")
+	if auth.Tokens.IDToken == "" || auth.Tokens.AccessToken == "" || auth.Tokens.RefreshToken == "" {
+		return authFile{}, fmt.Errorf("codex master auth requires id_token, access_token, and refresh_token")
 	}
 	return auth, nil
 }

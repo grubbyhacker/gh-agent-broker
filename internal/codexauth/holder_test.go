@@ -22,6 +22,7 @@ func TestIssueProjectsCurrentMasterWithoutRefreshing(t *testing.T) {
 	masterPath := writeMaster(t, root, `{
 		"auth_mode":"chatgpt",
 		"tokens":{
+			"id_token":"current-id",
 			"access_token":"current-access",
 			"refresh_token":"current-refresh",
 			"account_id":"acct",
@@ -52,7 +53,7 @@ func TestIssueProjectsCurrentMasterWithoutRefreshing(t *testing.T) {
 	if requests.Load() != 0 {
 		t.Fatalf("OAuth requests after two Issue calls = %d, want 0", requests.Load())
 	}
-	if first.Tokens.RefreshToken != "" || first.Tokens.IDToken != "" || first.Tokens.AccountID != "acct" {
+	if first.Tokens.RefreshToken != "" || first.Tokens.IDToken != "current-id" || first.Tokens.AccountID != "acct" {
 		t.Fatalf("access projection = %+v", first)
 	}
 
@@ -65,7 +66,7 @@ func TestIssueProjectsCurrentMasterWithoutRefreshing(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, forbidden := range []string{
-		"current-access", "current-refresh", "auth.openai.com", "codex_version",
+		"current-id", "current-access", "current-refresh", "auth.openai.com", "codex_version",
 		"token_host", "lineage", "refresh_pending",
 	} {
 		if strings.Contains(string(recordBytes), forbidden) {
@@ -90,6 +91,7 @@ func TestRefreshRotatesMasterThenIssueProjectsSubsequentAccess(t *testing.T) {
 	masterPath := writeMaster(t, root, `{
 		"auth_mode":"chatgpt",
 		"tokens":{
+			"id_token":"old-id",
 			"access_token":"old-access",
 			"refresh_token":"old-refresh",
 			"account_id":"acct",
@@ -129,7 +131,7 @@ func TestRefreshRotatesMasterThenIssueProjectsSubsequentAccess(t *testing.T) {
 	}
 
 	before := issueBundle(t, holder, "run-before", "idempotency-before")
-	if before.Tokens.AccessToken != "old-access" || requests.Load() != 0 {
+	if before.Tokens.IDToken != "old-id" || before.Tokens.AccessToken != "old-access" || requests.Load() != 0 {
 		t.Fatalf("pre-refresh projection=%+v requests=%d", before, requests.Load())
 	}
 	if err := holder.Refresh(context.Background()); err != nil {
@@ -139,7 +141,7 @@ func TestRefreshRotatesMasterThenIssueProjectsSubsequentAccess(t *testing.T) {
 		t.Fatalf("OAuth requests after Refresh = %d, want 1", requests.Load())
 	}
 	after := issueBundle(t, holder, "run-after", "idempotency-after")
-	if after.Tokens.AccessToken != "new-access" || requests.Load() != 1 {
+	if after.Tokens.IDToken != "new-id" || after.Tokens.AccessToken != "new-access" || requests.Load() != 1 {
 		t.Fatalf("post-refresh projection=%+v requests=%d", after, requests.Load())
 	}
 
@@ -171,7 +173,7 @@ func TestHolderRejectsUnsafeMasterModesAndRefreshErrorIsRedacted(t *testing.T) {
 	root := t.TempDir()
 	master := filepath.Join(root, "auth.json")
 	//nolint:gosec // G306: intentionally unsafe mode verifies fail-closed holder validation.
-	if err := os.WriteFile(master, []byte(`{"tokens":{"access_token":"a","refresh_token":"secret-refresh"}}`), 0o644); err != nil {
+	if err := os.WriteFile(master, []byte(`{"tokens":{"id_token":"id","access_token":"a","refresh_token":"secret-refresh"}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := New(Config{MasterAuthPath: master, IssuanceRoot: filepath.Join(root, "issuance")}); err == nil {

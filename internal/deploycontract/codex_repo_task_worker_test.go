@@ -27,6 +27,7 @@ func TestCodexRepoTaskWorkerContract(t *testing.T) {
 		"mv -f -- \"$temp_auth\" \"$CODEX_HOME/auth.json\"",
 		"rm -f -- \"$capability_path\"",
 		": > \"$acceptance_marker\"",
+		"ID token is missing",
 		"refresh_token must be explicitly empty",
 		"validate_preparation",
 		"codex exec",
@@ -56,6 +57,8 @@ func TestCodexRepoTaskWorkerContract(t *testing.T) {
 		"GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null",
 		"scan_for_token_contamination",
 		"purge_contaminated_artifacts",
+		"codex-execution-failure/v1",
+		"write_codex_failure_diagnostic",
 	} {
 		if !strings.Contains(text, required) {
 			t.Errorf("Codex repository task worker must contain %q", required)

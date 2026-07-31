@@ -110,15 +110,16 @@ general-internet route.
 
 Codex delivery is now a third deterministic phase, not wrapper-owned state in
 the same UID boundary. Preparation has private broker credentials and no OpenAI
-auth. Execution has access-only Codex auth streamed into tmpfs, the exact-path
-relay, no broker agent ID/secret/bundle, no private-broker route, and exactly
+auth. Execution has the current ID/access/account Codex fields streamed into
+tmpfs with an explicitly empty refresh token, the exact-path relay, no broker
+agent ID/secret/bundle, no private-broker route, and exactly
 one `codex exec`. It rejects created commits/refs, runs the required validation,
 and seals bounded `codex-execution-result/v1`, binary
 diff, validation output, final output, and usage projection artifacts only
 after exact token scanning across every host-backed work,
 output, lessons, symlink, filename, and Git object. Codex and validation
 statuses are captured so their scans run even after nonzero exits. Once the
-token FD exists, the EXIT trap scans before closing it; contamination or an
+task-credential FD exists, the EXIT trap scans before closing it; contamination or an
 incomplete scan purges all disposable host paths, exits nonzero, and prevents
 delivery. Purge first restores owner `rwX` without following symlinks, deletes,
 and verifies `/work`, `/output`, and `/lessons` before claiming removal. Any
@@ -127,6 +128,15 @@ quarantined, and leaves delivery blocked. Clean complete bounded valid-UTF-8
 final output remains verbatim in
 terminal projections for Codex, validation, and delivery failures; unusable
 output is reported explicitly and never truncated.
+
+Codex 0.146.0 requires `tokens.id_token` when loading ChatGPT `auth.json`.
+The holder therefore projects that current master field with the access token
+and account ID while continuing to omit all refresh capability. A nonzero
+Codex exit is credential-scanned before the worker atomically persists one
+bounded `codex-execution-failure/v1` operational projection. Raw JSON events,
+stderr, prompts, credentials, and hidden reasoning remain tmpfs-only and are
+removed at termination; the broker validates the projection identity and
+bounds before using it in the durable terminal failure.
 
 The fresh `/usr/local/bin/agent-codex-delivery-worker` has private broker
 credentials and no Codex auth, holder, relay, or proxy. It verifies preparation

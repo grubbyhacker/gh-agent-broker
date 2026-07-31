@@ -63,6 +63,22 @@ type executionResult struct {
 	FinalSizeBytes int64  `json:"final_size_bytes"`
 }
 
+type executionFailure struct {
+	Version          string `json:"version"`
+	Status           string `json:"status"`
+	RunID            string `json:"run_id"`
+	Repository       string `json:"repository"`
+	Branch           string `json:"branch"`
+	Stage            string `json:"stage"`
+	ExitCode         int    `json:"exit_code"`
+	DiagnosticSource string `json:"diagnostic_source"`
+	Diagnostic       string `json:"diagnostic"`
+	EventsSizeBytes  int64  `json:"events_size_bytes"`
+	EventsSHA256     string `json:"events_sha256"`
+	StderrSizeBytes  int64  `json:"stderr_size_bytes"`
+	StderrSHA256     string `json:"stderr_sha256"`
+}
+
 func (s *Service) resumeCodexIssueWorkflow(
 	ctx context.Context,
 	intent *launchIntent,
@@ -406,7 +422,11 @@ func (s *Service) completeExecution(
 		return LaunchAgentOutput{}, err
 	}
 	if status.ExitCode == nil || *status.ExitCode != 0 {
-		return s.failCodexIntent(ctx, intent, meta, "execution", fmt.Errorf("codex execution failed"))
+		failure, err := s.readExecutionFailure(meta, status.ExitCode)
+		if err != nil {
+			return s.failCodexIntent(ctx, intent, meta, "execution", fmt.Errorf("codex execution failed: %w", err))
+		}
+		return s.failCodexIntent(ctx, intent, meta, "execution", fmt.Errorf("codex execution failed: %s", failure.Diagnostic))
 	}
 	if _, err := s.readExecutionResult(meta); err != nil {
 		return s.failCodexIntent(ctx, intent, meta, "execution_verification", err)
@@ -703,6 +723,33 @@ func (s *Service) readExecutionResult(meta RunMetadata) (executionResult, error)
 		result.Verification != "passed" || result.FinalSizeBytes < 1 ||
 		result.FinalSizeBytes > int64(s.cfg.TerminalResultByteLimit) {
 		return executionResult{}, fmt.Errorf("execution result does not match broker launch identity or bounds")
+	}
+	return result, nil
+}
+
+func (s *Service) readExecutionFailure(meta RunMetadata, exitCode *int) (executionFailure, error) {
+	if exitCode == nil || *exitCode < 1 || *exitCode > 255 {
+		return executionFailure{}, fmt.Errorf("container exit status is unavailable or invalid")
+	}
+	path := filepath.Join(s.runDir(meta.RunID), "work", "execution", "execution-failure.json")
+	data, err := boundedRegularFile(path, 8192)
+	if err != nil {
+		return executionFailure{}, fmt.Errorf("bounded Codex failure diagnostic is unavailable")
+	}
+	var result executionFailure
+	if err := json.Unmarshal(data, &result); err != nil {
+		return executionFailure{}, fmt.Errorf("codex failure diagnostic is invalid")
+	}
+	validSource := result.DiagnosticSource == "event" || result.DiagnosticSource == "stderr" ||
+		result.DiagnosticSource == "none" || result.DiagnosticSource == "oversize"
+	if result.Version != "codex-execution-failure/v1" || result.Status != "failed" ||
+		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
+		result.Stage != "codex" || result.ExitCode != *exitCode || !validSource ||
+		result.Diagnostic == "" || len(result.Diagnostic) > 4096 ||
+		result.EventsSizeBytes < 0 || result.EventsSizeBytes > 8*1024*1024 ||
+		result.StderrSizeBytes < 0 || result.StderrSizeBytes > 8*1024*1024 ||
+		!regexpSHA(result.EventsSHA256, 64) || !regexpSHA(result.StderrSHA256, 64) {
+		return executionFailure{}, fmt.Errorf("codex failure diagnostic does not match broker launch identity or bounds")
 	}
 	return result, nil
 }
