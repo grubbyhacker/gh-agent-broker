@@ -42,6 +42,9 @@ on:
       image_sha:
         description: Optional Git SHA to deploy; defaults to the workflow dispatch ref SHA.
         required: false
+      image_digest:
+        description: Optional immutable sha256 digest paired with image_sha.
+        required: false
       force_recreate_sandbox_broker:
         description: Recreate sandbox-broker through the managed Ansible deployment.
         required: false
@@ -68,20 +71,34 @@ jobs:
     steps:
       - name: Resolve deployment inputs
         id: deploy_inputs
+        env:
+          INPUT_IMAGE_DIGEST: ${{ github.event.inputs.image_digest }}
         run: |
           set -euo pipefail
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             deploy_sha="${{ github.event.inputs.image_sha || github.sha }}"
+            image_digest="$INPUT_IMAGE_DIGEST"
             deploy_branch="${{ github.ref_name }}"
             deploy_source="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           else
             deploy_sha="${{ github.event.workflow_run.head_sha }}"
+            image_digest=""
             deploy_branch="${{ github.event.workflow_run.head_branch }}"
             deploy_source="${{ github.event.workflow_run.html_url }}"
           fi
 
+          deploy_image="ghcr.io/grubbyhacker/gh-agent-broker:sha-${deploy_sha}"
+          if [[ -n "$image_digest" ]]; then
+            [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "image_digest must be sha256 followed by 64 lowercase hex characters" >&2
+              exit 1
+            }
+            deploy_image="${deploy_image}@${image_digest}"
+          fi
+
           echo "deploy_sha=$deploy_sha" >> "$GITHUB_OUTPUT"
+          echo "deploy_image=$deploy_image" >> "$GITHUB_OUTPUT"
           echo "deploy_branch=$deploy_branch" >> "$GITHUB_OUTPUT"
           echo "deploy_source=$deploy_source" >> "$GITHUB_OUTPUT"
 
@@ -172,7 +189,7 @@ jobs:
           VPS_OPS_GH_BROKER_STATE_BACKUP_AWS_SECRET_ACCESS_KEY: ${{ secrets.VPS_OPS_GH_BROKER_STATE_BACKUP_AWS_SECRET_ACCESS_KEY }}
         run: |
           scripts/run-ansible-playbook.sh -i inventory/production.yml playbooks/deploy-gh-agent-broker.yml \
-            -e "broker_image=ghcr.io/grubbyhacker/gh-agent-broker:sha-${{ steps.deploy_inputs.outputs.deploy_sha }}" \
+            -e "broker_image=${{ steps.deploy_inputs.outputs.deploy_image }}" \
             -e "sandbox_broker_force_recreate=${{ inputs.force_recreate_sandbox_broker || false }}" \
             -e "ansible_host=${DEPLOY_HOST}" \
             -e "ansible_port=${DEPLOY_PORT}" \
