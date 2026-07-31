@@ -112,18 +112,29 @@ Codex delivery is now a third deterministic phase, not wrapper-owned state in
 the same UID boundary. Preparation has private broker credentials and no OpenAI
 auth. Execution has access-only Codex auth streamed into tmpfs, the exact-path
 relay, no broker agent ID/secret/bundle, no private-broker route, and exactly
-one `codex exec`. It rejects created commits/refs and seals bounded
-the required validation and seals bounded `codex-execution-result/v1`, binary
+one `codex exec`. It rejects created commits/refs, runs the required validation,
+and seals bounded `codex-execution-result/v1`, binary
 diff, validation output, final output, and usage projection artifacts only
 after exact token scanning across every host-backed work,
-output, lessons, symlink, filename, and Git object. Contamination purges those
-host paths, exits nonzero, and prevents delivery.
+output, lessons, symlink, filename, and Git object. Codex and validation
+statuses are captured so their scans run even after nonzero exits. Once the
+token FD exists, the EXIT trap scans before closing it; contamination or an
+incomplete scan purges all disposable host paths, exits nonzero, and prevents
+delivery. Purge first restores owner `rwX` without following symlinks, deletes,
+and verifies `/work`, `/output`, and `/lessons` before claiming removal. Any
+cleanup or verification failure emits `purge_failed`, keeps host artifacts
+quarantined, and leaves delivery blocked. Clean complete bounded valid-UTF-8
+final output remains verbatim in
+terminal projections for Codex, validation, and delivery failures; unusable
+output is reported explicitly and never truncated.
 
 The fresh `/usr/local/bin/agent-codex-delivery-worker` has private broker
 credentials and no Codex auth, holder, relay, or proxy. It verifies preparation
 and execution identity/digests, HEAD/ref invariants, and the sealed successful
-validation digest, reconstructs a trusted hook-free index and broker remote,
-then commits and pushes without running repository-controlled subprocesses, and
+validation digest, removes and recreates a fixed minimal local Git config
+before Git use, reconstructs a trusted hook/filter/fsmonitor-free index and
+broker remote under a scrubbed no-pager/no-editor environment, then commits and
+pushes without running repository-controlled subprocesses, and
 reconciles exactly one ready PR by repository, base, head, and the durable run
 body marker before create. Ambiguous create performs the same exact
 reconciliation. The durable launch intent uses `-prep`, `-exec`, and

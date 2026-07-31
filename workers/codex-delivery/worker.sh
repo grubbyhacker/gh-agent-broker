@@ -16,7 +16,28 @@ else
 fi
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
 require_env() { [[ -n "${!1:-}" ]] || fail "missing required environment variable: $1"; }
-trusted_git() { GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -c core.hooksPath=/dev/null "$@"; }
+trusted_git() {
+  local -a git_environment=(
+    "PATH=$PATH" HOME=/nonexistent LANG=C LC_ALL=C GIT_CONFIG_NOSYSTEM=1
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_OPTIONAL_LOCKS=0
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false
+    GIT_PAGER=cat PAGER=cat GIT_EDITOR=/bin/false GIT_SEQUENCE_EDITOR=/bin/false
+    "BROKER_AGENT_ID=$BROKER_AGENT_ID" "BROKER_AGENT_SECRET=$BROKER_AGENT_SECRET"
+    "BROKER_URL=$BROKER_URL"
+  )
+  [[ -z "${GIT_INDEX_FILE:-}" ]] || git_environment+=("GIT_INDEX_FILE=$GIT_INDEX_FILE")
+  env -i "${git_environment[@]}" git --no-optional-locks \
+    -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.pager=cat "$@"
+}
+trusted_broker_configure() {
+  env -i PATH="$PATH" HOME=/nonexistent LANG=C LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_OPTIONAL_LOCKS=0 \
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false \
+    GIT_PAGER=cat PAGER=cat GIT_EDITOR=/bin/false GIT_SEQUENCE_EDITOR=/bin/false \
+    BROKER_AGENT_ID="$BROKER_AGENT_ID" BROKER_AGENT_SECRET="$BROKER_AGENT_SECRET" \
+    BROKER_URL="$BROKER_URL" gh-agent-broker-cli configure \
+    -broker "$BROKER_URL" -repo "$AGENT_REPO" -remote origin
+}
 
 on_exit() {
   local status=$?
@@ -64,9 +85,29 @@ validate_results() {
     fail 'execution validation digest mismatch'
 }
 
+seal_repository_git_config() {
+  local repository=$1 git_dir="$1/.git"
+  [[ -d "$repository" && ! -L "$repository" && -d "$git_dir" && ! -L "$git_dir" &&
+    -f "$git_dir/HEAD" && ! -L "$git_dir/HEAD" ]] ||
+    fail 'workspace Git directory or HEAD is not an ordinary trusted path'
+  rm -f -- "$git_dir/config" "$git_dir/config.worktree"
+  rm -rf -- "$git_dir/hooks"
+  install -d -m 0700 "$git_dir/hooks"
+  trusted_git config --file "$git_dir/config" core.repositoryformatversion 0
+  trusted_git config --file "$git_dir/config" core.filemode true
+  trusted_git config --file "$git_dir/config" core.bare false
+  trusted_git config --file "$git_dir/config" core.logallrefupdates true
+  trusted_git config --file "$git_dir/config" core.hooksPath /dev/null
+  trusted_git config --file "$git_dir/config" core.fsmonitor false
+  trusted_git config --file "$git_dir/config" user.name 'Codex Repository Task Worker'
+  trusted_git config --file "$git_dir/config" user.email 'codex-repository-task-worker@invalid'
+  chmod 0600 "$git_dir/config"
+}
+
 restore_repository_authority() {
   local expected_head git_dir expected_git_dir current_refs
   expected_head=$(jq -r .workspace_head /work/prepared/preparation.json)
+  seal_repository_git_config /work/repo
   git_dir=$(trusted_git -C /work/repo rev-parse --absolute-git-dir)
   expected_git_dir="$(cd /work/repo && pwd -P)/.git"
   [[ "$git_dir" == "$expected_git_dir" && -d "$git_dir" && ! -L "$git_dir" &&
@@ -74,27 +115,20 @@ restore_repository_authority() {
     fail 'workspace Git directory or HEAD is not an ordinary trusted path'
   [[ "$(trusted_git -C /work/repo rev-parse HEAD)" == "$expected_head" ]] || fail 'workspace HEAD changed after preparation'
   [[ "$(trusted_git -C /work/repo symbolic-ref --short HEAD)" == "$AGENT_BRANCH" ]] || fail 'workspace branch changed after preparation'
-  current_refs=$(git -C /work/repo for-each-ref --format='%(refname) %(objectname) %(symref)' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+  current_refs=$(trusted_git -C /work/repo for-each-ref --format='%(refname) %(objectname) %(symref)' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
   [[ "$current_refs" == "$(jq -r .refs_sha256 /work/prepared/preparation.json)" &&
     "$current_refs" == "$(jq -r .refs_sha256 /work/execution/execution.json)" ]] ||
     fail 'workspace refs changed after preparation'
-  rm -rf -- /work/repo/.git/hooks
-  install -d -m 0700 /work/repo/.git/hooks
   rm -f -- /work/repo/.git/index /work/repo/.git/index.lock
   trusted_git -C /work/repo read-tree "$expected_head"
-  rm -f -- /work/repo/.git/config
-  trusted_git -C /work/repo config core.repositoryformatversion 0
-  trusted_git -C /work/repo config core.filemode true
-  trusted_git -C /work/repo config core.bare false
-  trusted_git -C /work/repo config core.logallrefupdates true
   trusted_git -C /work/repo remote add origin placeholder
-  gh-agent-broker-cli configure -broker "$BROKER_URL" -repo "$AGENT_REPO" -remote origin >/output/broker-remote.txt
-  [[ "$(git -C /work/repo rev-parse HEAD)" == "$expected_head" ]] || fail 'broker configuration changed workspace HEAD'
+  (cd /work/repo && trusted_broker_configure) > /output/broker-remote.txt
+  [[ "$(trusted_git -C /work/repo rev-parse HEAD)" == "$expected_head" ]] || fail 'broker configuration changed workspace HEAD'
   local regenerated=/work/execution/delivery-diff.patch
   local temp_index=/tmp/codex-delivery-index
   GIT_INDEX_FILE="$temp_index" trusted_git -C /work/repo read-tree HEAD
   GIT_INDEX_FILE="$temp_index" trusted_git -C /work/repo add --all
-  GIT_INDEX_FILE="$temp_index" trusted_git -C /work/repo diff --cached --binary HEAD > "$regenerated"
+  GIT_INDEX_FILE="$temp_index" trusted_git -C /work/repo diff --no-ext-diff --cached --binary HEAD > "$regenerated"
   cmp -s "$regenerated" /work/execution/diff.patch || fail 'workspace diff no longer matches execution result'
   rm -f -- "$regenerated" "$temp_index"
 }
@@ -126,7 +160,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   restore_repository_authority
   verification_status='passed'
   cd /work/repo
-  if git diff --quiet && git diff --cached --quiet && [[ -z "$(git status --porcelain)" ]]; then
+  if trusted_git diff --no-ext-diff --quiet &&
+    trusted_git diff --no-ext-diff --cached --quiet &&
+    [[ -z "$(trusted_git status --porcelain)" ]]; then
     stage='completed without changes'
     write_result no_change_required 'Codex determined that the issue requires no repository change'
     cp /output/codex-final.txt /output/final-summary.md

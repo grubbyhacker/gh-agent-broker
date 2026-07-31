@@ -113,7 +113,17 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 	if meta.Provenance != nil && meta.Error != "" && strings.HasPrefix(meta.TerminalSource, "codex_") {
 		result.Outcome = StatusFailed
 		result.FailureStage = strings.TrimPrefix(meta.TerminalSource, "codex_")
-		result.FailureReason = abbreviate(s.redactor(meta).Redact(meta.Error), 500)
+		reason := s.redactor(meta).Redact(meta.Error)
+		if !meta.ExecutionStartedAt.IsZero() {
+			if scanFailure := s.codexTokenScanFailure(meta); scanFailure != "" {
+				reason = scanFailure
+			} else if summary, outputFailure := s.readCodexFinalOutput(meta); outputFailure != "" {
+				reason += "; " + outputFailure
+			} else {
+				result.FinalSummary = summary
+			}
+		}
+		result.FailureReason = abbreviate(reason, 500)
 		return result
 	}
 	if meta.TerminalSource == terminalSourceStartupFailure && meta.Error != "" {
@@ -145,6 +155,52 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 		result.Result, result.FinalSummary = nil, ""
 	}
 	return result
+}
+
+func (s *Service) readCodexFinalOutput(meta RunMetadata) (string, string) {
+	data, err := boundedRegularFile(
+		filepath.Join(s.runDir(meta.RunID), "output", "codex-final.txt"),
+		s.cfg.TerminalResultByteLimit,
+	)
+	if err != nil {
+		return "", terminalOutputError("codex-final.txt", err) + " after Codex execution began"
+	}
+	if len(data) == 0 {
+		return "", "codex-final.txt is empty after Codex execution began"
+	}
+	if !utf8.Valid(data) {
+		return "", "codex-final.txt is not valid UTF-8 after Codex execution began"
+	}
+	return string(data), ""
+}
+
+func (s *Service) codexTokenScanFailure(meta RunMetadata) string {
+	runDir := s.runDir(meta.RunID)
+	marker, err := boundedRegularFile(filepath.Join(runDir, "output", "codex-token-scan-failure"), 32)
+	if err != nil {
+		return ""
+	}
+	if string(marker) == "purge_failed\n" {
+		return "credential contamination cleanup could not be verified; host-backed artifacts remain quarantined and delivery is blocked"
+	}
+	for _, relative := range []string{"work", "lessons"} {
+		entries, readErr := os.ReadDir(filepath.Join(runDir, relative))
+		if readErr != nil || len(entries) != 0 {
+			return ""
+		}
+	}
+	outputEntries, err := os.ReadDir(filepath.Join(runDir, "output"))
+	if err != nil || len(outputEntries) != 1 || outputEntries[0].Name() != "codex-token-scan-failure" {
+		return ""
+	}
+	switch string(marker) {
+	case "contamination\n":
+		return "exact access-token contamination detected; disposable execution artifacts were purged"
+	case "incomplete\n":
+		return "access-token scan was incomplete; disposable execution artifacts were purged"
+	default:
+		return ""
+	}
 }
 
 func (s *Service) terminalProvenance(meta RunMetadata) *TerminalProvenance {

@@ -16,6 +16,9 @@ readonly repo_path='/work/repo'
 readonly execution_path='/work/execution'
 readonly output_path='/output'
 readonly lessons_path='/lessons'
+readonly purge_work_root="${CODEX_WORKER_PURGE_WORK_ROOT:-/work}"
+readonly purge_output_root="${CODEX_WORKER_PURGE_OUTPUT_ROOT:-/output}"
+readonly purge_lessons_root="${CODEX_WORKER_PURGE_LESSONS_ROOT:-/lessons}"
 readonly events_path='/dev/shm/codex-events.jsonl'
 readonly stderr_path='/dev/shm/codex-stderr.log'
 readonly prompt_path='/dev/shm/codex-prompt.md'
@@ -24,10 +27,19 @@ CODEX_HOME=''
 scan_dir=''
 token_pattern_file=''
 contamination_detected=0
+scan_incomplete=0
+purge_failed=0
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
 security_fail() { contamination_detected=1; fail "$@"; }
 require_env() { [[ -n "${!1:-}" ]] || fail "missing required environment variable: $1"; }
+execution_git() {
+  env -i PATH="$PATH" HOME=/nonexistent LANG=C LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_OPTIONAL_LOCKS=0 \
+    GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false \
+    GIT_PAGER=cat PAGER=cat GIT_EDITOR=/bin/false GIT_SEQUENCE_EDITOR=/bin/false \
+    git --no-optional-locks -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
 
 cleanup_credentials() {
   rm -f -- "$capability_path" "$acceptance_marker" "$events_path" "$stderr_path" "$prompt_path" 2>/dev/null || true
@@ -37,18 +49,114 @@ cleanup_credentials() {
   exec 9<&- 2>/dev/null || true
 }
 
+restore_owner_rwX() {
+  local path=$1 child
+  [[ ! -L "$path" ]] || return 0
+  if [[ -d "$path" ]]; then
+    chmod u+rwx "$path" 2>/dev/null || return 1
+  else
+    chmod u+rw "$path" 2>/dev/null || return 1
+    return 0
+  fi
+  for child in "$path"/* "$path"/.[!.]* "$path"/..?*; do
+    [[ -e "$child" || -L "$child" ]] || continue
+    restore_owner_rwX "$child" || return 1
+  done
+}
+
 purge_contaminated_artifacts() {
-  find /work "$output_path" "$lessons_path" -mindepth 1 -delete 2>/dev/null || true
+  local root remaining status=0
+  for root in "$purge_work_root" "$purge_output_root" "$purge_lessons_root"; do
+    if [[ ! -d "$root" || -L "$root" ]]; then
+      status=1
+      continue
+    fi
+    restore_owner_rwX "$root" || status=1
+  done
+  find -P "$purge_work_root" "$purge_output_root" "$purge_lessons_root" \
+    -mindepth 1 -delete 2>/dev/null || status=1
+  for root in "$purge_work_root" "$purge_output_root" "$purge_lessons_root"; do
+    [[ -d "$root" && ! -L "$root" ]] || status=1
+    remaining=''
+    if ! remaining=$(find -P "$root" -mindepth 1 -print -quit 2>/dev/null); then
+      status=1
+    fi
+    [[ -z "$remaining" ]] || status=1
+  done
+  (( status == 0 ))
+}
+
+write_scan_failure_marker() {
+  local reason=$1 marker="$purge_output_root/codex-token-scan-failure"
+  local temp="$purge_output_root/.codex-token-scan-failure.$$"
+  [[ -d "$purge_output_root" && ! -L "$purge_output_root" ]] || return 1
+  rm -f -- "$marker" "$temp" 2>/dev/null || return 1
+  (umask 077; printf '%s\n' "$reason" > "$temp") || return 1
+  [[ -f "$temp" && ! -L "$temp" ]] || return 1
+  chmod 0444 "$temp" 2>/dev/null || return 1
+  mv -f -- "$temp" "$marker" 2>/dev/null || return 1
+}
+
+verify_scan_failure_layout() {
+  local reason=$1 root entry marker="$purge_output_root/codex-token-scan-failure"
+  for root in "$purge_work_root" "$purge_lessons_root"; do
+    [[ -d "$root" && ! -L "$root" ]] || return 1
+    entry=''
+    if ! entry=$(find -P "$root" -mindepth 1 -print -quit 2>/dev/null); then
+      return 1
+    fi
+    [[ -z "$entry" ]] || return 1
+  done
+  [[ -d "$purge_output_root" && ! -L "$purge_output_root" ]] || return 1
+  entry=$(find -P "$purge_output_root" -mindepth 1 -maxdepth 1 -print 2>/dev/null) || return 1
+  [[ "$entry" == "$marker" && -f "$marker" && ! -L "$marker" ]] || return 1
+  [[ "$(cat "$marker" 2>/dev/null)" == "$reason" ]]
+}
+
+record_scan_failure() {
+  local reason=$1
+  if ! purge_contaminated_artifacts; then
+    purge_failed=1
+  fi
+  if (( purge_failed != 0 )); then
+    write_scan_failure_marker purge_failed || true
+    return 1
+  fi
+  if ! write_scan_failure_marker "$reason" || ! verify_scan_failure_layout "$reason"; then
+    purge_failed=1
+    write_scan_failure_marker purge_failed || true
+    return 1
+  fi
+  return 0
 }
 
 on_exit() {
-  local status=$?
+  local status=$? scan_status=0
   trap - EXIT
-  cleanup_credentials
-  if (( status != 0 && contamination_detected != 0 )); then
-    purge_contaminated_artifacts
-    printf '%s: exact access-token contamination blocked; host-backed work and output removed\n' "$worker_name" >&2
+  if (( status != 0 )) && [[ -n "$token_pattern_file" ]]; then
+    scan_for_token_contamination || scan_status=$?
+    if (( scan_status == 1 )); then
+      contamination_detected=1
+    elif (( scan_status != 0 )); then
+      scan_incomplete=1
+    fi
   fi
+  if (( status != 0 && (contamination_detected != 0 || scan_incomplete != 0) )); then
+    if (( contamination_detected != 0 )); then
+      if record_scan_failure contamination; then
+        printf '%s: exact access-token contamination blocked; disposable host-backed artifacts purged\n' "$worker_name" >&2
+      else
+        printf '%s: credential contamination cleanup could not be verified; run remains blocked\n' "$worker_name" >&2
+      fi
+    else
+      if record_scan_failure incomplete; then
+        printf '%s: access-token scan incomplete; disposable host-backed artifacts purged\n' "$worker_name" >&2
+      else
+        printf '%s: credential contamination cleanup could not be verified; run remains blocked\n' "$worker_name" >&2
+      fi
+    fi
+  fi
+  cleanup_credentials
   exit "$status"
 }
 
@@ -78,6 +186,9 @@ validate_inputs() {
     fail 'AGENT_FINAL_OUTPUT_LIMIT must be a positive bounded integer'
   [[ "$AGENT_VERIFY_TASK" =~ ^[A-Za-z0-9_.:-]+$ ]] ||
     fail 'AGENT_VERIFY_TASK must be one reviewed mise task name'
+  [[ "$purge_work_root" == /work && "$purge_output_root" == /output &&
+    "$purge_lessons_root" == /lessons ]] ||
+    fail 'contamination purge roots are fixed by the reviewed execution contract'
 }
 
 validate_preparation() {
@@ -175,34 +286,139 @@ verify_git_identity() {
 }
 
 scan_for_token_contamination() {
-  local path
+  local path oid type grep_status
+  local found=0 incomplete=0
+  local scan_work host_paths git_objects git_object_contents result=0
   stage='exact access-token contamination scan'
-  for path in /work "$output_path" "$lessons_path" "$events_path" "$stderr_path"; do
+  [[ -r "$token_pattern_file" ]] || return 2
+  scan_work=$(mktemp -d "$scan_dir/pass.XXXXXX") || return 2
+  host_paths="$scan_work/host-paths"
+  git_objects="$scan_work/git-objects"
+  git_object_contents="$scan_work/git-object-contents"
+  if ! find -P /work "$output_path" "$lessons_path" -print0 > "$host_paths"; then
+    incomplete=1
+  fi
+  while IFS= read -r -d '' path; do
+    grep_status=0
+    printf '%s' "$path" | grep -F -q -f "$token_pattern_file" || grep_status=$?
+    if (( grep_status == 0 )); then
+      found=1
+    elif (( grep_status != 1 )); then
+      incomplete=1
+    fi
+    if [[ -f "$path" && ! -L "$path" ]]; then
+      grep_status=0
+      grep -F -q -f "$token_pattern_file" -- "$path" 2>/dev/null || grep_status=$?
+      if (( grep_status == 0 )); then
+        found=1
+      elif (( grep_status != 1 )); then
+        incomplete=1
+      fi
+    elif [[ -L "$path" ]]; then
+      grep_status=0
+      readlink -- "$path" | grep -F -q -f "$token_pattern_file" || grep_status=$?
+      if (( grep_status == 0 )); then
+        found=1
+      elif (( grep_status != 1 )); then
+        incomplete=1
+      fi
+    elif [[ ! -d "$path" ]]; then
+      incomplete=1
+    fi
+  done < "$host_paths"
+  for path in "$events_path" "$stderr_path"; do
     [[ -e "$path" ]] || continue
-    if grep -R -F -q -f "$token_pattern_file" -- "$path" 2>/dev/null; then
-      security_fail 'exact access token detected in Codex-controlled work or output'
+    if [[ ! -f "$path" || -L "$path" ]]; then
+      incomplete=1
+      continue
+    fi
+    grep_status=0
+    grep -F -q -f "$token_pattern_file" -- "$path" 2>/dev/null || grep_status=$?
+    if (( grep_status == 0 )); then
+      found=1
+    elif (( grep_status != 1 )); then
+      incomplete=1
     fi
   done
-  while IFS= read -r -d '' path; do
-    if printf '%s' "$path" | grep -F -q -f "$token_pattern_file"; then
-      security_fail 'exact access token detected in a Codex-controlled path'
+  if [[ ! -d "$repo_path/.git" || -L "$repo_path/.git" ]]; then
+    incomplete=1
+  else
+    rm -f -- "$repo_path/.git/config" "$repo_path/.git/config.worktree" || incomplete=1
+    if ! printf '%s\n' '[core]' 'repositoryformatversion = 0' 'filemode = true' \
+      'bare = false' 'logallrefupdates = true' 'hooksPath = /dev/null' \
+      'fsmonitor = false' > "$repo_path/.git/config"; then
+      incomplete=1
+    elif ! execution_git -C "$repo_path" cat-file --batch-all-objects \
+      --batch-check='%(objectname) %(objecttype)' > "$git_objects"; then
+      incomplete=1
+    else
+      while IFS=' ' read -r oid type; do
+        case "$type" in
+          blob|commit|tag|tree)
+            if ! execution_git -C "$repo_path" cat-file "$type" "$oid" > "$git_object_contents" 2>/dev/null; then
+              incomplete=1
+              continue
+            fi
+            grep_status=0
+            grep -F -q -f "$token_pattern_file" -- "$git_object_contents" || grep_status=$?
+            if (( grep_status == 0 )); then
+              found=1
+            elif (( grep_status != 1 )); then
+              incomplete=1
+            fi
+            ;;
+          '') ;;
+          *) incomplete=1 ;;
+        esac
+      done < "$git_objects"
     fi
-  done < <(find -P /work "$output_path" "$lessons_path" -print0)
-  while IFS= read -r -d '' path; do
-    if readlink -- "$path" | grep -F -q -f "$token_pattern_file"; then
-      security_fail 'exact access token detected in a Codex-controlled symlink'
-    fi
-  done < <(find -P /work "$output_path" "$lessons_path" -type l -print0)
-  while read -r oid type; do
-    case "$type" in
-      blob|commit|tag|tree)
-        if git -C "$repo_path" cat-file "$type" "$oid" |
-          grep -F -q -f "$token_pattern_file"; then
-          security_fail 'exact access token detected in a Git object'
-        fi
-        ;;
-    esac
-  done < <(git -C "$repo_path" cat-file --batch-all-objects --batch-check='%(objectname) %(objecttype)')
+  fi
+  (( found == 0 )) || result=1
+  if (( result == 0 && incomplete != 0 )); then
+    result=2
+  fi
+  rm -rf -- "$scan_work" 2>/dev/null || result=2
+  return "$result"
+}
+
+require_clean_token_scan() {
+  local scan_status=0
+  scan_for_token_contamination || scan_status=$?
+  if (( scan_status == 1 )); then
+    contamination_detected=1
+    record_scan_failure contamination || true
+    fail 'exact access token detected in Codex-controlled work or output'
+  fi
+  if (( scan_status != 0 )); then
+    scan_incomplete=1
+    record_scan_failure incomplete || true
+    fail 'access-token scan was incomplete'
+  fi
+}
+
+invoke_codex() {
+  codex exec --ephemeral --json --model "$AGENT_MODEL" \
+    -c "model_reasoning_effort=\"$AGENT_REASONING_EFFORT\"" \
+    --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C "$repo_path" \
+    -o "$output_path/codex-final.txt" "$(cat "$prompt_path")" > "$events_path" 2> "$stderr_path" 9<&-
+}
+
+invoke_validation() {
+  (cd "$repo_path" && mise run "$AGENT_VERIFY_TASK") > "$execution_path/verify.txt" 2>&1
+}
+
+run_codex_and_scan() {
+  local codex_status=0
+  invoke_codex || codex_status=$?
+  require_clean_token_scan
+  (( codex_status == 0 )) || fail "Codex repository task exited with status ${codex_status}"
+}
+
+run_validation_and_scan() {
+  local validation_status=0
+  invoke_validation || validation_status=$?
+  require_clean_token_scan
+  (( validation_status == 0 )) || fail "repository validation exited with status ${validation_status}"
 }
 
 build_prompt() {
@@ -267,25 +483,24 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   export CODEX_DISABLE_ANALYTICS=1 DO_NOT_TRACK=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
   unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
   stage='Codex repository task'
-  codex exec --ephemeral --json --model "$AGENT_MODEL" \
-    -c "model_reasoning_effort=\"$AGENT_REASONING_EFFORT\"" \
-    --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C "$repo_path" \
-    -o "$output_path/codex-final.txt" "$(cat "$prompt_path")" > "$events_path" 2> "$stderr_path" 9<&-
+  run_codex_and_scan
   verify_git_identity
   [[ -s "$output_path/codex-final.txt" ]] || fail 'Codex final output is missing or empty'
   (( $(stat -c %s "$output_path/codex-final.txt") <= final_output_limit )) ||
     fail "Codex final output exceeds ${final_output_limit}-byte complete-output limit"
+  iconv -f UTF-8 -t UTF-8 "$output_path/codex-final.txt" >/dev/null ||
+    fail 'Codex final output is not valid UTF-8'
   (( $(stat -c %s "$events_path") <= codex_events_limit )) || fail 'Codex event stream exceeded bounded limit'
   extract_usage
-  scan_for_token_contamination
+  require_clean_token_scan
   mkdir -p "$execution_path"
   stage='repository validation'
-  (cd "$repo_path" && mise run "$AGENT_VERIFY_TASK") > "$execution_path/verify.txt" 2>&1
+  run_validation_and_scan
   (( $(stat -c %s "$execution_path/verify.txt") <= verification_output_limit )) ||
     fail 'repository validation output exceeded bounded limit'
   verify_git_identity
-  scan_for_token_contamination
+  require_clean_token_scan
   write_execution_result
-  scan_for_token_contamination
+  require_clean_token_scan
   stage='executed'
 fi

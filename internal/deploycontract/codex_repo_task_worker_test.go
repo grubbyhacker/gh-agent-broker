@@ -109,6 +109,30 @@ func TestCodexRepoTaskWorkerSecurityBoundaries(t *testing.T) {
 	}
 }
 
+func TestCodexRepoTaskWorkerScansFailedSubprocessesBeforeTerminalizing(t *testing.T) {
+	cmd := exec.Command("bash", "workers/codex_failure_scan_test.sh")
+	cmd.Dir = "../.."
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run Codex failed-subprocess scan regression: %v\n%s", err, output)
+	}
+}
+
+func TestCodexContaminationPurgeRestoresUnreadableDirectoriesAndFailsClosed(t *testing.T) {
+	cmd := exec.Command("bash", "workers/codex_contamination_purge_test.sh")
+	cmd.Dir = "../.."
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run Codex contamination purge regression: %v\n%s", err, output)
+	}
+}
+
+func TestCodexDeliveryRemovesExecutableRepositoryConfiguration(t *testing.T) {
+	cmd := exec.Command("bash", "workers/codex_delivery_git_config_test.sh")
+	cmd.Dir = "../.."
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run Codex delivery Git-config regression: %v\n%s", err, output)
+	}
+}
+
 func TestCodexDeliveryReconcilesOneExactPullRequest(t *testing.T) {
 	cmd := exec.Command("bash", "workers/codex_delivery_reconcile_test.sh")
 	cmd.Dir = "../.."

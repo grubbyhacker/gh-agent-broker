@@ -127,25 +127,39 @@ objects must be unchanged. With no broker authority present, the worker runs
 the required reviewed validation task, then creates a bounded binary diff,
 bounded validation output, bounded final output, and a bounded execution result
 containing their digests and the prepared HEAD. It performs exact access-token
-contamination scanning before publishing those artifacts.
+contamination scanning before publishing those artifacts. Codex and validation
+exit statuses are captured explicitly: their scans always complete before a
+nonzero status is acted upon.
 
 The execution worker keeps an exact access-token match pattern only in
 `/dev/shm`. It scans Codex-controlled paths, file and symlink contents, Git
 objects, final output, events, stderr, and the bounded diff without emitting
-matched content. An
-exact match terminally fails the run and deletes the disposable prepared
-repository and output tree; contaminated artifacts are never redacted and
-delivered. Missing, empty, malformed, mismatched, or oversized execution
-artifacts are likewise terminal visible failures and prevent delivery launch.
+matched content. Once the token descriptor exists, the EXIT trap attempts the
+complete scan before closing it on every unexpected failure. An exact match or
+incomplete scan terminally fails the run. Cleanup first restores owner `rwX`
+recursively without following symlinks, deletes the disposable `/work`,
+`/output`, and `/lessons` contents, and verifies that only the static
+scan-failure marker remains. Only a verified cleanup may report that artifacts
+were purged. Any permission-restoration, deletion, marker, or verification
+failure emits the distinct `purge_failed` result: removal is not claimed,
+host-backed artifacts remain quarantined, and delivery stays blocked.
+Contaminated artifacts are never redacted or delivered. Clean, complete,
+bounded valid-UTF-8 Codex final
+output remains available verbatim when Codex, validation, or delivery fails
+after execution starts. Missing, empty, invalid, mismatched, or oversized
+execution artifacts are explicit terminal failures, are never truncated, and
+prevent delivery launch.
 
 The fresh deterministic delivery container revalidates the preparation and
 execution results, HEAD/branch identity, exact diff digest, final-output
 digest, and the sealed successful validation result/digest. It runs no
-repository-controlled subprocess with broker authority. It removes hooks,
-rebuilds the index from the prepared HEAD, and reconstructs the broker remote
-using its own private credential. It then commits and pushes. Before creating
-a non-draft PR it reconciles the broker `pulls` API by the exact repository
-endpoint, base branch, head branch, and
+repository-controlled subprocess with broker authority. It removes and
+recreates a fixed minimal local Git config before any Git command, and uses a
+scrubbed environment with hooks, filters, fsmonitor, pagers, and editors
+disabled. It rebuilds the index from the prepared HEAD and reconstructs the
+broker remote using its own private credential. It then commits and pushes.
+Before creating a non-draft PR it reconciles the broker `pulls` API by the exact
+repository endpoint, base branch, head branch, and
 `<!-- gh-agent-broker-codex-run:RUN_ID -->` marker. A failed or ambiguous
 create performs the same exact reconciliation; multiple matches fail closed.
 
