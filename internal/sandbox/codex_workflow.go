@@ -149,10 +149,6 @@ func (s *Service) resumePreparation(
 			info.Lifecycle = ContainerNeverStarted
 		}
 	} else {
-		meta.Phase = codexPhasePreparationRecon
-		if err := s.persistCodexIntent(ctx, intent, meta, intent.State); err != nil {
-			return LaunchAgentOutput{}, err
-		}
 		status, inspectErr := s.runtime.Inspect(ctx, meta.PreparationContainerID)
 		if inspectErr != nil {
 			return s.failCodexIntent(ctx, intent, meta, "preparation_reconcile", inspectErr)
@@ -231,6 +227,7 @@ func (s *Service) resumeExecution(
 	meta RunMetadata,
 	workflow CodexIssueWorkflow,
 ) (LaunchAgentOutput, error) {
+	durablePhase := meta.Phase
 	template := s.cfg.Templates[workflow.ExecutionTemplate]
 	spec, _, err := s.runtimeSpec(meta, template)
 	if err != nil {
@@ -266,20 +263,41 @@ func (s *Service) resumeExecution(
 			info.Lifecycle = ContainerNeverStarted
 		}
 	} else {
-		meta.Phase = codexPhaseExecutionRecon
-		if err := s.persistCodexIntent(ctx, intent, meta, intent.State); err != nil {
-			return LaunchAgentOutput{}, err
-		}
 		status, inspectErr := s.runtime.Inspect(ctx, meta.ExecutionContainerID)
 		if inspectErr != nil {
 			return s.failCodexIntent(ctx, intent, meta, "execution_reconcile", inspectErr)
 		}
 		info = ContainerInfo{ID: meta.ExecutionContainerID, Status: status, Lifecycle: lifecycleForStatus(status)}
 		if info.Lifecycle == ContainerRunning {
-			// A running execution container is adopted, never restarted. A
-			// fresh access-only projection is safe because acceptance is
-			// idempotent and issuance state contains no token.
-			meta.Phase = codexPhaseBundleInject
+			switch durablePhase {
+			case codexPhaseExecutionRunning:
+				return s.adoptExecution(ctx, intent, meta)
+			case codexPhaseBundleAccept:
+				meta.Phase = codexPhaseBundleAccept
+			case codexPhaseBundleInject:
+				accepted, markerErr := s.runtime.PathExists(
+					ctx,
+					meta.ExecutionContainerID,
+					codexAcceptanceMarker,
+				)
+				if markerErr != nil {
+					return s.failCodexIntent(ctx, intent, meta, "credential_acceptance_reconcile", markerErr)
+				}
+				if accepted {
+					meta.Phase = codexPhaseBundleAccept
+				}
+			case codexPhaseExecutionCreate, codexPhaseExecutionStart, codexPhaseExecutionRecon:
+				// Start may have succeeded immediately before a crash.
+				meta.Phase = codexPhaseBundleInject
+			default:
+				return s.failCodexIntent(
+					ctx,
+					intent,
+					meta,
+					"execution_reconcile",
+					fmt.Errorf("running execution container has incompatible durable phase %q", durablePhase),
+				)
+			}
 		}
 	}
 	if info.Lifecycle == ContainerExited {
@@ -314,18 +332,28 @@ func (s *Service) resumeExecution(
 		}
 	}
 	if meta.Phase == codexPhaseBundleInject {
-		bundle, issueErr := s.codexIssuer.Issue(ctx, meta.RunID, meta.IdempotencyKeyDigest)
-		if issueErr != nil {
-			return s.failCodexIntent(ctx, intent, meta, "credential_issuance", issueErr)
-		}
-		if injectErr := s.runtime.InjectSecret(
+		accepted, markerErr := s.runtime.PathExists(
 			ctx,
 			meta.ExecutionContainerID,
-			codexInjectionDir,
-			codexInjectionName,
-			bundle,
-		); injectErr != nil {
-			return s.failCodexIntent(ctx, intent, meta, "credential_injection", injectErr)
+			codexAcceptanceMarker,
+		)
+		if markerErr != nil {
+			return s.failCodexIntent(ctx, intent, meta, "credential_acceptance_reconcile", markerErr)
+		}
+		if !accepted {
+			bundle, issueErr := s.codexIssuer.Issue(ctx, meta.RunID, meta.IdempotencyKeyDigest)
+			if issueErr != nil {
+				return s.failCodexIntent(ctx, intent, meta, "credential_issuance", issueErr)
+			}
+			if injectErr := s.runtime.InjectSecret(
+				ctx,
+				meta.ExecutionContainerID,
+				codexInjectionDir,
+				codexInjectionName,
+				bundle,
+			); injectErr != nil {
+				return s.failCodexIntent(ctx, intent, meta, "credential_injection", injectErr)
+			}
 		}
 		meta.Phase = codexPhaseBundleAccept
 		if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
@@ -345,6 +373,14 @@ func (s *Service) resumeExecution(
 			return s.failCodexIntent(ctx, intent, meta, "credential_consumption", err)
 		}
 	}
+	return s.adoptExecution(ctx, intent, meta)
+}
+
+func (s *Service) adoptExecution(
+	ctx context.Context,
+	intent *launchIntent,
+	meta RunMetadata,
+) (LaunchAgentOutput, error) {
 	meta.Status = StatusRunning
 	meta.Phase = codexPhaseExecutionRunning
 	if meta.ExecutionStartedAt.IsZero() {
@@ -421,10 +457,6 @@ func (s *Service) resumeDelivery(
 			info.Lifecycle = ContainerNeverStarted
 		}
 	} else {
-		meta.Phase = codexPhaseDeliveryRecon
-		if err := s.persistCodexIntent(ctx, intent, meta, intent.State); err != nil {
-			return LaunchAgentOutput{}, err
-		}
 		status, inspectErr := s.runtime.Inspect(ctx, meta.DeliveryContainerID)
 		if inspectErr != nil {
 			return s.failCodexIntent(ctx, intent, meta, "delivery_reconcile", inspectErr)

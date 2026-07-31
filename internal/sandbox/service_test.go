@@ -759,25 +759,26 @@ func assertMount(t *testing.T, mounts []Mount, source, target string, readonly b
 }
 
 type fakeRuntime struct {
-	mu           sync.Mutex
-	specs        []RuntimeSpec
-	logs         string
-	started      map[string]bool
-	exits        map[string]ContainerStatus
-	writes       map[string][]byte
-	injections   map[string][]byte
-	paths        map[string]bool
-	waiters      map[string]chan struct{}
-	waitClosed   map[string]bool
-	stopErr      error
-	stopExitCode *int
-	stopHook     func()
+	mu             sync.Mutex
+	specs          []RuntimeSpec
+	logs           string
+	started        map[string]bool
+	exits          map[string]ContainerStatus
+	writes         map[string][]byte
+	injections     map[string][]byte
+	injectionCalls map[string]int
+	paths          map[string]bool
+	waiters        map[string]chan struct{}
+	waitClosed     map[string]bool
+	stopErr        error
+	stopExitCode   *int
+	stopHook       func()
 }
 
 func newFakeRuntime() *fakeRuntime {
 	return &fakeRuntime{
 		started: map[string]bool{}, exits: map[string]ContainerStatus{}, writes: map[string][]byte{},
-		injections: map[string][]byte{}, paths: map[string]bool{},
+		injections: map[string][]byte{}, injectionCalls: map[string]int{}, paths: map[string]bool{},
 		waiters: map[string]chan struct{}{}, waitClosed: map[string]bool{},
 	}
 }
@@ -826,6 +827,7 @@ func (f *fakeRuntime) InjectSecret(
 	}
 	key := containerID + ":" + filepath.Join(targetDir, name)
 	f.injections[key] = append([]byte(nil), contents...)
+	f.injectionCalls[containerID]++
 	f.paths[containerID+":"+codexAcceptanceMarker] = true
 	return nil
 }
@@ -850,6 +852,15 @@ func (f *fakeRuntime) WaitForPath(
 		case <-time.After(time.Millisecond):
 		}
 	}
+}
+
+func (f *fakeRuntime) PathExists(
+	_ context.Context,
+	containerID, targetPath string,
+) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paths[containerID+":"+targetPath], nil
 }
 
 func (f *fakeRuntime) Wait(ctx context.Context, containerID string) (ContainerStatus, error) {

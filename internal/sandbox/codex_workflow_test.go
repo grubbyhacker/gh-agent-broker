@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,11 +18,15 @@ type fakeCodexIssuer struct {
 	issues   int
 	consumes int
 	cleanups int
+	consumed bool
 }
 
 func (f *fakeCodexIssuer) Issue(_ context.Context, _, _ string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.consumed {
+		return nil, errors.New("issuance already consumed")
+	}
 	f.issues++
 	return []byte(`{"tokens":{"access_token":"access-only","refresh_token":""}}`), nil
 }
@@ -30,6 +35,7 @@ func (f *fakeCodexIssuer) Consume(_ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.consumes++
+	f.consumed = true
 	return nil
 }
 
@@ -312,7 +318,7 @@ func TestCodexExecutionContaminationFailurePreventsDeliveryAndLeavesNoHostCreden
 	}
 }
 
-func TestCodexWorkflowRestartReinjectsWithoutDuplicateExecution(t *testing.T) {
+func TestCodexWorkflowRestartAdoptsAcceptedExecutionWithoutReinjection(t *testing.T) {
 	cfg := codexWorkflowTestConfig(t)
 	cfg.ApplyDefaults()
 	cfg.StampLoaded(time.Now().UTC())
@@ -352,7 +358,7 @@ func TestCodexWorkflowRestartReinjectsWithoutDuplicateExecution(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("lookup intent found=%t err=%v", found, err)
 	}
-	intent.Metadata.Phase = codexPhaseBundleInject
+	intent.Metadata.Phase = codexPhaseBundleAccept
 	intent.State = intentStateRunning
 	if err := store.Save(context.Background(), intent); err != nil {
 		t.Fatal(err)
@@ -360,26 +366,59 @@ func TestCodexWorkflowRestartReinjectsWithoutDuplicateExecution(t *testing.T) {
 	if err := service.writeMetadataFile(intent.Metadata); err != nil {
 		t.Fatal(err)
 	}
+	issuer.mu.Lock()
+	issuer.consumed = false
+	issuer.mu.Unlock()
 
 	restarted := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
 	restarted.SetCodexCredentialIssuer(issuer)
 	if err := restarted.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		issuer.mu.Lock()
-		defer issuer.mu.Unlock()
-		return issuer.issues >= 2
-	})
+	intent, found, err = store.LookupRun(context.Background(), out.RunID)
+	if err != nil || !found {
+		t.Fatalf("lookup accepted intent found=%t err=%v", found, err)
+	}
+	intent.Metadata.Phase = codexPhaseBundleInject
+	if err := store.Save(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.writeMetadataFile(intent.Metadata); err != nil {
+		t.Fatal(err)
+	}
+	restartedAfterConsume := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	restartedAfterConsume.SetCodexCredentialIssuer(issuer)
+	if err := restartedAfterConsume.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	runtime.mu.Lock()
 	specCount := len(runtime.specs)
+	injectionCount := runtime.injectionCalls["container-"+out.RunID+"-exec"]
 	runtime.mu.Unlock()
 	if specCount != 2 {
 		t.Fatalf("restart created %d containers, want one preparation and one execution", specCount)
 	}
+	issuer.mu.Lock()
+	issueCount := issuer.issues
+	consumeCount := issuer.consumes
+	issuer.mu.Unlock()
+	if issueCount != 1 || injectionCount != 1 {
+		t.Fatalf("restart issued=%d injected=%d, want no replay after acceptance", issueCount, injectionCount)
+	}
+	if consumeCount != 3 {
+		t.Fatalf("consume calls=%d, want acceptance and post-consume crash recovery", consumeCount)
+	}
+	recovered, found, err := store.LookupRun(context.Background(), out.RunID)
+	if err != nil || !found {
+		t.Fatalf("lookup recovered intent found=%t err=%v", found, err)
+	}
+	if recovered.Metadata.Status != StatusRunning || recovered.Metadata.Phase != codexPhaseExecutionRunning {
+		t.Fatalf("recovered metadata=%+v", recovered.Metadata)
+	}
+
 	writeExecutionFixture(t, cfg, out.RunID, out.Branch)
 	runtime.finish(out.RunID+"-exec", 0, "")
-	if err := restarted.Reconcile(context.Background()); err != nil {
+	if err := restartedAfterConsume.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool {
@@ -396,6 +435,68 @@ func TestCodexWorkflowRestartReinjectsWithoutDuplicateExecution(t *testing.T) {
 	defer runtime.mu.Unlock()
 	if len(runtime.specs) != 3 {
 		t.Fatalf("restart created %d containers, want exactly one preparation, execution, and delivery", len(runtime.specs))
+	}
+}
+
+func TestCodexWorkflowRestartRunningExecutionOnlyReattachesWatcher(t *testing.T) {
+	cfg := codexWorkflowTestConfig(t)
+	cfg.ApplyDefaults()
+	cfg.StampLoaded(time.Now().UTC())
+	runtime := newFakeRuntime()
+	store, err := OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("close launch intent store: %v", closeErr)
+		}
+	})
+	issuer := &fakeCodexIssuer{}
+	service := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	service.SetCodexCredentialIssuer(issuer)
+	in := cfg.LaunchProfiles["terra-medium-v1"].LaunchAgentInput
+	in.Profile = "terra-medium-v1"
+	in.Parameters = map[string]any{"issue_number": 42, "source_delivery_id": "delivery-42"}
+	out, err := service.LaunchProfile(context.Background(), "signal-plane", "terra-medium-v1", "running-restart", "fp", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writePreparationFixture(t, cfg, out.RunID, out.Branch)
+	runtime.finish(out.RunID+"-prep", 0, "")
+	waitFor(t, func() bool {
+		intent, found, lookupErr := store.LookupRun(context.Background(), out.RunID)
+		return lookupErr == nil && found && intent.Metadata.Phase == codexPhaseExecutionRunning
+	})
+
+	restarted := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	restarted.SetCodexCredentialIssuer(issuer)
+	if err := restarted.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	specCount := len(runtime.specs)
+	injectionCount := runtime.injectionCalls["container-"+out.RunID+"-exec"]
+	runtime.mu.Unlock()
+	issuer.mu.Lock()
+	issueCount := issuer.issues
+	consumeCount := issuer.consumes
+	issuer.mu.Unlock()
+	if specCount != 2 || issueCount != 1 || consumeCount != 1 || injectionCount != 1 {
+		t.Fatalf(
+			"restart specs=%d issues=%d consumes=%d injections=%d, want pure adoption",
+			specCount,
+			issueCount,
+			consumeCount,
+			injectionCount,
+		)
+	}
+	intent, found, err := store.LookupRun(context.Background(), out.RunID)
+	if err != nil || !found {
+		t.Fatalf("lookup intent found=%t err=%v", found, err)
+	}
+	if intent.State == intentStateTerminal || intent.Metadata.Status != StatusRunning {
+		t.Fatalf("running execution was falsely terminalized: %+v", intent)
 	}
 }
 

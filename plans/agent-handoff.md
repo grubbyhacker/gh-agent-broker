@@ -141,6 +141,15 @@ reconciliation. The durable launch intent uses `-prep`, `-exec`, and
 `-deliver` identities and adopts phase containers across restart; it never
 launches a second execution or delivery container.
 
+Execution restart reconciliation preserves the durable phase observed before
+container inspection. A running `execution_running` container is watch-only.
+`bundle_accept_pending` waits for the in-container acceptance marker and
+idempotently consumes issuance before adoption. `bundle_inject_pending` first
+probes that marker, so a crash after injection or consumption cannot re-issue
+or re-inject an accepted bundle; only a still-unaccepted, unconsumed issuance
+may be projected again. Preparation and delivery adoption likewise inspect
+without overwriting their durable phase with a transient reconcile phase.
+
 The staged `repository_transport_stage` audit events remain on the real Git
 path. No local repository backend, registered green-PR endpoint, agentd
 authority lifecycle, or agentd-issued Git credential path remains.

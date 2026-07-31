@@ -22,6 +22,7 @@ type RuntimeBackend interface {
 	Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error)
 	Start(ctx context.Context, containerID string) error
 	InjectSecret(ctx context.Context, containerID, targetDir, name string, contents []byte) error
+	PathExists(ctx context.Context, containerID, targetPath string) (bool, error)
 	WaitForPath(ctx context.Context, containerID, targetPath string, timeout time.Duration) error
 	Wait(ctx context.Context, containerID string) (ContainerStatus, error)
 	Inspect(ctx context.Context, containerID string) (ContainerStatus, error)
@@ -216,23 +217,18 @@ func (d *DockerBackend) WaitForPath(
 	containerID, targetPath string,
 	timeout time.Duration,
 ) error {
-	cleanPath := path.Clean(targetPath)
-	if cleanPath != "/dev/shm" && !strings.HasPrefix(cleanPath, "/dev/shm/") {
-		return fmt.Errorf("wait target must be within /dev/shm")
-	}
 	if timeout <= 0 || timeout > time.Minute {
 		return fmt.Errorf("wait timeout must be positive and at most one minute")
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	archivePath := "/containers/" + url.PathEscape(containerID) + "/archive?path=" + url.QueryEscape(cleanPath)
 	for {
-		err := d.do(waitCtx, http.MethodHead, archivePath, nil, nil)
-		if err == nil {
-			return nil
-		}
-		if code, ok := DockerStatusCode(err); !ok || code != http.StatusNotFound {
+		exists, err := d.PathExists(waitCtx, containerID, targetPath)
+		if err != nil {
 			return err
+		}
+		if exists {
+			return nil
 		}
 		select {
 		case <-waitCtx.Done():
@@ -240,6 +236,25 @@ func (d *DockerBackend) WaitForPath(
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
+
+func (d *DockerBackend) PathExists(
+	ctx context.Context,
+	containerID, targetPath string,
+) (bool, error) {
+	cleanPath := path.Clean(targetPath)
+	if cleanPath != "/dev/shm" && !strings.HasPrefix(cleanPath, "/dev/shm/") {
+		return false, fmt.Errorf("path target must be within /dev/shm")
+	}
+	archivePath := "/containers/" + url.PathEscape(containerID) + "/archive?path=" + url.QueryEscape(cleanPath)
+	err := d.do(ctx, http.MethodHead, archivePath, nil, nil)
+	if err == nil {
+		return true, nil
+	}
+	if code, ok := DockerStatusCode(err); ok && code == http.StatusNotFound {
+		return false, nil
+	}
+	return false, err
 }
 
 func (d *DockerBackend) Wait(ctx context.Context, containerID string) (ContainerStatus, error) {

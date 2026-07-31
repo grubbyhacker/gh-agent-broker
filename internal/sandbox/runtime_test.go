@@ -192,6 +192,32 @@ func TestDockerWaitForPathUsesBoundedInContainerArchiveProbe(t *testing.T) {
 	}
 }
 
+func TestDockerPathExistsDistinguishesMissingAcceptanceMarker(t *testing.T) {
+	t.Parallel()
+	status := http.StatusNotFound
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodHead || req.URL.Query().Get("path") != codexAcceptanceMarker {
+			t.Fatalf("probe=%s %s", req.Method, req.URL)
+		}
+		return &http.Response{StatusCode: status, Header: make(http.Header), Body: http.NoBody}, nil
+	})}}
+	exists, err := backend.PathExists(context.Background(), "container-id", codexAcceptanceMarker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("missing marker reported as present")
+	}
+	status = http.StatusOK
+	exists, err = backend.PathExists(context.Background(), "container-id", codexAcceptanceMarker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("acceptance marker reported as missing")
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
