@@ -196,13 +196,13 @@ func TestCodexPreparationWorkerContract(t *testing.T) {
 		"reject_credentials", "typed issue ingestion", "is_pull_request != true",
 		"issue_comment_limit=30", "issue_context_byte_limit=24576",
 		"stale image: dependency/submodule manifest mismatch", "hydrate_baked_submodules",
-		"codex-preparation-result/v1", "source_delivery_id",
+		"codex-preparation-result/v1", "source_delivery_id", "--slurpfile issue",
 	} {
 		if !strings.Contains(text, required) {
 			t.Errorf("preparation worker must contain %q", required)
 		}
 	}
-	for _, forbidden := range []string{"codex exec", "oauth/token", "refresh_token", "npm ci", "go mod download", "https://github.com"} {
+	for _, forbidden := range []string{"codex exec", "oauth/token", "refresh_token", "npm ci", "go mod download", "https://github.com", "--argfile"} {
 		if strings.Contains(text, forbidden) {
 			t.Errorf("preparation worker contains forbidden path %q", forbidden)
 		}
