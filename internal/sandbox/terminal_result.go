@@ -77,6 +77,12 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 		IdempotencyKeyDigest: meta.IdempotencyKeyDigest, RequestFingerprint: meta.RequestFingerprint,
 		LaunchConfigVersion: meta.LaunchConfigVersion,
 	}
+	if meta.TerminalSource == terminalSourceStartupFailure && meta.Error != "" {
+		result.Outcome = StatusFailed
+		result.FailureStage = "sandbox_startup"
+		result.FailureReason = abbreviate(s.redactor(meta).Redact(meta.Error), 500)
+		return result
+	}
 	workerResult, summary, stage, reason := s.readWorkerTerminalOutput(meta)
 	if reason != "" {
 		result.Outcome = fallbackOutcome(meta.Status)

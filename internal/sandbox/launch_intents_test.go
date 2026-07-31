@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -58,6 +59,49 @@ func TestRESTLaunchReplayCanonicalBodyUsesOneRuntimeAndRunID(t *testing.T) {
 	defer runtime.mu.Unlock()
 	if len(runtime.specs) != 1 {
 		t.Fatalf("runtime creates=%d, want 1", len(runtime.specs))
+	}
+}
+
+func TestRESTLaunchCreateFailureBecomesReplayableTerminalResult(t *testing.T) {
+	cfg := restTestConfig(t)
+	runtime := &createFailureRuntime{
+		fakeRuntime: newFakeRuntime(),
+		err:         errors.New("image unavailable with secret broker-secret"),
+	}
+	service := newRESTTestService(t, cfg, runtime, testAudit(t))
+	handler := NewRESTHandler(service)
+
+	first := performLaunch(t, handler, "create-failure-key", nil)
+	second := performLaunch(t, handler, "create-failure-key", nil)
+	if first.RunID == "" || first.RunID != second.RunID || first.Status != StatusFailed || second.Status != StatusFailed {
+		t.Fatalf("first=%+v second=%+v", first, second)
+	}
+	if first.Replay || !second.Replay {
+		t.Fatalf("first replay=%v second replay=%v", first.Replay, second.Replay)
+	}
+	runtime.mu.Lock()
+	if len(runtime.specs) != 1 {
+		t.Fatalf("runtime creates=%d, want 1", len(runtime.specs))
+	}
+	runtime.mu.Unlock()
+
+	result, err := service.GetTerminalResult(context.Background(), RunInput{RunID: first.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != StatusFailed || result.Outcome != StatusFailed ||
+		result.FailureStage != "sandbox_startup" ||
+		result.FailureReason != "image unavailable with secret [REDACTED]" {
+		t.Fatalf("terminal result=%+v", result)
+	}
+	intent, found, err := service.launchIntents.Lookup(
+		context.Background(),
+		"timer",
+		"nightly",
+		service.launchIntents.digestKey("create-failure-key"),
+	)
+	if err != nil || !found || intent.State != intentStateTerminal {
+		t.Fatalf("intent found=%v state=%q err=%v", found, intent.State, err)
 	}
 }
 
@@ -454,6 +498,19 @@ type recoveryRuntime struct {
 	muRecovery sync.Mutex
 	statuses   map[string]ContainerStatus
 	startCalls int
+}
+
+type createFailureRuntime struct {
+	*fakeRuntime
+	err error
+}
+
+func (r *createFailureRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
+	_ = ctx
+	r.mu.Lock()
+	r.specs = append(r.specs, spec)
+	r.mu.Unlock()
+	return ContainerInfo{}, r.err
 }
 
 func newRecoveryRuntime() *recoveryRuntime {
