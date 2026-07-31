@@ -181,3 +181,10 @@ the command list and preserves them byte-for-byte when replaying the request
 upstream. Malformed shallow lines are rejected with the named
 `malformed_shallow` reason. Push certificates remain unsupported because their
 embedded commands require separate parsing to preserve ref policy enforcement.
+
+The secure Codex production activation also requires an encrypted broker-state
+backup. The deployment workflow projects only the three scoped Restic/R2
+inputs named `VPS_OPS_GH_BROKER_STATE_BACKUP_*` into the existing vps-ops
+env-source boundary. The master Codex `auth.json` is not a GitHub or Doppler
+secret and is never projected by this workflow; it remains exclusively in the
+managed broker-side holder installed through the separate one-shot bootstrap.
