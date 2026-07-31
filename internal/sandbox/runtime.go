@@ -108,6 +108,10 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 	if err != nil {
 		imageDigest = spec.Image
 	}
+	tmpfs, err := tmpfsOptions(spec.Tmpfs, spec.User)
+	if err != nil {
+		return ContainerInfo{}, err
+	}
 	reqBody := dockerCreateRequest{
 		Image:      spec.Image,
 		Cmd:        spec.Command,
@@ -127,7 +131,7 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 			AutoRemove:      false,
 			Privileged:      false,
 			PublishAllPorts: false,
-			Tmpfs:           tmpfsOptions(spec.Tmpfs),
+			Tmpfs:           tmpfs,
 			StorageOpt:      storageOptions(spec.StorageLimitMB),
 		},
 	}
@@ -662,15 +666,31 @@ func binds(mounts []Mount) []string {
 	return out
 }
 
-func tmpfsOptions(entries map[string]int64) map[string]string {
+func tmpfsOptions(entries map[string]int64, user string) (map[string]string, error) {
 	if len(entries) == 0 {
-		return nil
+		return map[string]string{}, nil
+	}
+	uid, gid, ok := strings.Cut(user, ":")
+	if !ok || uid == "" || gid == "" {
+		return nil, fmt.Errorf("tmpfs requires an explicit numeric uid:gid container user")
+	}
+	for _, value := range []string{uid, gid} {
+		for _, char := range value {
+			if char < '0' || char > '9' {
+				return nil, fmt.Errorf("tmpfs requires an explicit numeric uid:gid container user")
+			}
+		}
 	}
 	out := make(map[string]string, len(entries))
 	for target, sizeMB := range entries {
-		out[target] = fmt.Sprintf("rw,noexec,nosuid,nodev,size=%dm,mode=0700", sizeMB)
+		out[target] = fmt.Sprintf(
+			"rw,noexec,nosuid,nodev,size=%dm,mode=0700,uid=%s,gid=%s",
+			sizeMB,
+			uid,
+			gid,
+		)
 	}
-	return out
+	return out, nil
 }
 
 func storageOptions(sizeMB int64) map[string]string {

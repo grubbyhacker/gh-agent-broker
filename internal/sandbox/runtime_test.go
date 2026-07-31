@@ -43,10 +43,27 @@ func TestDockerCreateAppliesTmpfsStorageAndPrivateNetworkContract(t *testing.T) 
 		t.Fatalf("image identity=%+v", info)
 	}
 	if create.HostConfig.NetworkMode != "codex-execution-internal" ||
-		create.HostConfig.Tmpfs["/dev/shm"] != "rw,noexec,nosuid,nodev,size=64m,mode=0700" ||
+		create.HostConfig.Tmpfs["/dev/shm"] != "rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=1000,gid=1000" ||
 		create.HostConfig.StorageOpt["size"] != "8192M" ||
 		create.HostConfig.Privileged || create.HostConfig.PublishAllPorts {
 		t.Fatalf("host config=%+v", create.HostConfig)
+	}
+}
+
+func TestTmpfsOptionsRequireExplicitNumericOwnership(t *testing.T) {
+	t.Parallel()
+	entries := map[string]int64{"/dev/shm": 64}
+	for _, user := range []string{"", "1000", "worker:worker", "1000:worker"} {
+		if _, err := tmpfsOptions(entries, user); err == nil {
+			t.Fatalf("accepted tmpfs with non-numeric container user %q", user)
+		}
+	}
+	options, err := tmpfsOptions(entries, "10000:10001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options["/dev/shm"] != "rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=10000,gid=10001" {
+		t.Fatalf("tmpfs options=%q", options["/dev/shm"])
 	}
 }
 
