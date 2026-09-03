@@ -225,3 +225,16 @@ The workflow validates the digest shape and passes
 vps-ops. This is required for reviewed activation pins; omitting the digest
 retains the ordinary tag-only behavior for deployment paths whose Ansible
 contract does not require an immutable application image.
+
+PR #167 recovery hardening now persists a delivery-attempt identity before
+container creation; the initial and recovered deliveries therefore use distinct
+runtime specs and Docker cannot adopt the exited stale delivery. A single
+stale-lease handoff is sealed with a SHA-256 over canonical run/repository/
+branch/expected/winner/candidate/tree fields, persisted in run metadata, and
+rechecked by the credential-free recovery worker and the broker. Recovery uses
+`git merge-tree --write-tree` plus `commit-tree` to apply the candidate onto
+the winning head and fails closed on conflicts. Recovery templates accept no
+extra mounts and reject `BROKER_*`, Codex, OpenAI, and proxy environment keys.
+Issue-comment idempotency atomically reserves an exact request, retains its
+first rendered semantic body for reconciliation/retry, and scans an explicit
+ten pages of comments; raw idempotency keys remain absent from durable state.

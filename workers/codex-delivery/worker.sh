@@ -174,18 +174,22 @@ stale_lease_rejection() {
 }
 
 record_stale_repair_lease() {
-  local repair_head=$1 expected=$2 output=$3 winner candidate
+  local repair_head=$1 expected=$2 output=$3 winner candidate tree seal merge_tree
   stale_lease_rejection "$output" || return 1
-  # This is the only credentialed recovery operation: fetch the winning head,
-  # reset, and apply the sealed candidate diff without hooks, filters, or task execution.
+  # This is the only credentialed recovery operation. Merge the sealed
+  # candidate commit with the winning head using Git's three-way tree merge;
+  # a conflict is a hard stop, never a best-effort patch application.
   trusted_git -C /work/repo fetch --quiet origin "+refs/heads/${repair_head}:refs/remotes/origin/${repair_head}" || return 1
   winner=$(trusted_git -C /work/repo rev-parse "refs/remotes/origin/${repair_head}") || return 1
-  trusted_git -C /work/repo reset --hard "$winner" || return 1
-  trusted_git -C /work/repo apply --index --whitespace=nowarn /work/execution/diff.patch || return 1
-  trusted_git -C /work/repo commit --no-verify --quiet -m "Recover Codex issue task ${AGENT_RUN_ID}" || return 1
+  merge_tree=$(trusted_git -C /work/repo merge-tree --write-tree "$winner" "$candidate_head_sha") || return 1
+  candidate=$(trusted_git -C /work/repo commit-tree "$merge_tree" -p "$winner" -m "Recover Codex issue task ${AGENT_RUN_ID}") || return 1
+  trusted_git -C /work/repo reset --hard "$candidate" || return 1
   candidate=$(trusted_git -C /work/repo rev-parse HEAD) || return 1
-  jq -n --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" --arg expected "$expected" --arg winner "$winner" --arg candidate "$candidate" \
-    '{version:"codex-stale-lease/v2",status:"stale_lease",run_id:$run,repository:$repo,branch:$branch,expected_head_sha:$expected,winner_head_sha:$winner,candidate_head_sha:$candidate}' \
+  tree=$(trusted_git -C /work/repo rev-parse 'HEAD^{tree}') || return 1
+  seal=$(jq -cn --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" --arg expected "$expected" --arg winner "$winner" --arg candidate "$candidate" --arg tree "$tree" \
+    '{branch:$branch,candidate_head_sha:$candidate,candidate_tree_sha:$tree,expected_head_sha:$expected,repository:$repo,run_id:$run,winner_head_sha:$winner}' | sha256sum | cut -d' ' -f1) || return 1
+  jq -n --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" --arg expected "$expected" --arg winner "$winner" --arg candidate "$candidate" --arg tree "$tree" --arg seal "$seal" \
+    '{version:"codex-stale-lease/v3",status:"stale_lease",run_id:$run,repository:$repo,branch:$branch,expected_head_sha:$expected,winner_head_sha:$winner,candidate_head_sha:$candidate,candidate_tree_sha:$tree,seal_sha256:$seal}' \
     > /output/stale-lease.json
   return 0
 }

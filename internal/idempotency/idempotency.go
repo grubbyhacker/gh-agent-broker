@@ -28,6 +28,33 @@ type state struct {
 	Keys map[string]Record `json:"keys"`
 }
 
+// ReserveExact atomically reserves an exact mutation key. A pending record is
+// intentionally durable before the external call, so ambiguous calls can be
+// reconciled after a crash without allowing concurrent duplicate posts.
+func ReserveExact(cfg config.IdempotencyConfig, key, operation, digest, semanticBody string) (Record, bool, bool, error) {
+	if cfg.StatePath == "" || key == "" {
+		return Record{}, false, false, nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	st, err := readState(cfg.StatePath)
+	if err != nil {
+		return Record{}, false, false, err
+	}
+	if rec, ok := st.Keys[key]; ok {
+		if rec.Operation != operation || rec.RequestDigest == "" || rec.RequestDigest != digest {
+			return rec, true, true, nil
+		}
+		return rec, true, false, nil
+	}
+	rec := Record{CreatedAt: time.Now().UTC(), Operation: operation, RequestDigest: digest, Pending: true, SemanticBody: semanticBody}
+	st.Keys[key] = rec
+	if err := writeState(cfg.StatePath, st); err != nil {
+		return Record{}, false, false, err
+	}
+	return rec, false, false, nil
+}
+
 func Load(cfg config.IdempotencyConfig, key string) (Record, bool, error) {
 	if cfg.StatePath == "" || key == "" {
 		return Record{}, false, nil

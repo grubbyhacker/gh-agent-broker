@@ -48,6 +48,8 @@ type Server struct {
 	fence      pushtripwire.FenceAdapter
 }
 
+var issueCommentMutationMu sync.Mutex
+
 // transportOperation is retained while staged audit records are emitted by
 // handleGit. It has no authority or credential-bearing state.
 type transportOperation struct{}
@@ -1923,18 +1925,41 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 	// State never retains the caller supplied idempotency key. The digest is
 	// sufficient to bind retries and avoids turning durable state into a key log.
 	scopedKey := "issue.comment:" + principal.ID + ":" + repo + ":" + issueNumber + ":" + idempotencyKeyDigest(key)
+	// Serialise the complete external mutation per broker process. The durable
+	// reservation below handles restart; together they prevent two live
+	// identical requests from both reconciling an absent comment and posting.
+	issueCommentMutationMu.Lock()
+	defer issueCommentMutationMu.Unlock()
 	extra := map[string]interface{}{"issue_number": issueNumber, "idempotency_key_digest": idempotencyKeyDigest(key), "request_digest": requestDigest}
-	if pending, err := pendingIssueComment(cfg.Idempotency, scopedKey, requestDigest, body); err != nil {
-		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
-		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+	record, found, conflict, reserveErr := idempotency.ReserveExact(cfg.Idempotency, scopedKey, "issue.comment", requestDigest, body)
+	if reserveErr != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: reserveErr.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(reserveErr.Error()), OperationID: opID, Decision: policy.DecisionDeny})
 		return
-	} else if pending {
+	}
+	if conflict {
+		writeJSON(w, http.StatusConflict, api.ErrorResponse{Code: "idempotency_key_conflict", Message: "Idempotency-Key was already used for different issue-comment content or target", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	if found && !record.Pending {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(record.Status)
+		if _, err := w.Write(record.Body); err != nil {
+			return
+		}
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
+		return
+	}
+	if found && record.Pending {
+		// The original body includes the original broker operation metadata. It
+		// must be reused verbatim for reconciliation and any retry create.
+		body = record.SemanticBody
 		commentNumber, parseErr := strconv.Atoi(issueNumber)
 		if parseErr != nil || commentNumber < 1 {
 			writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "invalid issue comment target", OperationID: opID, Decision: policy.DecisionDeny})
 			return
 		}
-		comments, listErr := gh.ListIssueComments(appName, repo, inst, commentNumber, url.Values{"per_page": []string{"100"}})
+		comments, listErr := listIssueCommentsForReconciliation(gh, appName, repo, inst, commentNumber)
 		if listErr != nil {
 			writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(listErr.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
 			return
@@ -1947,22 +1972,6 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_reconciled", Extra: extra})
 			return
 		}
-	}
-	if replayed, conflict, err := replayExactIdempotent(w, cfg.Idempotency, scopedKey, "issue.comment", requestDigest); err != nil {
-		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
-		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
-		return
-	} else if conflict {
-		writeJSON(w, http.StatusConflict, api.ErrorResponse{Code: "idempotency_key_conflict", Message: "Idempotency-Key was already used for different issue-comment content or target", OperationID: opID, Decision: policy.DecisionDeny})
-		return
-	} else if replayed {
-		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
-		return
-	}
-	if err := storePendingIssueComment(cfg.Idempotency, scopedKey, requestDigest, body); err != nil {
-		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
-		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
-		return
 	}
 	ghResult, err := gh.CreateIssueComment(appName, repo, issueNumber, inst, body)
 	if err != nil {
@@ -1977,6 +1986,23 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		return
 	}
 	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: ghResult.HTMLURL, Result: "ok", Extra: extra})
+}
+
+const issueCommentReconciliationPageLimit = 10
+
+func listIssueCommentsForReconciliation(gh *githubapp.Client, appName, repo string, installationID int64, issueNumber int) ([]api.IssueComment, error) {
+	var comments []api.IssueComment
+	for page := 1; page <= issueCommentReconciliationPageLimit; page++ {
+		batch, err := gh.ListIssueComments(appName, repo, installationID, issueNumber, url.Values{"per_page": []string{"100"}, "page": []string{strconv.Itoa(page)}})
+		if err != nil {
+			return nil, err
+		}
+		comments = append(comments, batch...)
+		if len(batch) < 100 {
+			return comments, nil
+		}
+	}
+	return nil, fmt.Errorf("issue comment reconciliation exceeds %d pages", issueCommentReconciliationPageLimit)
 }
 
 func commentRequestDigest(repo, issue string, req api.CommentCreateRequest) string {
@@ -1995,21 +2021,6 @@ func commentRequestDigest(repo, issue string, req api.CommentCreateRequest) stri
 func idempotencyKeyDigest(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
-}
-
-func pendingIssueComment(cfg config.IdempotencyConfig, key, digest, body string) (bool, error) {
-	rec, found, err := idempotency.Load(cfg, key)
-	if err != nil || !found {
-		return false, err
-	}
-	if rec.Operation != "issue.comment" || rec.RequestDigest != digest {
-		return false, nil
-	}
-	return rec.Pending, nil
-}
-
-func storePendingIssueComment(cfg config.IdempotencyConfig, key, digest, body string) error {
-	return idempotency.Store(cfg, key, idempotency.Record{Operation: "issue.comment", RequestDigest: digest, Pending: true, SemanticBody: body})
 }
 
 func reconcilePendingComment(comments []api.IssueComment, body string) (api.GitHubResult, bool) {

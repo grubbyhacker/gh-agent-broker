@@ -2,11 +2,14 @@ package sandbox
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -90,10 +93,13 @@ type recoveryValidationResult struct {
 	RunID            string `json:"run_id"`
 	Repository       string `json:"repository"`
 	Branch           string `json:"branch"`
+	ExpectedHeadSHA  string `json:"expected_head_sha,omitempty"`
 	WinnerHeadSHA    string `json:"winner_head_sha"`
 	CandidateHeadSHA string `json:"candidate_head_sha"`
+	CandidateTreeSHA string `json:"candidate_tree_sha,omitempty"`
 	ValidatedTreeSHA string `json:"validated_tree_sha"`
 	VerifySHA256     string `json:"verify_sha256"`
+	SealSHA256       string `json:"seal_sha256,omitempty"`
 }
 
 func (s *Service) resumeCodexIssueWorkflow(
@@ -156,7 +162,7 @@ func (s *Service) resumeRecoveryValidation(ctx context.Context, intent *launchIn
 	if err != nil {
 		return LaunchAgentOutput{}, err
 	}
-	spec.RunID = meta.RunID + "-recover"
+	spec.RunID = meta.RunID + "-recover-" + strconv.Itoa(meta.RecoveryCount+1)
 	spec.Labels["gh-agent-broker.parent_run_id"] = meta.RunID
 	spec.Labels["gh-agent-broker.run_id"] = spec.RunID
 	spec.Labels["gh-agent-broker.template"] = workflow.RecoveryTemplate
@@ -223,7 +229,12 @@ func (s *Service) completeRecoveryValidation(ctx context.Context, intent *launch
 	if err := s.readRecoveryValidation(meta); err != nil {
 		return s.failCodexIntent(ctx, intent, meta, "recovery_validation", err)
 	}
-	meta.DeliveryContainerID, meta.ContainerID, meta.Phase = "", "", codexPhaseDeliveryCreate
+	// The initial delivery container is terminal. Allocate and persist a new
+	// runtime identity before the recovered delivery is created; Docker's
+	// adoption key includes this run ID, so it cannot adopt the stale exit.
+	meta.DeliveryContainerID, meta.ContainerID = "", ""
+	meta.DeliveryAttempt++
+	meta.Phase = codexPhaseDeliveryCreate
 	return s.resumeDelivery(ctx, intent, meta, workflow)
 }
 
@@ -550,7 +561,15 @@ func (s *Service) resumeDelivery(
 	if err != nil {
 		return LaunchAgentOutput{}, err
 	}
-	spec.RunID = meta.RunID + "-deliver"
+	if meta.DeliveryAttempt == 0 {
+		// Persist the attempt before Docker create so a restart reconciles the
+		// same identity; recovery advances this durable counter before retrying.
+		meta.DeliveryAttempt = 1
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateCreatePending); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+	}
+	spec.RunID = meta.RunID + "-deliver-" + strconv.Itoa(meta.DeliveryAttempt)
 	spec.Labels["gh-agent-broker.parent_run_id"] = meta.RunID
 	spec.Labels["gh-agent-broker.run_id"] = spec.RunID
 	spec.Labels["gh-agent-broker.template"] = workflow.DeliveryTemplate
@@ -629,7 +648,12 @@ func (s *Service) completeDelivery(
 		return LaunchAgentOutput{}, err
 	}
 	if status.ExitCode != nil && *status.ExitCode != 0 {
-		if _, err := s.readStaleLease(meta); err == nil {
+		if stale, err := s.readStaleLease(meta); err == nil && meta.RecoveryCount == 0 {
+			meta.RecoveryExpectedHeadSHA = stale.ExpectedHeadSHA
+			meta.RecoveryWinnerHeadSHA = stale.WinnerHeadSHA
+			meta.RecoveryCandidateHeadSHA = stale.CandidateHeadSHA
+			meta.RecoveryCandidateTreeSHA = stale.CandidateTreeSHA
+			meta.RecoverySealSHA256 = stale.SealSHA256
 			meta.Phase, meta.ContainerID = codexPhaseRecoveryCreate, ""
 			profile := s.cfg.LaunchProfiles[meta.Profile]
 			if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
@@ -877,9 +901,11 @@ func (s *Service) readStaleLease(meta RunMetadata) (recoveryValidationResult, er
 		return recoveryValidationResult{}, err
 	}
 	var result recoveryValidationResult
-	if err := json.Unmarshal(data, &result); err != nil || result.Version != "codex-stale-lease/v2" || result.Status != "stale_lease" ||
+	if err := json.Unmarshal(data, &result); err != nil || result.Version != "codex-stale-lease/v3" || result.Status != "stale_lease" ||
 		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
-		!regexpSHA(result.WinnerHeadSHA, 40) || !regexpSHA(result.CandidateHeadSHA, 40) {
+		!regexpSHA(result.ExpectedHeadSHA, 40) || !regexpSHA(result.WinnerHeadSHA, 40) || !regexpSHA(result.CandidateHeadSHA, 40) ||
+		!regexpSHA(result.CandidateTreeSHA, 40) || !regexpSHA(result.SealSHA256, 64) ||
+		result.SealSHA256 != recoverySeal(result.RunID, result.Repository, result.Branch, result.ExpectedHeadSHA, result.WinnerHeadSHA, result.CandidateHeadSHA, result.CandidateTreeSHA) {
 		return recoveryValidationResult{}, fmt.Errorf("stale lease handoff is invalid")
 	}
 	return result, nil
@@ -893,10 +919,29 @@ func (s *Service) readRecoveryValidation(meta RunMetadata) error {
 	var result recoveryValidationResult
 	if err := json.Unmarshal(data, &result); err != nil || result.Version != "codex-recovery-validation/v1" || result.Status != "passed" ||
 		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
-		!regexpSHA(result.WinnerHeadSHA, 40) || !regexpSHA(result.CandidateHeadSHA, 40) || !regexpSHA(result.ValidatedTreeSHA, 40) || !regexpSHA(result.VerifySHA256, 64) {
+		result.WinnerHeadSHA != meta.RecoveryWinnerHeadSHA || result.CandidateHeadSHA != meta.RecoveryCandidateHeadSHA ||
+		result.ValidatedTreeSHA != meta.RecoveryCandidateTreeSHA || result.SealSHA256 != meta.RecoverySealSHA256 ||
+		!regexpSHA(result.WinnerHeadSHA, 40) || !regexpSHA(result.CandidateHeadSHA, 40) || !regexpSHA(result.ValidatedTreeSHA, 40) || !regexpSHA(result.VerifySHA256, 64) || !regexpSHA(result.SealSHA256, 64) {
 		return fmt.Errorf("recovery validation result does not match broker launch identity")
 	}
 	return nil
+}
+
+func recoverySeal(runID, repository, branch, expected, winner, candidate, tree string) string {
+	identity, err := json.Marshal(struct {
+		Branch     string `json:"branch"`
+		Candidate  string `json:"candidate_head_sha"`
+		Tree       string `json:"candidate_tree_sha"`
+		Expected   string `json:"expected_head_sha"`
+		Repository string `json:"repository"`
+		RunID      string `json:"run_id"`
+		Winner     string `json:"winner_head_sha"`
+	}{branch, candidate, tree, expected, repository, runID, winner})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(identity)
+	return hex.EncodeToString(sum[:])
 }
 
 func regexpSHA(value string, size int) bool {

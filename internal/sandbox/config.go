@@ -652,6 +652,9 @@ func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, w
 			errs = append(errs, fmt.Sprintf("launch profile %q recovery template must be credential-free with no broker or Codex network", name))
 		}
 		errs = append(errs, validateCodexTemplateSurface(name, "recovery", recovery)...)
+		if len(recovery.ExtraMounts) != 0 {
+			errs = append(errs, fmt.Sprintf("launch profile %q recovery template must not configure extra_mounts", name))
+		}
 	}
 	for _, required := range []string{"issue_number", "source_delivery_id"} {
 		decl, ok := profile.Parameters[required]
@@ -675,7 +678,7 @@ func validateCodexTemplateSurface(profile, phase string, template Template) []st
 	var errs []string
 	for key := range template.Environment {
 		upper := strings.ToUpper(key)
-		if strings.HasPrefix(upper, "OPENAI_") || strings.HasPrefix(upper, "CODEX_") ||
+		if strings.HasPrefix(upper, "OPENAI_") || strings.HasPrefix(upper, "CODEX_") || (phase == "recovery" && strings.HasPrefix(upper, "BROKER_")) ||
 			upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY" {
 			errs = append(errs, fmt.Sprintf("launch profile %q %s template cannot configure credential or proxy environment %q", profile, phase, key))
 		}

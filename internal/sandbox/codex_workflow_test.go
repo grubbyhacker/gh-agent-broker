@@ -172,12 +172,12 @@ func TestCodexIssueWorkflowSeparatesPreparationIssuanceAndExecution(t *testing.T
 	waitFor(t, func() bool {
 		runtime.mu.Lock()
 		defer runtime.mu.Unlock()
-		return len(runtime.specs) == 3 && runtime.started["container-"+out.RunID+"-deliver"]
+		return len(runtime.specs) == 3 && runtime.started["container-"+out.RunID+"-deliver-1"]
 	})
 	runtime.mu.Lock()
 	deliverySpec := runtime.specs[2]
 	runtime.mu.Unlock()
-	if deliverySpec.RunID != out.RunID+"-deliver" ||
+	if deliverySpec.RunID != out.RunID+"-deliver-1" ||
 		!reflect.DeepEqual(deliverySpec.Network, cfg.Networks["delivery"]) {
 		t.Fatalf("delivery spec=%+v", deliverySpec)
 	}
@@ -204,7 +204,7 @@ func TestCodexIssueWorkflowSeparatesPreparationIssuanceAndExecution(t *testing.T
 	if err := os.WriteFile(filepath.Join(outputDir, "codex-usage.json"), []byte(`{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runtime.finish(out.RunID+"-deliver", 0, "")
+	runtime.finish(out.RunID+"-deliver-1", 0, "")
 	waitFor(t, func() bool {
 		_, terminalErr := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
 		return terminalErr == nil
@@ -240,6 +240,28 @@ func writeExecutionFixture(t *testing.T, cfg Config, runID, branch string) {
 		VerifySHA256: strings.Repeat("6", 64), Verification: "passed",
 		FinalSizeBytes: 10,
 	})
+}
+
+func TestRecoverySealRejectsTamperedStaleLease(t *testing.T) {
+	cfg := codexWorkflowTestConfig(t)
+	meta := RunMetadata{RunID: "20260903T000000Z-aaaaaaaaaaaaaaaa", Repo: "owner/repo", Branch: "agent/test"}
+	expected, winner, candidate, tree := strings.Repeat("1", 40), strings.Repeat("2", 40), strings.Repeat("3", 40), strings.Repeat("4", 40)
+	handoff := recoveryValidationResult{Version: "codex-stale-lease/v3", Status: "stale_lease", RunID: meta.RunID, Repository: meta.Repo, Branch: meta.Branch, ExpectedHeadSHA: expected, WinnerHeadSHA: winner, CandidateHeadSHA: candidate, CandidateTreeSHA: tree}
+	handoff.SealSHA256 = recoverySeal(meta.RunID, meta.Repo, meta.Branch, expected, winner, candidate, tree)
+	path := filepath.Join(cfg.RunsDir, meta.RunID, "output", "stale-lease.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONFileForTest(t, path, handoff)
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	if _, err := service.readStaleLease(meta); err != nil {
+		t.Fatalf("valid sealed handoff: %v", err)
+	}
+	handoff.CandidateHeadSHA = strings.Repeat("5", 40)
+	writeJSONFileForTest(t, path, handoff)
+	if _, err := service.readStaleLease(meta); err == nil {
+		t.Fatal("tampered sealed handoff was accepted")
+	}
 }
 
 func writeExecutionFailureFixture(t *testing.T, cfg Config, runID, branch string, exitCode int, diagnostic string) {

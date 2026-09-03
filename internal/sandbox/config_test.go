@@ -333,6 +333,16 @@ func TestCodexIssueWorkflowConfigIsExactAndDenyByDefault(t *testing.T) {
 			template.Environment = map[string]string{"OPENAI_API_KEY": "forbidden"}
 			c.Templates["prep"] = template
 		}, want: "cannot configure credential or proxy environment"},
+		{name: "recovery broker env", mutate: func(c *Config) {
+			template := c.Templates["recovery"]
+			template.Environment = map[string]string{"BROKER_AGENT_SECRET": "forbidden"}
+			c.Templates["recovery"] = template
+		}, want: "cannot configure credential or proxy environment"},
+		{name: "recovery extra mount", mutate: func(c *Config) {
+			template := c.Templates["recovery"]
+			template.ExtraMounts = []ExtraMount{{SourcePath: "/tmp/secret", MountPath: "/data/secret", ReadOnly: true}}
+			c.Templates["recovery"] = template
+		}, want: "must not configure extra_mounts"},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {

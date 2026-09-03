@@ -90,55 +90,61 @@ type runtimeFileWriter interface {
 }
 
 type RunMetadata struct {
-	RunID                  string           `json:"run_id"`
-	Profile                string           `json:"profile,omitempty"`
-	Principal              string           `json:"principal,omitempty"`
-	IdempotencyKeyDigest   string           `json:"idempotency_key_digest,omitempty"`
-	RequestFingerprint     string           `json:"request_fingerprint,omitempty"`
-	LaunchConfigVersion    string           `json:"launch_config_version,omitempty"`
-	Template               string           `json:"template"`
-	Repo                   string           `json:"repo"`
-	BaseBranch             string           `json:"base_branch"`
-	Branch                 string           `json:"branch"`
-	Task                   string           `json:"task"`
-	VerificationTask       string           `json:"verification_task,omitempty"`
-	Focus                  string           `json:"focus,omitempty"`
-	WorkerAgentID          string           `json:"worker_agent_id"`
-	BrokerAgentID          string           `json:"broker_agent_id"`
-	CredentialBundle       string           `json:"credential_bundle,omitempty"`
-	ContainerID            string           `json:"container_id,omitempty"`
-	Image                  string           `json:"image"`
-	ImageDigest            string           `json:"image_digest,omitempty"`
-	Status                 string           `json:"status"`
-	ExitCode               *int             `json:"exit_code,omitempty"`
-	FinalizeReason         string           `json:"finalize_reason,omitempty"`
-	TerminalSource         string           `json:"terminal_source,omitempty"`
-	Error                  string           `json:"error,omitempty"`
-	Deliverables           []string         `json:"deliverables,omitempty"`
-	Parameters             map[string]any   `json:"parameters,omitempty"`
-	StartedAt              time.Time        `json:"started_at"`
-	Deadline               time.Time        `json:"deadline"`
-	EndedAt                time.Time        `json:"ended_at,omitempty"`
-	Phase                  string           `json:"phase,omitempty"`
-	PreparationContainerID string           `json:"preparation_container_id,omitempty"`
-	ExecutionContainerID   string           `json:"execution_container_id,omitempty"`
-	DeliveryContainerID    string           `json:"delivery_container_id,omitempty"`
-	RecoveryContainerID    string           `json:"recovery_container_id,omitempty"`
-	RecoveryCount          int              `json:"recovery_count,omitempty"`
-	PreparationImageDigest string           `json:"preparation_image_digest,omitempty"`
-	PreparationPlatform    string           `json:"preparation_platform,omitempty"`
-	ExecutionPlatform      string           `json:"execution_platform,omitempty"`
-	DeliveryImageDigest    string           `json:"delivery_image_digest,omitempty"`
-	DeliveryPlatform       string           `json:"delivery_platform,omitempty"`
-	PreparationStartedAt   time.Time        `json:"preparation_started_at,omitempty"`
-	PreparationEndedAt     time.Time        `json:"preparation_ended_at,omitempty"`
-	ExecutionStartedAt     time.Time        `json:"execution_started_at,omitempty"`
-	ExecutionEndedAt       time.Time        `json:"execution_ended_at,omitempty"`
-	DeliveryStartedAt      time.Time        `json:"delivery_started_at,omitempty"`
-	DeliveryEndedAt        time.Time        `json:"delivery_ended_at,omitempty"`
-	RecoveryStartedAt      time.Time        `json:"recovery_started_at,omitempty"`
-	RecoveryEndedAt        time.Time        `json:"recovery_ended_at,omitempty"`
-	Provenance             *CodexProvenance `json:"provenance,omitempty"`
+	RunID                    string           `json:"run_id"`
+	Profile                  string           `json:"profile,omitempty"`
+	Principal                string           `json:"principal,omitempty"`
+	IdempotencyKeyDigest     string           `json:"idempotency_key_digest,omitempty"`
+	RequestFingerprint       string           `json:"request_fingerprint,omitempty"`
+	LaunchConfigVersion      string           `json:"launch_config_version,omitempty"`
+	Template                 string           `json:"template"`
+	Repo                     string           `json:"repo"`
+	BaseBranch               string           `json:"base_branch"`
+	Branch                   string           `json:"branch"`
+	Task                     string           `json:"task"`
+	VerificationTask         string           `json:"verification_task,omitempty"`
+	Focus                    string           `json:"focus,omitempty"`
+	WorkerAgentID            string           `json:"worker_agent_id"`
+	BrokerAgentID            string           `json:"broker_agent_id"`
+	CredentialBundle         string           `json:"credential_bundle,omitempty"`
+	ContainerID              string           `json:"container_id,omitempty"`
+	Image                    string           `json:"image"`
+	ImageDigest              string           `json:"image_digest,omitempty"`
+	Status                   string           `json:"status"`
+	ExitCode                 *int             `json:"exit_code,omitempty"`
+	FinalizeReason           string           `json:"finalize_reason,omitempty"`
+	TerminalSource           string           `json:"terminal_source,omitempty"`
+	Error                    string           `json:"error,omitempty"`
+	Deliverables             []string         `json:"deliverables,omitempty"`
+	Parameters               map[string]any   `json:"parameters,omitempty"`
+	StartedAt                time.Time        `json:"started_at"`
+	Deadline                 time.Time        `json:"deadline"`
+	EndedAt                  time.Time        `json:"ended_at,omitempty"`
+	Phase                    string           `json:"phase,omitempty"`
+	PreparationContainerID   string           `json:"preparation_container_id,omitempty"`
+	ExecutionContainerID     string           `json:"execution_container_id,omitempty"`
+	DeliveryContainerID      string           `json:"delivery_container_id,omitempty"`
+	DeliveryAttempt          int              `json:"delivery_attempt,omitempty"`
+	RecoveryContainerID      string           `json:"recovery_container_id,omitempty"`
+	RecoveryCount            int              `json:"recovery_count,omitempty"`
+	PreparationImageDigest   string           `json:"preparation_image_digest,omitempty"`
+	PreparationPlatform      string           `json:"preparation_platform,omitempty"`
+	ExecutionPlatform        string           `json:"execution_platform,omitempty"`
+	DeliveryImageDigest      string           `json:"delivery_image_digest,omitempty"`
+	DeliveryPlatform         string           `json:"delivery_platform,omitempty"`
+	PreparationStartedAt     time.Time        `json:"preparation_started_at,omitempty"`
+	PreparationEndedAt       time.Time        `json:"preparation_ended_at,omitempty"`
+	ExecutionStartedAt       time.Time        `json:"execution_started_at,omitempty"`
+	ExecutionEndedAt         time.Time        `json:"execution_ended_at,omitempty"`
+	DeliveryStartedAt        time.Time        `json:"delivery_started_at,omitempty"`
+	DeliveryEndedAt          time.Time        `json:"delivery_ended_at,omitempty"`
+	RecoveryStartedAt        time.Time        `json:"recovery_started_at,omitempty"`
+	RecoveryEndedAt          time.Time        `json:"recovery_ended_at,omitempty"`
+	RecoveryExpectedHeadSHA  string           `json:"recovery_expected_head_sha,omitempty"`
+	RecoveryWinnerHeadSHA    string           `json:"recovery_winner_head_sha,omitempty"`
+	RecoveryCandidateHeadSHA string           `json:"recovery_candidate_head_sha,omitempty"`
+	RecoveryCandidateTreeSHA string           `json:"recovery_candidate_tree_sha,omitempty"`
+	RecoverySealSHA256       string           `json:"recovery_seal_sha256,omitempty"`
+	Provenance               *CodexProvenance `json:"provenance,omitempty"`
 }
 
 type CodexProvenance struct {
@@ -1311,6 +1317,9 @@ func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Red
 	env["AGENT_BRANCH"] = meta.Branch
 	env["AGENT_TASK"] = meta.Task
 	env["AGENT_VERIFY_TASK"] = meta.VerificationTask
+	if meta.RecoverySealSHA256 != "" {
+		env["AGENT_RECOVERY_SEAL_SHA256"] = meta.RecoverySealSHA256
+	}
 	labels := map[string]string{
 		"gh-agent-broker.sandbox":  "true",
 		"gh-agent-broker.run_id":   meta.RunID,
