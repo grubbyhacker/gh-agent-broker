@@ -419,9 +419,12 @@ func codexWorkflowTestConfig(t *testing.T) Config {
 			},
 			RequireIdempotencyKey: true,
 			MaxConcurrentRuns:     1,
+			AllowOverrides:        []string{"max_runtime_seconds"},
 			Parameters: map[string]ParameterDeclaration{
 				"issue_number":       {Type: "integer", Required: true, Min: intPtr(1)},
 				"source_delivery_id": {Type: "string", Required: true, MaxLength: 128, Pattern: `^[A-Za-z0-9-]+$`},
+				"repair_pr_number":   {Type: "integer", Min: intPtr(1)},
+				"expected_head_sha":  {Type: "string", MaxLength: 40, Pattern: `^[a-f0-9]{40}$`},
 			},
 			CodexIssueWorkflow: &CodexIssueWorkflow{
 				PreparationTemplate: "prep", ExecutionTemplate: "execution", RecoveryTemplate: "recovery", DeliveryTemplate: "delivery",

@@ -291,8 +291,64 @@ func TestRESTParameterizedLaunchRejectsInvalidParametersBeforeRunCreation(t *tes
 	req = restRequest(http.MethodPost, "/v1/launch-profiles/nightly/preview", "timer-secret", body)
 	resp = httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "only parameters") {
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), `override field \"repo\" is not allowed`) {
 		t.Fatalf("unexpected top-level field status = %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestResolveCodexProfileParametersRequiresCompleteRepairIdentity(t *testing.T) {
+	profile := codexWorkflowTestConfig(t).LaunchProfiles["terra-medium-v1"]
+	base := map[string]any{"issue_number": float64(123), "source_delivery_id": "delivery-123"}
+
+	initial, err := resolveProfileParameters(profile, base)
+	if err != nil {
+		t.Fatalf("initial parameters: %v", err)
+	}
+	if _, ok := initial["repair_pr_number"]; ok {
+		t.Fatalf("initial parameters unexpectedly entered repair mode: %#v", initial)
+	}
+
+	repair := map[string]any{
+		"issue_number": float64(123), "source_delivery_id": "delivery-123",
+		"repair_pr_number": float64(456), "expected_head_sha": strings.Repeat("a", 40),
+	}
+	if _, err := resolveProfileParameters(profile, repair); err != nil {
+		t.Fatalf("complete repair parameters: %v", err)
+	}
+
+	for _, missing := range []string{"repair_pr_number", "expected_head_sha"} {
+		partial := map[string]any{}
+		for key, value := range repair {
+			if key != missing {
+				partial[key] = value
+			}
+		}
+		if _, err := resolveProfileParameters(profile, partial); err == nil || !strings.Contains(err.Error(), "must be supplied together") {
+			t.Fatalf("parameters missing %s error = %v, want pair rejection", missing, err)
+		}
+	}
+}
+
+func TestResolveParameterizedCodexRequestAllowsOnlyReviewedDeadlineOverride(t *testing.T) {
+	profile := codexWorkflowTestConfig(t).LaunchProfiles["terra-medium-v1"]
+	body := []byte(`{"parameters":{"issue_number":123,"source_delivery_id":"delivery-123","repair_pr_number":456,"expected_head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"max_runtime_seconds":37}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/launch-profiles/terra-medium-v1/launch", bytes.NewReader(body))
+
+	in, params, err := resolveLaunchProfileRequest(profile, req, defaultMaxParamBytes)
+	if err != nil {
+		t.Fatalf("resolve request: %v", err)
+	}
+	if in.MaxRuntimeSeconds != 37 || in.MaxRuntimeMinutes != 0 {
+		t.Fatalf("runtime override = %d seconds, %d minutes", in.MaxRuntimeSeconds, in.MaxRuntimeMinutes)
+	}
+	if params["repair_pr_number"] != 456 {
+		t.Fatalf("resolved parameters = %#v", params)
+	}
+
+	body = []byte(`{"parameters":{"issue_number":123,"source_delivery_id":"delivery-123"},"task":"unreviewed"}`)
+	req = httptest.NewRequest(http.MethodPost, "/v1/launch-profiles/terra-medium-v1/launch", bytes.NewReader(body))
+	if _, _, err := resolveLaunchProfileRequest(profile, req, defaultMaxParamBytes); err == nil || !strings.Contains(err.Error(), `override field "task" is not allowed`) {
+		t.Fatalf("unreviewed override error = %v", err)
 	}
 }
 

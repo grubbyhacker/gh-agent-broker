@@ -662,6 +662,18 @@ func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, w
 			errs = append(errs, fmt.Sprintf("launch profile %q requires typed parameter %q", name, required))
 		}
 	}
+	repairPR, repairPROK := profile.Parameters["repair_pr_number"]
+	if !repairPROK || repairPR.Type != "integer" || repairPR.Required || repairPR.Default != nil || repairPR.Min == nil || *repairPR.Min != 1 {
+		errs = append(errs, fmt.Sprintf("launch profile %q requires optional positive-integer parameter %q", name, "repair_pr_number"))
+	}
+	expectedHead, expectedHeadOK := profile.Parameters["expected_head_sha"]
+	if !expectedHeadOK || expectedHead.Type != "string" || expectedHead.Required || expectedHead.Default != nil ||
+		expectedHead.MaxLength != 40 || expectedHead.Pattern != "^[a-f0-9]{40}$" {
+		errs = append(errs, fmt.Sprintf("launch profile %q requires optional lowercase-SHA parameter %q", name, "expected_head_sha"))
+	}
+	if len(profile.AllowOverrides) != 1 || profile.AllowOverrides[0] != "max_runtime_seconds" {
+		errs = append(errs, fmt.Sprintf("launch profile %q must allow only the max_runtime_seconds deadline override", name))
+	}
 	return errs
 }
 
@@ -851,6 +863,13 @@ func resolveProfileParameters(profile LaunchProfile, submitted map[string]any) (
 			return nil, err
 		}
 		out[name] = normalized
+	}
+	if profile.CodexIssueWorkflow != nil {
+		_, hasRepairPR := out["repair_pr_number"]
+		_, hasExpectedHead := out["expected_head_sha"]
+		if hasRepairPR != hasExpectedHead {
+			return nil, fmt.Errorf("parameters %q and %q must be supplied together", "repair_pr_number", "expected_head_sha")
+		}
 	}
 	return out, nil
 }
