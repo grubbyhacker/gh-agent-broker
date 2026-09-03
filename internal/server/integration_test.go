@@ -53,8 +53,8 @@ func TestFakeGitHubRESTIntegration(t *testing.T) {
 			requireBearer(t, r)
 			sawComment++
 			body := readBody(t, r)
-			if !strings.Contains(body, "Broker-Operation-Id") || !strings.Contains(body, "Agent-Id") {
-				t.Fatalf("comment body missing broker metadata: %s", body)
+			if strings.Contains(body, "Broker-Operation-Id") || strings.Contains(body, "installation") || !strings.Contains(body, `"body":"done"`) {
+				t.Fatalf("comment body exposes broker metadata or changed content: %s", body)
 			}
 			writeTestJSON(t, w, map[string]interface{}{"id": 3003, "url": "https://api.fake/comments/1", "html_url": "https://fake/owner/repo/pull/7#issuecomment-1", "created_at": "2026-06-10T00:00:00Z"})
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls/7/reviews/80":

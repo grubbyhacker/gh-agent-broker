@@ -7,11 +7,119 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"gh-agent-broker/internal/api"
 	"gh-agent-broker/internal/config"
+	"gh-agent-broker/internal/idempotency"
 )
+
+func TestAggregateCIUsesActiveRuleIdentities(t *testing.T) {
+	appID := int64(42)
+	rules := &api.BranchRules{Rules: []api.BranchRule{{Type: "required_status_checks", Parameters: api.BranchRuleParameters{RequiredStatusChecks: []api.RequiredStatusCheck{{Context: "unit", IntegrationID: &appID}, {Context: "integration"}}}}}}
+	required := requiredCI(rules, nil)
+	if len(required) != 2 || aggregateCI(required, api.CommitStatus{}, api.CheckRuns{CheckRuns: []api.CheckRun{{Name: "unit", Status: "completed", Conclusion: "success", App: &api.CheckApp{ID: appID}}, {Name: "integration", Status: "completed", Conclusion: "failure"}}}, nil) != "code_failure" {
+		t.Fatalf("required CI aggregation did not use active rules: %#v", required)
+	}
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "unit", State: "success"}}}, api.CheckRuns{}, nil); got != "pending" {
+		t.Fatalf("missing required check = %q, want pending", got)
+	}
+}
+
+func TestAggregateCIRequiredCheckStatesAndLegacyProtection(t *testing.T) {
+	legacy := &api.BranchProtection{RequiredStatusChecks: &api.LegacyRequiredStatusChecks{Contexts: []string{"legacy"}, Checks: []api.RequiredStatusCheck{{Context: "check"}}}}
+	required := requiredCI(nil, legacy)
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "success"}}}, api.CheckRuns{CheckRuns: []api.CheckRun{{Name: "check", Status: "completed", Conclusion: "success"}}}, nil); got != "success" {
+		t.Fatalf("success=%q", got)
+	}
+	if got := aggregateCI(required, api.CommitStatus{}, api.CheckRuns{}, nil); got != "pending" {
+		t.Fatalf("missing=%q", got)
+	}
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "pending"}}}, api.CheckRuns{}, nil); got != "pending" {
+		t.Fatalf("pending=%q", got)
+	}
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "error"}}}, api.CheckRuns{}, nil); got != "infrastructure_failure" {
+		t.Fatalf("infra=%q", got)
+	}
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "failure"}}}, api.CheckRuns{}, nil); got != "code_failure" {
+		t.Fatalf("code=%q", got)
+	}
+	if got := aggregateCI(nil, api.CommitStatus{}, api.CheckRuns{}, nil); got != "success" {
+		t.Fatalf("no requirements=%q", got)
+	}
+}
+
+func TestAggregateCIUnboundChecksAcceptStatusAndRequiredWorkflows(t *testing.T) {
+	rules := &api.BranchRules{Rules: []api.BranchRule{
+		{Type: "required_status_checks", Parameters: api.BranchRuleParameters{RequiredStatusChecks: []api.RequiredStatusCheck{{Context: "build"}}}},
+		{Type: "required_workflows", Parameters: api.BranchRuleParameters{RequiredWorkflows: []api.RequiredWorkflow{{Path: ".github/workflows/verify.yml", Ref: "main", RepositoryID: 1, SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}},
+	}}
+	required := requiredCI(rules, nil)
+	if len(required) != 2 {
+		t.Fatalf("required=%#v", required)
+	}
+	// Mirrors GitHub's workflow-run response: the referenced path carries an
+	// @ref suffix and the object does not include repository_id.
+	workflow := api.ReferencedWorkflow{Path: "owner/repo/.github/workflows/verify.yml@main", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "build", State: "success"}}}, api.CheckRuns{}, []api.WorkflowRun{{Status: "completed", Conclusion: "success", ReferencedWorkflows: []api.ReferencedWorkflow{workflow}}}); got != "success" {
+		t.Fatalf("success=%q", got)
+	}
+	if got := aggregateCI(required, api.CommitStatus{}, api.CheckRuns{}, []api.WorkflowRun{{Status: "completed", Conclusion: "failure", ReferencedWorkflows: []api.ReferencedWorkflow{workflow}}}); got != "code_failure" {
+		t.Fatalf("failure=%q", got)
+	}
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "build", State: "success"}}}, api.CheckRuns{}, nil); got != "pending" {
+		t.Fatalf("missing workflow=%q", got)
+	}
+}
+
+func TestWorkflowRunMatchingFailsClosedForPinnedDefinitionSHA(t *testing.T) {
+	required := &api.RequiredWorkflow{Path: ".github/workflows/verify.yml", Ref: "main", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	if workflowRunMatches(required, ".github/workflows/verify.yml@main", "", 0, "") {
+		t.Fatal("direct workflow run without definition SHA satisfied SHA-pinned requirement")
+	}
+	if workflowRunMatches(required, "owner/repo/.github/workflows/verify.yml@main", "main", 0, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") {
+		t.Fatal("wrong definition SHA satisfied SHA-pinned requirement")
+	}
+	if !workflowRunMatches(required, "owner/repo/.github/workflows/verify.yml@main", "main", 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		t.Fatal("matching referenced workflow did not satisfy SHA-pinned requirement")
+	}
+}
+
+func TestReconcilePendingCommentFailsClosedOnAmbiguityAndIgnoresOldMatches(t *testing.T) {
+	reserved := time.Now().UTC()
+	body := "public body only"
+	old := reserved.Add(-3 * time.Minute).Format(time.RFC3339)
+	newer := reserved.Add(time.Second).Format(time.RFC3339)
+	if got, ok, err := reconcilePendingComment([]api.IssueComment{{ID: 1, Body: body, Author: "human", CreatedAt: old}}, body, reserved); err != nil || ok || got.ID != 0 {
+		t.Fatalf("old identical comment = %#v, %v, %v", got, ok, err)
+	}
+	if got, ok, err := reconcilePendingComment([]api.IssueComment{{ID: 2, Body: body, Author: "app", CreatedAt: newer}}, body, reserved); err != nil || !ok || got.ID != 2 {
+		t.Fatalf("unique new comment = %#v, %v, %v", got, ok, err)
+	}
+	if got, ok, err := reconcilePendingComment([]api.IssueComment{{ID: 2, Body: body, Author: "app", CreatedAt: newer}, {ID: 3, Body: body, Author: "app", CreatedAt: newer}}, body, reserved); err == nil || ok || got.ID != 0 {
+		t.Fatalf("ambiguous comment = %#v, %v, %v", got, ok, err)
+	}
+}
+
+func TestExactCommentIdempotencyReplaysOnlySameDigestAcrossReload(t *testing.T) {
+	cfg := config.IdempotencyConfig{StatePath: filepath.Join(t.TempDir(), "idempotency.json")}
+	key, digest := "issue.comment:agent:owner/repo:7:key", "digest-a"
+	if err := idempotency.Store(cfg, key, idempotency.Record{Operation: "issue.comment", RequestDigest: digest, Status: http.StatusCreated, Body: []byte(`{"id":9}`)}); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	replayed, conflict, err := replayExactIdempotent(recorder, cfg, key, "issue.comment", digest)
+	if err != nil || !replayed || conflict || recorder.Code != http.StatusCreated {
+		t.Fatalf("same request did not replay: replay=%v conflict=%v err=%v", replayed, conflict, err)
+	}
+	replayed, conflict, err = replayExactIdempotent(httptest.NewRecorder(), cfg, key, "issue.comment", "digest-b")
+	if err != nil || replayed || !conflict {
+		t.Fatalf("different request reused key: replay=%v conflict=%v err=%v", replayed, conflict, err)
+	}
+}
 
 func TestParseGitPath(t *testing.T) {
 	repo, suffix, ok := parseGitPath("/git/owner/repo.git/info/refs")

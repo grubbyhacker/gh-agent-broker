@@ -1,6 +1,8 @@
 // Package api defines shared request and response DTOs for the broker API.
 package api
 
+import "encoding/json"
+
 type ErrorResponse struct {
 	Code            string           `json:"code"`
 	Message         string           `json:"message"`
@@ -218,11 +220,162 @@ type CheckRuns struct {
 }
 
 type CheckRun struct {
+	ID          int64        `json:"id"`
+	Name        string       `json:"name"`
+	Status      string       `json:"status"`
+	Conclusion  string       `json:"conclusion,omitempty"`
+	HTMLURL     string       `json:"html_url,omitempty"`
+	StartedAt   string       `json:"started_at,omitempty"`
+	CompletedAt string       `json:"completed_at,omitempty"`
+	Output      *CheckOutput `json:"output,omitempty"`
+	App         *CheckApp    `json:"app,omitempty"`
+}
+
+// CheckApp identifies the GitHub App that produced a check run. A nil value
+// means GitHub did not provide an app identity for that run.
+type CheckApp struct {
+	ID int64 `json:"id"`
+}
+
+// CheckOutput carries GitHub's bounded failure annotation summary. Individual
+// annotations are intentionally fetched only when a check has failed.
+type CheckOutput struct {
+	Title       string            `json:"title,omitempty"`
+	Summary     string            `json:"summary,omitempty"`
+	Annotations []CheckAnnotation `json:"annotations,omitempty"`
+}
+
+type CheckAnnotation struct {
+	Path            string `json:"path,omitempty"`
+	StartLine       int    `json:"start_line,omitempty"`
+	EndLine         int    `json:"end_line,omitempty"`
+	AnnotationLevel string `json:"annotation_level,omitempty"`
+	Message         string `json:"message,omitempty"`
+}
+
+// CIObservation is the broker's read-only, point-in-time view of the CI state
+// for one pull request head. GitHub remains authoritative: this DTO deliberately
+// does not calculate a separate required-check verdict.
+type CIObservation struct {
+	RequestedHeadSHA string            `json:"requested_head_sha"`
+	Pull             PullSummary       `json:"pull"`
+	CommitStatus     CommitStatus      `json:"commit_status"`
+	CheckRuns        CheckRuns         `json:"check_runs"`
+	WorkflowRuns     []WorkflowRun     `json:"workflow_runs"`
+	WorkflowJobs     []WorkflowJob     `json:"workflow_jobs"`
+	BranchProtection *BranchProtection `json:"branch_protection,omitempty"`
+	BranchRules      *BranchRules      `json:"branch_rules,omitempty"`
+	RequiredCI       []RequiredCI      `json:"required_ci"`
+	AggregateState   string            `json:"aggregate_state"`
+}
+
+// RequiredCI is derived solely from the active GitHub branch rules. It is not
+// a separately configured check-name allowlist.
+type RequiredCI struct {
+	Identity      string            `json:"identity"`
+	Kind          string            `json:"kind"`
+	IntegrationID *int64            `json:"integration_id,omitempty"`
+	Workflow      *RequiredWorkflow `json:"workflow,omitempty"`
+}
+
+// RequiredWorkflow is GitHub's active required_workflows rule parameter.
+// Path, ref, repository_id and sha together identify the workflow definition.
+type RequiredWorkflow struct {
+	Path         string `json:"path"`
+	Ref          string `json:"ref"`
+	RepositoryID int64  `json:"repository_id"`
+	SHA          string `json:"sha"`
+}
+
+// BranchRules is GitHub's GET /repos/{owner}/{repo}/rules/branches/{branch}
+// response. This endpoint needs only Metadata:read.
+type BranchRules struct {
+	Rules []BranchRule `json:"rules"`
+}
+
+// UnmarshalJSON accepts GitHub's active-rules envelope and the direct array
+// returned by older endpoint versions without falling back to untyped maps.
+func (r *BranchRules) UnmarshalJSON(b []byte) error {
+	var direct []BranchRule
+	if len(b) > 0 && b[0] == '[' {
+		if err := json.Unmarshal(b, &direct); err != nil {
+			return err
+		}
+		r.Rules = direct
+		return nil
+	}
+	var envelope struct {
+		Rules []BranchRule `json:"rules"`
+	}
+	if err := json.Unmarshal(b, &envelope); err != nil {
+		return err
+	}
+	r.Rules = envelope.Rules
+	return nil
+}
+
+type BranchRule struct {
+	Type       string               `json:"type"`
+	Parameters BranchRuleParameters `json:"parameters"`
+}
+type BranchRuleParameters struct {
+	RequiredStatusChecks []RequiredStatusCheck `json:"required_status_checks,omitempty"`
+	RequiredWorkflows    []RequiredWorkflow    `json:"required_workflows,omitempty"`
+}
+type RequiredStatusCheck struct {
+	Context       string `json:"context"`
+	IntegrationID *int64 `json:"integration_id,omitempty"`
+}
+
+// BranchProtection is the legacy protection fallback (Administration:read).
+// It is optional because installations granted only Metadata:read cannot use it.
+type BranchProtection struct {
+	RequiredStatusChecks *LegacyRequiredStatusChecks `json:"required_status_checks,omitempty"`
+}
+type LegacyRequiredStatusChecks struct {
+	Contexts []string              `json:"contexts,omitempty"`
+	Checks   []RequiredStatusCheck `json:"checks,omitempty"`
+}
+
+type WorkflowRun struct {
+	ID                  int64                `json:"id"`
+	Name                string               `json:"name"`
+	Status              string               `json:"status"`
+	Conclusion          string               `json:"conclusion,omitempty"`
+	HeadSHA             string               `json:"head_sha"`
+	HTMLURL             string               `json:"html_url,omitempty"`
+	CreatedAt           string               `json:"created_at,omitempty"`
+	UpdatedAt           string               `json:"updated_at,omitempty"`
+	Path                string               `json:"path,omitempty"`
+	WorkflowID          int64                `json:"workflow_id,omitempty"`
+	ReferencedWorkflows []ReferencedWorkflow `json:"referenced_workflows,omitempty"`
+}
+
+type ReferencedWorkflow struct {
+	Path         string `json:"path,omitempty"`
+	Ref          string `json:"ref,omitempty"`
+	SHA          string `json:"sha,omitempty"`
+	RepositoryID int64  `json:"repository_id,omitempty"`
+}
+
+type WorkflowJob struct {
+	RunID       int64  `json:"run_id"`
 	ID          int64  `json:"id"`
 	Name        string `json:"name"`
 	Status      string `json:"status"`
 	Conclusion  string `json:"conclusion,omitempty"`
+	HeadSHA     string `json:"head_sha,omitempty"`
 	HTMLURL     string `json:"html_url,omitempty"`
 	StartedAt   string `json:"started_at,omitempty"`
 	CompletedAt string `json:"completed_at,omitempty"`
+}
+
+// ActionsJobLog contains one complete log only when it is within the reviewed
+// broker bound. It never contains a reusable GitHub URL or authorization data.
+type ActionsJobLog struct {
+	JobID     int64  `json:"job_id"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
+	ByteLimit int64  `json:"byte_limit"`
+	Text      string `json:"text"`
 }

@@ -2,11 +2,14 @@ package sandbox
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -28,6 +31,10 @@ const (
 	codexPhaseExecutionRunning   = "execution_running"
 	codexPhaseExecutionRecon     = "execution_reconcile_pending"
 	codexPhaseExecutionTerm      = "execution_terminal"
+	codexPhaseRecoveryCreate     = "recovery_validation_create_pending"
+	codexPhaseRecoveryStart      = "recovery_validation_start_pending"
+	codexPhaseRecoveryRunning    = "recovery_validation_running"
+	codexPhaseRecoveryTerm       = "recovery_validation_terminal"
 	codexPhaseDeliveryCreate     = "delivery_create_pending"
 	codexPhaseDeliveryStart      = "delivery_start_pending"
 	codexPhaseDeliveryRunning    = "delivery_running"
@@ -36,6 +43,22 @@ const (
 )
 
 type preparationResult struct {
+	Version               string `json:"version"`
+	Status                string `json:"status"`
+	RunID                 string `json:"run_id"`
+	Repository            string `json:"repository"`
+	Branch                string `json:"branch"`
+	WorkspaceHead         string `json:"workspace_head"`
+	RefsSHA256            string `json:"refs_sha256"`
+	ManifestSHA256        string `json:"manifest_sha256"`
+	IssueNumber           int    `json:"issue_number"`
+	SourceDeliveryID      string `json:"source_delivery_id"`
+	RepairPRNumber        int    `json:"repair_pr_number,omitempty"`
+	RepairHeadRef         string `json:"repair_head_ref,omitempty"`
+	RepairExpectedHeadSHA string `json:"repair_expected_head_sha,omitempty"`
+}
+
+type executionResult struct {
 	Version          string `json:"version"`
 	Status           string `json:"status"`
 	RunID            string `json:"run_id"`
@@ -43,24 +66,12 @@ type preparationResult struct {
 	Branch           string `json:"branch"`
 	WorkspaceHead    string `json:"workspace_head"`
 	RefsSHA256       string `json:"refs_sha256"`
-	ManifestSHA256   string `json:"manifest_sha256"`
-	IssueNumber      int    `json:"issue_number"`
-	SourceDeliveryID string `json:"source_delivery_id"`
-}
-
-type executionResult struct {
-	Version        string `json:"version"`
-	Status         string `json:"status"`
-	RunID          string `json:"run_id"`
-	Repository     string `json:"repository"`
-	Branch         string `json:"branch"`
-	WorkspaceHead  string `json:"workspace_head"`
-	RefsSHA256     string `json:"refs_sha256"`
-	DiffSHA256     string `json:"diff_sha256"`
-	FinalSHA256    string `json:"final_sha256"`
-	VerifySHA256   string `json:"verify_sha256"`
-	Verification   string `json:"verification"`
-	FinalSizeBytes int64  `json:"final_size_bytes"`
+	DiffSHA256       string `json:"diff_sha256"`
+	ValidatedTreeSHA string `json:"validated_tree_sha"`
+	FinalSHA256      string `json:"final_sha256"`
+	VerifySHA256     string `json:"verify_sha256"`
+	Verification     string `json:"verification"`
+	FinalSizeBytes   int64  `json:"final_size_bytes"`
 }
 
 type executionFailure struct {
@@ -77,6 +88,21 @@ type executionFailure struct {
 	EventsSHA256     string `json:"events_sha256"`
 	StderrSizeBytes  int64  `json:"stderr_size_bytes"`
 	StderrSHA256     string `json:"stderr_sha256"`
+}
+
+type recoveryValidationResult struct {
+	Version          string `json:"version"`
+	Status           string `json:"status"`
+	RunID            string `json:"run_id"`
+	Repository       string `json:"repository"`
+	Branch           string `json:"branch"`
+	ExpectedHeadSHA  string `json:"expected_head_sha,omitempty"`
+	WinnerHeadSHA    string `json:"winner_head_sha"`
+	CandidateHeadSHA string `json:"candidate_head_sha"`
+	CandidateTreeSHA string `json:"candidate_tree_sha,omitempty"`
+	ValidatedTreeSHA string `json:"validated_tree_sha"`
+	VerifySHA256     string `json:"verify_sha256"`
+	SealSHA256       string `json:"seal_sha256,omitempty"`
 }
 
 func (s *Service) resumeCodexIssueWorkflow(
@@ -120,12 +146,99 @@ func (s *Service) resumeCodexIssueWorkflow(
 		fallthrough
 	case codexPhaseExecutionRecon, codexPhaseExecutionTerm:
 		return s.resumeExecution(ctx, intent, meta, *workflow)
+	case codexPhaseRecoveryCreate, codexPhaseRecoveryStart, codexPhaseRecoveryRunning, codexPhaseRecoveryTerm:
+		return s.resumeRecoveryValidation(ctx, intent, meta, *workflow)
 	case codexPhaseDeliveryCreate, codexPhaseDeliveryStart, codexPhaseDeliveryRunning,
 		codexPhaseDeliveryRecon, codexPhaseDeliveryTerm:
 		return s.resumeDelivery(ctx, intent, meta, *workflow)
 	default:
 		return s.failCodexIntent(ctx, intent, meta, "state_reconciliation", fmt.Errorf("unsupported Codex workflow phase %q", meta.Phase))
 	}
+}
+
+// resumeRecoveryValidation runs exactly one credential-free verification after
+// a positively identified stale lease. It deliberately cannot create a new
+// model execution or access the broker.
+func (s *Service) resumeRecoveryValidation(ctx context.Context, intent *launchIntent, meta RunMetadata, workflow CodexIssueWorkflow) (LaunchAgentOutput, error) {
+	template := s.cfg.Templates[workflow.RecoveryTemplate]
+	spec, _, err := s.runtimeSpec(meta, template)
+	if err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	spec.RunID = meta.RunID + "-recover-" + strconv.Itoa(meta.RecoveryCount+1)
+	spec.Labels["gh-agent-broker.parent_run_id"] = meta.RunID
+	spec.Labels["gh-agent-broker.run_id"] = spec.RunID
+	spec.Labels["gh-agent-broker.template"] = workflow.RecoveryTemplate
+	spec.Labels["gh-agent-broker.phase"] = "recovery_validation"
+	var info ContainerInfo
+	if meta.RecoveryContainerID == "" {
+		if meta.RecoveryCount >= 1 {
+			return s.failCodexIntent(ctx, intent, meta, "recovery_bound", fmt.Errorf("stale lease recovery was already attempted"))
+		}
+		meta.Phase = codexPhaseRecoveryCreate
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateCreatePending); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		info, err = s.runtime.Create(ctx, spec)
+		if err != nil {
+			return s.failCodexIntent(ctx, intent, meta, "recovery_create", err)
+		}
+		meta.RecoveryContainerID, meta.ContainerID, meta.RecoveryCount = info.ID, info.ID, meta.RecoveryCount+1
+		meta.Phase = codexPhaseRecoveryStart
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateContainerMade); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		if info.Lifecycle == "" {
+			info.Lifecycle = ContainerNeverStarted
+		}
+	} else {
+		status, inspectErr := s.runtime.Inspect(ctx, meta.RecoveryContainerID)
+		if inspectErr != nil {
+			return s.failCodexIntent(ctx, intent, meta, "recovery_reconcile", inspectErr)
+		}
+		info = ContainerInfo{ID: meta.RecoveryContainerID, Status: status, Lifecycle: lifecycleForStatus(status)}
+	}
+	if info.Lifecycle == ContainerExited {
+		return s.completeRecoveryValidation(ctx, intent, meta, workflow, info.Status)
+	}
+	if info.Lifecycle == ContainerNeverStarted {
+		meta.Phase = codexPhaseRecoveryStart
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateStartPending); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		if err := s.runtime.Start(ctx, meta.RecoveryContainerID); err != nil {
+			return s.failCodexIntent(ctx, intent, meta, "recovery_start", err)
+		}
+	}
+	meta.Status, meta.Phase = StatusRunning, codexPhaseRecoveryRunning
+	if meta.RecoveryStartedAt.IsZero() {
+		meta.RecoveryStartedAt = time.Now().UTC()
+	}
+	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	s.watchCodexPhase(meta.RunID, meta.RecoveryContainerID)
+	return launchOutput(meta), nil
+}
+
+func (s *Service) completeRecoveryValidation(ctx context.Context, intent *launchIntent, meta RunMetadata, workflow CodexIssueWorkflow, status ContainerStatus) (LaunchAgentOutput, error) {
+	meta.RecoveryEndedAt, meta.Phase = terminalTime(status), codexPhaseRecoveryTerm
+	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	if status.ExitCode == nil || *status.ExitCode != 0 {
+		return s.failCodexIntent(ctx, intent, meta, "recovery_validation", fmt.Errorf("credential-free recovery validation failed"))
+	}
+	if err := s.readRecoveryValidation(meta); err != nil {
+		return s.failCodexIntent(ctx, intent, meta, "recovery_validation", err)
+	}
+	// The initial delivery container is terminal. Allocate and persist a new
+	// runtime identity before the recovered delivery is created; Docker's
+	// adoption key includes this run ID, so it cannot adopt the stale exit.
+	meta.DeliveryContainerID, meta.ContainerID = "", ""
+	meta.DeliveryAttempt++
+	meta.Phase = codexPhaseDeliveryCreate
+	return s.resumeDelivery(ctx, intent, meta, workflow)
 }
 
 func (s *Service) resumePreparation(
@@ -230,6 +343,12 @@ func (s *Service) completePreparation(
 	}
 	meta.Provenance.WorkspaceHead = result.WorkspaceHead
 	meta.Provenance.ManifestSHA256 = result.ManifestSHA256
+	if result.RepairPRNumber != 0 {
+		meta.RepairPRNumber, meta.RepairHeadRef, meta.RepairAdmittedHeadSHA = result.RepairPRNumber, result.RepairHeadRef, result.RepairExpectedHeadSHA
+		if err := s.writeRepairAuthority(meta); err != nil {
+			return s.failCodexIntent(ctx, intent, meta, "preparation_verification", err)
+		}
+	}
 	meta.Phase = codexPhaseExecutionCreate
 	meta.ContainerID = ""
 	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
@@ -451,7 +570,15 @@ func (s *Service) resumeDelivery(
 	if err != nil {
 		return LaunchAgentOutput{}, err
 	}
-	spec.RunID = meta.RunID + "-deliver"
+	if meta.DeliveryAttempt == 0 {
+		// Persist the attempt before Docker create so a restart reconciles the
+		// same identity; recovery advances this durable counter before retrying.
+		meta.DeliveryAttempt = 1
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateCreatePending); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+	}
+	spec.RunID = meta.RunID + "-deliver-" + strconv.Itoa(meta.DeliveryAttempt)
 	spec.Labels["gh-agent-broker.parent_run_id"] = meta.RunID
 	spec.Labels["gh-agent-broker.run_id"] = spec.RunID
 	spec.Labels["gh-agent-broker.template"] = workflow.DeliveryTemplate
@@ -467,6 +594,7 @@ func (s *Service) resumeDelivery(
 			return s.failCodexIntent(ctx, intent, meta, "delivery_create", err)
 		}
 		meta.DeliveryContainerID = info.ID
+		meta.DeliveryContainerIDs = appendUniqueContainerID(meta.DeliveryContainerIDs, info.ID)
 		meta.ContainerID = info.ID
 		meta.DeliveryImageDigest = info.ImageDigest
 		meta.DeliveryPlatform = info.Platform
@@ -529,6 +657,21 @@ func (s *Service) completeDelivery(
 	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
 		return LaunchAgentOutput{}, err
 	}
+	if status.ExitCode != nil && *status.ExitCode != 0 {
+		if stale, err := s.readStaleLease(meta); err == nil && meta.RecoveryCount == 0 {
+			meta.RecoveryExpectedHeadSHA = stale.ExpectedHeadSHA
+			meta.RecoveryWinnerHeadSHA = stale.WinnerHeadSHA
+			meta.RecoveryCandidateHeadSHA = stale.CandidateHeadSHA
+			meta.RecoveryCandidateTreeSHA = stale.CandidateTreeSHA
+			meta.RecoverySealSHA256 = stale.SealSHA256
+			meta.Phase, meta.ContainerID = codexPhaseRecoveryCreate, ""
+			profile := s.cfg.LaunchProfiles[meta.Profile]
+			if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
+				return LaunchAgentOutput{}, err
+			}
+			return s.resumeRecoveryValidation(ctx, intent, meta, *profile.CodexIssueWorkflow)
+		}
+	}
 	finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonWorkerExit, terminalSourceExited, func(current RunMetadata) RunMetadata {
 		return s.finalizeExitedRun(ctx, current, status)
 	})
@@ -560,6 +703,12 @@ func (s *Service) watchCodexPhase(runID, containerID string) {
 		if intent.Metadata.Phase == codexPhaseExecutionRunning {
 			if _, completeErr := s.completeExecution(context.Background(), &intent, intent.Metadata, status); completeErr != nil {
 				s.auditFinalizeFailure(runID, "codex_execution_failed", "codex_execution", completeErr)
+			}
+			return
+		}
+		if intent.Metadata.Phase == codexPhaseRecoveryRunning {
+			if _, completeErr := s.completeRecoveryValidation(context.Background(), &intent, intent.Metadata, *profile.CodexIssueWorkflow, status); completeErr != nil {
+				s.auditFinalizeFailure(runID, "codex_recovery_validation_failed", "codex_recovery_validation", completeErr)
 			}
 			return
 		}
@@ -655,6 +804,8 @@ func currentCodexPhaseContainer(meta RunMetadata) (string, string) {
 	case codexPhaseExecutionStart, codexPhaseBundleInject, codexPhaseBundleAccept,
 		codexPhaseExecutionRunning, codexPhaseExecutionRecon, codexPhaseExecutionTerm:
 		return meta.ExecutionContainerID, "execution"
+	case codexPhaseRecoveryStart, codexPhaseRecoveryRunning, codexPhaseRecoveryTerm:
+		return meta.RecoveryContainerID, "recovery validation"
 	case codexPhaseDeliveryStart, codexPhaseDeliveryRunning, codexPhaseDeliveryRecon,
 		codexPhaseDeliveryTerm:
 		return meta.DeliveryContainerID, "delivery"
@@ -702,7 +853,34 @@ func (s *Service) readPreparationResult(meta RunMetadata) (preparationResult, er
 		!regexpSHA(result.ManifestSHA256, 64) {
 		return preparationResult{}, fmt.Errorf("preparation result does not match broker launch identity")
 	}
+	if result.RepairPRNumber != 0 && (result.RepairPRNumber < 1 || result.RepairHeadRef == "" || !regexpSHA(result.RepairExpectedHeadSHA, 40)) {
+		return preparationResult{}, fmt.Errorf("preparation repair authority is invalid")
+	}
 	return result, nil
+}
+
+func appendUniqueContainerID(ids []string, id string) []string {
+	for _, existing := range ids {
+		if existing == id {
+			return ids
+		}
+	}
+	return append(ids, id)
+}
+
+func (s *Service) writeRepairAuthority(meta RunMetadata) error {
+	if meta.RepairPRNumber == 0 {
+		return nil
+	}
+	b, err := json.Marshal(struct {
+		PRNumber        int    `json:"pull_number"`
+		HeadRef         string `json:"head_ref"`
+		AdmittedHeadSHA string `json:"admitted_head_sha"`
+	}{meta.RepairPRNumber, meta.RepairHeadRef, meta.RepairAdmittedHeadSHA})
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(filepath.Join(s.runDir(meta.RunID), "input", "repair-authority.json"), append(b, '\n'), 0o444)
 }
 
 func (s *Service) readExecutionResult(meta RunMetadata) (executionResult, error) {
@@ -718,7 +896,7 @@ func (s *Service) readExecutionResult(meta RunMetadata) (executionResult, error)
 	if result.Version != "codex-execution-result/v1" || result.Status != "executed" ||
 		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
 		result.WorkspaceHead != meta.Provenance.WorkspaceHead || !regexpSHA(result.RefsSHA256, 64) ||
-		!regexpSHA(result.DiffSHA256, 64) ||
+		!regexpSHA(result.DiffSHA256, 64) || !regexpSHA(result.ValidatedTreeSHA, 40) ||
 		!regexpSHA(result.FinalSHA256, 64) || !regexpSHA(result.VerifySHA256, 64) ||
 		result.Verification != "passed" || result.FinalSizeBytes < 1 ||
 		result.FinalSizeBytes > int64(s.cfg.TerminalResultByteLimit) {
@@ -752,6 +930,55 @@ func (s *Service) readExecutionFailure(meta RunMetadata, exitCode *int) (executi
 		return executionFailure{}, fmt.Errorf("codex failure diagnostic does not match broker launch identity or bounds")
 	}
 	return result, nil
+}
+
+func (s *Service) readStaleLease(meta RunMetadata) (recoveryValidationResult, error) {
+	data, err := boundedRegularFile(filepath.Join(s.runDir(meta.RunID), "output", "stale-lease.json"), 2048)
+	if err != nil {
+		return recoveryValidationResult{}, err
+	}
+	var result recoveryValidationResult
+	if err := json.Unmarshal(data, &result); err != nil || result.Version != "codex-stale-lease/v3" || result.Status != "stale_lease" ||
+		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
+		!regexpSHA(result.ExpectedHeadSHA, 40) || !regexpSHA(result.WinnerHeadSHA, 40) || !regexpSHA(result.CandidateHeadSHA, 40) ||
+		!regexpSHA(result.CandidateTreeSHA, 40) || !regexpSHA(result.SealSHA256, 64) ||
+		result.SealSHA256 != recoverySeal(result.RunID, result.Repository, result.Branch, result.ExpectedHeadSHA, result.WinnerHeadSHA, result.CandidateHeadSHA, result.CandidateTreeSHA) {
+		return recoveryValidationResult{}, fmt.Errorf("stale lease handoff is invalid")
+	}
+	return result, nil
+}
+
+func (s *Service) readRecoveryValidation(meta RunMetadata) error {
+	data, err := boundedRegularFile(filepath.Join(s.runDir(meta.RunID), "work", "recovery", "recovery-validation.json"), 2048)
+	if err != nil {
+		return fmt.Errorf("bounded recovery validation result is unavailable")
+	}
+	var result recoveryValidationResult
+	if err := json.Unmarshal(data, &result); err != nil || result.Version != "codex-recovery-validation/v1" || result.Status != "passed" ||
+		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
+		result.WinnerHeadSHA != meta.RecoveryWinnerHeadSHA || result.CandidateHeadSHA != meta.RecoveryCandidateHeadSHA ||
+		result.ValidatedTreeSHA != meta.RecoveryCandidateTreeSHA || result.SealSHA256 != meta.RecoverySealSHA256 ||
+		!regexpSHA(result.WinnerHeadSHA, 40) || !regexpSHA(result.CandidateHeadSHA, 40) || !regexpSHA(result.ValidatedTreeSHA, 40) || !regexpSHA(result.VerifySHA256, 64) || !regexpSHA(result.SealSHA256, 64) {
+		return fmt.Errorf("recovery validation result does not match broker launch identity")
+	}
+	return nil
+}
+
+func recoverySeal(runID, repository, branch, expected, winner, candidate, tree string) string {
+	identity, err := json.Marshal(struct {
+		Branch     string `json:"branch"`
+		Candidate  string `json:"candidate_head_sha"`
+		Tree       string `json:"candidate_tree_sha"`
+		Expected   string `json:"expected_head_sha"`
+		Repository string `json:"repository"`
+		RunID      string `json:"run_id"`
+		Winner     string `json:"winner_head_sha"`
+	}{branch, candidate, tree, expected, repository, runID, winner})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(identity)
+	return hex.EncodeToString(sum[:])
 }
 
 func regexpSHA(value string, size int) bool {

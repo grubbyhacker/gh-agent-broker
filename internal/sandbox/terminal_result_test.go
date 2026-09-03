@@ -314,6 +314,51 @@ func TestCodexContaminationPurgeFailureKeepsRunBlockedWithoutRemovalClaim(t *tes
 	}
 }
 
+func TestCodexTerminalFailureClassUsesDurablePhaseAndExecutionFact(t *testing.T) {
+	tests := []struct {
+		name, phase, source, want string
+		started                   bool
+	}{
+		{"preparation", codexPhasePreparationCreate, "", "infrastructure", false},
+		{"execution create", codexPhaseExecutionCreate, "", "infrastructure", false},
+		{"execution model failure", codexPhaseExecutionRunning, "", "model_or_code", true},
+		{"timeout before execution", codexPhaseExecutionStart, "timeout", "infrastructure", false},
+		{"timeout after execution", codexPhaseExecutionRunning, "timeout", "model_or_code", true},
+		{"recovery validation", codexPhaseRecoveryRunning, "", "delivery_or_lease", true},
+		{"stale delivery", codexPhaseDeliveryRunning, "", "delivery_or_lease", true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			meta := terminalTestMetadata("class-"+strings.ReplaceAll(test.name, " ", "-"), StatusFailed)
+			meta.Phase, meta.TerminalSource, meta.Error, meta.Provenance = test.phase, test.source, "failed", &CodexProvenance{}
+			if test.started {
+				meta.ExecutionStartedAt = time.Now().UTC()
+			}
+			got := NewService(baseTestConfig(t), newFakeRuntime(), testAudit(t)).projectTerminalResult(meta)
+			if got.FailureClass != test.want || got.ModelExecutionStarted != test.started {
+				t.Fatalf("projection=%+v, want class %q started %v", got, test.want, test.started)
+			}
+		})
+	}
+}
+
+func TestCodexWorkerFailedResultAlwaysGetsFailureClass(t *testing.T) {
+	cfg := baseTestConfig(t)
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	meta := terminalTestMetadata("worker-failed", StatusFailed)
+	meta.Phase, meta.Provenance = codexPhaseDeliveryTerm, &CodexProvenance{}
+	if err := os.MkdirAll(filepath.Join(cfg.RunsDir, meta.RunID, "output"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.RunsDir, meta.RunID, "output", "result.json"), []byte(`{"version":"repository-task-worker-result/v1","outcome":"failed"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := service.projectTerminalResult(meta)
+	if got.FailureClass != "delivery_or_lease" {
+		t.Fatalf("failure class=%q", got.FailureClass)
+	}
+}
+
 func TestRESTTerminalResultIsProfileScopedAndDoesNotBroadenExistingPrincipals(t *testing.T) {
 	cfg := restTestConfig(t)
 	cfg.OperatorPrincipals["reporter"] = OperatorPrincipal{Token: "reporter-secret", AllowedProfiles: []string{"nightly"}, AllowedActions: []string{"terminal_result"}, RunScope: "profile"}

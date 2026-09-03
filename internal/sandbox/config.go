@@ -144,6 +144,7 @@ type LaunchProfile struct {
 type CodexIssueWorkflow struct {
 	PreparationTemplate string `yaml:"preparation_template"`
 	ExecutionTemplate   string `yaml:"execution_template"`
+	RecoveryTemplate    string `yaml:"recovery_template"`
 	DeliveryTemplate    string `yaml:"delivery_template"`
 	ModelPolicy         string `yaml:"model_policy"`
 	ModelProfile        string `yaml:"model_profile"`
@@ -422,10 +423,10 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 	if tmpl.MaxRuntimeMinutes < 1 {
 		errs = append(errs, fmt.Sprintf("template %q max_runtime_minutes must be positive", name))
 	}
-	if strings.TrimSpace(tmpl.BrokerAgentID) == "" && !c.isCodexExecutionTemplate(name) {
+	if strings.TrimSpace(tmpl.BrokerAgentID) == "" && !c.isCodexCredentialFreeTemplate(name) {
 		errs = append(errs, fmt.Sprintf("template %q broker_agent_id is required", name))
 	}
-	if tmpl.BrokerAgentSecret == "" && !c.isCodexExecutionTemplate(name) {
+	if tmpl.BrokerAgentSecret == "" && !c.isCodexCredentialFreeTemplate(name) {
 		errs = append(errs, fmt.Sprintf("template %q broker_agent_secret or broker_agent_secret_env is required", name))
 	}
 	if tmpl.CredentialBundle != "" {
@@ -577,6 +578,7 @@ func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, w
 	prep, prepOK := c.Templates[workflow.PreparationTemplate]
 	exec, execOK := c.Templates[workflow.ExecutionTemplate]
 	delivery, deliveryOK := c.Templates[workflow.DeliveryTemplate]
+	recovery, recoveryOK := c.Templates[workflow.RecoveryTemplate]
 	if !prepOK {
 		errs = append(errs, fmt.Sprintf("launch profile %q references unknown preparation_template %q", name, workflow.PreparationTemplate))
 	}
@@ -586,10 +588,14 @@ func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, w
 	if !deliveryOK {
 		errs = append(errs, fmt.Sprintf("launch profile %q references unknown delivery_template %q", name, workflow.DeliveryTemplate))
 	}
+	if !recoveryOK {
+		errs = append(errs, fmt.Sprintf("launch profile %q references unknown recovery_template %q", name, workflow.RecoveryTemplate))
+	}
 	if workflow.PreparationTemplate == workflow.ExecutionTemplate ||
 		workflow.PreparationTemplate == workflow.DeliveryTemplate ||
-		workflow.ExecutionTemplate == workflow.DeliveryTemplate {
-		errs = append(errs, fmt.Sprintf("launch profile %q requires distinct preparation, execution, and delivery templates", name))
+		workflow.ExecutionTemplate == workflow.DeliveryTemplate || workflow.RecoveryTemplate == workflow.PreparationTemplate ||
+		workflow.RecoveryTemplate == workflow.ExecutionTemplate || workflow.RecoveryTemplate == workflow.DeliveryTemplate {
+		errs = append(errs, fmt.Sprintf("launch profile %q requires distinct preparation, execution, recovery, and delivery templates", name))
 	}
 	if profile.Template != workflow.ExecutionTemplate {
 		errs = append(errs, fmt.Sprintf("launch profile %q template must equal its execution_template", name))
@@ -639,6 +645,17 @@ func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, w
 		}
 		errs = append(errs, validateCodexTemplateSurface(name, "delivery", delivery)...)
 	}
+	if recoveryOK {
+		network := c.Networks[recovery.NetworkPolicy]
+		if recovery.CredentialBundle != "" || recovery.BrokerAgentID != "" || recovery.BrokerAgentSecret != "" ||
+			network.PrivateBroker || network.CodexRelay || network.EgressProxy != "" || len(network.AllowedTLSHosts) != 0 {
+			errs = append(errs, fmt.Sprintf("launch profile %q recovery template must be credential-free with no broker or Codex network", name))
+		}
+		errs = append(errs, validateCodexTemplateSurface(name, "recovery", recovery)...)
+		if len(recovery.ExtraMounts) != 0 {
+			errs = append(errs, fmt.Sprintf("launch profile %q recovery template must not configure extra_mounts", name))
+		}
+	}
 	for _, required := range []string{"issue_number", "source_delivery_id"} {
 		decl, ok := profile.Parameters[required]
 		if !ok || required == "issue_number" && decl.Type != "integer" || required == "source_delivery_id" && decl.Type != "string" {
@@ -648,9 +665,9 @@ func (c Config) validateCodexIssueWorkflow(name string, profile LaunchProfile, w
 	return errs
 }
 
-func (c Config) isCodexExecutionTemplate(name string) bool {
+func (c Config) isCodexCredentialFreeTemplate(name string) bool {
 	for _, profile := range c.LaunchProfiles {
-		if profile.CodexIssueWorkflow != nil && profile.CodexIssueWorkflow.ExecutionTemplate == name {
+		if workflow := profile.CodexIssueWorkflow; workflow != nil && (workflow.ExecutionTemplate == name || workflow.RecoveryTemplate == name) {
 			return true
 		}
 	}
@@ -661,7 +678,7 @@ func validateCodexTemplateSurface(profile, phase string, template Template) []st
 	var errs []string
 	for key := range template.Environment {
 		upper := strings.ToUpper(key)
-		if strings.HasPrefix(upper, "OPENAI_") || strings.HasPrefix(upper, "CODEX_") ||
+		if strings.HasPrefix(upper, "OPENAI_") || strings.HasPrefix(upper, "CODEX_") || (phase == "recovery" && strings.HasPrefix(upper, "BROKER_")) ||
 			upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY" {
 			errs = append(errs, fmt.Sprintf("launch profile %q %s template cannot configure credential or proxy environment %q", profile, phase, key))
 		}

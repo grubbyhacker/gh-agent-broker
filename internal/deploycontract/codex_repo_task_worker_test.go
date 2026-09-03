@@ -185,8 +185,11 @@ func TestCodexDeliveryWorkerOwnsOnlyDeterministicDelivery(t *testing.T) {
 			t.Errorf("delivery worker contains Codex execution authority %q", forbidden)
 		}
 	}
-	if strings.Contains(text, "mise run") {
-		t.Error("delivery worker must not run repository-controlled validation with broker credentials")
+	if strings.Contains(text, "mise run \"$AGENT_VERIFY_TASK\"") {
+		t.Error("delivery worker must never execute repository validation after receiving broker authority")
+	}
+	if !strings.Contains(text, "codex-stale-lease/v3") || !strings.Contains(text, "merge-tree --write-tree") {
+		t.Error("delivery worker must return a structured stale-lease handoff")
 	}
 }
 

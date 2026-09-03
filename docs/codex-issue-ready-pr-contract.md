@@ -255,3 +255,10 @@ tokens, then persists only one bounded operational error projection with its
 source, byte counts, and SHA-256 digests. The raw streams are removed on
 termination. Logs and arbitrary artifact endpoints are disabled for these
 runs.
+
+For failed, timed-out, or stopped Codex runs, terminal `failure_class` always
+uses exactly one of: `infrastructure` (preparation, create, start, credential,
+or other pre-execution failure), `model_or_code` (a failure after model
+execution started), or `delivery_or_lease` (delivery, stale lease, or recovery
+validation failure). The class is derived from durable phase and execution
+start facts; worker-provided terminal JSON cannot select or omit it.

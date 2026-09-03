@@ -6,6 +6,8 @@ readonly dependency_manifest_path="${AGENT_IMAGE_DEPENDENCY_MANIFEST_PATH:-/usr/
 readonly baked_workspace_path="${AGENT_IMAGE_WORKSPACE:-/workspace}"
 readonly issue_context_byte_limit=24576
 readonly issue_comment_limit=30
+readonly repair_log_item_limit=32
+readonly repair_log_total_byte_limit=$((64 * 1024 * 1024))
 stage='initializing'
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
@@ -38,6 +40,15 @@ validate_contract() {
     (.parameters.issue_number | type == "number" and floor == . and . > 0) and
     (.parameters.source_delivery_id | type == "string" and test("^[A-Za-z0-9-]{1,128}$"))
   ' /input/task.json >/dev/null || fail 'typed issue task contract is invalid'
+}
+
+repair_mode() { jq -e '(.parameters.repair_pr_number? // 0) > 0' /input/task.json >/dev/null; }
+
+validate_repair_contract() {
+  jq -e '
+    (.parameters.repair_pr_number | type == "number" and floor == . and . > 0) and
+    (.parameters.expected_head_sha | type == "string" and test("^[a-f0-9]{40}$"))
+  ' /input/task.json >/dev/null || fail 'typed CI repair task contract is invalid'
 }
 
 collect_submodule_manifest_entries() {
@@ -142,6 +153,47 @@ ingest_issue() {
   (( bytes <= issue_context_byte_limit )) || fail "issue body/comments exceed ${issue_context_byte_limit}-byte input limit"
 }
 
+prepare_repair_pull() {
+  local number expected pull head_ref head_sha
+  validate_repair_contract
+  number=$(jq -r '.parameters.repair_pr_number' /input/task.json)
+  expected=$(jq -r '.parameters.expected_head_sha' /input/task.json)
+  gh-agent-broker-cli pull -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number" > /work/prepared/pull.json
+  jq -e --arg expected "$expected" '
+    .state == "open" and (.number | type == "number" and . > 0) and
+    (.head_ref | type == "string" and length > 0) and .head_sha == $expected and
+    (.base_ref | type == "string" and length > 0)
+  ' /work/prepared/pull.json >/dev/null || fail 'pull request is closed, malformed, or no longer at the admitted CI head'
+  head_ref=$(jq -r .head_ref /work/prepared/pull.json)
+  head_sha=$(jq -r .head_sha /work/prepared/pull.json)
+  git check-ref-format --branch "$head_ref" >/dev/null || fail 'pull request head branch is invalid'
+  git fetch --quiet origin "refs/heads/${head_ref}"
+  [[ "$(git rev-parse FETCH_HEAD)" == "$head_sha" ]] || fail 'broker checkout does not match admitted pull request head'
+  git checkout --quiet -B "$AGENT_BRANCH" FETCH_HEAD
+  gh-agent-broker-cli ci-observation -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number" -head-sha "$expected" > /work/prepared/ci-observation.json
+  jq -e --arg expected "$expected" '.requested_head_sha == $expected and .pull.head_sha == $expected' /work/prepared/ci-observation.json >/dev/null ||
+    fail 'authoritative CI observation no longer matches admitted pull request head'
+  mapfile -t failed_jobs < <(jq -r '
+    .workflow_jobs[]? | select(.status == "completed" and (.conclusion | ascii_downcase | IN("success", "skipped", "neutral")) | not) | .id
+  ' /work/prepared/ci-observation.json)
+  (( ${#failed_jobs[@]} <= repair_log_item_limit )) || fail 'authoritative CI observation has too many failed jobs for the explicit repair-log item bound'
+  mkdir -p /work/prepared/actions-logs
+  local total_log_bytes=0 log_size
+  for job_id in "${failed_jobs[@]}"; do
+    gh-agent-broker-cli actions-job-log -broker "$BROKER_URL" -repo "$AGENT_REPO" -job-id "$job_id" \
+      > "/work/prepared/actions-logs/${job_id}.json"
+    jq -e --argjson job "$job_id" '.job_id == $job and (.text | type == "string") and (.size_bytes | type == "number" and . >= 0) and (.byte_limit | type == "number" and . > 0) and (.size_bytes <= .byte_limit) and (.sha256 | test("^[a-f0-9]{64}$"))' \
+      "/work/prepared/actions-logs/${job_id}.json" >/dev/null || fail 'bounded Actions log response is malformed'
+    log_size=$(jq -r .size_bytes "/work/prepared/actions-logs/${job_id}.json")
+    total_log_bytes=$((total_log_bytes + log_size))
+    (( total_log_bytes <= repair_log_total_byte_limit )) || fail 'authoritative Actions logs exceed the explicit aggregate byte bound'
+  done
+  jq -n --argjson number "$number" --arg head_ref "$head_ref" --arg expected "$expected" --argjson total "$total_log_bytes" \
+    '{pull_number:$number,head_ref:$head_ref,expected_head_sha:$expected,actions_log_item_limit:32,actions_log_total_byte_limit:67108864,actions_log_total_bytes:$total}' > /work/prepared/repair.json
+  chmod -R a-w /work/prepared/actions-logs
+  chmod 0444 /work/prepared/pull.json /work/prepared/ci-observation.json /work/prepared/repair.json
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   require_env BROKER_URL
   require_env AGENT_REPO
@@ -166,6 +218,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 
   stage='typed issue ingestion'
   ingest_issue
+  if repair_mode; then
+    stage='authoritative pull request and CI observation'
+    prepare_repair_pull
+  fi
 
   stage='baked dependency and submodule verification'
   manifest=$(verify_baked_manifest)
@@ -180,6 +236,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     '{version:"codex-preparation-result/v1",status:"prepared",run_id:$run_id,repository:$repo,
       branch:$branch,workspace_head:$head,refs_sha256:$refs,manifest_sha256:$manifest,issue_number:$issue_number,
       source_delivery_id:$source_delivery_id}' > /work/prepared/preparation.json
+  if repair_mode; then
+    jq --slurpfile repair /work/prepared/repair.json '. + {repair_pr_number:$repair[0].pull_number,repair_head_ref:$repair[0].head_ref,repair_expected_head_sha:$repair[0].expected_head_sha}' \
+      /work/prepared/preparation.json > /work/prepared/preparation.json.next
+    mv /work/prepared/preparation.json.next /work/prepared/preparation.json
+  fi
   chmod 0444 /work/prepared/preparation.json /work/prepared/issue-context.md
   stage='prepared'
 fi

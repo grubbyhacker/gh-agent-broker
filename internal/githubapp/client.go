@@ -4,6 +4,7 @@ package githubapp
 import (
 	"bytes"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"gh-agent-broker/internal/api"
 	"gh-agent-broker/internal/config"
@@ -803,8 +805,11 @@ func (c *Client) GetCommitStatus(appName, repo string, installationID int64, sha
 		TotalCount int                 `json:"total_count"`
 		Statuses   []api.StatusContext `json:"statuses"`
 	}
-	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/status", installationID, nil, &out); err != nil {
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/status?per_page=100", installationID, nil, &out); err != nil {
 		return api.CommitStatus{}, err
+	}
+	if out.TotalCount > len(out.Statuses) {
+		return api.CommitStatus{}, fmt.Errorf("GitHub commit status observation is paginated beyond the broker bound")
 	}
 	return api.CommitStatus{State: out.State, SHA: out.SHA, TotalCount: out.TotalCount, Statuses: out.Statuses}, nil
 }
@@ -814,7 +819,191 @@ func (c *Client) ListCheckRuns(appName, repo string, installationID int64, sha s
 	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/check-runs?"+query.Encode(), installationID, nil, &out); err != nil {
 		return api.CheckRuns{}, err
 	}
+	if out.TotalCount > len(out.CheckRuns) {
+		return api.CheckRuns{}, fmt.Errorf("GitHub check-run observation is paginated beyond the broker bound")
+	}
+	for i := range out.CheckRuns {
+		if strings.EqualFold(out.CheckRuns[i].Conclusion, "failure") || strings.EqualFold(out.CheckRuns[i].Conclusion, "timed_out") || strings.EqualFold(out.CheckRuns[i].Conclusion, "startup_failure") {
+			annotations, err := c.ListCheckRunAnnotations(appName, repo, installationID, out.CheckRuns[i].ID, 100, 256*1024)
+			if err != nil {
+				return api.CheckRuns{}, err
+			}
+			if len(annotations) > 0 {
+				if out.CheckRuns[i].Output == nil {
+					out.CheckRuns[i].Output = &api.CheckOutput{}
+				}
+				out.CheckRuns[i].Output.Annotations = annotations
+			}
+		}
+	}
 	return out, nil
+}
+
+// ListCheckRunAnnotations obtains the separate, paginated annotations resource.
+// Bounds are intentionally enforced before returning partial evidence.
+func (c *Client) ListCheckRunAnnotations(appName, repo string, installationID, runID int64, maxItems, maxBytes int) ([]api.CheckAnnotation, error) {
+	if runID < 1 || maxItems < 1 || maxBytes < 1 {
+		return nil, errors.New("invalid check annotation bound")
+	}
+	var all []api.CheckAnnotation
+	used := 0
+	for page := 1; ; page++ {
+		q := url.Values{"per_page": {"100"}, "page": {strconv.Itoa(page)}}
+		var batch []api.CheckAnnotation
+		if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/check-runs/"+strconv.FormatInt(runID, 10)+"/annotations?"+q.Encode(), installationID, nil, &batch); err != nil {
+			return nil, err
+		}
+		for _, annotation := range batch {
+			b, err := json.Marshal(annotation)
+			if err != nil {
+				return nil, err
+			}
+			used += len(b)
+			if len(all) == maxItems || used > maxBytes {
+				return nil, fmt.Errorf("GitHub check annotations exceed broker bounds")
+			}
+			all = append(all, annotation)
+		}
+		if len(batch) < 100 {
+			break
+		}
+	}
+	return all, nil
+}
+
+func (c *Client) ListWorkflowRuns(appName, repo string, installationID int64, sha string) ([]api.WorkflowRun, error) {
+	q := url.Values{"head_sha": []string{sha}, "per_page": []string{"100"}}
+	var page struct {
+		TotalCount   int               `json:"total_count"`
+		WorkflowRuns []api.WorkflowRun `json:"workflow_runs"`
+	}
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/actions/runs?"+q.Encode(), installationID, nil, &page); err != nil {
+		return nil, err
+	}
+	if page.TotalCount > len(page.WorkflowRuns) {
+		return nil, fmt.Errorf("GitHub workflow-run observation is paginated beyond the broker bound")
+	}
+	return page.WorkflowRuns, nil
+}
+
+func (c *Client) ListWorkflowJobs(appName, repo string, installationID, runID int64) ([]api.WorkflowJob, error) {
+	var out struct {
+		TotalCount int               `json:"total_count"`
+		Jobs       []api.WorkflowJob `json:"jobs"`
+	}
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/actions/runs/"+strconv.FormatInt(runID, 10)+"/jobs?per_page=100", installationID, nil, &out); err != nil {
+		return nil, err
+	}
+	if out.TotalCount > len(out.Jobs) {
+		return nil, fmt.Errorf("GitHub workflow-job observation is paginated beyond the broker bound")
+	}
+	for i := range out.Jobs {
+		out.Jobs[i].RunID = runID
+	}
+	return out.Jobs, nil
+}
+
+// BranchRules is the least-privilege GitHub endpoint for the complete active
+// rules that apply to a branch. Older GitHub installations may not expose it;
+// callers can then use the legacy branch-protection response as a fallback.
+func (c *Client) BranchRules(appName, repo, branch string, installationID int64) (*api.BranchRules, error) {
+	var out api.BranchRules
+	err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/rules/branches/"+url.PathEscape(branch), installationID, nil, &out)
+	if err != nil {
+		var apiErr APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return &api.BranchRules{}, nil
+		}
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) BranchProtection(appName, repo, branch string, installationID int64) (*api.BranchProtection, error) {
+	var out api.BranchProtection
+	err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/branches/"+url.PathEscape(branch)+"/protection", installationID, nil, &out)
+	if err != nil {
+		var apiErr APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return &api.BranchProtection{}, nil
+		}
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetWorkflowJobLog follows only GitHub's signed Actions-log redirect, keeps
+// the signed URL private, and rejects rather than truncates oversized logs.
+func (c *Client) GetWorkflowJobLog(appName, repo string, installationID, jobID int64, maxBytes int64) (api.ActionsJobLog, error) {
+	if maxBytes < 1 {
+		return api.ActionsJobLog{}, errors.New("actions log byte limit must be positive")
+	}
+	token, err := c.InstallationToken(appName, installationID)
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(c.cfg.APIBaseURL, "/")+"/repos/"+repo+"/actions/jobs/"+strconv.FormatInt(jobID, 10)+"/logs", nil)
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	noRedirect := *c.http
+	noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	defer closeBody(resp.Body)
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if readErr != nil {
+			return api.ActionsJobLog{}, readErr
+		}
+		return api.ActionsJobLog{}, APIError{StatusCode: resp.StatusCode, Body: string(body)}
+	}
+	location, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil || location.Scheme != "https" || !safeActionsLogHost(location.Hostname()) {
+		return api.ActionsJobLog{}, errors.New("GitHub actions log redirect is not an approved HTTPS host")
+	}
+	logReq, err := http.NewRequest(http.MethodGet, location.String(), nil)
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	logResp, err := noRedirect.Do(logReq)
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	defer closeBody(logResp.Body)
+	if logResp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(logResp.Body, 1<<20))
+		if readErr != nil {
+			return api.ActionsJobLog{}, readErr
+		}
+		return api.ActionsJobLog{}, APIError{StatusCode: logResp.StatusCode, Body: string(body)}
+	}
+	body, err := io.ReadAll(io.LimitReader(logResp.Body, maxBytes+1))
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	if int64(len(body)) > maxBytes {
+		return api.ActionsJobLog{}, fmt.Errorf("actions job log exceeds %d-byte broker limit", maxBytes)
+	}
+	if !utf8.Valid(body) {
+		return api.ActionsJobLog{}, errors.New("actions job log is not valid UTF-8")
+	}
+	digest := sha256.Sum256(body)
+	return api.ActionsJobLog{JobID: jobID, SizeBytes: int64(len(body)), SHA256: fmt.Sprintf("%x", digest), ByteLimit: maxBytes, Text: string(body)}, nil
+}
+
+func safeActionsLogHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	// Job-log downloads are delivered through these GitHub Actions result
+	// services. Keep this deliberately exact: accepting arbitrary subdomains
+	// of github.com or actions.githubusercontent.com would make the redirect
+	// an open outbound fetch primitive.
+	return host == "results-receiver.actions.githubusercontent.com" ||
+		host == "pipelines.actions.githubusercontent.com"
 }
 
 type githubUser struct {

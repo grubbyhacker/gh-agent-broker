@@ -4,6 +4,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,14 @@ type Server struct {
 	http       *http.Client
 	tripwire   *pushtripwire.Store
 	fence      pushtripwire.FenceAdapter
+}
+
+var issueCommentMutationMu sync.Mutex
+
+type staleHeadError struct{ expected, actual string }
+
+func (e staleHeadError) Error() string {
+	return "pull request head no longer matches requested_head_sha"
 }
 
 // transportOperation is retained while staged audit records are emitted by
@@ -522,6 +531,7 @@ Operations:
 - GET  /v1/repos/{owner}/{repo}/pulls/{number}/reviews
 - GET  /v1/repos/{owner}/{repo}/pulls/{number}/review-comments
 - GET  /v1/repos/{owner}/{repo}/pulls/{number}/review-threads
+- GET  /v1/repos/{owner}/{repo}/pulls/{number}/ci-observation
 - PUT  /v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal
 - PUT  /v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve
 - POST /v1/repos/{owner}/{repo}/pulls
@@ -534,6 +544,7 @@ Operations:
 - DELETE /v1/repos/{owner}/{repo}/issues/{number}/labels/{label}
 - GET  /v1/repos/{owner}/{repo}/commits/{sha}/status
 - GET  /v1/repos/{owner}/{repo}/commits/{sha}/check-runs
+- GET  /v1/repos/{owner}/{repo}/actions/jobs/{job_id}/log
 
 Git smart HTTP:
 - /git/{owner}/{repo}.git
@@ -1011,6 +1022,8 @@ func (s *Server) handleRepoAPI(w http.ResponseWriter, r *http.Request) {
 		s.handlePullReviewComments(w, r, repo, parts[3])
 	case len(parts) == 5 && parts[2] == "pulls" && parts[4] == "review-threads" && r.Method == http.MethodGet:
 		s.handlePullReviewThreads(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "pulls" && parts[4] == "ci-observation" && r.Method == http.MethodGet:
+		s.handleCIObservation(w, r, repo, parts[3])
 	case len(parts) == 7 && parts[2] == "pulls" && parts[4] == "reviews" && parts[6] == "dismissal" && r.Method == http.MethodPut:
 		s.handlePullReviewDismiss(w, r, repo, parts[3], parts[5])
 	case len(parts) == 7 && parts[2] == "pulls" && parts[4] == "review-threads" && parts[6] == "resolve" && r.Method == http.MethodPut:
@@ -1033,6 +1046,10 @@ func (s *Server) handleRepoAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleCommitStatus(w, r, repo, parts[3])
 	case len(parts) == 5 && parts[2] == "commits" && parts[4] == "check-runs" && r.Method == http.MethodGet:
 		s.handleCheckRuns(w, r, repo, parts[3])
+	case len(parts) == 6 && parts[2] == "actions" && parts[3] == "jobs" && parts[5] == "log" && r.Method == http.MethodGet:
+		s.handleActionsJobLog(w, r, repo, parts[4])
+	case len(parts) == 6 && parts[2] == "actions" && parts[3] == "runs" && parts[5] == "jobs" && r.Method == http.MethodGet:
+		s.handleActionsRunJobs(w, r, repo, parts[4])
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
@@ -1178,7 +1195,7 @@ func (s *Server) handlePullReviewDismiss(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("pull.review.dismiss:%s:%d:%s", repo, number, reviewID))
-	extra := map[string]interface{}{"pull_number": number, "review_id": reviewID, "idempotency_key": key}
+	extra := map[string]interface{}{"pull_number": number, "review_id": reviewID, "idempotency_key_digest": idempotencyKeyDigest(key)}
 	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
@@ -1258,7 +1275,7 @@ func (s *Server) handlePullReviewThreadResolve(w http.ResponseWriter, r *http.Re
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("pull.review_thread.resolve:%s:%d:%s", repo, number, threadID))
-	extra := map[string]interface{}{"pull_number": number, "thread_id": threadID, "idempotency_key": key}
+	extra := map[string]interface{}{"pull_number": number, "thread_id": threadID, "idempotency_key_digest": idempotencyKeyDigest(key)}
 	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
@@ -1333,6 +1350,263 @@ func (s *Server) handleCheckRuns(w http.ResponseWriter, r *http.Request, repo, s
 	})
 }
 
+const maxActionsJobLogBytes int64 = 16 * 1024 * 1024
+
+func (s *Server) handleCIObservation(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	expected := r.URL.Query().Get("head_sha")
+	if !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(expected) {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_requested_head_sha", Message: "head_sha must be 40 lowercase hexadecimal characters", Decision: policy.DecisionDeny})
+		return
+	}
+	s.withReadAccess(w, r, repo, "ci.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		pull, err := gh.GetPull(appName, repo, inst, number)
+		if err != nil {
+			return nil, err
+		}
+		if pull.HeadSHA == "" {
+			return nil, fmt.Errorf("GitHub pull request has no head SHA")
+		}
+		if pull.HeadSHA != expected {
+			return nil, staleHeadError{expected, pull.HeadSHA}
+		}
+		status, err := gh.GetCommitStatus(appName, repo, inst, pull.HeadSHA)
+		if err != nil {
+			return nil, err
+		}
+		checks, err := gh.ListCheckRuns(appName, repo, inst, pull.HeadSHA, url.Values{"filter": []string{"latest"}, "per_page": []string{"100"}})
+		if err != nil {
+			return nil, err
+		}
+		runs, err := gh.ListWorkflowRuns(appName, repo, inst, pull.HeadSHA)
+		if err != nil {
+			return nil, err
+		}
+		var jobs []api.WorkflowJob
+		for _, run := range runs {
+			runJobs, err := gh.ListWorkflowJobs(appName, repo, inst, run.ID)
+			if err != nil {
+				return nil, err
+			}
+			jobs = append(jobs, runJobs...)
+			if len(jobs) > 1000 {
+				return nil, fmt.Errorf("GitHub CI observation exceeds the 1,000-job bound")
+			}
+		}
+		rules, err := gh.BranchRules(appName, repo, pull.BaseRef, inst)
+		if err != nil {
+			return nil, err
+		}
+		// The active-rules endpoint is authoritative and needs only
+		// Metadata:read. We deliberately do not use the legacy Administration:read
+		// protection fallback in this least-privilege observation endpoint.
+		var protection *api.BranchProtection
+		required := requiredCI(rules, protection)
+		// Re-read after evidence collection. No response may claim a current
+		// pull head while its evidence belongs to an earlier head.
+		current, err := gh.GetPull(appName, repo, inst, number)
+		if err != nil {
+			return nil, err
+		}
+		if current.HeadSHA != expected {
+			return nil, staleHeadError{expected, current.HeadSHA}
+		}
+		return api.CIObservation{RequestedHeadSHA: expected, Pull: current, CommitStatus: status, CheckRuns: checks, WorkflowRuns: runs, WorkflowJobs: jobs, BranchProtection: protection, BranchRules: rules, RequiredCI: required, AggregateState: aggregateCI(required, status, checks, runs)}, nil
+	})
+}
+
+// requiredCI reads identities from GitHub's active rules responses; it never
+// consults a broker-side check-name list.
+func requiredCI(rules *api.BranchRules, protection *api.BranchProtection) []api.RequiredCI {
+	seen := map[string]bool{}
+	var out []api.RequiredCI
+	add := func(kind, name string, integrationID *int64) {
+		name = strings.TrimSpace(name)
+		identity := ""
+		if integrationID != nil {
+			identity = strconv.FormatInt(*integrationID, 10)
+		}
+		key := kind + ":" + name + ":" + identity
+		if name != "" && !seen[key] {
+			seen[key] = true
+			out = append(out, api.RequiredCI{Kind: kind, Identity: name, IntegrationID: integrationID})
+		}
+	}
+	addWorkflow := func(workflow api.RequiredWorkflow) {
+		if workflow.Path == "" {
+			return
+		}
+		key := fmt.Sprintf("workflow:%s:%s:%d:%s", workflow.Path, workflow.Ref, workflow.RepositoryID, workflow.SHA)
+		if !seen[key] {
+			seen[key] = true
+			copy := workflow
+			out = append(out, api.RequiredCI{Kind: "workflow", Identity: workflow.Path, Workflow: &copy})
+		}
+	}
+	if rules != nil {
+		for _, rule := range rules.Rules {
+			switch rule.Type {
+			case "required_status_checks":
+				for _, check := range rule.Parameters.RequiredStatusChecks {
+					add("check", check.Context, check.IntegrationID)
+				}
+			case "required_workflows":
+				for _, workflow := range rule.Parameters.RequiredWorkflows {
+					addWorkflow(workflow)
+				}
+			}
+		}
+		return out
+	}
+	if protection == nil || protection.RequiredStatusChecks == nil {
+		return out
+	}
+	for _, context := range protection.RequiredStatusChecks.Contexts {
+		add("status", context, nil)
+	}
+	for _, check := range protection.RequiredStatusChecks.Checks {
+		add("check", check.Context, check.IntegrationID)
+	}
+	return out
+}
+
+// aggregateCI has the repository-neutral vocabulary consumed by Signal Plane.
+// A required identity missing from the complete authoritative observation is
+// pending, which is deliberately fail-closed.
+func aggregateCI(required []api.RequiredCI, statuses api.CommitStatus, checks api.CheckRuns, runs []api.WorkflowRun) string {
+	if len(required) == 0 {
+		return "success"
+	}
+	statusByName := map[string]string{}
+	for _, s := range statuses.Statuses {
+		statusByName[s.Context] = strings.ToLower(s.State)
+	}
+	checkByName := map[string][]api.CheckRun{}
+	for _, c := range checks.CheckRuns {
+		checkByName[c.Name] = append(checkByName[c.Name], c)
+	}
+	result := "success"
+	for _, required := range required {
+		state, conclusion := "", ""
+		if required.Kind == "status" {
+			state = statusByName[required.Identity]
+		} else if required.Kind == "check" {
+			candidates, ok := checkByName[required.Identity]
+			if !ok {
+				if required.IntegrationID == nil {
+					state = statusByName[required.Identity]
+				}
+			} else {
+				for _, check := range candidates {
+					if required.IntegrationID != nil && (check.App == nil || check.App.ID != *required.IntegrationID) {
+						continue
+					}
+					state, conclusion = strings.ToLower(check.Status), strings.ToLower(check.Conclusion)
+					break
+				}
+			}
+		} else if required.Kind == "workflow" {
+			for _, run := range runs {
+				if workflowRunMatches(required.Workflow, run.Path, "", 0, "") {
+					state, conclusion = strings.ToLower(run.Status), strings.ToLower(run.Conclusion)
+					break
+				}
+				for _, ref := range run.ReferencedWorkflows {
+					if workflowRunMatches(required.Workflow, ref.Path, ref.Ref, ref.RepositoryID, ref.SHA) {
+						state, conclusion = strings.ToLower(run.Status), strings.ToLower(run.Conclusion)
+						break
+					}
+				}
+				if state != "" {
+					break
+				}
+			}
+		}
+		if state == "" || state == "queued" || state == "in_progress" || state == "pending" || state == "requested" || state == "waiting" {
+			result = "pending"
+			continue
+		}
+		if state == "error" || conclusion == "startup_failure" || conclusion == "timed_out" {
+			return "infrastructure_failure"
+		}
+		if state == "failure" || conclusion == "failure" || conclusion == "cancelled" || conclusion == "action_required" {
+			return "code_failure"
+		}
+		if state != "success" && conclusion != "success" && conclusion != "neutral" && conclusion != "skipped" {
+			result = "pending"
+		}
+	}
+	return result
+}
+
+func workflowRunMatches(required *api.RequiredWorkflow, path, ref string, repositoryID int64, sha string) bool {
+	if required == nil {
+		return false
+	}
+	path, pathRef := splitWorkflowPathRef(path)
+	requiredPath, requiredPathRef := splitWorkflowPathRef(required.Path)
+	if path != requiredPath {
+		return false
+	}
+	if ref == "" {
+		ref = pathRef
+	}
+	requiredRef := required.Ref
+	if requiredRef == "" {
+		requiredRef = requiredPathRef
+	}
+	// GitHub's referenced_workflows objects do not provide repository_id. A
+	// required SHA/ref plus exact source path is the authoritative binding.
+	// The direct run object does not expose a definition SHA, so it cannot
+	// satisfy a SHA-pinned requirement. Accepting it would turn a pinned
+	// workflow requirement into path/ref-only matching.
+	if required.SHA != "" && sha == "" {
+		return false
+	}
+	return (requiredRef == "" || requiredRef == ref) &&
+		(required.SHA == "" || required.SHA == sha) &&
+		(repositoryID == 0 || required.RepositoryID == 0 || required.RepositoryID == repositoryID)
+}
+
+func splitWorkflowPathRef(value string) (string, string) {
+	if at := strings.LastIndex(value, "@"); at > 0 {
+		value, ref := value[:at], value[at+1:]
+		if source := strings.Index(value, ".github/workflows/"); source > 0 {
+			value = value[source:]
+		}
+		return value, ref
+	}
+	if source := strings.Index(value, ".github/workflows/"); source > 0 {
+		value = value[source:]
+	}
+	return value, ""
+}
+
+func (s *Server) handleActionsRunJobs(w http.ResponseWriter, r *http.Request, repo, rawRunID string) {
+	runID, err := strconv.ParseInt(rawRunID, 10, 64)
+	if err != nil || runID < 1 {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "run_id must be a positive integer", Decision: policy.DecisionDeny})
+		return
+	}
+	s.withReadAccess(w, r, repo, "actions.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.ListWorkflowJobs(appName, repo, inst, runID)
+	})
+}
+
+func (s *Server) handleActionsJobLog(w http.ResponseWriter, r *http.Request, repo, rawJobID string) {
+	jobID, err := strconv.ParseInt(rawJobID, 10, 64)
+	if err != nil || jobID < 1 {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "job_id must be a positive integer", Decision: policy.DecisionDeny})
+		return
+	}
+	s.withReadAccess(w, r, repo, "actions.logs.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.GetWorkflowJobLog(appName, repo, inst, jobID, maxActionsJobLogBytes)
+	})
+}
+
 func (s *Server) withReadAccess(w http.ResponseWriter, r *http.Request, repo, operation, branch string, fn func(opID string, gh *githubapp.Client, appName string, inst int64) (interface{}, error)) {
 	opID := ids.NewOperationID()
 	cfg, gh := s.snapshot()
@@ -1369,6 +1643,12 @@ func classifyGitHubReadError(err error) (int, string, string, map[string]interfa
 		"upstream": "github",
 	}
 	var apiErr githubapp.APIError
+	var stale staleHeadError
+	if errors.As(err, &stale) {
+		extra["requested_head_sha"] = stale.expected
+		extra["pull_head_sha"] = stale.actual
+		return http.StatusConflict, "stale_pull_head", "stale", extra
+	}
 	if errors.As(err, &apiErr) {
 		extra["github_status"] = apiErr.StatusCode
 		switch {
@@ -1427,6 +1707,22 @@ func replayIdempotent(w http.ResponseWriter, cfg config.IdempotencyConfig, key s
 	return true, nil
 }
 
+// replayExactIdempotent makes a caller-provided semantic key safe to retain
+// across restarts: the same key may replay only the exact same request.
+func replayExactIdempotent(w http.ResponseWriter, cfg config.IdempotencyConfig, key, operation, digest string) (replayed, conflict bool, err error) {
+	rec, ok, err := idempotency.Load(cfg, key)
+	if err != nil || !ok {
+		return false, false, err
+	}
+	if rec.Operation != operation || rec.RequestDigest == "" || rec.RequestDigest != digest {
+		return false, true, nil
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(rec.Status)
+	_, err = w.Write(rec.Body)
+	return true, false, err
+}
+
 func writeIdempotentJSON(w http.ResponseWriter, cfg config.IdempotencyConfig, key, operation string, status int, out interface{}) error {
 	body, err := json.Marshal(out)
 	if err != nil {
@@ -1441,6 +1737,20 @@ func writeIdempotentJSON(w http.ResponseWriter, cfg config.IdempotencyConfig, ke
 		return err
 	}
 	return nil
+}
+
+func writeExactIdempotentJSON(w http.ResponseWriter, cfg config.IdempotencyConfig, key, operation, digest string, status int, out interface{}) error {
+	body, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	if err := idempotency.Store(cfg, key, idempotency.Record{Operation: operation, RequestDigest: digest, Status: status, Body: body}); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, err = w.Write(body)
+	return err
 }
 
 func idempotencyHeader(r *http.Request) string {
@@ -1690,7 +2000,6 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
 		return
 	}
-	enriched := metadata.WithBrokerFields(req.Metadata, principal.ID, opID, inst)
 	result := policy.Check(policy.Request{
 		Agent:       principal.Agent,
 		AgentID:     principal.ID,
@@ -1700,7 +2009,7 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		Metadata:    req.Metadata,
 		Locations: map[string]map[string]string{
 			"request":      req.Metadata,
-			"comment_body": enriched,
+			"comment_body": req.Metadata,
 		},
 	})
 	if !result.Allowed {
@@ -1708,19 +2017,81 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "comment creation denied by policy", &result))
 		return
 	}
-	body := req.Body + metadata.RenderBlock(enriched)
+	// Public comments must never become a carrier for broker operation IDs,
+	// installation IDs, or idempotency material. Durable private state binds
+	// retries; reconciliation uses exact body plus the GitHub author.
+	body := req.Body
 	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "issue.comment", []securityscan.Segment{{Name: "body", Value: body}}) {
 		return
 	}
 	key := idempotencyHeader(r)
-	extra := map[string]interface{}{"issue_number": issueNumber, "idempotency_key": key}
-	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
-		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
-		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "idempotency_key_required", Message: "Idempotency-Key header is required for issue comments", OperationID: opID, Decision: policy.DecisionDeny})
 		return
-	} else if replayed {
+	}
+	requestDigest := commentRequestDigest(repo, issueNumber, req)
+	if requestDigest == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "issue comment request cannot be fingerprinted", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	// State never retains the caller supplied idempotency key. The digest is
+	// sufficient to bind retries and avoids turning durable state into a key log.
+	scopedKey := "issue.comment:" + principal.ID + ":" + repo + ":" + issueNumber + ":" + idempotencyKeyDigest(key)
+	// Serialise the complete external mutation per broker process. The durable
+	// reservation below handles restart; together they prevent two live
+	// identical requests from both reconciling an absent comment and posting.
+	issueCommentMutationMu.Lock()
+	defer issueCommentMutationMu.Unlock()
+	extra := map[string]interface{}{"issue_number": issueNumber, "idempotency_key_digest": idempotencyKeyDigest(key), "request_digest": requestDigest}
+	record, found, conflict, reserveErr := idempotency.ReserveExact(cfg.Idempotency, scopedKey, "issue.comment", requestDigest, body)
+	if reserveErr != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: reserveErr.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(reserveErr.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	if conflict {
+		writeJSON(w, http.StatusConflict, api.ErrorResponse{Code: "idempotency_key_conflict", Message: "Idempotency-Key was already used for different issue-comment content or target", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	if found && !record.Pending {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(record.Status)
+		if _, err := w.Write(record.Body); err != nil {
+			return
+		}
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
 		return
+	}
+	if found && record.Pending {
+		// The original body includes the original broker operation metadata. It
+		// must be reused verbatim for reconciliation and any retry create.
+		body = record.SemanticBody
+		commentNumber, parseErr := strconv.Atoi(issueNumber)
+		if parseErr != nil || commentNumber < 1 {
+			writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "invalid issue comment target", OperationID: opID, Decision: policy.DecisionDeny})
+			return
+		}
+		comments, listErr := listIssueCommentsForReconciliation(gh, appName, repo, inst, commentNumber)
+		if listErr != nil {
+			writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(listErr.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
+			return
+		}
+		reconciled, reconciledOK, reconcileErr := reconcilePendingComment(comments, body, record.CreatedAt)
+		if reconcileErr != nil {
+			// Ambiguous visible evidence is never a reason to create another
+			// public comment. Keep the durable reservation pending for a human or
+			// a later unambiguous retry to resolve.
+			writeJSON(w, http.StatusConflict, api.ErrorResponse{Code: "comment_reconciliation_ambiguous", Message: "existing matching comments cannot be safely reconciled", OperationID: opID, Decision: policy.DecisionDeny})
+			return
+		}
+		if reconciledOK {
+			if err := writeExactIdempotentJSON(w, cfg.Idempotency, scopedKey, "issue.comment", requestDigest, http.StatusCreated, reconciled); err != nil {
+				writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+				return
+			}
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_reconciled", Extra: extra})
+			return
+		}
 	}
 	ghResult, err := gh.CreateIssueComment(appName, repo, issueNumber, inst, body)
 	if err != nil {
@@ -1729,12 +2100,75 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		return
 	}
 	extra["comment_id"] = ghResult.ID
-	if err := writeIdempotentJSON(w, cfg.Idempotency, key, "issue.comment", http.StatusCreated, ghResult); err != nil {
+	if err := writeExactIdempotentJSON(w, cfg.Idempotency, scopedKey, "issue.comment", requestDigest, http.StatusCreated, ghResult); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision})
 		return
 	}
 	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: ghResult.HTMLURL, Result: "ok", Extra: extra})
+}
+
+const issueCommentReconciliationPageLimit = 10
+
+func listIssueCommentsForReconciliation(gh *githubapp.Client, appName, repo string, installationID int64, issueNumber int) ([]api.IssueComment, error) {
+	var comments []api.IssueComment
+	for page := 1; page <= issueCommentReconciliationPageLimit; page++ {
+		batch, err := gh.ListIssueComments(appName, repo, installationID, issueNumber, url.Values{"per_page": []string{"100"}, "page": []string{strconv.Itoa(page)}})
+		if err != nil {
+			return nil, err
+		}
+		comments = append(comments, batch...)
+		if len(batch) < 100 {
+			return comments, nil
+		}
+	}
+	return nil, fmt.Errorf("issue comment reconciliation exceeds %d pages", issueCommentReconciliationPageLimit)
+}
+
+func commentRequestDigest(repo, issue string, req api.CommentCreateRequest) string {
+	b, err := json.Marshal(struct {
+		Repo    string                   `json:"repo"`
+		Issue   string                   `json:"issue"`
+		Request api.CommentCreateRequest `json:"request"`
+	}{repo, issue, req})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func idempotencyKeyDigest(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+const issueCommentReconciliationClockSkew = 2 * time.Minute
+
+// reconcilePendingComment claims only a unique exact comment created at or
+// after the durable reservation (with a small clock-skew margin). This avoids
+// claiming an older human comment that happens to use identical prose.
+func reconcilePendingComment(comments []api.IssueComment, body string, reservedAt time.Time) (api.GitHubResult, bool, error) {
+	var found *api.IssueComment
+	for index := range comments {
+		comment := &comments[index]
+		// Exact semantic content plus a GitHub-supplied author is the stable
+		// visible evidence; no internal identifier is inserted into prose.
+		createdAt, err := time.Parse(time.RFC3339, comment.CreatedAt)
+		if err != nil || createdAt.Before(reservedAt.Add(-issueCommentReconciliationClockSkew)) {
+			continue
+		}
+		if comment.Body == body && comment.Author != "" {
+			if found != nil {
+				return api.GitHubResult{}, false, fmt.Errorf("multiple exact issue comments match pending reservation")
+			}
+			found = comment
+		}
+	}
+	if found == nil {
+		return api.GitHubResult{}, false, nil
+	}
+	return api.GitHubResult{ID: found.ID, URL: found.URL, HTMLURL: found.HTMLURL, CreatedAt: found.CreatedAt}, true, nil
 }
 
 func (s *Server) handleIssueLabelsAdd(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
@@ -1780,7 +2214,7 @@ func (s *Server) handleIssueLabelsAdd(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("issue.label.add:%s:%d:%s", repo, number, strings.Join(labels, ",")))
-	extra := map[string]interface{}{"issue_number": number, "labels": labels, "idempotency_key": key}
+	extra := map[string]interface{}{"issue_number": number, "labels": labels, "idempotency_key_digest": idempotencyKeyDigest(key)}
 	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.add", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
@@ -1835,7 +2269,7 @@ func (s *Server) handleIssueLabelRemove(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("issue.label.remove:%s:%d:%s", repo, number, label))
-	extra := map[string]interface{}{"issue_number": number, "label": label, "idempotency_key": key}
+	extra := map[string]interface{}{"issue_number": number, "label": label, "idempotency_key_digest": idempotencyKeyDigest(key)}
 	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.remove", Repo: repo, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})

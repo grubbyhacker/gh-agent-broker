@@ -90,6 +90,12 @@ func main() {
 		cmdCommitStatus(os.Args[2:])
 	case "check-runs":
 		cmdCheckRuns(os.Args[2:])
+	case "ci-observation":
+		cmdCIObservation(os.Args[2:])
+	case "actions-job-log":
+		cmdActionsJobLog(os.Args[2:])
+	case "actions-run-jobs":
+		cmdActionsRunJobs(os.Args[2:])
 	case "comment":
 		cmdComment(os.Args[2:])
 	default:
@@ -99,7 +105,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|reload|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|dismiss-review|resolve-review-thread|add-label|remove-label|issues|issue|issue-comments|commit-status|check-runs|comment> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|reload|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|ci-observation|actions-job-log|actions-run-jobs|dismiss-review|resolve-review-thread|add-label|remove-label|issues|issue|issue-comments|commit-status|check-runs|comment> [flags]")
 }
 
 func commonFlags(fs *flag.FlagSet) (broker, agentID, secret *string) {
@@ -491,6 +497,43 @@ func cmdCheckRuns(args []string) {
 	}
 	resolveSecret(secret)
 	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/commits/"+*sha+"/check-runs", *agentID, *secret, nil)
+}
+
+func cmdCIObservation(args []string) {
+	fs := flag.NewFlagSet("ci-observation", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	number := fs.String("number", "", "pull request number")
+	headSHA := fs.String("head-sha", "", "expected pull request head SHA")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/pulls/"+*number+"/ci-observation?head_sha="+url.QueryEscape(*headSHA), *agentID, *secret, nil)
+}
+
+func cmdActionsJobLog(args []string) {
+	fs := flag.NewFlagSet("actions-job-log", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	jobID := fs.String("job-id", "", "Actions job ID")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/actions/jobs/"+*jobID+"/log", *agentID, *secret, nil)
+}
+
+func cmdActionsRunJobs(args []string) {
+	fs := flag.NewFlagSet("actions-run-jobs", flag.ExitOnError)
+	broker, agentID, secret := commonFlags(fs)
+	repo := fs.String("repo", "", "owner/repo")
+	runID := fs.String("run-id", "", "Actions workflow run ID")
+	if err := fs.Parse(args); err != nil {
+		fatal(err)
+	}
+	resolveSecret(secret)
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/actions/runs/"+*runID+"/jobs", *agentID, *secret, nil)
 }
 
 func queryString(values map[string]string) string {

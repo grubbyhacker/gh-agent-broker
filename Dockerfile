@@ -1,4 +1,4 @@
-FROM golang:1.26.5 AS build
+FROM golang:1.26.6 AS build
 WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download
@@ -23,6 +23,7 @@ COPY --chmod=0755 workers/repo-task/worker.sh /usr/local/bin/agent-repo-task-wor
 COPY --chmod=0755 workers/codex-repo-task/worker.sh /usr/local/bin/agent-codex-repo-task-worker
 COPY --chmod=0755 workers/codex-repo-prep/worker.sh /usr/local/bin/agent-codex-repo-prep-worker
 COPY --chmod=0755 workers/codex-delivery/worker.sh /usr/local/bin/agent-codex-delivery-worker
+COPY --chmod=0755 workers/codex-recovery-validation/worker.sh /usr/local/bin/agent-codex-recovery-validation-worker
 COPY --from=build --chown=65532:65532 /out/audit /var/log/gh-agent-broker
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/gh-agent-broker"]

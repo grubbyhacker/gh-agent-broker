@@ -37,7 +37,7 @@ result_json() {
   local outcome="$1" detail="$2" current_stage="$3" verification="$4" verify_task="$5" pull_request="${6:-null}"
   printf '{"version":"repository-task-worker-result/v1","outcome":"%s","detail":"%s","stage":"%s","run_id":"run-1","repository":"owner/repository","base_branch":"main","branch":"agent/run-1","verification":{"status":"%s"},"verify_task":"%s","dependency_manifest":"match"%s' "$outcome" "$detail" "$current_stage" "$verification" "$verify_task" "$producer_fields"
   if [[ "$outcome" == 'ready_for_review' ]]; then
-    printf ',"pull_request":%s' "$pull_request"
+    printf ',"pull_request":%s,"expected_old_head_sha":"3333333333333333333333333333333333333333","candidate_head_sha":"4444444444444444444444444444444444444444","delivered_head_sha":"1111111111111111111111111111111111111111","validated_tree_sha":"2222222222222222222222222222222222222222","delivered_tree_sha":"2222222222222222222222222222222222222222"' "$pull_request"
   fi
   printf '}'
 }
@@ -70,6 +70,11 @@ printf '%s\n' '{"number":42,"html_url":"https://github.example/owner/repository/
 pull_request=$(read_pull_request) || fail_test 'valid broker pull request response was rejected'
 stage='completed'
 verification_status='passed'
+export delivered_head_sha='1111111111111111111111111111111111111111'
+export validated_tree_sha='2222222222222222222222222222222222222222'
+export delivered_tree_sha="$validated_tree_sha"
+export expected_old_head_sha='3333333333333333333333333333333333333333'
+export candidate_head_sha='4444444444444444444444444444444444444444'
 write_result ready_for_review 'repository changed and a pull request was created' "$pull_request"
 assert_result "$(result_json ready_for_review 'repository changed and a pull request was created' completed passed verify "$pull_request")"
 if grep -Fq 'canary-secret' "$AGENT_RESULT_OUTPUT_PATH"; then

@@ -38,6 +38,32 @@ The vps-ops and Signal Plane schema/network handoff is
 `docs/codex-issue-ready-pr-contract.md`. No production or vps-ops change is
 included.
 
+The failed-CI repair extension is specified by
+`docs/repository-agent-ci-repair-contract.md`. It adds broker-owned complete,
+bounded/fail-closed CI observation (active branch rules/rulesets, statuses,
+checks, Actions and log metadata), checks out an existing PR at an admitted
+SHA, seals final validation to the candidate tree, and uses an exact-SHA
+force-with-lease for delivery. A credentialed delivery process now emits a
+bounded stale-lease handoff only for Git's positive `stale info` diagnostic;
+it does not execute repository validation after broker authority is present.
+Sandbox-broker now owns same-run stale-lease recovery: it persists a bounded
+credential-free recovery-validation phase, starts a separate recovery template
+with the shared prepared workspace, seals winner/candidate/tree/verify
+provenance, then creates one fresh delivery container for the single leased
+retry. Signal Plane consumes the final terminal result only; it does not
+orchestrate a second worker phase or attempt identity.
+Ready terminal results carry exact PR, branch, expected-old-head, candidate,
+delivered-head, validated-tree, and delivered-tree identities.
+Signal Plane owns durable event correlation, attempt/deadline accounting, and
+idempotent issue escalation; issue comment keys are durable exact-request keys
+namespaced by principal, operation, repository, and issue.
+
+Final validation hardens Actions log redirects to the exact GitHub Actions
+delivery hosts and rejects arbitrary GitHub subdomains. SHA-pinned required
+workflows now require a matching definition SHA from `referenced_workflows`;
+the direct workflow-run path alone cannot satisfy them. The restart-adoption
+test explicitly drains its delivery watcher to avoid TempDir cleanup races.
+
 Sandbox-broker now seals a durable `repository-task-terminal-result/v1` at
 terminal finalization. `GET /v1/runs/{run_id}/terminal-result` requires the
 new explicit `terminal_result` operator action and retains existing
@@ -81,9 +107,9 @@ The repository-agent lifecycle experiment has been removed. The production
 surface remains the broker-agent authenticated smart-HTTP proxy at `/git/*`
 and the GitHub REST proxy at `/v1/repos/*`.
 
-Development, CI, and Go-based container builds use Go 1.26.5. The `go 1.25.0`
+Development, CI, and Go-based container builds use Go 1.26.6. The `go 1.25.0`
 directive is intentionally retained as the module compatibility floor; the
-`toolchain go1.26.5` directive pins the build toolchain.
+`toolchain go1.26.6` directive pins the build toolchain.
 
 For a curator push, `handleGit` authenticates the configured broker agent,
 checks Git policy and branch/ref preflight, resolves the configured GitHub App
@@ -205,3 +231,35 @@ The workflow validates the digest shape and passes
 vps-ops. This is required for reviewed activation pins; omitting the digest
 retains the ordinary tag-only behavior for deployment paths whose Ansible
 contract does not require an immutable application image.
+
+PR #167 follow-up: CI observation now requires `head_sha` and returns both
+requested and authoritative heads; active rules include required workflow DTOs;
+and public comments no longer render broker metadata. Repair authority is
+persisted in RunMetadata and projected read-only under `/input`; delivery
+compares untrusted preparation artifacts to it. Delivery container identities
+are retained for cleanup, and terminal results expose bounded model-start and
+failure-class fields. Local test/lint/race checks pass. Go 1.26.6 is pinned so
+the standard-library vulnerability scan passes as well.
+
+PR #167 recovery hardening now persists a delivery-attempt identity before
+container creation; the initial and recovered deliveries therefore use distinct
+runtime specs and Docker cannot adopt the exited stale delivery. A single
+stale-lease handoff is sealed with a SHA-256 over canonical run/repository/
+branch/expected/winner/candidate/tree fields, persisted in run metadata, and
+rechecked by the credential-free recovery worker and the broker. Recovery uses
+`git merge-tree --write-tree` plus `commit-tree` to apply the candidate onto
+the winning head and fails closed on conflicts. Recovery templates accept no
+extra mounts and reject `BROKER_*`, Codex, OpenAI, and proxy environment keys.
+Issue-comment idempotency atomically reserves an exact request, retains its
+first rendered semantic body for reconciliation/retry, and scans an explicit
+ten pages of comments; raw idempotency keys remain absent from durable state.
+
+PR #167 acceptance follow-up: terminal failure classification is now durable
+phase/execution-start based and limited to `infrastructure`, `model_or_code`,
+and `delivery_or_lease`; worker-emitted failed output cannot omit it. Repair
+delivery re-reads the authority PR before and after its lease push and projects
+the terminal PR from that post-push response. Required workflow matching strips
+GitHub's `@ref` path suffix and accepts official referenced-workflow shapes
+without repository IDs. Pending comment reconciliation ignores old exact prose
+outside a two-minute skew allowance and fails closed on ambiguous candidates.
+Repair authority input is mode 0444.
