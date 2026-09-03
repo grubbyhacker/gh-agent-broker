@@ -22,8 +22,8 @@ Build a GitHub Agent Access Broker that lets agent containers use GitHub App acc
 - Do not push directly to `main`.
 - Never merge your own pull requests unless the human-in-the-loop explicitly instructs you to merge.
 - Language: Go.
-- Target build toolchain: Go 1.26.5. The `go 1.25.0` directive in `go.mod`
-  is an intentional compatibility floor; `toolchain go1.26.5` pins builds.
+- Target build toolchain: Go 1.26.6. The `go 1.25.0` directive in `go.mod`
+  is an intentional compatibility floor; `toolchain go1.26.6` pins builds.
 - Prefer small packages under `internal/` with unit tests for policy, metadata, auth, and audit behavior.
 - Use `make fmt` on changed Go files.
 - Run `make check` before handoff when possible.

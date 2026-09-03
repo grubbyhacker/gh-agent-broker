@@ -71,8 +71,8 @@ environment variables.
 
 ## Development
 
-This repo builds and tests with Go 1.26.5. The `go 1.25.0` directive in
-`go.mod` remains the compatibility floor, while `toolchain go1.26.5` pins the
+This repo builds and tests with Go 1.26.6. The `go 1.25.0` directive in
+`go.mod` remains the compatibility floor, while `toolchain go1.26.6` pins the
 build toolchain. `mise run check` is the source of truth for local and CI
 hygiene:
 

@@ -107,9 +107,9 @@ The repository-agent lifecycle experiment has been removed. The production
 surface remains the broker-agent authenticated smart-HTTP proxy at `/git/*`
 and the GitHub REST proxy at `/v1/repos/*`.
 
-Development, CI, and Go-based container builds use Go 1.26.5. The `go 1.25.0`
+Development, CI, and Go-based container builds use Go 1.26.6. The `go 1.25.0`
 directive is intentionally retained as the module compatibility floor; the
-`toolchain go1.26.5` directive pins the build toolchain.
+`toolchain go1.26.6` directive pins the build toolchain.
 
 For a curator push, `handleGit` authenticates the configured broker agent,
 checks Git policy and branch/ref preflight, resolves the configured GitHub App
@@ -238,8 +238,8 @@ and public comments no longer render broker metadata. Repair authority is
 persisted in RunMetadata and projected read-only under `/input`; delivery
 compares untrusted preparation artifacts to it. Delivery container identities
 are retained for cleanup, and terminal results expose bounded model-start and
-failure-class fields. Local test/lint/race checks pass; the final vulnerability
-scan is blocked by the repository-pinned Go 1.26.5 standard library.
+failure-class fields. Local test/lint/race checks pass. Go 1.26.6 is pinned so
+the standard-library vulnerability scan passes as well.
 
 PR #167 recovery hardening now persists a delivery-attempt identity before
 container creation; the initial and recovered deliveries therefore use distinct
