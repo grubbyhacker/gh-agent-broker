@@ -822,7 +822,53 @@ func (c *Client) ListCheckRuns(appName, repo string, installationID int64, sha s
 	if out.TotalCount > len(out.CheckRuns) {
 		return api.CheckRuns{}, fmt.Errorf("GitHub check-run observation is paginated beyond the broker bound")
 	}
+	for i := range out.CheckRuns {
+		if strings.EqualFold(out.CheckRuns[i].Conclusion, "failure") || strings.EqualFold(out.CheckRuns[i].Conclusion, "timed_out") || strings.EqualFold(out.CheckRuns[i].Conclusion, "startup_failure") {
+			annotations, err := c.ListCheckRunAnnotations(appName, repo, installationID, out.CheckRuns[i].ID, 100, 256*1024)
+			if err != nil {
+				return api.CheckRuns{}, err
+			}
+			if len(annotations) > 0 {
+				if out.CheckRuns[i].Output == nil {
+					out.CheckRuns[i].Output = &api.CheckOutput{}
+				}
+				out.CheckRuns[i].Output.Annotations = annotations
+			}
+		}
+	}
 	return out, nil
+}
+
+// ListCheckRunAnnotations obtains the separate, paginated annotations resource.
+// Bounds are intentionally enforced before returning partial evidence.
+func (c *Client) ListCheckRunAnnotations(appName, repo string, installationID, runID int64, maxItems, maxBytes int) ([]api.CheckAnnotation, error) {
+	if runID < 1 || maxItems < 1 || maxBytes < 1 {
+		return nil, errors.New("invalid check annotation bound")
+	}
+	var all []api.CheckAnnotation
+	used := 0
+	for page := 1; ; page++ {
+		q := url.Values{"per_page": {"100"}, "page": {strconv.Itoa(page)}}
+		var batch []api.CheckAnnotation
+		if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/check-runs/"+strconv.FormatInt(runID, 10)+"/annotations?"+q.Encode(), installationID, nil, &batch); err != nil {
+			return nil, err
+		}
+		for _, annotation := range batch {
+			b, err := json.Marshal(annotation)
+			if err != nil {
+				return nil, err
+			}
+			used += len(b)
+			if len(all) == maxItems || used > maxBytes {
+				return nil, fmt.Errorf("GitHub check annotations exceed broker bounds")
+			}
+			all = append(all, annotation)
+		}
+		if len(batch) < 100 {
+			break
+		}
+	}
+	return all, nil
 }
 
 func (c *Client) ListWorkflowRuns(appName, repo string, installationID int64, sha string) ([]api.WorkflowRun, error) {
@@ -860,30 +906,30 @@ func (c *Client) ListWorkflowJobs(appName, repo string, installationID, runID in
 // BranchRules is the least-privilege GitHub endpoint for the complete active
 // rules that apply to a branch. Older GitHub installations may not expose it;
 // callers can then use the legacy branch-protection response as a fallback.
-func (c *Client) BranchRules(appName, repo, branch string, installationID int64) (any, error) {
-	var out any
+func (c *Client) BranchRules(appName, repo, branch string, installationID int64) (*api.BranchRules, error) {
+	var out api.BranchRules
 	err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/rules/branches/"+url.PathEscape(branch), installationID, nil, &out)
 	if err != nil {
 		var apiErr APIError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
-			return map[string]any{}, nil
+			return &api.BranchRules{}, nil
 		}
 		return nil, err
 	}
-	return out, nil
+	return &out, nil
 }
 
-func (c *Client) BranchProtection(appName, repo, branch string, installationID int64) (any, error) {
-	var out any
+func (c *Client) BranchProtection(appName, repo, branch string, installationID int64) (*api.BranchProtection, error) {
+	var out api.BranchProtection
 	err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/branches/"+url.PathEscape(branch)+"/protection", installationID, nil, &out)
 	if err != nil {
 		var apiErr APIError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
-			return map[string]any{}, nil
+			return &api.BranchProtection{}, nil
 		}
 		return nil, err
 	}
-	return out, nil
+	return &out, nil
 }
 
 // GetWorkflowJobLog follows only GitHub's signed Actions-log redirect, keeps

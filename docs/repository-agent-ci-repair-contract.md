@@ -74,14 +74,15 @@ git push --force-with-lease=refs/heads/<head-ref>:<expected_head_sha> \
 ```
 
 The broker smart-HTTP preflight independently checks that advertised expected
-old SHA. Deletion and unconditional overwrite remain denied. On one exact-lease
-rejection, the same already-authorized deterministic delivery fetches the
-winning head, applies the already-produced candidate diff, reruns the reviewed
-final validation, binds provenance to the resulting exact tree, and retries
-with the winner SHA as a new exact lease. This recovery is bounded to one
-attempt and never launches or charges a second model attempt. An integration or
-validation failure remains a visible delivery failure; it is not deferred to
-Signal Plane.
+old SHA. Deletion and unconditional overwrite remain denied. A credentialed
+delivery process never runs repository-controlled validation. On the sole
+positive stale-lease diagnostic (`stale info`), it records a bounded
+`codex-stale-lease/v1` handoff; Signal Plane must restart the same attempt in a
+credential-free integration-and-validation container and only then launch a
+new delivery process with the winner SHA as its exact lease. Transport,
+authentication, hook, and upstream-policy failures are terminal delivery
+failures and must not create a recovery handoff. Recovery is bounded to one
+attempt and never launches or charges a second model attempt.
 
 Both an initial and repair `ready_for_review` terminal result include the
 exact `pull_request.number`, `branch`, `delivered_head_sha`, and
@@ -105,8 +106,10 @@ for the reviewed PR-head namespace, and the existing selected reporting
 operation. vps-ops must grant the GitHub App narrowly sufficient read access
 for Actions logs and branch/ruleset requirement observation. Confirmed official
 GitHub App endpoints are `GET /repos/{owner}/{repo}/rules/branches/{branch}`
-(rulesets), `GET /repos/{owner}/{repo}/branches/{branch}/protection`, commit
-statuses/check-runs, Actions runs/jobs/logs, and issue comments; these require
-only the corresponding repository read permissions plus Issues/Pull requests
-write for reporting. This repository does not change App installation
-permissions.
+(active rules; Metadata:read), commit statuses (Commit statuses:read), check
+runs and annotations (Checks:read), and Actions runs/jobs/logs (Actions:read),
+plus Issues/Pull requests write for reporting. The broker intentionally avoids
+the legacy protection fallback because it requires Administration:read.
+Check annotations are fetched from their separate paginated endpoint only for
+failed checks, bounded to 100 items and 256 KiB per run; exceeding either bound
+fails the observation closed.

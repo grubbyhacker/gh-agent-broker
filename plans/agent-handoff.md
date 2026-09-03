@@ -43,9 +43,12 @@ The failed-CI repair extension is specified by
 bounded/fail-closed CI observation (active branch rules/rulesets, statuses,
 checks, Actions and log metadata), checks out an existing PR at an admitted
 SHA, seals final validation to the candidate tree, and uses an exact-SHA
-force-with-lease for delivery. One lease race is recovered in that same
-deterministic delivery by integrating the sealed diff onto the winning head
-and revalidating it; it never starts another Codex attempt. Ready terminal
+force-with-lease for delivery. A credentialed delivery process now emits a
+bounded stale-lease handoff only for Git's positive `stale info` diagnostic;
+it does not execute repository validation after broker authority is present.
+The remaining Signal Plane recovery orchestration must consume that handoff in
+a credential-free integration-and-validation phase before a new exact-lease
+delivery process; it never starts another Codex attempt. Ready terminal
 results carry exact PR, branch, delivered-head, and validated-tree identities.
 Signal Plane owns durable event correlation, attempt/deadline accounting, and
 idempotent issue escalation; issue comment keys are durable exact-request keys

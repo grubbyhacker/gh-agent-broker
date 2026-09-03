@@ -185,8 +185,11 @@ func TestCodexDeliveryWorkerOwnsOnlyDeterministicDelivery(t *testing.T) {
 			t.Errorf("delivery worker contains Codex execution authority %q", forbidden)
 		}
 	}
-	if !strings.Contains(text, "stale repair final validation") || !strings.Contains(text, "mise run \"$AGENT_VERIFY_TASK\"") {
-		t.Error("delivery worker must revalidate only the integrated stale-lease candidate")
+	if strings.Contains(text, "mise run \"$AGENT_VERIFY_TASK\"") {
+		t.Error("delivery worker must never execute repository validation after receiving broker authority")
+	}
+	if !strings.Contains(text, "codex-stale-lease/v1") {
+		t.Error("delivery worker must return a structured stale-lease handoff")
 	}
 }
 

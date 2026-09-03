@@ -1187,7 +1187,7 @@ func (s *Server) handlePullReviewDismiss(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("pull.review.dismiss:%s:%d:%s", repo, number, reviewID))
-	extra := map[string]interface{}{"pull_number": number, "review_id": reviewID, "idempotency_key": key}
+	extra := map[string]interface{}{"pull_number": number, "review_id": reviewID, "idempotency_key_digest": idempotencyKeyDigest(key)}
 	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review.dismiss", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
@@ -1267,7 +1267,7 @@ func (s *Server) handlePullReviewThreadResolve(w http.ResponseWriter, r *http.Re
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("pull.review_thread.resolve:%s:%d:%s", repo, number, threadID))
-	extra := map[string]interface{}{"pull_number": number, "thread_id": threadID, "idempotency_key": key}
+	extra := map[string]interface{}{"pull_number": number, "thread_id": threadID, "idempotency_key_digest": idempotencyKeyDigest(key)}
 	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.review_thread.resolve", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
@@ -1380,14 +1380,14 @@ func (s *Server) handleCIObservation(w http.ResponseWriter, r *http.Request, rep
 				return nil, fmt.Errorf("GitHub CI observation exceeds the 1,000-job bound")
 			}
 		}
-		protection, err := gh.BranchProtection(appName, repo, pull.BaseRef, inst)
-		if err != nil {
-			return nil, err
-		}
 		rules, err := gh.BranchRules(appName, repo, pull.BaseRef, inst)
 		if err != nil {
 			return nil, err
 		}
+		// The active-rules endpoint is authoritative and needs only
+		// Metadata:read. We deliberately do not use the legacy Administration:read
+		// protection fallback in this least-privilege observation endpoint.
+		var protection *api.BranchProtection
 		required := requiredCI(rules, protection)
 		return api.CIObservation{Pull: pull, CommitStatus: status, CheckRuns: checks, WorkflowRuns: runs, WorkflowJobs: jobs, BranchProtection: protection, BranchRules: rules, RequiredCI: required, AggregateState: aggregateCI(required, status, checks)}, nil
 	})
@@ -1395,51 +1395,40 @@ func (s *Server) handleCIObservation(w http.ResponseWriter, r *http.Request, rep
 
 // requiredCI reads identities from GitHub's active rules responses; it never
 // consults a broker-side check-name list.
-func requiredCI(values ...any) []api.RequiredCI {
+func requiredCI(rules *api.BranchRules, protection *api.BranchProtection) []api.RequiredCI {
 	seen := map[string]bool{}
 	var out []api.RequiredCI
-	var walk func(any)
-	add := func(kind, name string) {
+	add := func(kind, name string, integrationID *int64) {
 		name = strings.TrimSpace(name)
-		key := kind + ":" + name
+		identity := ""
+		if integrationID != nil {
+			identity = strconv.FormatInt(*integrationID, 10)
+		}
+		key := kind + ":" + name + ":" + identity
 		if name != "" && !seen[key] {
 			seen[key] = true
-			out = append(out, api.RequiredCI{Kind: kind, Identity: name})
+			out = append(out, api.RequiredCI{Kind: kind, Identity: name, IntegrationID: integrationID})
 		}
 	}
-	walk = func(v any) {
-		switch x := v.(type) {
-		case map[string]any:
-			if contexts, ok := x["contexts"].([]any); ok {
-				for _, c := range contexts {
-					if s, ok := c.(string); ok {
-						add("status", s)
-					}
-				}
+	if rules != nil {
+		for _, rule := range rules.Rules {
+			if rule.Type != "required_status_checks" {
+				continue
 			}
-			if checks, ok := x["checks"].([]any); ok {
-				for _, c := range checks {
-					if m, ok := c.(map[string]any); ok {
-						if s, ok := m["context"].(string); ok {
-							add("check", s)
-						}
-						if s, ok := m["name"].(string); ok {
-							add("check", s)
-						}
-					}
-				}
-			}
-			for _, child := range x {
-				walk(child)
-			}
-		case []any:
-			for _, child := range x {
-				walk(child)
+			for _, check := range rule.Parameters.RequiredStatusChecks {
+				add("check", check.Context, check.IntegrationID)
 			}
 		}
+		return out
 	}
-	for _, v := range values {
-		walk(v)
+	if protection == nil || protection.RequiredStatusChecks == nil {
+		return out
+	}
+	for _, context := range protection.RequiredStatusChecks.Contexts {
+		add("status", context, nil)
+	}
+	for _, check := range protection.RequiredStatusChecks.Checks {
+		add("check", check.Context, check.IntegrationID)
 	}
 	return out
 }
@@ -1449,23 +1438,29 @@ func requiredCI(values ...any) []api.RequiredCI {
 // pending, which is deliberately fail-closed.
 func aggregateCI(required []api.RequiredCI, statuses api.CommitStatus, checks api.CheckRuns) string {
 	if len(required) == 0 {
-		return "pending"
+		return "success"
 	}
 	statusByName := map[string]string{}
 	for _, s := range statuses.Statuses {
 		statusByName[s.Context] = strings.ToLower(s.State)
 	}
-	checkByName := map[string]api.CheckRun{}
+	checkByName := map[string][]api.CheckRun{}
 	for _, c := range checks.CheckRuns {
-		checkByName[c.Name] = c
+		checkByName[c.Name] = append(checkByName[c.Name], c)
 	}
 	result := "success"
 	for _, required := range required {
 		state, conclusion := "", ""
 		if required.Kind == "status" {
 			state = statusByName[required.Identity]
-		} else if check, ok := checkByName[required.Identity]; ok {
-			state, conclusion = strings.ToLower(check.Status), strings.ToLower(check.Conclusion)
+		} else if candidates, ok := checkByName[required.Identity]; ok {
+			for _, check := range candidates {
+				if required.IntegrationID != nil && (check.App == nil || check.App.ID != *required.IntegrationID) {
+					continue
+				}
+				state, conclusion = strings.ToLower(check.Status), strings.ToLower(check.Conclusion)
+				break
+			}
 		}
 		if state == "" || state == "queued" || state == "in_progress" || state == "pending" || state == "requested" || state == "waiting" {
 			result = "pending"
@@ -1926,7 +1921,7 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		return
 	}
 	scopedKey := "issue.comment:" + principal.ID + ":" + repo + ":" + issueNumber + ":" + key
-	extra := map[string]interface{}{"issue_number": issueNumber, "idempotency_key": key, "request_digest": requestDigest}
+	extra := map[string]interface{}{"issue_number": issueNumber, "idempotency_key_digest": idempotencyKeyDigest(key), "request_digest": requestDigest}
 	if replayed, conflict, err := replayExactIdempotent(w, cfg.Idempotency, scopedKey, "issue.comment", requestDigest); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
@@ -1963,6 +1958,11 @@ func commentRequestDigest(repo, issue string, req api.CommentCreateRequest) stri
 		return ""
 	}
 	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func idempotencyKeyDigest(key string) string {
+	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -2009,7 +2009,7 @@ func (s *Server) handleIssueLabelsAdd(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("issue.label.add:%s:%d:%s", repo, number, strings.Join(labels, ",")))
-	extra := map[string]interface{}{"issue_number": number, "labels": labels, "idempotency_key": key}
+	extra := map[string]interface{}{"issue_number": number, "labels": labels, "idempotency_key_digest": idempotencyKeyDigest(key)}
 	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.add", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
@@ -2064,7 +2064,7 @@ func (s *Server) handleIssueLabelRemove(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	key := idempotencyKey(r, fmt.Sprintf("issue.label.remove:%s:%d:%s", repo, number, label))
-	extra := map[string]interface{}{"issue_number": number, "label": label, "idempotency_key": key}
+	extra := map[string]interface{}{"issue_number": number, "label": label, "idempotency_key_digest": idempotencyKeyDigest(key)}
 	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.label.remove", Repo: repo, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})

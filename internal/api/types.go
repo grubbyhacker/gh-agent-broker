@@ -1,6 +1,8 @@
 // Package api defines shared request and response DTOs for the broker API.
 package api
 
+import "encoding/json"
+
 type ErrorResponse struct {
 	Code            string           `json:"code"`
 	Message         string           `json:"message"`
@@ -226,6 +228,13 @@ type CheckRun struct {
 	StartedAt   string       `json:"started_at,omitempty"`
 	CompletedAt string       `json:"completed_at,omitempty"`
 	Output      *CheckOutput `json:"output,omitempty"`
+	App         *CheckApp    `json:"app,omitempty"`
+}
+
+// CheckApp identifies the GitHub App that produced a check run. A nil value
+// means GitHub did not provide an app identity for that run.
+type CheckApp struct {
+	ID int64 `json:"id"`
 }
 
 // CheckOutput carries GitHub's bounded failure annotation summary. Individual
@@ -248,22 +257,72 @@ type CheckAnnotation struct {
 // for one pull request head. GitHub remains authoritative: this DTO deliberately
 // does not calculate a separate required-check verdict.
 type CIObservation struct {
-	Pull             PullSummary   `json:"pull"`
-	CommitStatus     CommitStatus  `json:"commit_status"`
-	CheckRuns        CheckRuns     `json:"check_runs"`
-	WorkflowRuns     []WorkflowRun `json:"workflow_runs"`
-	WorkflowJobs     []WorkflowJob `json:"workflow_jobs"`
-	BranchProtection any           `json:"branch_protection,omitempty"`
-	BranchRules      any           `json:"branch_rules,omitempty"`
-	RequiredCI       []RequiredCI  `json:"required_ci"`
-	AggregateState   string        `json:"aggregate_state"`
+	Pull             PullSummary       `json:"pull"`
+	CommitStatus     CommitStatus      `json:"commit_status"`
+	CheckRuns        CheckRuns         `json:"check_runs"`
+	WorkflowRuns     []WorkflowRun     `json:"workflow_runs"`
+	WorkflowJobs     []WorkflowJob     `json:"workflow_jobs"`
+	BranchProtection *BranchProtection `json:"branch_protection,omitempty"`
+	BranchRules      *BranchRules      `json:"branch_rules,omitempty"`
+	RequiredCI       []RequiredCI      `json:"required_ci"`
+	AggregateState   string            `json:"aggregate_state"`
 }
 
 // RequiredCI is derived solely from the active GitHub branch rules. It is not
 // a separately configured check-name allowlist.
 type RequiredCI struct {
-	Identity string `json:"identity"`
-	Kind     string `json:"kind"`
+	Identity      string `json:"identity"`
+	Kind          string `json:"kind"`
+	IntegrationID *int64 `json:"integration_id,omitempty"`
+}
+
+// BranchRules is GitHub's GET /repos/{owner}/{repo}/rules/branches/{branch}
+// response. This endpoint needs only Metadata:read.
+type BranchRules struct {
+	Rules []BranchRule `json:"rules"`
+}
+
+// UnmarshalJSON accepts GitHub's active-rules envelope and the direct array
+// returned by older endpoint versions without falling back to untyped maps.
+func (r *BranchRules) UnmarshalJSON(b []byte) error {
+	var direct []BranchRule
+	if len(b) > 0 && b[0] == '[' {
+		if err := json.Unmarshal(b, &direct); err != nil {
+			return err
+		}
+		r.Rules = direct
+		return nil
+	}
+	var envelope struct {
+		Rules []BranchRule `json:"rules"`
+	}
+	if err := json.Unmarshal(b, &envelope); err != nil {
+		return err
+	}
+	r.Rules = envelope.Rules
+	return nil
+}
+
+type BranchRule struct {
+	Type       string               `json:"type"`
+	Parameters BranchRuleParameters `json:"parameters"`
+}
+type BranchRuleParameters struct {
+	RequiredStatusChecks []RequiredStatusCheck `json:"required_status_checks,omitempty"`
+}
+type RequiredStatusCheck struct {
+	Context       string `json:"context"`
+	IntegrationID *int64 `json:"integration_id,omitempty"`
+}
+
+// BranchProtection is the legacy protection fallback (Administration:read).
+// It is optional because installations granted only Metadata:read cannot use it.
+type BranchProtection struct {
+	RequiredStatusChecks *LegacyRequiredStatusChecks `json:"required_status_checks,omitempty"`
+}
+type LegacyRequiredStatusChecks struct {
+	Contexts []string              `json:"contexts,omitempty"`
+	Checks   []RequiredStatusCheck `json:"checks,omitempty"`
 }
 
 type WorkflowRun struct {
