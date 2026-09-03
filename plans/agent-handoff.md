@@ -58,6 +58,12 @@ Signal Plane owns durable event correlation, attempt/deadline accounting, and
 idempotent issue escalation; issue comment keys are durable exact-request keys
 namespaced by principal, operation, repository, and issue.
 
+Final validation hardens Actions log redirects to the exact GitHub Actions
+delivery hosts and rejects arbitrary GitHub subdomains. SHA-pinned required
+workflows now require a matching definition SHA from `referenced_workflows`;
+the direct workflow-run path alone cannot satisfy them. The restart-adoption
+test explicitly drains its delivery watcher to avoid TempDir cleanup races.
+
 Sandbox-broker now seals a durable `repository-task-terminal-result/v1` at
 terminal finalization. `GET /v1/runs/{run_id}/terminal-result` requires the
 new explicit `terminal_result` operator action and retains existing

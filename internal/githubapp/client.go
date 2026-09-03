@@ -998,7 +998,12 @@ func (c *Client) GetWorkflowJobLog(appName, repo string, installationID, jobID i
 
 func safeActionsLogHost(host string) bool {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	return host == "github.com" || strings.HasSuffix(host, ".github.com") || strings.HasSuffix(host, ".actions.githubusercontent.com")
+	// Job-log downloads are delivered through these GitHub Actions result
+	// services. Keep this deliberately exact: accepting arbitrary subdomains
+	// of github.com or actions.githubusercontent.com would make the redirect
+	// an open outbound fetch primitive.
+	return host == "results-receiver.actions.githubusercontent.com" ||
+		host == "pipelines.actions.githubusercontent.com"
 }
 
 type githubUser struct {

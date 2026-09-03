@@ -762,10 +762,21 @@ func TestCodexWorkflowRestartAdoptsAcceptedExecutionWithoutReinjection(t *testin
 		t.Fatal(err)
 	}
 	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
 	if len(runtime.specs) != 3 {
+		runtime.mu.Unlock()
 		t.Fatalf("restart created %d containers, want exactly one preparation, execution, and delivery", len(runtime.specs))
 	}
+	runtime.mu.Unlock()
+	// Drain the delivery watcher before TempDir cleanup. Leaving it blocked in
+	// Wait races its final metadata persistence with RemoveAll.
+	runtime.finish(out.RunID+"-deliver-1", 1, "test cleanup")
+	if err := restartedAgain.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		intent, found, lookupErr := store.LookupRun(context.Background(), out.RunID)
+		return lookupErr == nil && found && intent.State == intentStateTerminal
+	})
 }
 
 func TestCodexWorkflowRestartRunningExecutionOnlyReattachesWatcher(t *testing.T) {

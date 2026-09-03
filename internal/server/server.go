@@ -1560,10 +1560,14 @@ func workflowRunMatches(required *api.RequiredWorkflow, path, ref string, reposi
 	}
 	// GitHub's referenced_workflows objects do not provide repository_id. A
 	// required SHA/ref plus exact source path is the authoritative binding.
+	// The direct run object does not expose a definition SHA, so it cannot
+	// satisfy a SHA-pinned requirement. Accepting it would turn a pinned
+	// workflow requirement into path/ref-only matching.
+	if required.SHA != "" && sha == "" {
+		return false
+	}
 	return (requiredRef == "" || requiredRef == ref) &&
-		// A workflow-run's own path is source@ref but does not expose the
-		// definition SHA. Referenced workflows do; bind it when present.
-		(required.SHA == "" || sha == "" || required.SHA == sha) &&
+		(required.SHA == "" || required.SHA == sha) &&
 		(repositoryID == 0 || required.RepositoryID == 0 || required.RepositoryID == repositoryID)
 }
 

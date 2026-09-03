@@ -75,6 +75,19 @@ func TestAggregateCIUnboundChecksAcceptStatusAndRequiredWorkflows(t *testing.T) 
 	}
 }
 
+func TestWorkflowRunMatchingFailsClosedForPinnedDefinitionSHA(t *testing.T) {
+	required := &api.RequiredWorkflow{Path: ".github/workflows/verify.yml", Ref: "main", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	if workflowRunMatches(required, ".github/workflows/verify.yml@main", "", 0, "") {
+		t.Fatal("direct workflow run without definition SHA satisfied SHA-pinned requirement")
+	}
+	if workflowRunMatches(required, "owner/repo/.github/workflows/verify.yml@main", "main", 0, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") {
+		t.Fatal("wrong definition SHA satisfied SHA-pinned requirement")
+	}
+	if !workflowRunMatches(required, "owner/repo/.github/workflows/verify.yml@main", "main", 0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		t.Fatal("matching referenced workflow did not satisfy SHA-pinned requirement")
+	}
+}
+
 func TestReconcilePendingCommentFailsClosedOnAmbiguityAndIgnoresOldMatches(t *testing.T) {
 	reserved := time.Now().UTC()
 	body := "public body only"
