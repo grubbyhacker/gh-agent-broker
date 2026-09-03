@@ -28,6 +28,10 @@ const (
 	codexPhaseExecutionRunning   = "execution_running"
 	codexPhaseExecutionRecon     = "execution_reconcile_pending"
 	codexPhaseExecutionTerm      = "execution_terminal"
+	codexPhaseRecoveryCreate     = "recovery_validation_create_pending"
+	codexPhaseRecoveryStart      = "recovery_validation_start_pending"
+	codexPhaseRecoveryRunning    = "recovery_validation_running"
+	codexPhaseRecoveryTerm       = "recovery_validation_terminal"
 	codexPhaseDeliveryCreate     = "delivery_create_pending"
 	codexPhaseDeliveryStart      = "delivery_start_pending"
 	codexPhaseDeliveryRunning    = "delivery_running"
@@ -80,6 +84,18 @@ type executionFailure struct {
 	StderrSHA256     string `json:"stderr_sha256"`
 }
 
+type recoveryValidationResult struct {
+	Version          string `json:"version"`
+	Status           string `json:"status"`
+	RunID            string `json:"run_id"`
+	Repository       string `json:"repository"`
+	Branch           string `json:"branch"`
+	WinnerHeadSHA    string `json:"winner_head_sha"`
+	CandidateHeadSHA string `json:"candidate_head_sha"`
+	ValidatedTreeSHA string `json:"validated_tree_sha"`
+	VerifySHA256     string `json:"verify_sha256"`
+}
+
 func (s *Service) resumeCodexIssueWorkflow(
 	ctx context.Context,
 	intent *launchIntent,
@@ -121,12 +137,94 @@ func (s *Service) resumeCodexIssueWorkflow(
 		fallthrough
 	case codexPhaseExecutionRecon, codexPhaseExecutionTerm:
 		return s.resumeExecution(ctx, intent, meta, *workflow)
+	case codexPhaseRecoveryCreate, codexPhaseRecoveryStart, codexPhaseRecoveryRunning, codexPhaseRecoveryTerm:
+		return s.resumeRecoveryValidation(ctx, intent, meta, *workflow)
 	case codexPhaseDeliveryCreate, codexPhaseDeliveryStart, codexPhaseDeliveryRunning,
 		codexPhaseDeliveryRecon, codexPhaseDeliveryTerm:
 		return s.resumeDelivery(ctx, intent, meta, *workflow)
 	default:
 		return s.failCodexIntent(ctx, intent, meta, "state_reconciliation", fmt.Errorf("unsupported Codex workflow phase %q", meta.Phase))
 	}
+}
+
+// resumeRecoveryValidation runs exactly one credential-free verification after
+// a positively identified stale lease. It deliberately cannot create a new
+// model execution or access the broker.
+func (s *Service) resumeRecoveryValidation(ctx context.Context, intent *launchIntent, meta RunMetadata, workflow CodexIssueWorkflow) (LaunchAgentOutput, error) {
+	template := s.cfg.Templates[workflow.RecoveryTemplate]
+	spec, _, err := s.runtimeSpec(meta, template)
+	if err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	spec.RunID = meta.RunID + "-recover"
+	spec.Labels["gh-agent-broker.parent_run_id"] = meta.RunID
+	spec.Labels["gh-agent-broker.run_id"] = spec.RunID
+	spec.Labels["gh-agent-broker.template"] = workflow.RecoveryTemplate
+	spec.Labels["gh-agent-broker.phase"] = "recovery_validation"
+	var info ContainerInfo
+	if meta.RecoveryContainerID == "" {
+		if meta.RecoveryCount >= 1 {
+			return s.failCodexIntent(ctx, intent, meta, "recovery_bound", fmt.Errorf("stale lease recovery was already attempted"))
+		}
+		meta.Phase = codexPhaseRecoveryCreate
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateCreatePending); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		info, err = s.runtime.Create(ctx, spec)
+		if err != nil {
+			return s.failCodexIntent(ctx, intent, meta, "recovery_create", err)
+		}
+		meta.RecoveryContainerID, meta.ContainerID, meta.RecoveryCount = info.ID, info.ID, meta.RecoveryCount+1
+		meta.Phase = codexPhaseRecoveryStart
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateContainerMade); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		if info.Lifecycle == "" {
+			info.Lifecycle = ContainerNeverStarted
+		}
+	} else {
+		status, inspectErr := s.runtime.Inspect(ctx, meta.RecoveryContainerID)
+		if inspectErr != nil {
+			return s.failCodexIntent(ctx, intent, meta, "recovery_reconcile", inspectErr)
+		}
+		info = ContainerInfo{ID: meta.RecoveryContainerID, Status: status, Lifecycle: lifecycleForStatus(status)}
+	}
+	if info.Lifecycle == ContainerExited {
+		return s.completeRecoveryValidation(ctx, intent, meta, workflow, info.Status)
+	}
+	if info.Lifecycle == ContainerNeverStarted {
+		meta.Phase = codexPhaseRecoveryStart
+		if err := s.persistCodexIntent(ctx, intent, meta, intentStateStartPending); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		if err := s.runtime.Start(ctx, meta.RecoveryContainerID); err != nil {
+			return s.failCodexIntent(ctx, intent, meta, "recovery_start", err)
+		}
+	}
+	meta.Status, meta.Phase = StatusRunning, codexPhaseRecoveryRunning
+	if meta.RecoveryStartedAt.IsZero() {
+		meta.RecoveryStartedAt = time.Now().UTC()
+	}
+	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	s.watchCodexPhase(meta.RunID, meta.RecoveryContainerID)
+	return launchOutput(meta), nil
+}
+
+func (s *Service) completeRecoveryValidation(ctx context.Context, intent *launchIntent, meta RunMetadata, workflow CodexIssueWorkflow, status ContainerStatus) (LaunchAgentOutput, error) {
+	meta.RecoveryEndedAt, meta.Phase = terminalTime(status), codexPhaseRecoveryTerm
+	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	if status.ExitCode == nil || *status.ExitCode != 0 {
+		return s.failCodexIntent(ctx, intent, meta, "recovery_validation", fmt.Errorf("credential-free recovery validation failed"))
+	}
+	if err := s.readRecoveryValidation(meta); err != nil {
+		return s.failCodexIntent(ctx, intent, meta, "recovery_validation", err)
+	}
+	meta.DeliveryContainerID, meta.ContainerID, meta.Phase = "", "", codexPhaseDeliveryCreate
+	return s.resumeDelivery(ctx, intent, meta, workflow)
 }
 
 func (s *Service) resumePreparation(
@@ -530,6 +628,16 @@ func (s *Service) completeDelivery(
 	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
 		return LaunchAgentOutput{}, err
 	}
+	if status.ExitCode != nil && *status.ExitCode != 0 {
+		if _, err := s.readStaleLease(meta); err == nil {
+			meta.Phase, meta.ContainerID = codexPhaseRecoveryCreate, ""
+			profile := s.cfg.LaunchProfiles[meta.Profile]
+			if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
+				return LaunchAgentOutput{}, err
+			}
+			return s.resumeRecoveryValidation(ctx, intent, meta, *profile.CodexIssueWorkflow)
+		}
+	}
 	finalized, _, err := s.finalizeTerminalRun(ctx, meta.RunID, finalizeReasonWorkerExit, terminalSourceExited, func(current RunMetadata) RunMetadata {
 		return s.finalizeExitedRun(ctx, current, status)
 	})
@@ -561,6 +669,12 @@ func (s *Service) watchCodexPhase(runID, containerID string) {
 		if intent.Metadata.Phase == codexPhaseExecutionRunning {
 			if _, completeErr := s.completeExecution(context.Background(), &intent, intent.Metadata, status); completeErr != nil {
 				s.auditFinalizeFailure(runID, "codex_execution_failed", "codex_execution", completeErr)
+			}
+			return
+		}
+		if intent.Metadata.Phase == codexPhaseRecoveryRunning {
+			if _, completeErr := s.completeRecoveryValidation(context.Background(), &intent, intent.Metadata, *profile.CodexIssueWorkflow, status); completeErr != nil {
+				s.auditFinalizeFailure(runID, "codex_recovery_validation_failed", "codex_recovery_validation", completeErr)
 			}
 			return
 		}
@@ -656,6 +770,8 @@ func currentCodexPhaseContainer(meta RunMetadata) (string, string) {
 	case codexPhaseExecutionStart, codexPhaseBundleInject, codexPhaseBundleAccept,
 		codexPhaseExecutionRunning, codexPhaseExecutionRecon, codexPhaseExecutionTerm:
 		return meta.ExecutionContainerID, "execution"
+	case codexPhaseRecoveryStart, codexPhaseRecoveryRunning, codexPhaseRecoveryTerm:
+		return meta.RecoveryContainerID, "recovery validation"
 	case codexPhaseDeliveryStart, codexPhaseDeliveryRunning, codexPhaseDeliveryRecon,
 		codexPhaseDeliveryTerm:
 		return meta.DeliveryContainerID, "delivery"
@@ -753,6 +869,34 @@ func (s *Service) readExecutionFailure(meta RunMetadata, exitCode *int) (executi
 		return executionFailure{}, fmt.Errorf("codex failure diagnostic does not match broker launch identity or bounds")
 	}
 	return result, nil
+}
+
+func (s *Service) readStaleLease(meta RunMetadata) (recoveryValidationResult, error) {
+	data, err := boundedRegularFile(filepath.Join(s.runDir(meta.RunID), "output", "stale-lease.json"), 2048)
+	if err != nil {
+		return recoveryValidationResult{}, err
+	}
+	var result recoveryValidationResult
+	if err := json.Unmarshal(data, &result); err != nil || result.Version != "codex-stale-lease/v2" || result.Status != "stale_lease" ||
+		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
+		!regexpSHA(result.WinnerHeadSHA, 40) || !regexpSHA(result.CandidateHeadSHA, 40) {
+		return recoveryValidationResult{}, fmt.Errorf("stale lease handoff is invalid")
+	}
+	return result, nil
+}
+
+func (s *Service) readRecoveryValidation(meta RunMetadata) error {
+	data, err := boundedRegularFile(filepath.Join(s.runDir(meta.RunID), "work", "recovery", "recovery-validation.json"), 2048)
+	if err != nil {
+		return fmt.Errorf("bounded recovery validation result is unavailable")
+	}
+	var result recoveryValidationResult
+	if err := json.Unmarshal(data, &result); err != nil || result.Version != "codex-recovery-validation/v1" || result.Status != "passed" ||
+		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
+		!regexpSHA(result.WinnerHeadSHA, 40) || !regexpSHA(result.CandidateHeadSHA, 40) || !regexpSHA(result.ValidatedTreeSHA, 40) || !regexpSHA(result.VerifySHA256, 64) {
+		return fmt.Errorf("recovery validation result does not match broker launch identity")
+	}
+	return nil
 }
 
 func regexpSHA(value string, size int) bool {

@@ -373,6 +373,7 @@ func codexWorkflowTestConfig(t *testing.T) Config {
 		"delivery": {
 			Network: "delivery-net", PrivateBroker: true,
 		},
+		"recovery": {Network: "recovery-net"},
 	}
 	prep := testTemplate("example.com/prep@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	prep.NetworkPolicy = "prep"
@@ -390,7 +391,10 @@ func codexWorkflowTestConfig(t *testing.T) Config {
 	delivery.NetworkPolicy = "delivery"
 	delivery.CredentialBundle = ""
 	delivery.Command = []string{"/usr/local/bin/agent-codex-delivery-worker"}
-	cfg.Templates = map[string]Template{"prep": prep, "execution": execution, "delivery": delivery}
+	recovery := testTemplate("example.com/recovery@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+	recovery.NetworkPolicy, recovery.CredentialBundle, recovery.BrokerAgentID, recovery.BrokerAgentSecret = "recovery", "", "", ""
+	recovery.Command = []string{"/usr/local/bin/agent-codex-recovery-validation-worker"}
+	cfg.Templates = map[string]Template{"prep": prep, "execution": execution, "recovery": recovery, "delivery": delivery}
 	cfg.ModelPolicies = map[string]ModelPolicy{"reviewed": reviewedModelPolicy()}
 	cfg.CodexHolder = CodexHolderConfig{
 		MasterAuthPath: filepath.Join(t.TempDir(), "master", "auth.json"),
@@ -410,7 +414,7 @@ func codexWorkflowTestConfig(t *testing.T) Config {
 				"source_delivery_id": {Type: "string", Required: true, MaxLength: 128, Pattern: `^[A-Za-z0-9-]+$`},
 			},
 			CodexIssueWorkflow: &CodexIssueWorkflow{
-				PreparationTemplate: "prep", ExecutionTemplate: "execution", DeliveryTemplate: "delivery",
+				PreparationTemplate: "prep", ExecutionTemplate: "execution", RecoveryTemplate: "recovery", DeliveryTemplate: "delivery",
 				ModelPolicy: "reviewed", ModelProfile: "terra-medium-v1", PromptRevision: "issue-ready-pr/v1",
 			},
 		},

@@ -108,6 +108,18 @@ seal_repository_git_config() {
 
 restore_repository_authority() {
   local expected_head git_dir expected_git_dir current_refs
+  if [[ -f /work/recovery/recovery-validation.json ]]; then
+    jq -e --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" '
+      .version == "codex-recovery-validation/v1" and .status == "passed" and .run_id == $run and .repository == $repo and .branch == $branch and
+      (.winner_head_sha | test("^[a-f0-9]{40}$")) and (.candidate_head_sha | test("^[a-f0-9]{40}$")) and (.validated_tree_sha | test("^[a-f0-9]{40}$")) and (.verify_sha256 | test("^[a-f0-9]{64}$"))
+    ' /work/recovery/recovery-validation.json >/dev/null || fail 'recovery validation result is invalid'
+    seal_repository_git_config /work/repo
+    [[ "$(trusted_git -C /work/repo rev-parse HEAD)" == "$(jq -r .candidate_head_sha /work/recovery/recovery-validation.json)" ]] || fail 'recovery candidate head changed after validation'
+    [[ "$(trusted_git -C /work/repo rev-parse 'HEAD^{tree}')" == "$(jq -r .validated_tree_sha /work/recovery/recovery-validation.json)" ]] || fail 'recovery candidate tree changed after validation'
+    trusted_git -C /work/repo remote add origin placeholder
+    (cd /work/repo && trusted_broker_configure) > /output/broker-remote.txt
+    return
+  fi
   expected_head=$(jq -r .workspace_head /work/prepared/preparation.json)
   seal_repository_git_config /work/repo
   git_dir=$(trusted_git -C /work/repo rev-parse --absolute-git-dir)
@@ -147,7 +159,9 @@ repair_target() {
 verify_validated_candidate_tree() {
   local tree
   tree=$(trusted_git -C /work/repo rev-parse 'HEAD^{tree}')
-  [[ "$tree" == "$(jq -r .validated_tree_sha /work/execution/execution.json)" ]] ||
+  local sealed=/work/execution/execution.json
+  [[ -f /work/recovery/recovery-validation.json ]] && sealed=/work/recovery/recovery-validation.json
+  [[ "$tree" == "$(jq -r .validated_tree_sha "$sealed")" ]] ||
     fail 'delivered candidate tree differs from the tree that passed final validation'
 }
 
@@ -160,14 +174,19 @@ stale_lease_rejection() {
 }
 
 record_stale_repair_lease() {
-  local repair_head=$1 expected=$2 output=$3
+  local repair_head=$1 expected=$2 output=$3 winner candidate
   stale_lease_rejection "$output" || return 1
-  jq -n --arg branch "$repair_head" --arg expected "$expected" \
-    '{version:"codex-stale-lease/v1",status:"stale_lease",branch:$branch,expected_head_sha:$expected}' \
+  # This is the only credentialed recovery operation: fetch the winning head,
+  # reset, and apply the sealed candidate diff without hooks, filters, or task execution.
+  trusted_git -C /work/repo fetch --quiet origin "+refs/heads/${repair_head}:refs/remotes/origin/${repair_head}" || return 1
+  winner=$(trusted_git -C /work/repo rev-parse "refs/remotes/origin/${repair_head}") || return 1
+  trusted_git -C /work/repo reset --hard "$winner" || return 1
+  trusted_git -C /work/repo apply --index --whitespace=nowarn /work/execution/diff.patch || return 1
+  trusted_git -C /work/repo commit --no-verify --quiet -m "Recover Codex issue task ${AGENT_RUN_ID}" || return 1
+  candidate=$(trusted_git -C /work/repo rev-parse HEAD) || return 1
+  jq -n --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" --arg expected "$expected" --arg winner "$winner" --arg candidate "$candidate" \
+    '{version:"codex-stale-lease/v2",status:"stale_lease",run_id:$run,repository:$repo,branch:$branch,expected_head_sha:$expected,winner_head_sha:$winner,candidate_head_sha:$candidate}' \
     > /output/stale-lease.json
-  # Validation must be orchestrated in a credential-free container. This
-  # delivery process has broker authority and therefore intentionally never
-  # applies a candidate, invokes mise, or retries after a stale lease.
   return 0
 }
 
@@ -207,13 +226,23 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     exit 0
   fi
   stage='commit and push'
-  trusted_git add --all
-  trusted_git commit --quiet -m "Implement Codex issue task ${AGENT_RUN_ID}"
+  if [[ -f /work/recovery/recovery-validation.json ]]; then
+    candidate_head_sha=$(jq -r .candidate_head_sha /work/recovery/recovery-validation.json)
+    validated_tree_sha=$(jq -r .validated_tree_sha /work/recovery/recovery-validation.json)
+  else
+    trusted_git add --all
+    trusted_git commit --quiet -m "Implement Codex issue task ${AGENT_RUN_ID}"
+    candidate_head_sha=$(trusted_git rev-parse HEAD)
+    validated_tree_sha=$(jq -r .validated_tree_sha /work/execution/execution.json)
+  fi
   verify_validated_candidate_tree
-  validated_tree_sha=$(jq -r .validated_tree_sha /work/execution/execution.json)
   if repair_target; then
     repair_head=$(jq -r .head_ref /work/prepared/repair.json)
     expected_head=$(jq -r .expected_head_sha /work/prepared/repair.json)
+    if [[ -f /work/recovery/recovery-validation.json ]]; then
+      expected_head=$(jq -r .winner_head_sha /work/recovery/recovery-validation.json)
+      candidate_head_sha=$(jq -r .candidate_head_sha /work/recovery/recovery-validation.json)
+    fi
     stage='leased repair push'
     push_error=/tmp/codex-repair-push.stderr
     if ! trusted_git push --quiet --force-with-lease="refs/heads/${repair_head}:${expected_head}" \
@@ -225,6 +254,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
       fail 'repair leased push failed (not a positively identified stale lease)'
     fi
     delivered_head_sha=$(trusted_git rev-parse HEAD)
+	 expected_old_head_sha="$expected_head"
+	 delivered_tree_sha=$(trusted_git rev-parse 'HEAD^{tree}')
+	 [[ "$delivered_tree_sha" == "$validated_tree_sha" ]] || fail 'delivered tree differs from validated tree'
     delivered_branch="$repair_head"
     pull_request=$(jq '{number,html_url,url}' /work/prepared/pull.json)
     stage='completed repair'
@@ -234,6 +266,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   fi
   trusted_git push --quiet origin "HEAD:${AGENT_BRANCH}"
   delivered_head_sha=$(trusted_git rev-parse HEAD)
+	 expected_old_head_sha=$(jq -r .workspace_head /work/prepared/preparation.json)
+	 delivered_tree_sha=$(trusted_git rev-parse 'HEAD^{tree}')
+	 [[ "$delivered_tree_sha" == "$validated_tree_sha" ]] || fail 'delivered tree differs from validated tree'
   delivered_branch="$AGENT_BRANCH"
   marker="<!-- gh-agent-broker-codex-run:${AGENT_RUN_ID} -->"
   stage='pull request reconciliation'

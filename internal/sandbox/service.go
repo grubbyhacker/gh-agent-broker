@@ -123,6 +123,8 @@ type RunMetadata struct {
 	PreparationContainerID string           `json:"preparation_container_id,omitempty"`
 	ExecutionContainerID   string           `json:"execution_container_id,omitempty"`
 	DeliveryContainerID    string           `json:"delivery_container_id,omitempty"`
+	RecoveryContainerID    string           `json:"recovery_container_id,omitempty"`
+	RecoveryCount          int              `json:"recovery_count,omitempty"`
 	PreparationImageDigest string           `json:"preparation_image_digest,omitempty"`
 	PreparationPlatform    string           `json:"preparation_platform,omitempty"`
 	ExecutionPlatform      string           `json:"execution_platform,omitempty"`
@@ -134,6 +136,8 @@ type RunMetadata struct {
 	ExecutionEndedAt       time.Time        `json:"execution_ended_at,omitempty"`
 	DeliveryStartedAt      time.Time        `json:"delivery_started_at,omitempty"`
 	DeliveryEndedAt        time.Time        `json:"delivery_ended_at,omitempty"`
+	RecoveryStartedAt      time.Time        `json:"recovery_started_at,omitempty"`
+	RecoveryEndedAt        time.Time        `json:"recovery_ended_at,omitempty"`
 	Provenance             *CodexProvenance `json:"provenance,omitempty"`
 }
 

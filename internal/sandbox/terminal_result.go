@@ -333,11 +333,14 @@ func validateCodexWorkerResult(meta RunMetadata, result map[string]any) error {
 	}
 	worker, workerOK := result["worker"].(string)
 	if workerOK && worker == "codex" {
-		for _, field := range []string{"branch", "delivered_head_sha", "validated_tree_sha"} {
+		for _, field := range []string{"branch", "expected_old_head_sha", "candidate_head_sha", "delivered_head_sha", "validated_tree_sha", "delivered_tree_sha"} {
 			value, ok := result[field].(string)
 			if !ok || (field == "branch" && value == "") || (field != "branch" && !isLowerHexSHA(value)) {
 				return fmt.Errorf("codex ready_for_review result is missing valid %s", field)
 			}
+		}
+		if result["delivered_tree_sha"] != result["validated_tree_sha"] {
+			return fmt.Errorf("codex ready_for_review delivered tree does not match validated tree")
 		}
 	}
 	return nil

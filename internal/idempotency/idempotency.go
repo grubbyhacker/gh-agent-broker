@@ -20,6 +20,8 @@ type Record struct {
 	RequestDigest string          `json:"request_digest,omitempty"`
 	Status        int             `json:"status"`
 	Body          json.RawMessage `json:"body"`
+	Pending       bool            `json:"pending,omitempty"`
+	SemanticBody  string          `json:"semantic_body,omitempty"`
 }
 
 type state struct {

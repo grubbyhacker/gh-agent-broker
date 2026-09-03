@@ -188,7 +188,7 @@ func TestCodexDeliveryWorkerOwnsOnlyDeterministicDelivery(t *testing.T) {
 	if strings.Contains(text, "mise run \"$AGENT_VERIFY_TASK\"") {
 		t.Error("delivery worker must never execute repository validation after receiving broker authority")
 	}
-	if !strings.Contains(text, "codex-stale-lease/v1") {
+	if !strings.Contains(text, "codex-stale-lease/v2") {
 		t.Error("delivery worker must return a structured stale-lease handoff")
 	}
 }

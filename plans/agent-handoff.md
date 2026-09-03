@@ -46,10 +46,14 @@ SHA, seals final validation to the candidate tree, and uses an exact-SHA
 force-with-lease for delivery. A credentialed delivery process now emits a
 bounded stale-lease handoff only for Git's positive `stale info` diagnostic;
 it does not execute repository validation after broker authority is present.
-The remaining Signal Plane recovery orchestration must consume that handoff in
-a credential-free integration-and-validation phase before a new exact-lease
-delivery process; it never starts another Codex attempt. Ready terminal
-results carry exact PR, branch, delivered-head, and validated-tree identities.
+Sandbox-broker now owns same-run stale-lease recovery: it persists a bounded
+credential-free recovery-validation phase, starts a separate recovery template
+with the shared prepared workspace, seals winner/candidate/tree/verify
+provenance, then creates one fresh delivery container for the single leased
+retry. Signal Plane consumes the final terminal result only; it does not
+orchestrate a second worker phase or attempt identity.
+Ready terminal results carry exact PR, branch, expected-old-head, candidate,
+delivered-head, validated-tree, and delivered-tree identities.
 Signal Plane owns durable event correlation, attempt/deadline accounting, and
 idempotent issue escalation; issue comment keys are durable exact-request keys
 namespaced by principal, operation, repository, and issue.

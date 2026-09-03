@@ -1920,8 +1920,34 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "issue comment request cannot be fingerprinted", OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
-	scopedKey := "issue.comment:" + principal.ID + ":" + repo + ":" + issueNumber + ":" + key
+	// State never retains the caller supplied idempotency key. The digest is
+	// sufficient to bind retries and avoids turning durable state into a key log.
+	scopedKey := "issue.comment:" + principal.ID + ":" + repo + ":" + issueNumber + ":" + idempotencyKeyDigest(key)
 	extra := map[string]interface{}{"issue_number": issueNumber, "idempotency_key_digest": idempotencyKeyDigest(key), "request_digest": requestDigest}
+	if pending, err := pendingIssueComment(cfg.Idempotency, scopedKey, requestDigest, body); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	} else if pending {
+		commentNumber, parseErr := strconv.Atoi(issueNumber)
+		if parseErr != nil || commentNumber < 1 {
+			writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "invalid issue comment target", OperationID: opID, Decision: policy.DecisionDeny})
+			return
+		}
+		comments, listErr := gh.ListIssueComments(appName, repo, inst, commentNumber, url.Values{"per_page": []string{"100"}})
+		if listErr != nil {
+			writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(listErr.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
+			return
+		}
+		if reconciled, ok := reconcilePendingComment(comments, body); ok {
+			if err := writeExactIdempotentJSON(w, cfg.Idempotency, scopedKey, "issue.comment", requestDigest, http.StatusCreated, reconciled); err != nil {
+				writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+				return
+			}
+			s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_reconciled", Extra: extra})
+			return
+		}
+	}
 	if replayed, conflict, err := replayExactIdempotent(w, cfg.Idempotency, scopedKey, "issue.comment", requestDigest); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
@@ -1931,6 +1957,11 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		return
 	} else if replayed {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
+		return
+	}
+	if err := storePendingIssueComment(cfg.Idempotency, scopedKey, requestDigest, body); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	}
 	ghResult, err := gh.CreateIssueComment(appName, repo, issueNumber, inst, body)
@@ -1964,6 +1995,40 @@ func commentRequestDigest(repo, issue string, req api.CommentCreateRequest) stri
 func idempotencyKeyDigest(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])
+}
+
+func pendingIssueComment(cfg config.IdempotencyConfig, key, digest, body string) (bool, error) {
+	rec, found, err := idempotency.Load(cfg, key)
+	if err != nil || !found {
+		return false, err
+	}
+	if rec.Operation != "issue.comment" || rec.RequestDigest != digest {
+		return false, nil
+	}
+	return rec.Pending, nil
+}
+
+func storePendingIssueComment(cfg config.IdempotencyConfig, key, digest, body string) error {
+	return idempotency.Store(cfg, key, idempotency.Record{Operation: "issue.comment", RequestDigest: digest, Pending: true, SemanticBody: body})
+}
+
+func reconcilePendingComment(comments []api.IssueComment, body string) (api.GitHubResult, bool) {
+	var found *api.IssueComment
+	for index := range comments {
+		comment := &comments[index]
+		// Exact semantic content plus a GitHub-supplied author is the stable
+		// visible evidence; no internal identifier is inserted into prose.
+		if comment.Body == body && comment.Author != "" {
+			if found != nil {
+				return api.GitHubResult{}, false
+			}
+			found = comment
+		}
+	}
+	if found == nil {
+		return api.GitHubResult{}, false
+	}
+	return api.GitHubResult{ID: found.ID, URL: found.URL, HTMLURL: found.HTMLURL, CreatedAt: found.CreatedAt}, true
 }
 
 func (s *Server) handleIssueLabelsAdd(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
