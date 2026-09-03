@@ -170,8 +170,8 @@ prepare_repair_pull() {
   git fetch --quiet origin "refs/heads/${head_ref}"
   [[ "$(git rev-parse FETCH_HEAD)" == "$head_sha" ]] || fail 'broker checkout does not match admitted pull request head'
   git checkout --quiet -B "$AGENT_BRANCH" FETCH_HEAD
-  gh-agent-broker-cli ci-observation -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number" > /work/prepared/ci-observation.json
-  jq -e --arg expected "$expected" '.pull.head_sha == $expected' /work/prepared/ci-observation.json >/dev/null ||
+  gh-agent-broker-cli ci-observation -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number" -head-sha "$expected" > /work/prepared/ci-observation.json
+  jq -e --arg expected "$expected" '.requested_head_sha == $expected and .pull.head_sha == $expected' /work/prepared/ci-observation.json >/dev/null ||
     fail 'authoritative CI observation no longer matches admitted pull request head'
   mapfile -t failed_jobs < <(jq -r '
     .workflow_jobs[]? | select(.status == "completed" and (.conclusion | ascii_downcase | IN("success", "skipped", "neutral")) | not) | .id
@@ -236,6 +236,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     '{version:"codex-preparation-result/v1",status:"prepared",run_id:$run_id,repository:$repo,
       branch:$branch,workspace_head:$head,refs_sha256:$refs,manifest_sha256:$manifest,issue_number:$issue_number,
       source_delivery_id:$source_delivery_id}' > /work/prepared/preparation.json
+  if repair_mode; then
+    jq --slurpfile repair /work/prepared/repair.json '. + {repair_pr_number:$repair[0].pull_number,repair_head_ref:$repair[0].head_ref,repair_expected_head_sha:$repair[0].expected_head_sha}' \
+      /work/prepared/preparation.json > /work/prepared/preparation.json.next
+    mv /work/prepared/preparation.json.next /work/prepared/preparation.json
+  fi
   chmod 0444 /work/prepared/preparation.json /work/prepared/issue-context.md
   stage='prepared'
 fi

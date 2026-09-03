@@ -43,16 +43,19 @@ const (
 )
 
 type preparationResult struct {
-	Version          string `json:"version"`
-	Status           string `json:"status"`
-	RunID            string `json:"run_id"`
-	Repository       string `json:"repository"`
-	Branch           string `json:"branch"`
-	WorkspaceHead    string `json:"workspace_head"`
-	RefsSHA256       string `json:"refs_sha256"`
-	ManifestSHA256   string `json:"manifest_sha256"`
-	IssueNumber      int    `json:"issue_number"`
-	SourceDeliveryID string `json:"source_delivery_id"`
+	Version               string `json:"version"`
+	Status                string `json:"status"`
+	RunID                 string `json:"run_id"`
+	Repository            string `json:"repository"`
+	Branch                string `json:"branch"`
+	WorkspaceHead         string `json:"workspace_head"`
+	RefsSHA256            string `json:"refs_sha256"`
+	ManifestSHA256        string `json:"manifest_sha256"`
+	IssueNumber           int    `json:"issue_number"`
+	SourceDeliveryID      string `json:"source_delivery_id"`
+	RepairPRNumber        int    `json:"repair_pr_number,omitempty"`
+	RepairHeadRef         string `json:"repair_head_ref,omitempty"`
+	RepairExpectedHeadSHA string `json:"repair_expected_head_sha,omitempty"`
 }
 
 type executionResult struct {
@@ -340,6 +343,12 @@ func (s *Service) completePreparation(
 	}
 	meta.Provenance.WorkspaceHead = result.WorkspaceHead
 	meta.Provenance.ManifestSHA256 = result.ManifestSHA256
+	if result.RepairPRNumber != 0 {
+		meta.RepairPRNumber, meta.RepairHeadRef, meta.RepairAdmittedHeadSHA = result.RepairPRNumber, result.RepairHeadRef, result.RepairExpectedHeadSHA
+		if err := s.writeRepairAuthority(meta); err != nil {
+			return s.failCodexIntent(ctx, intent, meta, "preparation_verification", err)
+		}
+	}
 	meta.Phase = codexPhaseExecutionCreate
 	meta.ContainerID = ""
 	if err := s.persistCodexIntent(ctx, intent, meta, intentStateRunning); err != nil {
@@ -585,6 +594,7 @@ func (s *Service) resumeDelivery(
 			return s.failCodexIntent(ctx, intent, meta, "delivery_create", err)
 		}
 		meta.DeliveryContainerID = info.ID
+		meta.DeliveryContainerIDs = appendUniqueContainerID(meta.DeliveryContainerIDs, info.ID)
 		meta.ContainerID = info.ID
 		meta.DeliveryImageDigest = info.ImageDigest
 		meta.DeliveryPlatform = info.Platform
@@ -843,7 +853,34 @@ func (s *Service) readPreparationResult(meta RunMetadata) (preparationResult, er
 		!regexpSHA(result.ManifestSHA256, 64) {
 		return preparationResult{}, fmt.Errorf("preparation result does not match broker launch identity")
 	}
+	if result.RepairPRNumber != 0 && (result.RepairPRNumber < 1 || result.RepairHeadRef == "" || !regexpSHA(result.RepairExpectedHeadSHA, 40)) {
+		return preparationResult{}, fmt.Errorf("preparation repair authority is invalid")
+	}
 	return result, nil
+}
+
+func appendUniqueContainerID(ids []string, id string) []string {
+	for _, existing := range ids {
+		if existing == id {
+			return ids
+		}
+	}
+	return append(ids, id)
+}
+
+func (s *Service) writeRepairAuthority(meta RunMetadata) error {
+	if meta.RepairPRNumber == 0 {
+		return nil
+	}
+	b, err := json.Marshal(struct {
+		PRNumber        int    `json:"pull_number"`
+		HeadRef         string `json:"head_ref"`
+		AdmittedHeadSHA string `json:"admitted_head_sha"`
+	}{meta.RepairPRNumber, meta.RepairHeadRef, meta.RepairAdmittedHeadSHA})
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(filepath.Join(s.runDir(meta.RunID), "input", "repair-authority.json"), append(b, '\n'), 0o400)
 }
 
 func (s *Service) readExecutionResult(meta RunMetadata) (executionResult, error) {

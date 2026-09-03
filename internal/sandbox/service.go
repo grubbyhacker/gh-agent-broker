@@ -123,6 +123,7 @@ type RunMetadata struct {
 	PreparationContainerID   string           `json:"preparation_container_id,omitempty"`
 	ExecutionContainerID     string           `json:"execution_container_id,omitempty"`
 	DeliveryContainerID      string           `json:"delivery_container_id,omitempty"`
+	DeliveryContainerIDs     []string         `json:"delivery_container_ids,omitempty"`
 	DeliveryAttempt          int              `json:"delivery_attempt,omitempty"`
 	RecoveryContainerID      string           `json:"recovery_container_id,omitempty"`
 	RecoveryCount            int              `json:"recovery_count,omitempty"`
@@ -144,6 +145,9 @@ type RunMetadata struct {
 	RecoveryCandidateHeadSHA string           `json:"recovery_candidate_head_sha,omitempty"`
 	RecoveryCandidateTreeSHA string           `json:"recovery_candidate_tree_sha,omitempty"`
 	RecoverySealSHA256       string           `json:"recovery_seal_sha256,omitempty"`
+	RepairPRNumber           int              `json:"repair_pr_number,omitempty"`
+	RepairHeadRef            string           `json:"repair_head_ref,omitempty"`
+	RepairAdmittedHeadSHA    string           `json:"repair_admitted_head_sha,omitempty"`
 	Provenance               *CodexProvenance `json:"provenance,omitempty"`
 }
 
@@ -1175,7 +1179,8 @@ func (s *Service) CleanupRun(ctx context.Context, in RunInput) (StatusOutput, er
 	}
 	containerIDs := []string{meta.ContainerID}
 	if meta.Provenance != nil {
-		containerIDs = []string{meta.PreparationContainerID, meta.ExecutionContainerID}
+		containerIDs = append([]string{meta.PreparationContainerID, meta.ExecutionContainerID, meta.RecoveryContainerID}, meta.DeliveryContainerIDs...)
+		containerIDs = append(containerIDs, meta.DeliveryContainerID)
 		if s.codexIssuer != nil {
 			if err := s.codexIssuer.Cleanup(meta.RunID); err != nil {
 				return StatusOutput{}, err

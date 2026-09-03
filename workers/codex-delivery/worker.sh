@@ -148,12 +148,25 @@ restore_repository_authority() {
 }
 
 repair_target() {
+  [[ -f /input/repair-authority.json ]] || return 1
   [[ -f /work/prepared/repair.json ]] || return 1
   jq -e '
     (.pull_number | type == "number" and . > 0) and
     (.head_ref | type == "string" and length > 0) and
     (.expected_head_sha | type == "string" and test("^[a-f0-9]{40}$"))
   ' /work/prepared/repair.json >/dev/null || fail 'repair target is invalid'
+  jq -e '
+    (.pull_number | type == "number" and . > 0) and (.head_ref | type == "string" and length > 0) and
+    (.admitted_head_sha | type == "string" and test("^[a-f0-9]{40}$"))
+  ' /input/repair-authority.json >/dev/null || fail 'broker repair authority is invalid'
+  jq -e --slurpfile authority /input/repair-authority.json '
+    .pull_number == $authority[0].pull_number and .head_ref == $authority[0].head_ref and
+    .expected_head_sha == $authority[0].admitted_head_sha
+  ' /work/prepared/repair.json >/dev/null || fail 'untrusted repair artifact differs from broker repair authority'
+  jq -e --slurpfile authority /input/repair-authority.json '
+    .number == $authority[0].pull_number and .head_ref == $authority[0].head_ref and
+    .head_sha == $authority[0].admitted_head_sha
+  ' /work/prepared/pull.json >/dev/null || fail 'untrusted pull artifact differs from broker repair authority'
 }
 
 verify_validated_candidate_tree() {

@@ -20,10 +20,10 @@ func TestAggregateCIUsesActiveRuleIdentities(t *testing.T) {
 	appID := int64(42)
 	rules := &api.BranchRules{Rules: []api.BranchRule{{Type: "required_status_checks", Parameters: api.BranchRuleParameters{RequiredStatusChecks: []api.RequiredStatusCheck{{Context: "unit", IntegrationID: &appID}, {Context: "integration"}}}}}}
 	required := requiredCI(rules, nil)
-	if len(required) != 2 || aggregateCI(required, api.CommitStatus{}, api.CheckRuns{CheckRuns: []api.CheckRun{{Name: "unit", Status: "completed", Conclusion: "success", App: &api.CheckApp{ID: appID}}, {Name: "integration", Status: "completed", Conclusion: "failure"}}}) != "code_failure" {
+	if len(required) != 2 || aggregateCI(required, api.CommitStatus{}, api.CheckRuns{CheckRuns: []api.CheckRun{{Name: "unit", Status: "completed", Conclusion: "success", App: &api.CheckApp{ID: appID}}, {Name: "integration", Status: "completed", Conclusion: "failure"}}}, nil) != "code_failure" {
 		t.Fatalf("required CI aggregation did not use active rules: %#v", required)
 	}
-	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "unit", State: "success"}}}, api.CheckRuns{}); got != "pending" {
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "unit", State: "success"}}}, api.CheckRuns{}, nil); got != "pending" {
 		t.Fatalf("missing required check = %q, want pending", got)
 	}
 }
@@ -31,23 +31,44 @@ func TestAggregateCIUsesActiveRuleIdentities(t *testing.T) {
 func TestAggregateCIRequiredCheckStatesAndLegacyProtection(t *testing.T) {
 	legacy := &api.BranchProtection{RequiredStatusChecks: &api.LegacyRequiredStatusChecks{Contexts: []string{"legacy"}, Checks: []api.RequiredStatusCheck{{Context: "check"}}}}
 	required := requiredCI(nil, legacy)
-	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "success"}}}, api.CheckRuns{CheckRuns: []api.CheckRun{{Name: "check", Status: "completed", Conclusion: "success"}}}); got != "success" {
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "success"}}}, api.CheckRuns{CheckRuns: []api.CheckRun{{Name: "check", Status: "completed", Conclusion: "success"}}}, nil); got != "success" {
 		t.Fatalf("success=%q", got)
 	}
-	if got := aggregateCI(required, api.CommitStatus{}, api.CheckRuns{}); got != "pending" {
+	if got := aggregateCI(required, api.CommitStatus{}, api.CheckRuns{}, nil); got != "pending" {
 		t.Fatalf("missing=%q", got)
 	}
-	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "pending"}}}, api.CheckRuns{}); got != "pending" {
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "pending"}}}, api.CheckRuns{}, nil); got != "pending" {
 		t.Fatalf("pending=%q", got)
 	}
-	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "error"}}}, api.CheckRuns{}); got != "infrastructure_failure" {
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "error"}}}, api.CheckRuns{}, nil); got != "infrastructure_failure" {
 		t.Fatalf("infra=%q", got)
 	}
-	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "failure"}}}, api.CheckRuns{}); got != "code_failure" {
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "legacy", State: "failure"}}}, api.CheckRuns{}, nil); got != "code_failure" {
 		t.Fatalf("code=%q", got)
 	}
-	if got := aggregateCI(nil, api.CommitStatus{}, api.CheckRuns{}); got != "success" {
+	if got := aggregateCI(nil, api.CommitStatus{}, api.CheckRuns{}, nil); got != "success" {
 		t.Fatalf("no requirements=%q", got)
+	}
+}
+
+func TestAggregateCIUnboundChecksAcceptStatusAndRequiredWorkflows(t *testing.T) {
+	rules := &api.BranchRules{Rules: []api.BranchRule{
+		{Type: "required_status_checks", Parameters: api.BranchRuleParameters{RequiredStatusChecks: []api.RequiredStatusCheck{{Context: "build"}}}},
+		{Type: "required_workflows", Parameters: api.BranchRuleParameters{RequiredWorkflows: []api.RequiredWorkflow{{Path: ".github/workflows/verify.yml", Ref: "main", RepositoryID: 1, SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}},
+	}}
+	required := requiredCI(rules, nil)
+	if len(required) != 2 {
+		t.Fatalf("required=%#v", required)
+	}
+	workflow := api.ReferencedWorkflow{Path: ".github/workflows/verify.yml", Ref: "main", RepositoryID: 1, SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "build", State: "success"}}}, api.CheckRuns{}, []api.WorkflowRun{{Status: "completed", Conclusion: "success", ReferencedWorkflows: []api.ReferencedWorkflow{workflow}}}); got != "success" {
+		t.Fatalf("success=%q", got)
+	}
+	if got := aggregateCI(required, api.CommitStatus{}, api.CheckRuns{}, []api.WorkflowRun{{Status: "completed", Conclusion: "failure", ReferencedWorkflows: []api.ReferencedWorkflow{workflow}}}); got != "code_failure" {
+		t.Fatalf("failure=%q", got)
+	}
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "build", State: "success"}}}, api.CheckRuns{}, nil); got != "pending" {
+		t.Fatalf("missing workflow=%q", got)
 	}
 }
 

@@ -30,7 +30,7 @@ Before launching, and on each relevant admitted check/status/pull-request
 event, Signal Plane calls:
 
 ```
-GET /v1/repos/{owner}/{repo}/pulls/{number}/ci-observation
+GET /v1/repos/{owner}/{repo}/pulls/{number}/ci-observation?head_sha={40-lower-hex}
 ```
 
 The response is a point-in-time authoritative GitHub observation containing
@@ -42,7 +42,9 @@ from those active GitHub rules and `aggregate_state` is one of `pending`,
 `success`, `code_failure`, or `infrastructure_failure`; there is no second
 broker check-name configuration. Pagination or an explicit observation bound
 fails closed. Signal Plane must correlate the
-response to `pull.head_sha == expected_head_sha`; a changed head is a new
+response to both `requested_head_sha` and authoritative `pull.head_sha`;
+the broker rejects a changed head with stable `409 stale_pull_head` rather
+than returning mixed-head evidence. A changed head is a new
 semantic lifecycle state, not a retry of the old repair.
 
 The preparation worker selects every completed unsuccessful Actions job from
@@ -89,6 +91,12 @@ exact `pull_request.number`, `branch`, `delivered_head_sha`, and
 `validated_tree_sha` fields. The terminal projection rejects a Codex result
 without these bounded values, so replay/reconciliation carries the same PR,
 head, and validated-tree identity.
+
+Every Codex terminal projection includes `model_execution_started`. Failed
+results also use the bounded `failure_class` vocabulary: `infrastructure`
+(zero-charge pre-model/start failures), `model_or_code`, or
+`delivery_or_lease`. `finalize_reason` and `terminal_source` remain
+diagnostic-only details.
 
 GitHub reporting uses the existing idempotent mutation endpoints. `POST
 /v1/repos/{owner}/{repo}/issues/{number}/comments` requires one visible-ASCII

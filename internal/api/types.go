@@ -257,6 +257,7 @@ type CheckAnnotation struct {
 // for one pull request head. GitHub remains authoritative: this DTO deliberately
 // does not calculate a separate required-check verdict.
 type CIObservation struct {
+	RequestedHeadSHA string            `json:"requested_head_sha"`
 	Pull             PullSummary       `json:"pull"`
 	CommitStatus     CommitStatus      `json:"commit_status"`
 	CheckRuns        CheckRuns         `json:"check_runs"`
@@ -271,9 +272,19 @@ type CIObservation struct {
 // RequiredCI is derived solely from the active GitHub branch rules. It is not
 // a separately configured check-name allowlist.
 type RequiredCI struct {
-	Identity      string `json:"identity"`
-	Kind          string `json:"kind"`
-	IntegrationID *int64 `json:"integration_id,omitempty"`
+	Identity      string            `json:"identity"`
+	Kind          string            `json:"kind"`
+	IntegrationID *int64            `json:"integration_id,omitempty"`
+	Workflow      *RequiredWorkflow `json:"workflow,omitempty"`
+}
+
+// RequiredWorkflow is GitHub's active required_workflows rule parameter.
+// Path, ref, repository_id and sha together identify the workflow definition.
+type RequiredWorkflow struct {
+	Path         string `json:"path"`
+	Ref          string `json:"ref"`
+	RepositoryID int64  `json:"repository_id"`
+	SHA          string `json:"sha"`
 }
 
 // BranchRules is GitHub's GET /repos/{owner}/{repo}/rules/branches/{branch}
@@ -309,6 +320,7 @@ type BranchRule struct {
 }
 type BranchRuleParameters struct {
 	RequiredStatusChecks []RequiredStatusCheck `json:"required_status_checks,omitempty"`
+	RequiredWorkflows    []RequiredWorkflow    `json:"required_workflows,omitempty"`
 }
 type RequiredStatusCheck struct {
 	Context       string `json:"context"`
@@ -326,14 +338,24 @@ type LegacyRequiredStatusChecks struct {
 }
 
 type WorkflowRun struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion,omitempty"`
-	HeadSHA    string `json:"head_sha"`
-	HTMLURL    string `json:"html_url,omitempty"`
-	CreatedAt  string `json:"created_at,omitempty"`
-	UpdatedAt  string `json:"updated_at,omitempty"`
+	ID                  int64                `json:"id"`
+	Name                string               `json:"name"`
+	Status              string               `json:"status"`
+	Conclusion          string               `json:"conclusion,omitempty"`
+	HeadSHA             string               `json:"head_sha"`
+	HTMLURL             string               `json:"html_url,omitempty"`
+	CreatedAt           string               `json:"created_at,omitempty"`
+	UpdatedAt           string               `json:"updated_at,omitempty"`
+	Path                string               `json:"path,omitempty"`
+	WorkflowID          int64                `json:"workflow_id,omitempty"`
+	ReferencedWorkflows []ReferencedWorkflow `json:"referenced_workflows,omitempty"`
+}
+
+type ReferencedWorkflow struct {
+	Path         string `json:"path,omitempty"`
+	Ref          string `json:"ref,omitempty"`
+	SHA          string `json:"sha,omitempty"`
+	RepositoryID int64  `json:"repository_id,omitempty"`
 }
 
 type WorkflowJob struct {

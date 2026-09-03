@@ -226,6 +226,15 @@ vps-ops. This is required for reviewed activation pins; omitting the digest
 retains the ordinary tag-only behavior for deployment paths whose Ansible
 contract does not require an immutable application image.
 
+PR #167 follow-up: CI observation now requires `head_sha` and returns both
+requested and authoritative heads; active rules include required workflow DTOs;
+and public comments no longer render broker metadata. Repair authority is
+persisted in RunMetadata and projected read-only under `/input`; delivery
+compares untrusted preparation artifacts to it. Delivery container identities
+are retained for cleanup, and terminal results expose bounded model-start and
+failure-class fields. Local test/lint/race checks pass; the final vulnerability
+scan is blocked by the repository-pinned Go 1.26.5 standard library.
+
 PR #167 recovery hardening now persists a delivery-attempt identity before
 container creation; the initial and recovered deliveries therefore use distinct
 runtime specs and Docker cannot adopt the exited stale delivery. A single

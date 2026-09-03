@@ -20,23 +20,25 @@ const (
 // TerminalResult is the only worker-produced output available to the terminal
 // reporter. It intentionally excludes logs and arbitrary artifacts.
 type TerminalResult struct {
-	Version              string              `json:"version"`
-	RunID                string              `json:"run_id"`
-	Profile              string              `json:"profile"`
-	Repo                 string              `json:"repo"`
-	Branch               string              `json:"branch,omitempty"`
-	Status               string              `json:"status"`
-	Outcome              string              `json:"outcome"`
-	FinalizeReason       string              `json:"finalize_reason,omitempty"`
-	TerminalSource       string              `json:"terminal_source,omitempty"`
-	IdempotencyKeyDigest string              `json:"idempotency_key_digest,omitempty"`
-	RequestFingerprint   string              `json:"request_fingerprint,omitempty"`
-	LaunchConfigVersion  string              `json:"launch_config_version,omitempty"`
-	Result               map[string]any      `json:"result,omitempty"`
-	FinalSummary         string              `json:"final_summary"`
-	FailureStage         string              `json:"failure_stage,omitempty"`
-	FailureReason        string              `json:"failure_reason,omitempty"`
-	Provenance           *TerminalProvenance `json:"provenance,omitempty"`
+	Version               string              `json:"version"`
+	RunID                 string              `json:"run_id"`
+	Profile               string              `json:"profile"`
+	Repo                  string              `json:"repo"`
+	Branch                string              `json:"branch,omitempty"`
+	Status                string              `json:"status"`
+	Outcome               string              `json:"outcome"`
+	FinalizeReason        string              `json:"finalize_reason,omitempty"`
+	TerminalSource        string              `json:"terminal_source,omitempty"`
+	IdempotencyKeyDigest  string              `json:"idempotency_key_digest,omitempty"`
+	RequestFingerprint    string              `json:"request_fingerprint,omitempty"`
+	LaunchConfigVersion   string              `json:"launch_config_version,omitempty"`
+	Result                map[string]any      `json:"result,omitempty"`
+	FinalSummary          string              `json:"final_summary"`
+	FailureStage          string              `json:"failure_stage,omitempty"`
+	FailureReason         string              `json:"failure_reason,omitempty"`
+	ModelExecutionStarted bool                `json:"model_execution_started"`
+	FailureClass          string              `json:"failure_class,omitempty"`
+	Provenance            *TerminalProvenance `json:"provenance,omitempty"`
 }
 
 type TerminalProvenance struct {
@@ -105,7 +107,8 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 		Repo: meta.Repo, Branch: meta.Branch, Status: meta.Status,
 		FinalizeReason: meta.FinalizeReason, TerminalSource: meta.TerminalSource,
 		IdempotencyKeyDigest: meta.IdempotencyKeyDigest, RequestFingerprint: meta.RequestFingerprint,
-		LaunchConfigVersion: meta.LaunchConfigVersion,
+		LaunchConfigVersion:   meta.LaunchConfigVersion,
+		ModelExecutionStarted: !meta.ExecutionStartedAt.IsZero(),
 	}
 	if meta.Provenance != nil {
 		result.Provenance = s.terminalProvenance(meta)
@@ -124,18 +127,21 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 			}
 		}
 		result.FailureReason = abbreviate(reason, 500)
+		result.FailureClass = codexFailureClass(meta)
 		return result
 	}
 	if meta.TerminalSource == terminalSourceStartupFailure && meta.Error != "" {
 		result.Outcome = StatusFailed
 		result.FailureStage = "sandbox_startup"
 		result.FailureReason = abbreviate(s.redactor(meta).Redact(meta.Error), 500)
+		result.FailureClass = "infrastructure"
 		return result
 	}
 	workerResult, summary, stage, reason := s.readWorkerTerminalOutput(meta)
 	if reason != "" {
 		result.Outcome = fallbackOutcome(meta.Status)
 		result.FailureStage, result.FailureReason = stage, reason
+		result.FailureClass = "delivery"
 		return result
 	}
 	result.Result, result.FinalSummary = workerResult, summary
@@ -152,9 +158,26 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 	} else {
 		result.Outcome = fallbackOutcome(meta.Status)
 		result.FailureStage, result.FailureReason = "terminal_result", "result.json is missing outcome"
+		result.FailureClass = "delivery"
 		result.Result, result.FinalSummary = nil, ""
 	}
 	return result
+}
+
+// failure_class is intentionally small and stable; finalize_reason remains
+// diagnostic detail rather than a machine-facing taxonomy.
+func codexFailureClass(meta RunMetadata) string {
+	stage := strings.TrimPrefix(meta.TerminalSource, "codex_")
+	switch {
+	case strings.HasPrefix(stage, "preparation"), strings.HasPrefix(stage, "credential"), strings.HasPrefix(stage, "execution_create"), strings.HasPrefix(stage, "execution_start"), strings.HasPrefix(stage, "bundle"):
+		return "infrastructure"
+	case strings.HasPrefix(stage, "execution"), strings.HasPrefix(stage, "timeout"):
+		return "model_or_code"
+	case strings.HasPrefix(stage, "recovery"), strings.HasPrefix(stage, "delivery"), strings.HasPrefix(stage, "stale"):
+		return "delivery_or_lease"
+	default:
+		return "infrastructure"
+	}
 }
 
 func (s *Service) readCodexFinalOutput(meta RunMetadata) (string, string) {

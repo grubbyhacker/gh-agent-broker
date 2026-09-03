@@ -50,6 +50,12 @@ type Server struct {
 
 var issueCommentMutationMu sync.Mutex
 
+type staleHeadError struct{ expected, actual string }
+
+func (e staleHeadError) Error() string {
+	return "pull request head no longer matches requested_head_sha"
+}
+
 // transportOperation is retained while staged audit records are emitted by
 // handleGit. It has no authority or credential-bearing state.
 type transportOperation struct{}
@@ -1351,6 +1357,11 @@ func (s *Server) handleCIObservation(w http.ResponseWriter, r *http.Request, rep
 	if !ok {
 		return
 	}
+	expected := r.URL.Query().Get("head_sha")
+	if !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(expected) {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_requested_head_sha", Message: "head_sha must be 40 lowercase hexadecimal characters", Decision: policy.DecisionDeny})
+		return
+	}
 	s.withReadAccess(w, r, repo, "ci.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
 		pull, err := gh.GetPull(appName, repo, inst, number)
 		if err != nil {
@@ -1358,6 +1369,9 @@ func (s *Server) handleCIObservation(w http.ResponseWriter, r *http.Request, rep
 		}
 		if pull.HeadSHA == "" {
 			return nil, fmt.Errorf("GitHub pull request has no head SHA")
+		}
+		if pull.HeadSHA != expected {
+			return nil, staleHeadError{expected, pull.HeadSHA}
 		}
 		status, err := gh.GetCommitStatus(appName, repo, inst, pull.HeadSHA)
 		if err != nil {
@@ -1391,7 +1405,16 @@ func (s *Server) handleCIObservation(w http.ResponseWriter, r *http.Request, rep
 		// protection fallback in this least-privilege observation endpoint.
 		var protection *api.BranchProtection
 		required := requiredCI(rules, protection)
-		return api.CIObservation{Pull: pull, CommitStatus: status, CheckRuns: checks, WorkflowRuns: runs, WorkflowJobs: jobs, BranchProtection: protection, BranchRules: rules, RequiredCI: required, AggregateState: aggregateCI(required, status, checks)}, nil
+		// Re-read after evidence collection. No response may claim a current
+		// pull head while its evidence belongs to an earlier head.
+		current, err := gh.GetPull(appName, repo, inst, number)
+		if err != nil {
+			return nil, err
+		}
+		if current.HeadSHA != expected {
+			return nil, staleHeadError{expected, current.HeadSHA}
+		}
+		return api.CIObservation{RequestedHeadSHA: expected, Pull: current, CommitStatus: status, CheckRuns: checks, WorkflowRuns: runs, WorkflowJobs: jobs, BranchProtection: protection, BranchRules: rules, RequiredCI: required, AggregateState: aggregateCI(required, status, checks, runs)}, nil
 	})
 }
 
@@ -1412,13 +1435,28 @@ func requiredCI(rules *api.BranchRules, protection *api.BranchProtection) []api.
 			out = append(out, api.RequiredCI{Kind: kind, Identity: name, IntegrationID: integrationID})
 		}
 	}
+	addWorkflow := func(workflow api.RequiredWorkflow) {
+		if workflow.Path == "" {
+			return
+		}
+		key := fmt.Sprintf("workflow:%s:%s:%d:%s", workflow.Path, workflow.Ref, workflow.RepositoryID, workflow.SHA)
+		if !seen[key] {
+			seen[key] = true
+			copy := workflow
+			out = append(out, api.RequiredCI{Kind: "workflow", Identity: workflow.Path, Workflow: &copy})
+		}
+	}
 	if rules != nil {
 		for _, rule := range rules.Rules {
-			if rule.Type != "required_status_checks" {
-				continue
-			}
-			for _, check := range rule.Parameters.RequiredStatusChecks {
-				add("check", check.Context, check.IntegrationID)
+			switch rule.Type {
+			case "required_status_checks":
+				for _, check := range rule.Parameters.RequiredStatusChecks {
+					add("check", check.Context, check.IntegrationID)
+				}
+			case "required_workflows":
+				for _, workflow := range rule.Parameters.RequiredWorkflows {
+					addWorkflow(workflow)
+				}
 			}
 		}
 		return out
@@ -1438,7 +1476,7 @@ func requiredCI(rules *api.BranchRules, protection *api.BranchProtection) []api.
 // aggregateCI has the repository-neutral vocabulary consumed by Signal Plane.
 // A required identity missing from the complete authoritative observation is
 // pending, which is deliberately fail-closed.
-func aggregateCI(required []api.RequiredCI, statuses api.CommitStatus, checks api.CheckRuns) string {
+func aggregateCI(required []api.RequiredCI, statuses api.CommitStatus, checks api.CheckRuns, runs []api.WorkflowRun) string {
 	if len(required) == 0 {
 		return "success"
 	}
@@ -1463,6 +1501,29 @@ func aggregateCI(required []api.RequiredCI, statuses api.CommitStatus, checks ap
 				state, conclusion = strings.ToLower(check.Status), strings.ToLower(check.Conclusion)
 				break
 			}
+		} else if required.Kind == "check" {
+			// An unbound required_status_checks context is satisfied by either
+			// a legacy commit status or a check run. App-bound contexts remain
+			// check-run-only and must match that app.
+			if required.IntegrationID == nil {
+				state = statusByName[required.Identity]
+			}
+		} else if required.Kind == "workflow" {
+			for _, run := range runs {
+				if workflowRunMatches(required.Workflow, run.Path, "", 0, "") {
+					state, conclusion = strings.ToLower(run.Status), strings.ToLower(run.Conclusion)
+					break
+				}
+				for _, ref := range run.ReferencedWorkflows {
+					if workflowRunMatches(required.Workflow, ref.Path, ref.Ref, ref.RepositoryID, ref.SHA) {
+						state, conclusion = strings.ToLower(run.Status), strings.ToLower(run.Conclusion)
+						break
+					}
+				}
+				if state != "" {
+					break
+				}
+			}
 		}
 		if state == "" || state == "queued" || state == "in_progress" || state == "pending" || state == "requested" || state == "waiting" {
 			result = "pending"
@@ -1479,6 +1540,13 @@ func aggregateCI(required []api.RequiredCI, statuses api.CommitStatus, checks ap
 		}
 	}
 	return result
+}
+
+func workflowRunMatches(required *api.RequiredWorkflow, path, ref string, repositoryID int64, sha string) bool {
+	if required == nil || path != required.Path {
+		return false
+	}
+	return (required.Ref == "" || required.Ref == ref) && (required.RepositoryID == 0 || required.RepositoryID == repositoryID) && (required.SHA == "" || required.SHA == sha)
 }
 
 func (s *Server) handleActionsRunJobs(w http.ResponseWriter, r *http.Request, repo, rawRunID string) {
@@ -1539,6 +1607,12 @@ func classifyGitHubReadError(err error) (int, string, string, map[string]interfa
 		"upstream": "github",
 	}
 	var apiErr githubapp.APIError
+	var stale staleHeadError
+	if errors.As(err, &stale) {
+		extra["requested_head_sha"] = stale.expected
+		extra["pull_head_sha"] = stale.actual
+		return http.StatusConflict, "stale_pull_head", "stale", extra
+	}
 	if errors.As(err, &apiErr) {
 		extra["github_status"] = apiErr.StatusCode
 		switch {
@@ -1890,7 +1964,6 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "installation_not_configured", "repository has no configured GitHub App installation", nil))
 		return
 	}
-	enriched := metadata.WithBrokerFields(req.Metadata, principal.ID, opID, inst)
 	result := policy.Check(policy.Request{
 		Agent:       principal.Agent,
 		AgentID:     principal.ID,
@@ -1900,7 +1973,7 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		Metadata:    req.Metadata,
 		Locations: map[string]map[string]string{
 			"request":      req.Metadata,
-			"comment_body": enriched,
+			"comment_body": req.Metadata,
 		},
 	})
 	if !result.Allowed {
@@ -1908,7 +1981,10 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		writeJSON(w, http.StatusForbidden, s.errorResponse(opID, "policy_denied", "comment creation denied by policy", &result))
 		return
 	}
-	body := req.Body + metadata.RenderBlock(enriched)
+	// Public comments must never become a carrier for broker operation IDs,
+	// installation IDs, or idempotency material. Durable private state binds
+	// retries; reconciliation uses exact body plus the GitHub author.
+	body := req.Body
 	if s.blockUnsafeEgress(w, opID, principal.ID, repo, "issue.comment", []securityscan.Segment{{Name: "body", Value: body}}) {
 		return
 	}

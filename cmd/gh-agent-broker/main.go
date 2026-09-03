@@ -504,11 +504,12 @@ func cmdCIObservation(args []string) {
 	broker, agentID, secret := commonFlags(fs)
 	repo := fs.String("repo", "", "owner/repo")
 	number := fs.String("number", "", "pull request number")
+	headSHA := fs.String("head-sha", "", "expected pull request head SHA")
 	if err := fs.Parse(args); err != nil {
 		fatal(err)
 	}
 	resolveSecret(secret)
-	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/pulls/"+*number+"/ci-observation", *agentID, *secret, nil)
+	doRequest(http.MethodGet, *broker, "/v1/repos/"+*repo+"/pulls/"+*number+"/ci-observation?head_sha="+url.QueryEscape(*headSHA), *agentID, *secret, nil)
 }
 
 func cmdActionsJobLog(args []string) {
