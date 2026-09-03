@@ -509,9 +509,6 @@ func resolveLaunchProfileRequest(profile LaunchProfile, r *http.Request, maxByte
 		return in, resolved, err
 	}
 	if rawParams, ok := raw["parameters"]; ok {
-		if len(raw) != 1 {
-			return LaunchAgentInput{}, nil, fmt.Errorf("request body must contain only parameters")
-		}
 		var submitted map[string]any
 		if err := json.Unmarshal(rawParams, &submitted); err != nil {
 			return LaunchAgentInput{}, nil, fmt.Errorf("parameters must be an object")
@@ -520,7 +517,11 @@ func resolveLaunchProfileRequest(profile LaunchProfile, r *http.Request, maxByte
 		if err != nil {
 			return LaunchAgentInput{}, resolved, err
 		}
-		in := profile.LaunchAgentInput
+		delete(raw, "parameters")
+		in, err := applyLaunchProfileOverrides(profile, raw)
+		if err != nil {
+			return LaunchAgentInput{}, resolved, err
+		}
 		in.Parameters = resolved
 		return in, resolved, nil
 	}
@@ -536,40 +537,54 @@ func resolveLaunchProfileRequest(profile LaunchProfile, r *http.Request, maxByte
 			return LaunchAgentInput{}, nil, fmt.Errorf("overrides must be an object")
 		}
 	}
+	out, err := applyLaunchProfileOverrides(profile, raw)
+	if err != nil {
+		return LaunchAgentInput{}, nil, err
+	}
+	params, err = resolveProfileParameters(profile, nil)
+	out.Parameters = params
+	return out, params, err
+}
+
+func applyLaunchProfileOverrides(profile LaunchProfile, raw map[string]json.RawMessage) (LaunchAgentInput, error) {
 	allowed := map[string]bool{}
 	for _, field := range profile.AllowOverrides {
 		allowed[field] = true
 	}
 	for field := range raw {
 		if !launchOverrideFieldAllowed(field) {
-			return LaunchAgentInput{}, nil, fmt.Errorf("unsupported override field %q", field)
+			return LaunchAgentInput{}, fmt.Errorf("unsupported override field %q", field)
 		}
 		if !allowed[field] {
-			return LaunchAgentInput{}, nil, fmt.Errorf("override field %q is not allowed for this profile", field)
+			return LaunchAgentInput{}, fmt.Errorf("override field %q is not allowed for this profile", field)
 		}
 	}
 	mergedBytes, err := json.Marshal(profile.LaunchAgentInput)
 	if err != nil {
-		return LaunchAgentInput{}, nil, err
+		return LaunchAgentInput{}, err
 	}
 	var merged map[string]json.RawMessage
 	if err := json.Unmarshal(mergedBytes, &merged); err != nil {
-		return LaunchAgentInput{}, nil, err
+		return LaunchAgentInput{}, err
 	}
 	for field, value := range raw {
 		merged[field] = value
 	}
 	finalBytes, err := json.Marshal(merged)
 	if err != nil {
-		return LaunchAgentInput{}, nil, err
+		return LaunchAgentInput{}, err
 	}
 	var out LaunchAgentInput
 	if err := json.Unmarshal(finalBytes, &out); err != nil {
-		return LaunchAgentInput{}, nil, err
+		return LaunchAgentInput{}, err
 	}
-	params, err = resolveProfileParameters(profile, nil)
-	out.Parameters = params
-	return out, params, err
+	if _, ok := raw["max_runtime_seconds"]; ok {
+		out.MaxRuntimeMinutes = 0
+	}
+	if _, ok := raw["max_runtime_minutes"]; ok {
+		out.MaxRuntimeSeconds = 0
+	}
+	return out, nil
 }
 
 func bearerToken(r *http.Request) string {

@@ -19,20 +19,24 @@ contract even if a prompt tells the agent not to do so.
 
 Signal Plane launches only the reviewed `terra-medium-v1` launch profile via
 `POST /v1/launch-profiles/terra-medium-v1/launch`. It must send a stable
-`Idempotency-Key` and exactly these typed parameters:
+`Idempotency-Key` and these typed parameters. Signal Plane may also set the
+single reviewed top-level `max_runtime_seconds` override to the remaining
+durable deadline budget:
 
 ```json
 {
   "parameters": {
     "issue_number": 123,
     "source_delivery_id": "stable-source-delivery-id"
-  }
+  },
+  "max_runtime_seconds": 1800
 }
 ```
 
 `issue_number` is a positive integer. `source_delivery_id` matches
 `^[A-Za-z0-9-]{1,128}$`. Existing canonical request fingerprinting and
 principal/profile/idempotency namespaces remain authoritative.
+Initial issue-to-PR launches omit both conditional repair parameters.
 
 Terminal delivery reads
 `GET /v1/runs/{run_id}/terminal-result`. Successful outcomes are
@@ -42,7 +46,7 @@ arbitrary artifacts.
 
 ## sandbox-broker configuration
 
-The profile is a durable three-container workflow under one broker run:
+The profile is a durable four-phase container workflow under one broker run:
 
 ```yaml
 codex_holder:
@@ -80,20 +84,25 @@ launch_profiles:
     max_runtime_minutes: 60
     max_concurrent_runs: 1
     require_idempotency_key: true
+    allow_overrides: [max_runtime_seconds]
     parameters:
       issue_number: {type: integer, required: true, min: 1}
       source_delivery_id:
         {type: string, required: true, max_length: 128, pattern: "^[A-Za-z0-9-]+$"}
+      repair_pr_number: {type: integer, required: false, min: 1}
+      expected_head_sha:
+        {type: string, required: false, max_length: 40, pattern: "^[a-f0-9]{40}$"}
     codex_issue_workflow:
       preparation_template: codex-preparation
       execution_template: codex-execution
+      recovery_template: codex-recovery-validation
       delivery_template: codex-delivery
       model_policy: reviewed-codex-v1
       model_profile: terra-medium-v1
       prompt_revision: issue-ready-pr/v1
 ```
 
-All three templates use digest-pinned versions of the same reviewed repository
+All four templates use digest-pinned versions of the same reviewed repository
 worker image. `codex-preparation` runs
 `/usr/local/bin/agent-codex-repo-prep-worker`, has no credential bundle, uses
 the private-broker-only preparation network, and has bounded resources and

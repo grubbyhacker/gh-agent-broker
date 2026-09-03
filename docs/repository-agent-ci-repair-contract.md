@@ -3,10 +3,12 @@
 This is the exact broker/worker interface consumed by Signal Plane for the
 first failed-CI repair milestone. It does not authorize deployment.
 
-Signal Plane launches a reviewed Codex repair profile with a stable,
-task-attempt idempotency key. The launch profile must require these typed
-parameters in addition to the existing `issue_number` and
-`source_delivery_id`:
+Signal Plane launches the same reviewed `terra-medium-v1` profile used for the
+initial issue-to-PR execution with a stable task-attempt idempotency key. The
+profile always requires `issue_number` and `source_delivery_id`; it declares
+`repair_pr_number` and `expected_head_sha` as optional individually but the
+broker requires them all-or-neither before run creation. A repair supplies both
+and may set the sole reviewed deadline override:
 
 ```json
 {
@@ -15,15 +17,18 @@ parameters in addition to the existing `issue_number` and
     "source_delivery_id": "github-delivery-id",
     "repair_pr_number": 456,
     "expected_head_sha": "40-lowercase-hex-characters"
-  }
+  },
+  "max_runtime_seconds": 1800
 }
 ```
 
 `source_delivery_id` identifies the admitted delivery, not a GitHub mutable
-object. The Signal Plane durable attempt identity must include repository,
+object. `max_runtime_seconds`, when present, is a positive remaining-deadline
+budget no greater than the reviewed template cap; every other top-level
+override is denied. The Signal Plane durable attempt identity must include repository,
 pull number, admitted head SHA, model/profile, and attempt number. It may
 launch no more than two coding attempts for that model/profile before its own
-deadline; broker runtime deadlines remain independent and are not a polling
+deadline. The broker runtime cap is enforcement for that launch, not a polling
 mechanism.
 
 Before launching, and on each relevant admitted check/status/pull-request

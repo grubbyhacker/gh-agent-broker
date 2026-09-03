@@ -263,3 +263,11 @@ GitHub's `@ref` path suffix and accepts official referenced-workflow shapes
 without repository IDs. Pending comment reconciliation ignores old exact prose
 outside a two-minute skew allowance and fails closed on ambiguous candidates.
 Repair authority input is mode 0444.
+
+Post-merge contract correction: `terra-medium-v1` remains the single reviewed
+initial-and-repair profile. `repair_pr_number` and `expected_head_sha` are
+optional declarations but must be supplied together for repair, with partial
+pairs rejected before run creation. Parameterized requests may also carry the
+sole reviewed top-level `max_runtime_seconds` override when the profile
+allowlists it; applying the seconds override replaces the profile's minute
+default so Signal Plane can enforce its remaining durable deadline.
