@@ -4,6 +4,7 @@ package githubapp
 import (
 	"bytes"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"gh-agent-broker/internal/api"
 	"gh-agent-broker/internal/config"
@@ -815,6 +817,112 @@ func (c *Client) ListCheckRuns(appName, repo string, installationID int64, sha s
 		return api.CheckRuns{}, err
 	}
 	return out, nil
+}
+
+func (c *Client) ListWorkflowRuns(appName, repo string, installationID int64, sha string) ([]api.WorkflowRun, error) {
+	var out struct {
+		WorkflowRuns []api.WorkflowRun `json:"workflow_runs"`
+	}
+	q := url.Values{"head_sha": []string{sha}, "per_page": []string{"100"}}
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/actions/runs?"+q.Encode(), installationID, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.WorkflowRuns, nil
+}
+
+func (c *Client) ListWorkflowJobs(appName, repo string, installationID, runID int64) ([]api.WorkflowJob, error) {
+	var out struct {
+		Jobs []api.WorkflowJob `json:"jobs"`
+	}
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/actions/runs/"+strconv.FormatInt(runID, 10)+"/jobs?per_page=100", installationID, nil, &out); err != nil {
+		return nil, err
+	}
+	for i := range out.Jobs {
+		out.Jobs[i].RunID = runID
+	}
+	return out.Jobs, nil
+}
+
+func (c *Client) BranchProtection(appName, repo, branch string, installationID int64) (any, error) {
+	var out any
+	err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/branches/"+url.PathEscape(branch)+"/protection", installationID, nil, &out)
+	if err != nil {
+		var apiErr APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return map[string]any{}, nil
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetWorkflowJobLog follows only GitHub's signed Actions-log redirect, keeps
+// the signed URL private, and rejects rather than truncates oversized logs.
+func (c *Client) GetWorkflowJobLog(appName, repo string, installationID, jobID int64, maxBytes int64) (api.ActionsJobLog, error) {
+	if maxBytes < 1 {
+		return api.ActionsJobLog{}, errors.New("actions log byte limit must be positive")
+	}
+	token, err := c.InstallationToken(appName, installationID)
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(c.cfg.APIBaseURL, "/")+"/repos/"+repo+"/actions/jobs/"+strconv.FormatInt(jobID, 10)+"/logs", nil)
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	noRedirect := *c.http
+	noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	defer closeBody(resp.Body)
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if readErr != nil {
+			return api.ActionsJobLog{}, readErr
+		}
+		return api.ActionsJobLog{}, APIError{StatusCode: resp.StatusCode, Body: string(body)}
+	}
+	location, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil || location.Scheme != "https" || !safeActionsLogHost(location.Hostname()) {
+		return api.ActionsJobLog{}, errors.New("GitHub actions log redirect is not an approved HTTPS host")
+	}
+	logReq, err := http.NewRequest(http.MethodGet, location.String(), nil)
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	logResp, err := noRedirect.Do(logReq)
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	defer closeBody(logResp.Body)
+	if logResp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(logResp.Body, 1<<20))
+		if readErr != nil {
+			return api.ActionsJobLog{}, readErr
+		}
+		return api.ActionsJobLog{}, APIError{StatusCode: logResp.StatusCode, Body: string(body)}
+	}
+	body, err := io.ReadAll(io.LimitReader(logResp.Body, maxBytes+1))
+	if err != nil {
+		return api.ActionsJobLog{}, err
+	}
+	if int64(len(body)) > maxBytes {
+		return api.ActionsJobLog{}, fmt.Errorf("actions job log exceeds %d-byte broker limit", maxBytes)
+	}
+	if !utf8.Valid(body) {
+		return api.ActionsJobLog{}, errors.New("actions job log is not valid UTF-8")
+	}
+	digest := sha256.Sum256(body)
+	return api.ActionsJobLog{JobID: jobID, SizeBytes: int64(len(body)), SHA256: fmt.Sprintf("%x", digest), Text: string(body)}, nil
+}
+
+func safeActionsLogHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	return host == "github.com" || strings.HasSuffix(host, ".github.com") || strings.HasSuffix(host, ".actions.githubusercontent.com")
 }
 
 type githubUser struct {

@@ -6,6 +6,7 @@ readonly dependency_manifest_path="${AGENT_IMAGE_DEPENDENCY_MANIFEST_PATH:-/usr/
 readonly baked_workspace_path="${AGENT_IMAGE_WORKSPACE:-/workspace}"
 readonly issue_context_byte_limit=24576
 readonly issue_comment_limit=30
+readonly repair_log_job_limit=4
 stage='initializing'
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
@@ -38,6 +39,15 @@ validate_contract() {
     (.parameters.issue_number | type == "number" and floor == . and . > 0) and
     (.parameters.source_delivery_id | type == "string" and test("^[A-Za-z0-9-]{1,128}$"))
   ' /input/task.json >/dev/null || fail 'typed issue task contract is invalid'
+}
+
+repair_mode() { jq -e '(.parameters.repair_pr_number? // 0) > 0' /input/task.json >/dev/null; }
+
+validate_repair_contract() {
+  jq -e '
+    (.parameters.repair_pr_number | type == "number" and floor == . and . > 0) and
+    (.parameters.expected_head_sha | type == "string" and test("^[a-f0-9]{40}$"))
+  ' /input/task.json >/dev/null || fail 'typed CI repair task contract is invalid'
 }
 
 collect_submodule_manifest_entries() {
@@ -142,6 +152,43 @@ ingest_issue() {
   (( bytes <= issue_context_byte_limit )) || fail "issue body/comments exceed ${issue_context_byte_limit}-byte input limit"
 }
 
+prepare_repair_pull() {
+  local number expected pull head_ref head_sha
+  validate_repair_contract
+  number=$(jq -r '.parameters.repair_pr_number' /input/task.json)
+  expected=$(jq -r '.parameters.expected_head_sha' /input/task.json)
+  gh-agent-broker-cli pull -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number" > /work/prepared/pull.json
+  jq -e --arg expected "$expected" '
+    .state == "open" and (.number | type == "number" and . > 0) and
+    (.head_ref | type == "string" and length > 0) and .head_sha == $expected and
+    (.base_ref | type == "string" and length > 0)
+  ' /work/prepared/pull.json >/dev/null || fail 'pull request is closed, malformed, or no longer at the admitted CI head'
+  head_ref=$(jq -r .head_ref /work/prepared/pull.json)
+  head_sha=$(jq -r .head_sha /work/prepared/pull.json)
+  git check-ref-format --branch "$head_ref" >/dev/null || fail 'pull request head branch is invalid'
+  git fetch --quiet origin "refs/heads/${head_ref}"
+  [[ "$(git rev-parse FETCH_HEAD)" == "$head_sha" ]] || fail 'broker checkout does not match admitted pull request head'
+  git checkout --quiet -B "$AGENT_BRANCH" FETCH_HEAD
+  gh-agent-broker-cli ci-observation -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number" > /work/prepared/ci-observation.json
+  jq -e --arg expected "$expected" '.pull.head_sha == $expected' /work/prepared/ci-observation.json >/dev/null ||
+    fail 'authoritative CI observation no longer matches admitted pull request head'
+  mapfile -t failed_jobs < <(jq -r '
+    .workflow_jobs[]? | select(.status == "completed" and (.conclusion | ascii_downcase | IN("success", "skipped", "neutral")) | not) | .id
+  ' /work/prepared/ci-observation.json)
+  (( ${#failed_jobs[@]} <= repair_log_job_limit )) || fail 'authoritative CI observation has too many failed jobs for the bounded repair-log contract'
+  mkdir -p /work/prepared/actions-logs
+  for job_id in "${failed_jobs[@]}"; do
+    gh-agent-broker-cli actions-job-log -broker "$BROKER_URL" -repo "$AGENT_REPO" -job-id "$job_id" \
+      > "/work/prepared/actions-logs/${job_id}.json"
+    jq -e --argjson job "$job_id" '.job_id == $job and (.text | type == "string") and (.size_bytes | type == "number") and (.sha256 | test("^[a-f0-9]{64}$"))' \
+      "/work/prepared/actions-logs/${job_id}.json" >/dev/null || fail 'bounded Actions log response is malformed'
+  done
+  jq -n --argjson number "$number" --arg head_ref "$head_ref" --arg expected "$expected" \
+    '{pull_number:$number,head_ref:$head_ref,expected_head_sha:$expected}' > /work/prepared/repair.json
+  chmod -R a-w /work/prepared/actions-logs
+  chmod 0444 /work/prepared/pull.json /work/prepared/ci-observation.json /work/prepared/repair.json
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   require_env BROKER_URL
   require_env AGENT_REPO
@@ -166,6 +213,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 
   stage='typed issue ingestion'
   ingest_issue
+  if repair_mode; then
+    stage='authoritative pull request and CI observation'
+    prepare_repair_pull
+  fi
 
   stage='baked dependency and submodule verification'
   manifest=$(verify_baked_manifest)

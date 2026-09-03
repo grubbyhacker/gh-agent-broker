@@ -522,6 +522,7 @@ Operations:
 - GET  /v1/repos/{owner}/{repo}/pulls/{number}/reviews
 - GET  /v1/repos/{owner}/{repo}/pulls/{number}/review-comments
 - GET  /v1/repos/{owner}/{repo}/pulls/{number}/review-threads
+- GET  /v1/repos/{owner}/{repo}/pulls/{number}/ci-observation
 - PUT  /v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissal
 - PUT  /v1/repos/{owner}/{repo}/pulls/{number}/review-threads/{thread_id}/resolve
 - POST /v1/repos/{owner}/{repo}/pulls
@@ -534,6 +535,7 @@ Operations:
 - DELETE /v1/repos/{owner}/{repo}/issues/{number}/labels/{label}
 - GET  /v1/repos/{owner}/{repo}/commits/{sha}/status
 - GET  /v1/repos/{owner}/{repo}/commits/{sha}/check-runs
+- GET  /v1/repos/{owner}/{repo}/actions/jobs/{job_id}/log
 
 Git smart HTTP:
 - /git/{owner}/{repo}.git
@@ -1011,6 +1013,8 @@ func (s *Server) handleRepoAPI(w http.ResponseWriter, r *http.Request) {
 		s.handlePullReviewComments(w, r, repo, parts[3])
 	case len(parts) == 5 && parts[2] == "pulls" && parts[4] == "review-threads" && r.Method == http.MethodGet:
 		s.handlePullReviewThreads(w, r, repo, parts[3])
+	case len(parts) == 5 && parts[2] == "pulls" && parts[4] == "ci-observation" && r.Method == http.MethodGet:
+		s.handleCIObservation(w, r, repo, parts[3])
 	case len(parts) == 7 && parts[2] == "pulls" && parts[4] == "reviews" && parts[6] == "dismissal" && r.Method == http.MethodPut:
 		s.handlePullReviewDismiss(w, r, repo, parts[3], parts[5])
 	case len(parts) == 7 && parts[2] == "pulls" && parts[4] == "review-threads" && parts[6] == "resolve" && r.Method == http.MethodPut:
@@ -1033,6 +1037,10 @@ func (s *Server) handleRepoAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleCommitStatus(w, r, repo, parts[3])
 	case len(parts) == 5 && parts[2] == "commits" && parts[4] == "check-runs" && r.Method == http.MethodGet:
 		s.handleCheckRuns(w, r, repo, parts[3])
+	case len(parts) == 6 && parts[2] == "actions" && parts[3] == "jobs" && parts[5] == "log" && r.Method == http.MethodGet:
+		s.handleActionsJobLog(w, r, repo, parts[4])
+	case len(parts) == 6 && parts[2] == "actions" && parts[3] == "runs" && parts[5] == "jobs" && r.Method == http.MethodGet:
+		s.handleActionsRunJobs(w, r, repo, parts[4])
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 	}
@@ -1330,6 +1338,74 @@ func (s *Server) handleCommitStatus(w http.ResponseWriter, r *http.Request, repo
 func (s *Server) handleCheckRuns(w http.ResponseWriter, r *http.Request, repo, sha string) {
 	s.withReadAccess(w, r, repo, "checks.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
 		return gh.ListCheckRuns(appName, repo, inst, sha, githubListQuery(r, []string{"check_name", "status", "filter"}))
+	})
+}
+
+const maxActionsJobLogBytes int64 = 16 * 1024 * 1024
+
+func (s *Server) handleCIObservation(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {
+	number, ok := parsePositiveInt(w, rawNumber)
+	if !ok {
+		return
+	}
+	s.withReadAccess(w, r, repo, "ci.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		pull, err := gh.GetPull(appName, repo, inst, number)
+		if err != nil {
+			return nil, err
+		}
+		if pull.HeadSHA == "" {
+			return nil, fmt.Errorf("GitHub pull request has no head SHA")
+		}
+		status, err := gh.GetCommitStatus(appName, repo, inst, pull.HeadSHA)
+		if err != nil {
+			return nil, err
+		}
+		checks, err := gh.ListCheckRuns(appName, repo, inst, pull.HeadSHA, url.Values{"filter": []string{"latest"}, "per_page": []string{"100"}})
+		if err != nil {
+			return nil, err
+		}
+		runs, err := gh.ListWorkflowRuns(appName, repo, inst, pull.HeadSHA)
+		if err != nil {
+			return nil, err
+		}
+		var jobs []api.WorkflowJob
+		for _, run := range runs {
+			runJobs, err := gh.ListWorkflowJobs(appName, repo, inst, run.ID)
+			if err != nil {
+				return nil, err
+			}
+			jobs = append(jobs, runJobs...)
+			if len(jobs) > 1000 {
+				return nil, fmt.Errorf("GitHub CI observation exceeds the 1,000-job bound")
+			}
+		}
+		protection, err := gh.BranchProtection(appName, repo, pull.BaseRef, inst)
+		if err != nil {
+			return nil, err
+		}
+		return api.CIObservation{Pull: pull, CommitStatus: status, CheckRuns: checks, WorkflowRuns: runs, WorkflowJobs: jobs, BranchProtection: protection}, nil
+	})
+}
+
+func (s *Server) handleActionsRunJobs(w http.ResponseWriter, r *http.Request, repo, rawRunID string) {
+	runID, err := strconv.ParseInt(rawRunID, 10, 64)
+	if err != nil || runID < 1 {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "run_id must be a positive integer", Decision: policy.DecisionDeny})
+		return
+	}
+	s.withReadAccess(w, r, repo, "actions.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.ListWorkflowJobs(appName, repo, inst, runID)
+	})
+}
+
+func (s *Server) handleActionsJobLog(w http.ResponseWriter, r *http.Request, repo, rawJobID string) {
+	jobID, err := strconv.ParseInt(rawJobID, 10, 64)
+	if err != nil || jobID < 1 {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "job_id must be a positive integer", Decision: policy.DecisionDeny})
+		return
+	}
+	s.withReadAccess(w, r, repo, "actions.logs.read", "", func(_ string, gh *githubapp.Client, appName string, inst int64) (interface{}, error) {
+		return gh.GetWorkflowJobLog(appName, repo, inst, jobID, maxActionsJobLogBytes)
 	})
 }
 

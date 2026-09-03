@@ -226,3 +226,47 @@ type CheckRun struct {
 	StartedAt   string `json:"started_at,omitempty"`
 	CompletedAt string `json:"completed_at,omitempty"`
 }
+
+// CIObservation is the broker's read-only, point-in-time view of the CI state
+// for one pull request head. GitHub remains authoritative: this DTO deliberately
+// does not calculate a separate required-check verdict.
+type CIObservation struct {
+	Pull             PullSummary   `json:"pull"`
+	CommitStatus     CommitStatus  `json:"commit_status"`
+	CheckRuns        CheckRuns     `json:"check_runs"`
+	WorkflowRuns     []WorkflowRun `json:"workflow_runs"`
+	WorkflowJobs     []WorkflowJob `json:"workflow_jobs"`
+	BranchProtection any           `json:"branch_protection,omitempty"`
+}
+
+type WorkflowRun struct {
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion,omitempty"`
+	HeadSHA    string `json:"head_sha"`
+	HTMLURL    string `json:"html_url,omitempty"`
+	CreatedAt  string `json:"created_at,omitempty"`
+	UpdatedAt  string `json:"updated_at,omitempty"`
+}
+
+type WorkflowJob struct {
+	RunID       int64  `json:"run_id"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Conclusion  string `json:"conclusion,omitempty"`
+	HeadSHA     string `json:"head_sha,omitempty"`
+	HTMLURL     string `json:"html_url,omitempty"`
+	StartedAt   string `json:"started_at,omitempty"`
+	CompletedAt string `json:"completed_at,omitempty"`
+}
+
+// ActionsJobLog contains one complete log only when it is within the reviewed
+// broker bound. It never contains a reusable GitHub URL or authorization data.
+type ActionsJobLog struct {
+	JobID     int64  `json:"job_id"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
+	Text      string `json:"text"`
+}

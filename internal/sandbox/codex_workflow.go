@@ -49,18 +49,19 @@ type preparationResult struct {
 }
 
 type executionResult struct {
-	Version        string `json:"version"`
-	Status         string `json:"status"`
-	RunID          string `json:"run_id"`
-	Repository     string `json:"repository"`
-	Branch         string `json:"branch"`
-	WorkspaceHead  string `json:"workspace_head"`
-	RefsSHA256     string `json:"refs_sha256"`
-	DiffSHA256     string `json:"diff_sha256"`
-	FinalSHA256    string `json:"final_sha256"`
-	VerifySHA256   string `json:"verify_sha256"`
-	Verification   string `json:"verification"`
-	FinalSizeBytes int64  `json:"final_size_bytes"`
+	Version          string `json:"version"`
+	Status           string `json:"status"`
+	RunID            string `json:"run_id"`
+	Repository       string `json:"repository"`
+	Branch           string `json:"branch"`
+	WorkspaceHead    string `json:"workspace_head"`
+	RefsSHA256       string `json:"refs_sha256"`
+	DiffSHA256       string `json:"diff_sha256"`
+	ValidatedTreeSHA string `json:"validated_tree_sha"`
+	FinalSHA256      string `json:"final_sha256"`
+	VerifySHA256     string `json:"verify_sha256"`
+	Verification     string `json:"verification"`
+	FinalSizeBytes   int64  `json:"final_size_bytes"`
 }
 
 type executionFailure struct {
@@ -718,7 +719,7 @@ func (s *Service) readExecutionResult(meta RunMetadata) (executionResult, error)
 	if result.Version != "codex-execution-result/v1" || result.Status != "executed" ||
 		result.RunID != meta.RunID || result.Repository != meta.Repo || result.Branch != meta.Branch ||
 		result.WorkspaceHead != meta.Provenance.WorkspaceHead || !regexpSHA(result.RefsSHA256, 64) ||
-		!regexpSHA(result.DiffSHA256, 64) ||
+		!regexpSHA(result.DiffSHA256, 64) || !regexpSHA(result.ValidatedTreeSHA, 40) ||
 		!regexpSHA(result.FinalSHA256, 64) || !regexpSHA(result.VerifySHA256, 64) ||
 		result.Verification != "passed" || result.FinalSizeBytes < 1 ||
 		result.FinalSizeBytes > int64(s.cfg.TerminalResultByteLimit) {

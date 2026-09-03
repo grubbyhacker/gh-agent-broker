@@ -74,6 +74,7 @@ validate_results() {
     .run_id == $run and .repository == $repo and .branch == $branch and .workspace_head == $head and
     (.refs_sha256 | test("^[a-f0-9]{64}$")) and
     (.diff_sha256 | test("^[a-f0-9]{64}$")) and (.final_sha256 | test("^[a-f0-9]{64}$")) and
+    (.validated_tree_sha | test("^[a-f0-9]{40}$")) and
     .verification == "passed" and (.verify_sha256 | test("^[a-f0-9]{64}$")) and
     (.final_size_bytes | type == "number" and . > 0 and . <= 1048576)
   ' /work/execution/execution.json >/dev/null || fail 'execution result is invalid'
@@ -133,6 +134,22 @@ restore_repository_authority() {
   rm -f -- "$regenerated" "$temp_index"
 }
 
+repair_target() {
+  [[ -f /work/prepared/repair.json ]] || return 1
+  jq -e '
+    (.pull_number | type == "number" and . > 0) and
+    (.head_ref | type == "string" and length > 0) and
+    (.expected_head_sha | type == "string" and test("^[a-f0-9]{40}$"))
+  ' /work/prepared/repair.json >/dev/null || fail 'repair target is invalid'
+}
+
+verify_validated_candidate_tree() {
+  local tree
+  tree=$(trusted_git -C /work/repo rev-parse 'HEAD^{tree}')
+  [[ "$tree" == "$(jq -r .validated_tree_sha /work/execution/execution.json)" ]] ||
+    fail 'delivered candidate tree differs from the tree that passed final validation'
+}
+
 reconcile_pull_request() {
   local marker=$1 list="$delivery_output_path/pull-request-reconcile.json" count
   gh-agent-broker-cli pulls -broker "$BROKER_URL" -repo "$AGENT_REPO" -state all \
@@ -171,6 +188,19 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   stage='commit and push'
   trusted_git add --all
   trusted_git commit --quiet -m "Implement Codex issue task ${AGENT_RUN_ID}"
+  verify_validated_candidate_tree
+  if repair_target; then
+    repair_head=$(jq -r .head_ref /work/prepared/repair.json)
+    expected_head=$(jq -r .expected_head_sha /work/prepared/repair.json)
+    stage='leased repair push'
+    trusted_git push --quiet --force-with-lease="refs/heads/${repair_head}:${expected_head}" \
+      origin "HEAD:refs/heads/${repair_head}"
+    pull_request=$(jq '{number,html_url,url}' /work/prepared/pull.json)
+    stage='completed repair'
+    write_result ready_for_review 'Codex CI repair was delivered to the existing pull request after validation of the exact candidate tree' "$pull_request"
+    cp /output/codex-final.txt /output/final-summary.md
+    exit 0
+  fi
   trusted_git push --quiet origin "HEAD:${AGENT_BRANCH}"
   marker="<!-- gh-agent-broker-codex-run:${AGENT_RUN_ID} -->"
   stage='pull request reconciliation'

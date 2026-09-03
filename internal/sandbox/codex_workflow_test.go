@@ -236,7 +236,7 @@ func writeExecutionFixture(t *testing.T, cfg Config, runID, branch string) {
 		Repository: "owner/repo", Branch: branch,
 		WorkspaceHead: "1111111111111111111111111111111111111111",
 		RefsSHA256:    strings.Repeat("5", 64),
-		DiffSHA256:    strings.Repeat("3", 64), FinalSHA256: strings.Repeat("4", 64),
+		DiffSHA256:    strings.Repeat("3", 64), ValidatedTreeSHA: strings.Repeat("7", 40), FinalSHA256: strings.Repeat("4", 64),
 		VerifySHA256: strings.Repeat("6", 64), Verification: "passed",
 		FinalSizeBytes: 10,
 	})

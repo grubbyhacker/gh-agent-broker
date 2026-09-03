@@ -491,6 +491,13 @@ build_prompt() {
   {
     printf '# Implementation Task\n\n'; cat /input/task.md
     printf '\n# Authoritative Issue Context\n\n'; cat /work/prepared/issue-context.md
+    if [[ -f /work/prepared/ci-observation.json ]]; then
+      printf '\n# Authoritative CI Observation\n\n'; cat /work/prepared/ci-observation.json
+      for log in /work/prepared/actions-logs/*.json; do
+        [[ -f "$log" ]] || continue
+        printf '\n# Failed Actions Job Log\n\n'; jq -r .text "$log"
+      done
+    fi
     printf '\n# Execution Contract\n\n'
     printf '%s\n' '- Work only in this prepared repository checkout.'
     printf '%s\n' '- Do not push, create a pull request, or contact GitHub; a separate deterministic container owns delivery.'
@@ -500,7 +507,7 @@ build_prompt() {
 }
 
 write_execution_result() {
-  local temp_index="$scan_dir/index" diff_temp="$execution_path/diff.patch.tmp"
+  local temp_index="$scan_dir/index" diff_temp="$execution_path/diff.patch.tmp" tree
   local result_temp="$execution_path/execution.json.tmp" final_size
   mkdir -p "$execution_path"
   GIT_INDEX_FILE="$temp_index" git -C "$repo_path" read-tree HEAD
@@ -508,16 +515,17 @@ write_execution_result() {
   GIT_INDEX_FILE="$temp_index" git -C "$repo_path" diff --cached --binary HEAD > "$diff_temp"
   (( $(stat -c %s "$diff_temp") <= execution_diff_limit )) || fail 'Codex diff exceeded bounded execution limit'
   mv -f -- "$diff_temp" "$execution_path/diff.patch"
+  tree=$(GIT_INDEX_FILE="$temp_index" git -C "$repo_path" write-tree)
   final_size=$(stat -c %s "$output_path/codex-final.txt")
   jq -n --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" \
     --arg head "$(cat "$scan_dir/head")" \
     --arg refs "$(sha256sum "$scan_dir/refs" | cut -d' ' -f1)" \
-    --arg diff "$(sha256sum "$execution_path/diff.patch" | cut -d' ' -f1)" \
+    --arg diff "$(sha256sum "$execution_path/diff.patch" | cut -d' ' -f1)" --arg tree "$tree" \
     --arg final "$(sha256sum "$output_path/codex-final.txt" | cut -d' ' -f1)" \
     --arg verify "$(sha256sum "$execution_path/verify.txt" | cut -d' ' -f1)" \
     --argjson final_size "$final_size" \
     '{version:"codex-execution-result/v1",status:"executed",run_id:$run,repository:$repo,
-      branch:$branch,workspace_head:$head,refs_sha256:$refs,diff_sha256:$diff,final_sha256:$final,
+      branch:$branch,workspace_head:$head,refs_sha256:$refs,diff_sha256:$diff,validated_tree_sha:$tree,final_sha256:$final,
       verification:"passed",verify_sha256:$verify,final_size_bytes:$final_size}' > "$result_temp"
   (( $(stat -c %s "$result_temp") <= 4096 )) || fail 'execution result exceeded bound'
   mv -f -- "$result_temp" "$execution_path/execution.json"
