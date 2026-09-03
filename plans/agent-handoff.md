@@ -247,3 +247,13 @@ extra mounts and reject `BROKER_*`, Codex, OpenAI, and proxy environment keys.
 Issue-comment idempotency atomically reserves an exact request, retains its
 first rendered semantic body for reconciliation/retry, and scans an explicit
 ten pages of comments; raw idempotency keys remain absent from durable state.
+
+PR #167 acceptance follow-up: terminal failure classification is now durable
+phase/execution-start based and limited to `infrastructure`, `model_or_code`,
+and `delivery_or_lease`; worker-emitted failed output cannot omit it. Repair
+delivery re-reads the authority PR before and after its lease push and projects
+the terminal PR from that post-push response. Required workflow matching strips
+GitHub's `@ref` path suffix and accepts official referenced-workflow shapes
+without repository IDs. Pending comment reconciliation ignores old exact prose
+outside a two-minute skew allowance and fails closed on ambiguous candidates.
+Repair authority input is mode 0444.

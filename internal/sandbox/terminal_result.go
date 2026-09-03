@@ -113,7 +113,7 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 	if meta.Provenance != nil {
 		result.Provenance = s.terminalProvenance(meta)
 	}
-	if meta.Provenance != nil && meta.Error != "" && strings.HasPrefix(meta.TerminalSource, "codex_") {
+	if meta.Provenance != nil && meta.Error != "" && isCodexTerminalFailure(meta) {
 		result.Outcome = StatusFailed
 		result.FailureStage = strings.TrimPrefix(meta.TerminalSource, "codex_")
 		reason := s.redactor(meta).Redact(meta.Error)
@@ -141,7 +141,7 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 	if reason != "" {
 		result.Outcome = fallbackOutcome(meta.Status)
 		result.FailureStage, result.FailureReason = stage, reason
-		result.FailureClass = "delivery"
+		result.FailureClass = terminalFailureClass(meta)
 		return result
 	}
 	result.Result, result.FinalSummary = workerResult, summary
@@ -158,26 +158,49 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 	} else {
 		result.Outcome = fallbackOutcome(meta.Status)
 		result.FailureStage, result.FailureReason = "terminal_result", "result.json is missing outcome"
-		result.FailureClass = "delivery"
+		result.FailureClass = terminalFailureClass(meta)
 		result.Result, result.FinalSummary = nil, ""
 	}
+	// A worker may return a syntactically valid failed terminal result.  Its
+	// classification is broker-owned and therefore cannot be omitted or chosen
+	// by the worker.
+	if isFailedTerminalOutcome(result.Outcome) {
+		result.FailureClass = terminalFailureClass(meta)
+	}
 	return result
+}
+
+func isFailedTerminalOutcome(outcome string) bool {
+	return outcome == StatusFailed || outcome == StatusTimedOut || outcome == StatusStopped
+}
+
+func isCodexTerminalFailure(meta RunMetadata) bool {
+	return strings.HasPrefix(meta.Phase, "preparation_") ||
+		strings.HasPrefix(meta.Phase, "execution_") ||
+		strings.HasPrefix(meta.Phase, "recovery_") ||
+		strings.HasPrefix(meta.Phase, "delivery_") ||
+		strings.HasPrefix(meta.TerminalSource, "codex_")
+}
+
+// terminalFailureClass is deliberately a three-value, stable vocabulary:
+// infrastructure, model_or_code, and delivery_or_lease.  It uses the durable
+// phase and execution-start fact, rather than an incidental terminal source.
+func terminalFailureClass(meta RunMetadata) string {
+	if strings.HasPrefix(meta.Phase, "delivery_") || strings.HasPrefix(meta.Phase, "recovery_") ||
+		strings.Contains(meta.TerminalSource, "delivery") || strings.Contains(meta.TerminalSource, "stale") {
+		return "delivery_or_lease"
+	}
+	if !meta.ExecutionStartedAt.IsZero() && (strings.HasPrefix(meta.Phase, "execution_") ||
+		strings.Contains(meta.TerminalSource, "execution") || strings.Contains(meta.TerminalSource, "timeout")) {
+		return "model_or_code"
+	}
+	return "infrastructure"
 }
 
 // failure_class is intentionally small and stable; finalize_reason remains
 // diagnostic detail rather than a machine-facing taxonomy.
 func codexFailureClass(meta RunMetadata) string {
-	stage := strings.TrimPrefix(meta.TerminalSource, "codex_")
-	switch {
-	case strings.HasPrefix(stage, "preparation"), strings.HasPrefix(stage, "credential"), strings.HasPrefix(stage, "execution_create"), strings.HasPrefix(stage, "execution_start"), strings.HasPrefix(stage, "bundle"):
-		return "infrastructure"
-	case strings.HasPrefix(stage, "execution"), strings.HasPrefix(stage, "timeout"):
-		return "model_or_code"
-	case strings.HasPrefix(stage, "recovery"), strings.HasPrefix(stage, "delivery"), strings.HasPrefix(stage, "stale"):
-		return "delivery_or_lease"
-	default:
-		return "infrastructure"
-	}
+	return terminalFailureClass(meta)
 }
 
 func (s *Service) readCodexFinalOutput(meta RunMetadata) (string, string) {

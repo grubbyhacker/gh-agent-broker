@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gh-agent-broker/internal/api"
 	"gh-agent-broker/internal/config"
@@ -60,7 +61,9 @@ func TestAggregateCIUnboundChecksAcceptStatusAndRequiredWorkflows(t *testing.T) 
 	if len(required) != 2 {
 		t.Fatalf("required=%#v", required)
 	}
-	workflow := api.ReferencedWorkflow{Path: ".github/workflows/verify.yml", Ref: "main", RepositoryID: 1, SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	// Mirrors GitHub's workflow-run response: the referenced path carries an
+	// @ref suffix and the object does not include repository_id.
+	workflow := api.ReferencedWorkflow{Path: "owner/repo/.github/workflows/verify.yml@main", SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "build", State: "success"}}}, api.CheckRuns{}, []api.WorkflowRun{{Status: "completed", Conclusion: "success", ReferencedWorkflows: []api.ReferencedWorkflow{workflow}}}); got != "success" {
 		t.Fatalf("success=%q", got)
 	}
@@ -69,6 +72,22 @@ func TestAggregateCIUnboundChecksAcceptStatusAndRequiredWorkflows(t *testing.T) 
 	}
 	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "build", State: "success"}}}, api.CheckRuns{}, nil); got != "pending" {
 		t.Fatalf("missing workflow=%q", got)
+	}
+}
+
+func TestReconcilePendingCommentFailsClosedOnAmbiguityAndIgnoresOldMatches(t *testing.T) {
+	reserved := time.Now().UTC()
+	body := "public body only"
+	old := reserved.Add(-3 * time.Minute).Format(time.RFC3339)
+	newer := reserved.Add(time.Second).Format(time.RFC3339)
+	if got, ok, err := reconcilePendingComment([]api.IssueComment{{ID: 1, Body: body, Author: "human", CreatedAt: old}}, body, reserved); err != nil || ok || got.ID != 0 {
+		t.Fatalf("old identical comment = %#v, %v, %v", got, ok, err)
+	}
+	if got, ok, err := reconcilePendingComment([]api.IssueComment{{ID: 2, Body: body, Author: "app", CreatedAt: newer}}, body, reserved); err != nil || !ok || got.ID != 2 {
+		t.Fatalf("unique new comment = %#v, %v, %v", got, ok, err)
+	}
+	if got, ok, err := reconcilePendingComment([]api.IssueComment{{ID: 2, Body: body, Author: "app", CreatedAt: newer}, {ID: 3, Body: body, Author: "app", CreatedAt: newer}}, body, reserved); err == nil || ok || got.ID != 0 {
+		t.Fatalf("ambiguous comment = %#v, %v, %v", got, ok, err)
 	}
 }
 

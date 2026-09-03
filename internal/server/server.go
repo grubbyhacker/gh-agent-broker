@@ -1493,20 +1493,20 @@ func aggregateCI(required []api.RequiredCI, statuses api.CommitStatus, checks ap
 		state, conclusion := "", ""
 		if required.Kind == "status" {
 			state = statusByName[required.Identity]
-		} else if candidates, ok := checkByName[required.Identity]; ok {
-			for _, check := range candidates {
-				if required.IntegrationID != nil && (check.App == nil || check.App.ID != *required.IntegrationID) {
-					continue
-				}
-				state, conclusion = strings.ToLower(check.Status), strings.ToLower(check.Conclusion)
-				break
-			}
 		} else if required.Kind == "check" {
-			// An unbound required_status_checks context is satisfied by either
-			// a legacy commit status or a check run. App-bound contexts remain
-			// check-run-only and must match that app.
-			if required.IntegrationID == nil {
-				state = statusByName[required.Identity]
+			candidates, ok := checkByName[required.Identity]
+			if !ok {
+				if required.IntegrationID == nil {
+					state = statusByName[required.Identity]
+				}
+			} else {
+				for _, check := range candidates {
+					if required.IntegrationID != nil && (check.App == nil || check.App.ID != *required.IntegrationID) {
+						continue
+					}
+					state, conclusion = strings.ToLower(check.Status), strings.ToLower(check.Conclusion)
+					break
+				}
 			}
 		} else if required.Kind == "workflow" {
 			for _, run := range runs {
@@ -1543,10 +1543,42 @@ func aggregateCI(required []api.RequiredCI, statuses api.CommitStatus, checks ap
 }
 
 func workflowRunMatches(required *api.RequiredWorkflow, path, ref string, repositoryID int64, sha string) bool {
-	if required == nil || path != required.Path {
+	if required == nil {
 		return false
 	}
-	return (required.Ref == "" || required.Ref == ref) && (required.RepositoryID == 0 || required.RepositoryID == repositoryID) && (required.SHA == "" || required.SHA == sha)
+	path, pathRef := splitWorkflowPathRef(path)
+	requiredPath, requiredPathRef := splitWorkflowPathRef(required.Path)
+	if path != requiredPath {
+		return false
+	}
+	if ref == "" {
+		ref = pathRef
+	}
+	requiredRef := required.Ref
+	if requiredRef == "" {
+		requiredRef = requiredPathRef
+	}
+	// GitHub's referenced_workflows objects do not provide repository_id. A
+	// required SHA/ref plus exact source path is the authoritative binding.
+	return (requiredRef == "" || requiredRef == ref) &&
+		// A workflow-run's own path is source@ref but does not expose the
+		// definition SHA. Referenced workflows do; bind it when present.
+		(required.SHA == "" || sha == "" || required.SHA == sha) &&
+		(repositoryID == 0 || required.RepositoryID == 0 || required.RepositoryID == repositoryID)
+}
+
+func splitWorkflowPathRef(value string) (string, string) {
+	if at := strings.LastIndex(value, "@"); at > 0 {
+		value, ref := value[:at], value[at+1:]
+		if source := strings.Index(value, ".github/workflows/"); source > 0 {
+			value = value[source:]
+		}
+		return value, ref
+	}
+	if source := strings.Index(value, ".github/workflows/"); source > 0 {
+		value = value[source:]
+	}
+	return value, ""
 }
 
 func (s *Server) handleActionsRunJobs(w http.ResponseWriter, r *http.Request, repo, rawRunID string) {
@@ -2040,7 +2072,15 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 			writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(listErr.Error()), OperationID: opID, Decision: result.Decision, Warnings: result.Warnings})
 			return
 		}
-		if reconciled, ok := reconcilePendingComment(comments, body); ok {
+		reconciled, reconciledOK, reconcileErr := reconcilePendingComment(comments, body, record.CreatedAt)
+		if reconcileErr != nil {
+			// Ambiguous visible evidence is never a reason to create another
+			// public comment. Keep the durable reservation pending for a human or
+			// a later unambiguous retry to resolve.
+			writeJSON(w, http.StatusConflict, api.ErrorResponse{Code: "comment_reconciliation_ambiguous", Message: "existing matching comments cannot be safely reconciled", OperationID: opID, Decision: policy.DecisionDeny})
+			return
+		}
+		if reconciledOK {
 			if err := writeExactIdempotentJSON(w, cfg.Idempotency, scopedKey, "issue.comment", requestDigest, http.StatusCreated, reconciled); err != nil {
 				writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
 				return
@@ -2099,23 +2139,32 @@ func idempotencyKeyDigest(key string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func reconcilePendingComment(comments []api.IssueComment, body string) (api.GitHubResult, bool) {
+const issueCommentReconciliationClockSkew = 2 * time.Minute
+
+// reconcilePendingComment claims only a unique exact comment created at or
+// after the durable reservation (with a small clock-skew margin). This avoids
+// claiming an older human comment that happens to use identical prose.
+func reconcilePendingComment(comments []api.IssueComment, body string, reservedAt time.Time) (api.GitHubResult, bool, error) {
 	var found *api.IssueComment
 	for index := range comments {
 		comment := &comments[index]
 		// Exact semantic content plus a GitHub-supplied author is the stable
 		// visible evidence; no internal identifier is inserted into prose.
+		createdAt, err := time.Parse(time.RFC3339, comment.CreatedAt)
+		if err != nil || createdAt.Before(reservedAt.Add(-issueCommentReconciliationClockSkew)) {
+			continue
+		}
 		if comment.Body == body && comment.Author != "" {
 			if found != nil {
-				return api.GitHubResult{}, false
+				return api.GitHubResult{}, false, fmt.Errorf("multiple exact issue comments match pending reservation")
 			}
 			found = comment
 		}
 	}
 	if found == nil {
-		return api.GitHubResult{}, false
+		return api.GitHubResult{}, false, nil
 	}
-	return api.GitHubResult{ID: found.ID, URL: found.URL, HTMLURL: found.HTMLURL, CreatedAt: found.CreatedAt}, true
+	return api.GitHubResult{ID: found.ID, URL: found.URL, HTMLURL: found.HTMLURL, CreatedAt: found.CreatedAt}, true, nil
 }
 
 func (s *Server) handleIssueLabelsAdd(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {

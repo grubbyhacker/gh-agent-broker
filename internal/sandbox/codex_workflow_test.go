@@ -24,6 +24,28 @@ type fakeCodexIssuer struct {
 	cleanupErr error
 }
 
+func TestWriteRepairAuthorityIsReadableByContainerUID(t *testing.T) {
+	cfg := baseTestConfig(t)
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	meta := terminalTestMetadata("repair-authority-mode", StatusRunning)
+	meta.RepairPRNumber = 42
+	meta.RepairHeadRef = "agent/repair"
+	meta.RepairAdmittedHeadSHA = strings.Repeat("a", 40)
+	if err := os.MkdirAll(filepath.Join(cfg.RunsDir, meta.RunID, "input"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.writeRepairAuthority(meta); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(cfg.RunsDir, meta.RunID, "input", "repair-authority.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o444 {
+		t.Fatalf("repair authority mode=%#o, want 0444", info.Mode().Perm())
+	}
+}
+
 func (f *fakeCodexIssuer) Issue(_ context.Context, _, _ string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

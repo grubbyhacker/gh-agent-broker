@@ -880,7 +880,7 @@ func (s *Service) writeRepairAuthority(meta RunMetadata) error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(filepath.Join(s.runDir(meta.RunID), "input", "repair-authority.json"), append(b, '\n'), 0o400)
+	return atomicWriteFile(filepath.Join(s.runDir(meta.RunID), "input", "repair-authority.json"), append(b, '\n'), 0o444)
 }
 
 func (s *Service) readExecutionResult(meta RunMetadata) (executionResult, error) {

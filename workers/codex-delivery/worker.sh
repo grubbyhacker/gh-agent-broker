@@ -163,10 +163,21 @@ repair_target() {
     .pull_number == $authority[0].pull_number and .head_ref == $authority[0].head_ref and
     .expected_head_sha == $authority[0].admitted_head_sha
   ' /work/prepared/repair.json >/dev/null || fail 'untrusted repair artifact differs from broker repair authority'
-  jq -e --slurpfile authority /input/repair-authority.json '
-    .number == $authority[0].pull_number and .head_ref == $authority[0].head_ref and
-    .head_sha == $authority[0].admitted_head_sha
-  ' /work/prepared/pull.json >/dev/null || fail 'untrusted pull artifact differs from broker repair authority'
+}
+
+# The broker pull read is authoritative at the mutation boundary. Prepared
+# artifacts are inputs to execution only and must never project terminal PR
+# state. The expected lease is admitted initially and the recovery winner on
+# the one permitted retry.
+authoritative_repair_pull() {
+  local expected=$1 output=$delivery_output_path/repair-pull.json
+  gh-agent-broker-cli pull -broker "$BROKER_URL" -repo "$AGENT_REPO" \
+    -number "$(jq -r .pull_number /input/repair-authority.json)" > "$output"
+  jq -e --arg head "$(jq -r .head_ref /input/repair-authority.json)" --arg expected "$expected" '
+    .state == "open" and .head_ref == $head and .head_sha == $expected and
+    (.number | type == "number" and . > 0)
+  ' "$output" >/dev/null || return 1
+  printf '%s' "$output"
 }
 
 verify_validated_candidate_tree() {
@@ -261,6 +272,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
       candidate_head_sha=$(jq -r .candidate_head_sha /work/recovery/recovery-validation.json)
     fi
     stage='leased repair push'
+	 authoritative_repair_pull "$expected_head" >/dev/null || fail 'authoritative repair pull no longer matches the leased head'
     push_error=/tmp/codex-repair-push.stderr
     if ! trusted_git push --quiet --force-with-lease="refs/heads/${repair_head}:${expected_head}" \
       origin "HEAD:refs/heads/${repair_head}" 2>"$push_error"; then
@@ -275,7 +287,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 	 delivered_tree_sha=$(trusted_git rev-parse 'HEAD^{tree}')
 	 [[ "$delivered_tree_sha" == "$validated_tree_sha" ]] || fail 'delivered tree differs from validated tree'
     delivered_branch="$repair_head"
-    pull_request=$(jq '{number,html_url,url}' /work/prepared/pull.json)
+	 authoritative_repair_pull "$delivered_head_sha" >/dev/null || fail 'authoritative repair pull did not advance to delivered head'
+    pull_request=$(jq '{number,html_url,url}' "$delivery_output_path/repair-pull.json")
     stage='completed repair'
     write_result ready_for_review 'Codex CI repair was delivered to the existing pull request after validation of the exact candidate tree' "$pull_request"
     cp /output/codex-final.txt /output/final-summary.md
