@@ -34,14 +34,20 @@ GET /v1/repos/{owner}/{repo}/pulls/{number}/ci-observation
 ```
 
 The response is a point-in-time authoritative GitHub observation containing
-the pull, commit status, latest check runs, Actions workflow runs and jobs for
-the head, and branch protection when GitHub exposes it. It intentionally contains no
-broker-computed required-check verdict. Signal Plane must correlate the
+the pull, complete bounded/paginated commit statuses and latest check runs,
+failed check annotations, Actions workflow runs and jobs for the head, plus
+the active branch rules (rulesets first through GitHub's branch-rules endpoint)
+and legacy branch protection when exposed. `required_ci` is extracted only
+from those active GitHub rules and `aggregate_state` is one of `pending`,
+`success`, `code_failure`, or `infrastructure_failure`; there is no second
+broker check-name configuration. Pagination or an explicit observation bound
+fails closed. Signal Plane must correlate the
 response to `pull.head_sha == expected_head_sha`; a changed head is a new
 semantic lifecycle state, not a retry of the old repair.
 
-The preparation worker selects completed unsuccessful jobs from that observation
-(at most four; more fails closed) and calls for each:
+The preparation worker selects every completed unsuccessful Actions job from
+that observation, subject to explicit safety bounds of 32 items and 64 MiB in
+aggregate (excess fails visibly), and calls for each:
 
 ```
 GET /v1/repos/{owner}/{repo}/actions/jobs/{job_id}/log
@@ -49,7 +55,8 @@ GET /v1/repos/{owner}/{repo}/actions/jobs/{job_id}/log
 
 The broker follows only an approved HTTPS GitHub Actions signed-log redirect,
 does not return the URL, and returns the whole log only when it is valid UTF-8
-and at most 16 MiB. Oversize or invalid logs fail closed rather than truncate.
+and at most 16 MiB. Responses include `size_bytes`, `sha256`, and `byte_limit`.
+Oversize or invalid logs fail closed rather than truncate.
 Logs are untrusted repository input and must not be copied wholesale into
 GitHub comments.
 
@@ -67,14 +74,28 @@ git push --force-with-lease=refs/heads/<head-ref>:<expected_head_sha> \
 ```
 
 The broker smart-HTTP preflight independently checks that advertised expected
-old SHA. Deletion and unconditional overwrite remain denied. A lease rejection
-is a stale-head outcome: Signal Plane must reconcile GitHub and decide whether
-the new head merits a new admitted attempt; it must never reinterpret it as a
-successful repair.
+old SHA. Deletion and unconditional overwrite remain denied. On one exact-lease
+rejection, the same already-authorized deterministic delivery fetches the
+winning head, applies the already-produced candidate diff, reruns the reviewed
+final validation, binds provenance to the resulting exact tree, and retries
+with the winner SHA as a new exact lease. This recovery is bounded to one
+attempt and never launches or charges a second model attempt. An integration or
+validation failure remains a visible delivery failure; it is not deferred to
+Signal Plane.
 
-GitHub reporting uses the existing idempotent mutation endpoints. Signal Plane
-owns issue escalation/comment outbox delivery and supplies a stable
-`Idempotency-Key`; the broker replays the recorded result for exact retries.
+Both an initial and repair `ready_for_review` terminal result include the
+exact `pull_request.number`, `branch`, `delivered_head_sha`, and
+`validated_tree_sha` fields. The terminal projection rejects a Codex result
+without these bounded values, so replay/reconciliation carries the same PR,
+head, and validated-tree identity.
+
+GitHub reporting uses the existing idempotent mutation endpoints. `POST
+/v1/repos/{owner}/{repo}/issues/{number}/comments` requires one visible-ASCII
+`Idempotency-Key` header. It is durable and namespaced by principal, operation,
+repository, and issue; the broker records a request digest, replays only an
+identical request, and returns `409 idempotency_key_conflict` for reuse with
+different content or target. Signal Plane owns issue escalation/comment outbox
+delivery and supplies that stable key.
 Public comments must be terse, specific, and free of raw logs, credentials,
 internal IDs, or hidden reasoning.
 
@@ -82,5 +103,10 @@ Required broker policy operations for the repair identity are `pull.read`,
 `ci.read`, `actions.logs.read`, `status.read`, `checks.read`, Git receive-pack
 for the reviewed PR-head namespace, and the existing selected reporting
 operation. vps-ops must grant the GitHub App narrowly sufficient read access
-for Actions logs and branch/ruleset requirement observation; this repository
-does not change App installation permissions.
+for Actions logs and branch/ruleset requirement observation. Confirmed official
+GitHub App endpoints are `GET /repos/{owner}/{repo}/rules/branches/{branch}`
+(rulesets), `GET /repos/{owner}/{repo}/branches/{branch}/protection`, commit
+statuses/check-runs, Actions runs/jobs/logs, and issue comments; these require
+only the corresponding repository read permissions plus Issues/Pull requests
+write for reporting. This repository does not change App installation
+permissions.

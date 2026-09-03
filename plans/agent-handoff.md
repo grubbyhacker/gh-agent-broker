@@ -39,11 +39,17 @@ The vps-ops and Signal Plane schema/network handoff is
 included.
 
 The failed-CI repair extension is specified by
-`docs/repository-agent-ci-repair-contract.md`. It adds broker-owned
-authoritative observation and bounded Actions-log input, checks out an existing
-PR at an admitted SHA, seals final validation to the candidate tree, and uses
-an exact-SHA force-with-lease for delivery. Signal Plane owns durable event
-correlation, attempt/deadline accounting, and idempotent issue escalation.
+`docs/repository-agent-ci-repair-contract.md`. It adds broker-owned complete,
+bounded/fail-closed CI observation (active branch rules/rulesets, statuses,
+checks, Actions and log metadata), checks out an existing PR at an admitted
+SHA, seals final validation to the candidate tree, and uses an exact-SHA
+force-with-lease for delivery. One lease race is recovered in that same
+deterministic delivery by integrating the sealed diff onto the winning head
+and revalidating it; it never starts another Codex attempt. Ready terminal
+results carry exact PR, branch, delivered-head, and validated-tree identities.
+Signal Plane owns durable event correlation, attempt/deadline accounting, and
+idempotent issue escalation; issue comment keys are durable exact-request keys
+namespaced by principal, operation, repository, and issue.
 
 Sandbox-broker now seals a durable `repository-task-terminal-result/v1` at
 terminal finalization. `GET /v1/runs/{run_id}/terminal-result` requires the

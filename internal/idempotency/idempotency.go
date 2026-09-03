@@ -15,10 +15,11 @@ import (
 var mu sync.Mutex
 
 type Record struct {
-	CreatedAt time.Time       `json:"created_at"`
-	Operation string          `json:"operation"`
-	Status    int             `json:"status"`
-	Body      json.RawMessage `json:"body"`
+	CreatedAt     time.Time       `json:"created_at"`
+	Operation     string          `json:"operation"`
+	RequestDigest string          `json:"request_digest,omitempty"`
+	Status        int             `json:"status"`
+	Body          json.RawMessage `json:"body"`
 }
 
 type state struct {

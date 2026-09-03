@@ -218,13 +218,30 @@ type CheckRuns struct {
 }
 
 type CheckRun struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	Status      string `json:"status"`
-	Conclusion  string `json:"conclusion,omitempty"`
-	HTMLURL     string `json:"html_url,omitempty"`
-	StartedAt   string `json:"started_at,omitempty"`
-	CompletedAt string `json:"completed_at,omitempty"`
+	ID          int64        `json:"id"`
+	Name        string       `json:"name"`
+	Status      string       `json:"status"`
+	Conclusion  string       `json:"conclusion,omitempty"`
+	HTMLURL     string       `json:"html_url,omitempty"`
+	StartedAt   string       `json:"started_at,omitempty"`
+	CompletedAt string       `json:"completed_at,omitempty"`
+	Output      *CheckOutput `json:"output,omitempty"`
+}
+
+// CheckOutput carries GitHub's bounded failure annotation summary. Individual
+// annotations are intentionally fetched only when a check has failed.
+type CheckOutput struct {
+	Title       string            `json:"title,omitempty"`
+	Summary     string            `json:"summary,omitempty"`
+	Annotations []CheckAnnotation `json:"annotations,omitempty"`
+}
+
+type CheckAnnotation struct {
+	Path            string `json:"path,omitempty"`
+	StartLine       int    `json:"start_line,omitempty"`
+	EndLine         int    `json:"end_line,omitempty"`
+	AnnotationLevel string `json:"annotation_level,omitempty"`
+	Message         string `json:"message,omitempty"`
 }
 
 // CIObservation is the broker's read-only, point-in-time view of the CI state
@@ -237,6 +254,16 @@ type CIObservation struct {
 	WorkflowRuns     []WorkflowRun `json:"workflow_runs"`
 	WorkflowJobs     []WorkflowJob `json:"workflow_jobs"`
 	BranchProtection any           `json:"branch_protection,omitempty"`
+	BranchRules      any           `json:"branch_rules,omitempty"`
+	RequiredCI       []RequiredCI  `json:"required_ci"`
+	AggregateState   string        `json:"aggregate_state"`
+}
+
+// RequiredCI is derived solely from the active GitHub branch rules. It is not
+// a separately configured check-name allowlist.
+type RequiredCI struct {
+	Identity string `json:"identity"`
+	Kind     string `json:"kind"`
 }
 
 type WorkflowRun struct {
@@ -268,5 +295,6 @@ type ActionsJobLog struct {
 	JobID     int64  `json:"job_id"`
 	SizeBytes int64  `json:"size_bytes"`
 	SHA256    string `json:"sha256"`
+	ByteLimit int64  `json:"byte_limit"`
 	Text      string `json:"text"`
 }

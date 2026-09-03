@@ -29,6 +29,8 @@ write_result() {
   fi
   if [[ "$outcome" == 'ready_for_review' ]]; then
     [[ -n "$pull_request" ]] || return 1
+    [[ "${delivered_head_sha:-}" =~ ^[a-f0-9]{40}$ ]] || return 1
+    [[ "${validated_tree_sha:-}" =~ ^[a-f0-9]{40}$ ]] || return 1
   else
     pull_request='null'
   fi
@@ -36,10 +38,11 @@ write_result() {
   result_tmp=$(mktemp "$result_dir/.result.json.XXXXXX") || return 1
   if ! mise exec -- jq -n --arg version "$worker_result_schema_version" --arg outcome "$outcome" --arg detail "$detail" --arg stage "$stage" \
     --arg run_id "$AGENT_RUN_ID" --arg repository "$AGENT_REPO" --arg base_branch "$AGENT_BASE_BRANCH" \
-    --arg branch "$AGENT_BRANCH" --arg verification "$verification" --arg verify_task "${AGENT_VERIFY_TASK:-}" \
+    --arg branch "${delivered_branch:-$AGENT_BRANCH}" --arg verification "$verification" --arg verify_task "${AGENT_VERIFY_TASK:-}" \
     --arg manifest_status "${manifest_status:-not_checked}" --arg task "${worker_result_task:-}" --arg worker "${worker_result_worker:-}" \
+    --arg delivered_head_sha "${delivered_head_sha:-}" --arg validated_tree_sha "${validated_tree_sha:-}" \
     --argjson pull_request "$pull_request" \
-    '{version: $version, outcome: $outcome, detail: $detail, stage: $stage, run_id: $run_id, repository: $repository, base_branch: $base_branch, branch: $branch, verification: {status: $verification}, verify_task: $verify_task, dependency_manifest: $manifest_status} + if $task == "" then {} else {task: $task} end + if $worker == "" then {} else {worker: $worker} end + if $outcome == "ready_for_review" then {pull_request: $pull_request} else {} end' \
+    '{version: $version, outcome: $outcome, detail: $detail, stage: $stage, run_id: $run_id, repository: $repository, base_branch: $base_branch, branch: $branch, verification: {status: $verification}, verify_task: $verify_task, dependency_manifest: $manifest_status} + if $task == "" then {} else {task: $task} end + if $worker == "" then {} else {worker: $worker} end + if $outcome == "ready_for_review" then {pull_request: $pull_request, delivered_head_sha: $delivered_head_sha, validated_tree_sha: $validated_tree_sha} else {} end' \
     > "$result_tmp"; then
     rm -f -- "$result_tmp"
     return 1

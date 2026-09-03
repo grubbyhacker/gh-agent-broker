@@ -7,11 +7,42 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"gh-agent-broker/internal/api"
 	"gh-agent-broker/internal/config"
+	"gh-agent-broker/internal/idempotency"
 )
+
+func TestAggregateCIUsesActiveRuleIdentities(t *testing.T) {
+	rules := map[string]any{"rules": []any{map[string]any{"parameters": map[string]any{"required_status_checks": map[string]any{"contexts": []any{"unit"}, "checks": []any{map[string]any{"context": "integration"}}}}}}}
+	required := requiredCI(rules)
+	if len(required) != 2 || aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "unit", State: "success"}}}, api.CheckRuns{CheckRuns: []api.CheckRun{{Name: "integration", Status: "completed", Conclusion: "failure"}}}) != "code_failure" {
+		t.Fatalf("required CI aggregation did not use active rules: %#v", required)
+	}
+	if got := aggregateCI(required, api.CommitStatus{Statuses: []api.StatusContext{{Context: "unit", State: "success"}}}, api.CheckRuns{}); got != "pending" {
+		t.Fatalf("missing required check = %q, want pending", got)
+	}
+}
+
+func TestExactCommentIdempotencyReplaysOnlySameDigestAcrossReload(t *testing.T) {
+	cfg := config.IdempotencyConfig{StatePath: filepath.Join(t.TempDir(), "idempotency.json")}
+	key, digest := "issue.comment:agent:owner/repo:7:key", "digest-a"
+	if err := idempotency.Store(cfg, key, idempotency.Record{Operation: "issue.comment", RequestDigest: digest, Status: http.StatusCreated, Body: []byte(`{"id":9}`)}); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	replayed, conflict, err := replayExactIdempotent(recorder, cfg, key, "issue.comment", digest)
+	if err != nil || !replayed || conflict || recorder.Code != http.StatusCreated {
+		t.Fatalf("same request did not replay: replay=%v conflict=%v err=%v", replayed, conflict, err)
+	}
+	replayed, conflict, err = replayExactIdempotent(httptest.NewRecorder(), cfg, key, "issue.comment", "digest-b")
+	if err != nil || replayed || !conflict {
+		t.Fatalf("different request reused key: replay=%v conflict=%v err=%v", replayed, conflict, err)
+	}
+}
 
 func TestParseGitPath(t *testing.T) {
 	repo, suffix, ok := parseGitPath("/git/owner/repo.git/info/refs")

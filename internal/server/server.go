@@ -4,6 +4,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1383,8 +1384,104 @@ func (s *Server) handleCIObservation(w http.ResponseWriter, r *http.Request, rep
 		if err != nil {
 			return nil, err
 		}
-		return api.CIObservation{Pull: pull, CommitStatus: status, CheckRuns: checks, WorkflowRuns: runs, WorkflowJobs: jobs, BranchProtection: protection}, nil
+		rules, err := gh.BranchRules(appName, repo, pull.BaseRef, inst)
+		if err != nil {
+			return nil, err
+		}
+		required := requiredCI(rules, protection)
+		return api.CIObservation{Pull: pull, CommitStatus: status, CheckRuns: checks, WorkflowRuns: runs, WorkflowJobs: jobs, BranchProtection: protection, BranchRules: rules, RequiredCI: required, AggregateState: aggregateCI(required, status, checks)}, nil
 	})
+}
+
+// requiredCI reads identities from GitHub's active rules responses; it never
+// consults a broker-side check-name list.
+func requiredCI(values ...any) []api.RequiredCI {
+	seen := map[string]bool{}
+	var out []api.RequiredCI
+	var walk func(any)
+	add := func(kind, name string) {
+		name = strings.TrimSpace(name)
+		key := kind + ":" + name
+		if name != "" && !seen[key] {
+			seen[key] = true
+			out = append(out, api.RequiredCI{Kind: kind, Identity: name})
+		}
+	}
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			if contexts, ok := x["contexts"].([]any); ok {
+				for _, c := range contexts {
+					if s, ok := c.(string); ok {
+						add("status", s)
+					}
+				}
+			}
+			if checks, ok := x["checks"].([]any); ok {
+				for _, c := range checks {
+					if m, ok := c.(map[string]any); ok {
+						if s, ok := m["context"].(string); ok {
+							add("check", s)
+						}
+						if s, ok := m["name"].(string); ok {
+							add("check", s)
+						}
+					}
+				}
+			}
+			for _, child := range x {
+				walk(child)
+			}
+		case []any:
+			for _, child := range x {
+				walk(child)
+			}
+		}
+	}
+	for _, v := range values {
+		walk(v)
+	}
+	return out
+}
+
+// aggregateCI has the repository-neutral vocabulary consumed by Signal Plane.
+// A required identity missing from the complete authoritative observation is
+// pending, which is deliberately fail-closed.
+func aggregateCI(required []api.RequiredCI, statuses api.CommitStatus, checks api.CheckRuns) string {
+	if len(required) == 0 {
+		return "pending"
+	}
+	statusByName := map[string]string{}
+	for _, s := range statuses.Statuses {
+		statusByName[s.Context] = strings.ToLower(s.State)
+	}
+	checkByName := map[string]api.CheckRun{}
+	for _, c := range checks.CheckRuns {
+		checkByName[c.Name] = c
+	}
+	result := "success"
+	for _, required := range required {
+		state, conclusion := "", ""
+		if required.Kind == "status" {
+			state = statusByName[required.Identity]
+		} else if check, ok := checkByName[required.Identity]; ok {
+			state, conclusion = strings.ToLower(check.Status), strings.ToLower(check.Conclusion)
+		}
+		if state == "" || state == "queued" || state == "in_progress" || state == "pending" || state == "requested" || state == "waiting" {
+			result = "pending"
+			continue
+		}
+		if state == "error" || conclusion == "startup_failure" || conclusion == "timed_out" {
+			return "infrastructure_failure"
+		}
+		if state == "failure" || conclusion == "failure" || conclusion == "cancelled" || conclusion == "action_required" {
+			return "code_failure"
+		}
+		if state != "success" && conclusion != "success" && conclusion != "neutral" && conclusion != "skipped" {
+			result = "pending"
+		}
+	}
+	return result
 }
 
 func (s *Server) handleActionsRunJobs(w http.ResponseWriter, r *http.Request, repo, rawRunID string) {
@@ -1503,6 +1600,22 @@ func replayIdempotent(w http.ResponseWriter, cfg config.IdempotencyConfig, key s
 	return true, nil
 }
 
+// replayExactIdempotent makes a caller-provided semantic key safe to retain
+// across restarts: the same key may replay only the exact same request.
+func replayExactIdempotent(w http.ResponseWriter, cfg config.IdempotencyConfig, key, operation, digest string) (replayed, conflict bool, err error) {
+	rec, ok, err := idempotency.Load(cfg, key)
+	if err != nil || !ok {
+		return false, false, err
+	}
+	if rec.Operation != operation || rec.RequestDigest == "" || rec.RequestDigest != digest {
+		return false, true, nil
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(rec.Status)
+	_, err = w.Write(rec.Body)
+	return true, false, err
+}
+
 func writeIdempotentJSON(w http.ResponseWriter, cfg config.IdempotencyConfig, key, operation string, status int, out interface{}) error {
 	body, err := json.Marshal(out)
 	if err != nil {
@@ -1517,6 +1630,20 @@ func writeIdempotentJSON(w http.ResponseWriter, cfg config.IdempotencyConfig, ke
 		return err
 	}
 	return nil
+}
+
+func writeExactIdempotentJSON(w http.ResponseWriter, cfg config.IdempotencyConfig, key, operation, digest string, status int, out interface{}) error {
+	body, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	if err := idempotency.Store(cfg, key, idempotency.Record{Operation: operation, RequestDigest: digest, Status: status, Body: body}); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, err = w.Write(body)
+	return err
 }
 
 func idempotencyHeader(r *http.Request) string {
@@ -1789,10 +1916,23 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		return
 	}
 	key := idempotencyHeader(r)
-	extra := map[string]interface{}{"issue_number": issueNumber, "idempotency_key": key}
-	if replayed, err := replayIdempotent(w, cfg.Idempotency, key); err != nil {
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "idempotency_key_required", Message: "Idempotency-Key header is required for issue comments", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	requestDigest := commentRequestDigest(repo, issueNumber, req)
+	if requestDigest == "" {
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "invalid_request", Message: "issue comment request cannot be fingerprinted", OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	}
+	scopedKey := "issue.comment:" + principal.ID + ":" + repo + ":" + issueNumber + ":" + key
+	extra := map[string]interface{}{"issue_number": issueNumber, "idempotency_key": key, "request_digest": requestDigest}
+	if replayed, conflict, err := replayExactIdempotent(w, cfg.Idempotency, scopedKey, "issue.comment", requestDigest); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: policy.DecisionDeny, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: policy.DecisionDeny})
+		return
+	} else if conflict {
+		writeJSON(w, http.StatusConflict, api.ErrorResponse{Code: "idempotency_key_conflict", Message: "Idempotency-Key was already used for different issue-comment content or target", OperationID: opID, Decision: policy.DecisionDeny})
 		return
 	} else if replayed {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Result: "idempotent_replay", Extra: extra})
@@ -1805,12 +1945,25 @@ func (s *Server) handleCommentCreate(w http.ResponseWriter, r *http.Request, rep
 		return
 	}
 	extra["comment_id"] = ghResult.ID
-	if err := writeIdempotentJSON(w, cfg.Idempotency, key, "issue.comment", http.StatusCreated, ghResult); err != nil {
+	if err := writeExactIdempotentJSON(w, cfg.Idempotency, scopedKey, "issue.comment", requestDigest, http.StatusCreated, ghResult); err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error(), Extra: extra})
 		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(err.Error()), OperationID: opID, Decision: result.Decision})
 		return
 	}
 	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "issue.comment", Repo: repo, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: ghResult.HTMLURL, Result: "ok", Extra: extra})
+}
+
+func commentRequestDigest(repo, issue string, req api.CommentCreateRequest) string {
+	b, err := json.Marshal(struct {
+		Repo    string                   `json:"repo"`
+		Issue   string                   `json:"issue"`
+		Request api.CommentCreateRequest `json:"request"`
+	}{repo, issue, req})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Server) handleIssueLabelsAdd(w http.ResponseWriter, r *http.Request, repo, rawNumber string) {

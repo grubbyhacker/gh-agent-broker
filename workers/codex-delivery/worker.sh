@@ -8,6 +8,7 @@ readonly delivery_output_path="${CODEX_DELIVERY_OUTPUT_PATH:-/output}"
 stage='initializing'
 verification_status='not_run'
 manifest_status='match'
+readonly repair_recovery_limit=1
 
 if [[ -r "$worker_result_lib_path" ]]; then
   source "$worker_result_lib_path"
@@ -150,6 +151,33 @@ verify_validated_candidate_tree() {
     fail 'delivered candidate tree differs from the tree that passed final validation'
 }
 
+# A lease race is recovered inside this already-authorized deterministic
+# delivery. The model is never invoked again: we apply its sealed diff to the
+# winning head, re-run the reviewed validation, bind a new tree provenance, and
+# make exactly one new exact-lease attempt.
+recover_stale_repair_lease() {
+  local repair_head=$1 winner tree
+  stage='stale repair lease recovery'
+  trusted_git fetch --quiet origin "refs/heads/${repair_head}"
+  winner=$(trusted_git rev-parse FETCH_HEAD)
+  [[ "$winner" =~ ^[a-f0-9]{40}$ ]] || fail 'stale repair winner head is invalid'
+  trusted_git reset --hard --quiet "$winner"
+  trusted_git apply --index --whitespace=nowarn /work/execution/diff.patch ||
+    fail 'stale repair candidate cannot be integrated with winning head'
+  stage='stale repair final validation'
+  (cd /work/repo && env -u BROKER_AGENT_ID -u BROKER_AGENT_SECRET -u BROKER_URL mise run "$AGENT_VERIFY_TASK") > /work/execution/stale-recovery-verify.txt 2>&1 ||
+    fail 'integrated stale repair candidate failed reviewed final validation'
+  tree=$(trusted_git write-tree)
+  [[ "$tree" =~ ^[a-f0-9]{40}$ ]] || fail 'integrated stale repair tree is invalid'
+  validated_tree_sha="$tree"
+  trusted_git commit --quiet -m "Implement Codex issue task ${AGENT_RUN_ID} (stale-lease recovery)"
+  [[ "$(trusted_git rev-parse 'HEAD^{tree}')" == "$validated_tree_sha" ]] ||
+    fail 'integrated repair commit tree differs from revalidated tree'
+  stage='stale repair leased retry'
+  trusted_git push --quiet --force-with-lease="refs/heads/${repair_head}:${winner}" \
+    origin "HEAD:refs/heads/${repair_head}" || fail 'stale repair leased retry was rejected'
+}
+
 reconcile_pull_request() {
   local marker=$1 list="$delivery_output_path/pull-request-reconcile.json" count
   gh-agent-broker-cli pulls -broker "$BROKER_URL" -repo "$AGENT_REPO" -state all \
@@ -189,12 +217,18 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   trusted_git add --all
   trusted_git commit --quiet -m "Implement Codex issue task ${AGENT_RUN_ID}"
   verify_validated_candidate_tree
+  validated_tree_sha=$(jq -r .validated_tree_sha /work/execution/execution.json)
   if repair_target; then
     repair_head=$(jq -r .head_ref /work/prepared/repair.json)
     expected_head=$(jq -r .expected_head_sha /work/prepared/repair.json)
     stage='leased repair push'
-    trusted_git push --quiet --force-with-lease="refs/heads/${repair_head}:${expected_head}" \
-      origin "HEAD:refs/heads/${repair_head}"
+    if ! trusted_git push --quiet --force-with-lease="refs/heads/${repair_head}:${expected_head}" \
+      origin "HEAD:refs/heads/${repair_head}"; then
+      (( repair_recovery_limit == 1 )) || fail 'stale repair recovery bound is invalid'
+      recover_stale_repair_lease "$repair_head"
+    fi
+    delivered_head_sha=$(trusted_git rev-parse HEAD)
+    delivered_branch="$repair_head"
     pull_request=$(jq '{number,html_url,url}' /work/prepared/pull.json)
     stage='completed repair'
     write_result ready_for_review 'Codex CI repair was delivered to the existing pull request after validation of the exact candidate tree' "$pull_request"
@@ -202,6 +236,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     exit 0
   fi
   trusted_git push --quiet origin "HEAD:${AGENT_BRANCH}"
+  delivered_head_sha=$(trusted_git rev-parse HEAD)
+  delivered_branch="$AGENT_BRANCH"
   marker="<!-- gh-agent-broker-codex-run:${AGENT_RUN_ID} -->"
   stage='pull request reconciliation'
   if ! reconcile_pull_request "$marker"; then

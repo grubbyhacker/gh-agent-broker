@@ -805,8 +805,11 @@ func (c *Client) GetCommitStatus(appName, repo string, installationID int64, sha
 		TotalCount int                 `json:"total_count"`
 		Statuses   []api.StatusContext `json:"statuses"`
 	}
-	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/status", installationID, nil, &out); err != nil {
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/status?per_page=100", installationID, nil, &out); err != nil {
 		return api.CommitStatus{}, err
+	}
+	if out.TotalCount > len(out.Statuses) {
+		return api.CommitStatus{}, fmt.Errorf("GitHub commit status observation is paginated beyond the broker bound")
 	}
 	return api.CommitStatus{State: out.State, SHA: out.SHA, TotalCount: out.TotalCount, Statuses: out.Statuses}, nil
 }
@@ -816,31 +819,58 @@ func (c *Client) ListCheckRuns(appName, repo string, installationID int64, sha s
 	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/commits/"+url.PathEscape(sha)+"/check-runs?"+query.Encode(), installationID, nil, &out); err != nil {
 		return api.CheckRuns{}, err
 	}
+	if out.TotalCount > len(out.CheckRuns) {
+		return api.CheckRuns{}, fmt.Errorf("GitHub check-run observation is paginated beyond the broker bound")
+	}
 	return out, nil
 }
 
 func (c *Client) ListWorkflowRuns(appName, repo string, installationID int64, sha string) ([]api.WorkflowRun, error) {
-	var out struct {
+	q := url.Values{"head_sha": []string{sha}, "per_page": []string{"100"}}
+	var page struct {
+		TotalCount   int               `json:"total_count"`
 		WorkflowRuns []api.WorkflowRun `json:"workflow_runs"`
 	}
-	q := url.Values{"head_sha": []string{sha}, "per_page": []string{"100"}}
-	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/actions/runs?"+q.Encode(), installationID, nil, &out); err != nil {
+	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/actions/runs?"+q.Encode(), installationID, nil, &page); err != nil {
 		return nil, err
 	}
-	return out.WorkflowRuns, nil
+	if page.TotalCount > len(page.WorkflowRuns) {
+		return nil, fmt.Errorf("GitHub workflow-run observation is paginated beyond the broker bound")
+	}
+	return page.WorkflowRuns, nil
 }
 
 func (c *Client) ListWorkflowJobs(appName, repo string, installationID, runID int64) ([]api.WorkflowJob, error) {
 	var out struct {
-		Jobs []api.WorkflowJob `json:"jobs"`
+		TotalCount int               `json:"total_count"`
+		Jobs       []api.WorkflowJob `json:"jobs"`
 	}
 	if err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/actions/runs/"+strconv.FormatInt(runID, 10)+"/jobs?per_page=100", installationID, nil, &out); err != nil {
 		return nil, err
+	}
+	if out.TotalCount > len(out.Jobs) {
+		return nil, fmt.Errorf("GitHub workflow-job observation is paginated beyond the broker bound")
 	}
 	for i := range out.Jobs {
 		out.Jobs[i].RunID = runID
 	}
 	return out.Jobs, nil
+}
+
+// BranchRules is the least-privilege GitHub endpoint for the complete active
+// rules that apply to a branch. Older GitHub installations may not expose it;
+// callers can then use the legacy branch-protection response as a fallback.
+func (c *Client) BranchRules(appName, repo, branch string, installationID int64) (any, error) {
+	var out any
+	err := c.doJSON(appName, http.MethodGet, "/repos/"+repo+"/rules/branches/"+url.PathEscape(branch), installationID, nil, &out)
+	if err != nil {
+		var apiErr APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return map[string]any{}, nil
+		}
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *Client) BranchProtection(appName, repo, branch string, installationID int64) (any, error) {
@@ -917,7 +947,7 @@ func (c *Client) GetWorkflowJobLog(appName, repo string, installationID, jobID i
 		return api.ActionsJobLog{}, errors.New("actions job log is not valid UTF-8")
 	}
 	digest := sha256.Sum256(body)
-	return api.ActionsJobLog{JobID: jobID, SizeBytes: int64(len(body)), SHA256: fmt.Sprintf("%x", digest), Text: string(body)}, nil
+	return api.ActionsJobLog{JobID: jobID, SizeBytes: int64(len(body)), SHA256: fmt.Sprintf("%x", digest), ByteLimit: maxBytes, Text: string(body)}, nil
 }
 
 func safeActionsLogHost(host string) bool {

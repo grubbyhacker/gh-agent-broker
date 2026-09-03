@@ -299,7 +299,7 @@ func (s *Service) readWorkerTerminalOutput(meta RunMetadata) (map[string]any, st
 func validateCodexWorkerResult(meta RunMetadata, result map[string]any) error {
 	for field, expected := range map[string]string{
 		"version": workerResultVersion, "run_id": meta.RunID, "repository": meta.Repo,
-		"base_branch": meta.BaseBranch, "branch": meta.Branch,
+		"base_branch": meta.BaseBranch,
 	} {
 		if actual, ok := result[field].(string); !ok || actual != expected {
 			return fmt.Errorf("codex result.json %s does not match broker metadata", field)
@@ -331,7 +331,28 @@ func validateCodexWorkerResult(meta RunMetadata, result map[string]any) error {
 		!htmlURLOK || htmlURL == "" || !apiURLOK || apiURL == "" {
 		return fmt.Errorf("codex ready_for_review pull request identity is invalid")
 	}
+	worker, workerOK := result["worker"].(string)
+	if workerOK && worker == "codex" {
+		for _, field := range []string{"branch", "delivered_head_sha", "validated_tree_sha"} {
+			value, ok := result[field].(string)
+			if !ok || (field == "branch" && value == "") || (field != "branch" && !isLowerHexSHA(value)) {
+				return fmt.Errorf("codex ready_for_review result is missing valid %s", field)
+			}
+		}
+	}
 	return nil
+}
+
+func isLowerHexSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) normalizeLegacyWorkerResult(meta RunMetadata, result map[string]any, redactor Redactor) error {

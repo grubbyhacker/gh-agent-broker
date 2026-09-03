@@ -6,7 +6,8 @@ readonly dependency_manifest_path="${AGENT_IMAGE_DEPENDENCY_MANIFEST_PATH:-/usr/
 readonly baked_workspace_path="${AGENT_IMAGE_WORKSPACE:-/workspace}"
 readonly issue_context_byte_limit=24576
 readonly issue_comment_limit=30
-readonly repair_log_job_limit=4
+readonly repair_log_item_limit=32
+readonly repair_log_total_byte_limit=$((64 * 1024 * 1024))
 stage='initializing'
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
@@ -175,16 +176,20 @@ prepare_repair_pull() {
   mapfile -t failed_jobs < <(jq -r '
     .workflow_jobs[]? | select(.status == "completed" and (.conclusion | ascii_downcase | IN("success", "skipped", "neutral")) | not) | .id
   ' /work/prepared/ci-observation.json)
-  (( ${#failed_jobs[@]} <= repair_log_job_limit )) || fail 'authoritative CI observation has too many failed jobs for the bounded repair-log contract'
+  (( ${#failed_jobs[@]} <= repair_log_item_limit )) || fail 'authoritative CI observation has too many failed jobs for the explicit repair-log item bound'
   mkdir -p /work/prepared/actions-logs
+  local total_log_bytes=0 log_size
   for job_id in "${failed_jobs[@]}"; do
     gh-agent-broker-cli actions-job-log -broker "$BROKER_URL" -repo "$AGENT_REPO" -job-id "$job_id" \
       > "/work/prepared/actions-logs/${job_id}.json"
-    jq -e --argjson job "$job_id" '.job_id == $job and (.text | type == "string") and (.size_bytes | type == "number") and (.sha256 | test("^[a-f0-9]{64}$"))' \
+    jq -e --argjson job "$job_id" '.job_id == $job and (.text | type == "string") and (.size_bytes | type == "number" and . >= 0) and (.byte_limit | type == "number" and . > 0) and (.size_bytes <= .byte_limit) and (.sha256 | test("^[a-f0-9]{64}$"))' \
       "/work/prepared/actions-logs/${job_id}.json" >/dev/null || fail 'bounded Actions log response is malformed'
+    log_size=$(jq -r .size_bytes "/work/prepared/actions-logs/${job_id}.json")
+    total_log_bytes=$((total_log_bytes + log_size))
+    (( total_log_bytes <= repair_log_total_byte_limit )) || fail 'authoritative Actions logs exceed the explicit aggregate byte bound'
   done
-  jq -n --argjson number "$number" --arg head_ref "$head_ref" --arg expected "$expected" \
-    '{pull_number:$number,head_ref:$head_ref,expected_head_sha:$expected}' > /work/prepared/repair.json
+  jq -n --argjson number "$number" --arg head_ref "$head_ref" --arg expected "$expected" --argjson total "$total_log_bytes" \
+    '{pull_number:$number,head_ref:$head_ref,expected_head_sha:$expected,actions_log_item_limit:32,actions_log_total_byte_limit:67108864,actions_log_total_bytes:$total}' > /work/prepared/repair.json
   chmod -R a-w /work/prepared/actions-logs
   chmod 0444 /work/prepared/pull.json /work/prepared/ci-observation.json /work/prepared/repair.json
 }

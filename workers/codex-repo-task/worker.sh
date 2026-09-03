@@ -502,6 +502,8 @@ build_prompt() {
     printf '%s\n' '- Work only in this prepared repository checkout.'
     printf '%s\n' '- Do not push, create a pull request, or contact GitHub; a separate deterministic container owns delivery.'
     printf '%s\n' '- Do not create commits or refs. Leave only working-tree changes.'
+
+    printf '%s\n' '- For CI repair, start with the smallest useful reproduction; expand by the affected boundary. Use expensive suites as confirmation, and narrow again after repeated broad failures. CI observation informs diagnosis; it is not a rigid test scheduler.'
     printf '%s\n' '- Web search, plugins, MCP, updates, analytics, and general internet are disabled.'
   } > "$prompt_path"
 }
