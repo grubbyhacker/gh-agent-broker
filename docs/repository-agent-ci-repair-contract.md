@@ -78,13 +78,15 @@ git push --force-with-lease=refs/heads/<head-ref>:<expected_head_sha> \
 The broker smart-HTTP preflight independently checks that advertised expected
 old SHA. Deletion and unconditional overwrite remain denied. A credentialed
 delivery process never runs repository-controlled validation. On the sole
-positive stale-lease diagnostic (`stale info`), it records a bounded
-`codex-stale-lease/v1` handoff; Signal Plane must restart the same attempt in a
-credential-free integration-and-validation container and only then launch a
-new delivery process with the winner SHA as its exact lease. Transport,
-authentication, hook, and upstream-policy failures are terminal delivery
-failures and must not create a recovery handoff. Recovery is bounded to one
-attempt and never launches or charges a second model attempt.
+positive stale-lease diagnostic (`stale info`), it records a bounded,
+broker-sealed `codex-stale-lease/v3` handoff. The broker keeps the admitted
+attempt running, starts its distinct credential-free recovery template, and,
+after successful integration and validation, starts a fresh delivery process
+with the winner SHA as its exact lease. Signal Plane observes only the eventual
+terminal result; it does not launch or model stale-lease recovery as a separate
+state. Transport, authentication, hook, and upstream-policy failures are
+terminal delivery failures and must not create a recovery handoff. Recovery is
+bounded to one attempt and never launches or charges a second model attempt.
 
 Both an initial and repair `ready_for_review` terminal result include the
 exact `pull_request.number`, `branch`, `delivered_head_sha`, and
