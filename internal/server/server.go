@@ -1662,16 +1662,31 @@ func classifyGitHubReadError(err error) (int, string, string, map[string]interfa
 			extra["github_error_category"] = "rate_limited"
 			extra["broker_status"] = http.StatusTooManyRequests
 			return http.StatusTooManyRequests, "github_rate_limited", "rate_limited", extra
+		case apiErr.StatusCode == http.StatusRequestTimeout:
+			extra["github_error_code"] = "github_timeout"
+			extra["github_error_category"] = "timeout"
+			extra["broker_status"] = http.StatusGatewayTimeout
+			return http.StatusGatewayTimeout, "github_timeout", "timeout", extra
+		case apiErr.StatusCode == http.StatusUnauthorized:
+			extra["github_error_code"] = "github_unauthorized"
+			extra["github_error_category"] = "authentication"
+			extra["broker_status"] = http.StatusBadGateway
+			return http.StatusBadGateway, "github_unauthorized", "authentication", extra
 		case apiErr.StatusCode == http.StatusForbidden:
 			extra["github_error_code"] = "github_forbidden"
 			extra["github_error_category"] = "forbidden"
 			extra["broker_status"] = http.StatusForbidden
 			return http.StatusForbidden, "github_forbidden", "forbidden", extra
-		default:
+		case apiErr.StatusCode >= http.StatusInternalServerError:
 			extra["github_error_code"] = "github_error"
 			extra["github_error_category"] = "upstream_error"
 			extra["broker_status"] = http.StatusBadGateway
 			return http.StatusBadGateway, "github_error", "upstream_error", extra
+		default:
+			extra["github_error_code"] = "github_rejected"
+			extra["github_error_category"] = "rejected"
+			extra["broker_status"] = http.StatusBadGateway
+			return http.StatusBadGateway, "github_rejected", "rejected", extra
 		}
 	}
 	if isTimeoutError(err) {

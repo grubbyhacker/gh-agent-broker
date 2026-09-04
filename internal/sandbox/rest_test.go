@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRESTLaunchProfileAuthzAndLaunch(t *testing.T) {
@@ -462,6 +463,57 @@ func restTestConfig(t *testing.T) Config {
 		},
 	}
 	return cfg
+}
+
+func TestRunResumeRequiresIdempotencyAndPreservesLaunchAuthorization(t *testing.T) {
+	cfg := codexWorkflowTestConfig(t)
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"signal-plane": {Token: "signal-secret", AllowedProfiles: []string{"terra-medium-v1"}, AllowedActions: []string{"launch", "status"}, RunScope: "owned"},
+	}
+	cfg.ApplyDefaults()
+	runtime := newFakeRuntime()
+	service := newRESTTestService(t, cfg, runtime, testAudit(t))
+	service.SetCodexCredentialIssuer(&fakeCodexIssuer{})
+	in := cfg.LaunchProfiles["terra-medium-v1"].LaunchAgentInput
+	in.Profile = "terra-medium-v1"
+	in.Parameters = map[string]any{"issue_number": 42, "source_delivery_id": "delivery-42"}
+	launched, err := service.LaunchProfile(context.Background(), "signal-plane", "terra-medium-v1", "launch-key", "launch-fingerprint", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, found, err := service.launchIntents.LookupRun(context.Background(), launched.RunID)
+	if err != nil || !found {
+		t.Fatalf("lookup found=%t err=%v", found, err)
+	}
+	intent.Metadata.Status = StatusWaitingExternal
+	intent.Metadata.Phase = codexPhasePreparationTerm
+	intent.Metadata.ExternalWait = &ExternalWait{Service: "github", Phase: "preparation", Operation: "pull.read", Reason: "unavailable", Since: time.Now().UTC()}
+	if err := service.persistCodexIntent(context.Background(), &intent, intent.Metadata, intentStateWaitingExternal); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewRESTHandler(service)
+	missing := restRequest(http.MethodPost, "/v1/runs/"+launched.RunID+"/resume", "signal-secret", []byte(`{"max_runtime_seconds":30}`))
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missing)
+	if missingResponse.Code != http.StatusPreconditionRequired {
+		t.Fatalf("missing key status=%d body=%s", missingResponse.Code, missingResponse.Body.String())
+	}
+	request := restLaunchRequest("/v1/runs/"+launched.RunID+"/resume", "signal-secret", "resume-key", []byte(`{"max_runtime_seconds":30}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("resume status=%d body=%s", response.Code, response.Body.String())
+	}
+	var output LaunchAgentOutput
+	if err := json.Unmarshal(response.Body.Bytes(), &output); err != nil || output.RunID != launched.RunID || output.Replay {
+		t.Fatalf("resume output=%+v err=%v", output, err)
+	}
+	replay := restLaunchRequest("/v1/runs/"+launched.RunID+"/resume", "signal-secret", "resume-key", []byte(`{"max_runtime_seconds":30}`))
+	replayResponse := httptest.NewRecorder()
+	handler.ServeHTTP(replayResponse, replay)
+	if replayResponse.Code != http.StatusOK || !strings.Contains(replayResponse.Body.String(), `"replay":true`) {
+		t.Fatalf("replay status=%d body=%s", replayResponse.Code, replayResponse.Body.String())
+	}
 }
 
 func restRequest(method, target, token string, body []byte) *http.Request {

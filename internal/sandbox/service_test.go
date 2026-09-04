@@ -337,7 +337,11 @@ func TestTimeoutPreservesPartialArtifactsAndCleanupWorks(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(outputDir, "partial.txt"), []byte("partial output"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	service.watchTimeout(context.Background(), out.RunID, time.Now().Add(10*time.Millisecond))
+	deadline := time.Now().Add(10 * time.Millisecond)
+	service.mu.Lock()
+	service.runs[out.RunID].Deadline = deadline
+	service.mu.Unlock()
+	service.watchTimeout(context.Background(), out.RunID, deadline)
 	status, err := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
 	if err != nil {
 		t.Fatalf("GetAgentStatus() error = %v", err)
@@ -385,7 +389,11 @@ func TestTimeoutWatcherPreservesAlreadyExitedFailure(t *testing.T) {
 	}
 	runtime.finish(out.RunID, 2, "permission denied")
 
-	service.watchTimeout(context.Background(), out.RunID, time.Now().Add(10*time.Millisecond))
+	deadline := time.Now().Add(10 * time.Millisecond)
+	service.mu.Lock()
+	service.runs[out.RunID].Deadline = deadline
+	service.mu.Unlock()
+	service.watchTimeout(context.Background(), out.RunID, deadline)
 	status, err := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
 	if err != nil {
 		t.Fatalf("GetAgentStatus() error = %v", err)
@@ -517,7 +525,11 @@ func TestTimeoutStopAlreadyStoppedFinalizesExitedRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LaunchAgent() error = %v", err)
 	}
-	service.watchTimeout(context.Background(), out.RunID, time.Now().Add(10*time.Millisecond))
+	deadline := time.Now().Add(10 * time.Millisecond)
+	service.mu.Lock()
+	service.runs[out.RunID].Deadline = deadline
+	service.mu.Unlock()
+	service.watchTimeout(context.Background(), out.RunID, deadline)
 	status, err := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
 	if err != nil {
 		t.Fatalf("GetAgentStatus() error = %v", err)

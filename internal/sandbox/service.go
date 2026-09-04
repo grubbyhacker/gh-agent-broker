@@ -20,14 +20,15 @@ import (
 )
 
 const (
-	StatusPending   = "pending"
-	StatusRunning   = "running"
-	StatusCompleted = "completed"
-	StatusStopped   = "stopped"
-	StatusFailed    = "failed"
-	StatusTimedOut  = "timed_out"
-	StatusCancelled = "cancelled"
-	StatusCleaned   = "cleaned"
+	StatusPending         = "pending"
+	StatusRunning         = "running"
+	StatusWaitingExternal = "waiting_external"
+	StatusCompleted       = "completed"
+	StatusStopped         = "stopped"
+	StatusFailed          = "failed"
+	StatusTimedOut        = "timed_out"
+	StatusCancelled       = "cancelled"
+	StatusCleaned         = "cleaned"
 )
 
 const (
@@ -90,65 +91,82 @@ type runtimeFileWriter interface {
 }
 
 type RunMetadata struct {
-	RunID                    string           `json:"run_id"`
-	Profile                  string           `json:"profile,omitempty"`
-	Principal                string           `json:"principal,omitempty"`
-	IdempotencyKeyDigest     string           `json:"idempotency_key_digest,omitempty"`
-	RequestFingerprint       string           `json:"request_fingerprint,omitempty"`
-	LaunchConfigVersion      string           `json:"launch_config_version,omitempty"`
-	Template                 string           `json:"template"`
-	Repo                     string           `json:"repo"`
-	BaseBranch               string           `json:"base_branch"`
-	Branch                   string           `json:"branch"`
-	Task                     string           `json:"task"`
-	VerificationTask         string           `json:"verification_task,omitempty"`
-	Focus                    string           `json:"focus,omitempty"`
-	WorkerAgentID            string           `json:"worker_agent_id"`
-	BrokerAgentID            string           `json:"broker_agent_id"`
-	CredentialBundle         string           `json:"credential_bundle,omitempty"`
-	ContainerID              string           `json:"container_id,omitempty"`
-	Image                    string           `json:"image"`
-	ImageDigest              string           `json:"image_digest,omitempty"`
-	Status                   string           `json:"status"`
-	ExitCode                 *int             `json:"exit_code,omitempty"`
-	FinalizeReason           string           `json:"finalize_reason,omitempty"`
-	TerminalSource           string           `json:"terminal_source,omitempty"`
-	Error                    string           `json:"error,omitempty"`
-	Deliverables             []string         `json:"deliverables,omitempty"`
-	Parameters               map[string]any   `json:"parameters,omitempty"`
-	StartedAt                time.Time        `json:"started_at"`
-	Deadline                 time.Time        `json:"deadline"`
-	EndedAt                  time.Time        `json:"ended_at,omitempty"`
-	Phase                    string           `json:"phase,omitempty"`
-	PreparationContainerID   string           `json:"preparation_container_id,omitempty"`
-	ExecutionContainerID     string           `json:"execution_container_id,omitempty"`
-	DeliveryContainerID      string           `json:"delivery_container_id,omitempty"`
-	DeliveryContainerIDs     []string         `json:"delivery_container_ids,omitempty"`
-	DeliveryAttempt          int              `json:"delivery_attempt,omitempty"`
-	RecoveryContainerID      string           `json:"recovery_container_id,omitempty"`
-	RecoveryCount            int              `json:"recovery_count,omitempty"`
-	PreparationImageDigest   string           `json:"preparation_image_digest,omitempty"`
-	PreparationPlatform      string           `json:"preparation_platform,omitempty"`
-	ExecutionPlatform        string           `json:"execution_platform,omitempty"`
-	DeliveryImageDigest      string           `json:"delivery_image_digest,omitempty"`
-	DeliveryPlatform         string           `json:"delivery_platform,omitempty"`
-	PreparationStartedAt     time.Time        `json:"preparation_started_at,omitempty"`
-	PreparationEndedAt       time.Time        `json:"preparation_ended_at,omitempty"`
-	ExecutionStartedAt       time.Time        `json:"execution_started_at,omitempty"`
-	ExecutionEndedAt         time.Time        `json:"execution_ended_at,omitempty"`
-	DeliveryStartedAt        time.Time        `json:"delivery_started_at,omitempty"`
-	DeliveryEndedAt          time.Time        `json:"delivery_ended_at,omitempty"`
-	RecoveryStartedAt        time.Time        `json:"recovery_started_at,omitempty"`
-	RecoveryEndedAt          time.Time        `json:"recovery_ended_at,omitempty"`
-	RecoveryExpectedHeadSHA  string           `json:"recovery_expected_head_sha,omitempty"`
-	RecoveryWinnerHeadSHA    string           `json:"recovery_winner_head_sha,omitempty"`
-	RecoveryCandidateHeadSHA string           `json:"recovery_candidate_head_sha,omitempty"`
-	RecoveryCandidateTreeSHA string           `json:"recovery_candidate_tree_sha,omitempty"`
-	RecoverySealSHA256       string           `json:"recovery_seal_sha256,omitempty"`
-	RepairPRNumber           int              `json:"repair_pr_number,omitempty"`
-	RepairHeadRef            string           `json:"repair_head_ref,omitempty"`
-	RepairAdmittedHeadSHA    string           `json:"repair_admitted_head_sha,omitempty"`
-	Provenance               *CodexProvenance `json:"provenance,omitempty"`
+	RunID                     string            `json:"run_id"`
+	Profile                   string            `json:"profile,omitempty"`
+	Principal                 string            `json:"principal,omitempty"`
+	IdempotencyKeyDigest      string            `json:"idempotency_key_digest,omitempty"`
+	RequestFingerprint        string            `json:"request_fingerprint,omitempty"`
+	LaunchConfigVersion       string            `json:"launch_config_version,omitempty"`
+	Template                  string            `json:"template"`
+	Repo                      string            `json:"repo"`
+	BaseBranch                string            `json:"base_branch"`
+	Branch                    string            `json:"branch"`
+	Task                      string            `json:"task"`
+	VerificationTask          string            `json:"verification_task,omitempty"`
+	Focus                     string            `json:"focus,omitempty"`
+	WorkerAgentID             string            `json:"worker_agent_id"`
+	BrokerAgentID             string            `json:"broker_agent_id"`
+	CredentialBundle          string            `json:"credential_bundle,omitempty"`
+	ContainerID               string            `json:"container_id,omitempty"`
+	Image                     string            `json:"image"`
+	ImageDigest               string            `json:"image_digest,omitempty"`
+	Status                    string            `json:"status"`
+	ExitCode                  *int              `json:"exit_code,omitempty"`
+	FinalizeReason            string            `json:"finalize_reason,omitempty"`
+	TerminalSource            string            `json:"terminal_source,omitempty"`
+	Error                     string            `json:"error,omitempty"`
+	Deliverables              []string          `json:"deliverables,omitempty"`
+	Parameters                map[string]any    `json:"parameters,omitempty"`
+	StartedAt                 time.Time         `json:"started_at"`
+	Deadline                  time.Time         `json:"deadline"`
+	ExternalWait              *ExternalWait     `json:"external_wait,omitempty"`
+	ResumeRequestFingerprints map[string]string `json:"resume_request_fingerprints,omitempty"`
+	ResumeGeneration          int               `json:"resume_generation,omitempty"`
+	EndedAt                   time.Time         `json:"ended_at,omitempty"`
+	Phase                     string            `json:"phase,omitempty"`
+	PreparationContainerID    string            `json:"preparation_container_id,omitempty"`
+	PreparationContainerIDs   []string          `json:"preparation_container_ids,omitempty"`
+	PreparationAttempt        int               `json:"preparation_attempt,omitempty"`
+	ExecutionContainerID      string            `json:"execution_container_id,omitempty"`
+	DeliveryContainerID       string            `json:"delivery_container_id,omitempty"`
+	DeliveryContainerIDs      []string          `json:"delivery_container_ids,omitempty"`
+	DeliveryAttempt           int               `json:"delivery_attempt,omitempty"`
+	RecoveryContainerID       string            `json:"recovery_container_id,omitempty"`
+	RecoveryCount             int               `json:"recovery_count,omitempty"`
+	PreparationImageDigest    string            `json:"preparation_image_digest,omitempty"`
+	PreparationPlatform       string            `json:"preparation_platform,omitempty"`
+	ExecutionPlatform         string            `json:"execution_platform,omitempty"`
+	DeliveryImageDigest       string            `json:"delivery_image_digest,omitempty"`
+	DeliveryPlatform          string            `json:"delivery_platform,omitempty"`
+	PreparationStartedAt      time.Time         `json:"preparation_started_at,omitempty"`
+	PreparationEndedAt        time.Time         `json:"preparation_ended_at,omitempty"`
+	ExecutionStartedAt        time.Time         `json:"execution_started_at,omitempty"`
+	ExecutionEndedAt          time.Time         `json:"execution_ended_at,omitempty"`
+	DeliveryStartedAt         time.Time         `json:"delivery_started_at,omitempty"`
+	DeliveryEndedAt           time.Time         `json:"delivery_ended_at,omitempty"`
+	RecoveryStartedAt         time.Time         `json:"recovery_started_at,omitempty"`
+	RecoveryEndedAt           time.Time         `json:"recovery_ended_at,omitempty"`
+	RecoveryExpectedHeadSHA   string            `json:"recovery_expected_head_sha,omitempty"`
+	RecoveryWinnerHeadSHA     string            `json:"recovery_winner_head_sha,omitempty"`
+	RecoveryCandidateHeadSHA  string            `json:"recovery_candidate_head_sha,omitempty"`
+	RecoveryCandidateTreeSHA  string            `json:"recovery_candidate_tree_sha,omitempty"`
+	RecoverySealSHA256        string            `json:"recovery_seal_sha256,omitempty"`
+	RepairPRNumber            int               `json:"repair_pr_number,omitempty"`
+	RepairHeadRef             string            `json:"repair_head_ref,omitempty"`
+	RepairAdmittedHeadSHA     string            `json:"repair_admitted_head_sha,omitempty"`
+	Provenance                *CodexProvenance  `json:"provenance,omitempty"`
+}
+
+// ExternalWait is the stable, bounded projection of a worker's structured
+// report that GitHub is temporarily unavailable. It is deliberately narrower
+// than arbitrary worker failure text.
+type ExternalWait struct {
+	Service    string    `json:"service"`
+	Phase      string    `json:"phase"`
+	Operation  string    `json:"operation"`
+	Reason     string    `json:"reason"`
+	Generation int       `json:"generation"`
+	Since      time.Time `json:"since"`
 }
 
 type CodexProvenance struct {
@@ -276,6 +294,11 @@ type RunInput struct {
 	RunID string `json:"run_id"`
 }
 
+type ResumeRunInput struct {
+	RunID             string `json:"-"`
+	MaxRuntimeSeconds int    `json:"max_runtime_seconds"`
+}
+
 type LogsInput struct {
 	RunID    string `json:"run_id"`
 	MaxBytes int    `json:"max_bytes,omitempty"`
@@ -287,15 +310,16 @@ type LogsOutput struct {
 }
 
 type StatusOutput struct {
-	RunID       string              `json:"run_id"`
-	Status      string              `json:"status"`
-	Branch      string              `json:"branch,omitempty"`
-	Repo        string              `json:"repo,omitempty"`
-	ExitCode    *int                `json:"exit_code,omitempty"`
-	Error       string              `json:"error,omitempty"`
-	Deadline    time.Time           `json:"deadline,omitempty"`
-	EndedAt     *time.Time          `json:"ended_at,omitempty"`
-	Diagnostics *FailureDiagnostics `json:"diagnostics,omitempty"`
+	RunID        string              `json:"run_id"`
+	Status       string              `json:"status"`
+	Branch       string              `json:"branch,omitempty"`
+	Repo         string              `json:"repo,omitempty"`
+	ExitCode     *int                `json:"exit_code,omitempty"`
+	Error        string              `json:"error,omitempty"`
+	Deadline     time.Time           `json:"deadline,omitempty"`
+	EndedAt      *time.Time          `json:"ended_at,omitempty"`
+	Diagnostics  *FailureDiagnostics `json:"diagnostics,omitempty"`
+	ExternalWait *ExternalWait       `json:"external_wait,omitempty"`
 }
 
 type FailureDiagnostics struct {
@@ -1084,6 +1108,92 @@ func (s *Service) GetAgentStatus(ctx context.Context, in RunInput) (StatusOutput
 	return s.statusOutput(meta), nil
 }
 
+// ResumeRun resumes only a durable Codex workflow that explicitly reported
+// structured GitHub unavailability. It never creates a second model execution:
+// preparation restarts before issuance, while delivery reuses the sealed
+// execution/recovery artifacts already present in the run workspace.
+func (s *Service) ResumeRun(ctx context.Context, principal, rawKey, fingerprint string, in ResumeRunInput) (LaunchAgentOutput, error) {
+	if s.launchIntents == nil {
+		return LaunchAgentOutput{}, fmt.Errorf("durable launch intent store is unavailable")
+	}
+	digest := s.launchIntents.digestKey(rawKey)
+	unlock := s.lockLaunchIntent("codex\x00" + in.RunID)
+	defer unlock()
+	intent, found, err := s.launchIntents.LookupRun(ctx, in.RunID)
+	if err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	if !found || intent.Principal != principal {
+		return LaunchAgentOutput{}, &intentConflictError{Code: "run_not_found", Message: "run not found"}
+	}
+	meta := intent.Metadata
+	if existing, replay := meta.ResumeRequestFingerprints[digest]; replay {
+		if existing != fingerprint {
+			return LaunchAgentOutput{}, &intentConflictError{Code: "idempotency_conflict", Message: "Idempotency-Key was already used for a different canonical resume request"}
+		}
+		out, err := s.resumeLaunchIntent(ctx, &intent, false)
+		out.Replay = true
+		return out, err
+	}
+	if meta.Status != StatusWaitingExternal || meta.ExternalWait == nil || intent.State != intentStateWaitingExternal {
+		return LaunchAgentOutput{}, &intentConflictError{Code: "run_not_waiting_external", Message: "run is not waiting for an external dependency"}
+	}
+	profile, ok := s.cfg.LaunchProfiles[intent.Profile]
+	if !ok || profile.CodexIssueWorkflow == nil {
+		return LaunchAgentOutput{}, &intentConflictError{Code: "run_not_resumable", Message: "run does not use a resumable Codex workflow"}
+	}
+	tmpl, ok := s.cfg.Templates[meta.Template]
+	if !ok {
+		return LaunchAgentOutput{}, fmt.Errorf("run references unknown template %q", meta.Template)
+	}
+	limit, err := runtimeLimit(LaunchAgentInput{MaxRuntimeSeconds: in.MaxRuntimeSeconds}, tmpl)
+	if err != nil {
+		return LaunchAgentOutput{}, &launchValidationError{err: err}
+	}
+	wait := *meta.ExternalWait
+	if meta.ResumeRequestFingerprints == nil {
+		meta.ResumeRequestFingerprints = map[string]string{}
+	}
+	meta.ResumeRequestFingerprints[digest] = fingerprint
+	meta.ResumeGeneration++
+	meta.Deadline = time.Now().UTC().Add(limit)
+	meta.Status = StatusPending
+	meta.Error = ""
+	meta.ExitCode = nil
+	meta.ExternalWait = nil
+	if err := os.Remove(filepath.Join(s.runDir(meta.RunID), "output", "external-wait.json")); err != nil && !os.IsNotExist(err) {
+		return LaunchAgentOutput{}, err
+	}
+	switch wait.Phase {
+	case "preparation":
+		if err := os.RemoveAll(filepath.Join(s.runDir(meta.RunID), "work", "repo")); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		if err := os.RemoveAll(filepath.Join(s.runDir(meta.RunID), "work", "prepared")); err != nil {
+			return LaunchAgentOutput{}, err
+		}
+		meta.PreparationAttempt++
+		meta.PreparationContainerID = ""
+		meta.ContainerID = ""
+		meta.Phase = codexPhasePreparationCreate
+	case "delivery":
+		meta.DeliveryAttempt++
+		meta.DeliveryContainerID = ""
+		meta.ContainerID = ""
+		meta.Phase = codexPhaseDeliveryCreate
+	default:
+		return LaunchAgentOutput{}, fmt.Errorf("unsupported external wait phase %q", wait.Phase)
+	}
+	if err := s.persistCodexIntent(ctx, &intent, meta, intentStateCreatePending); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	out, err := s.resumeCodexIssueWorkflow(ctx, &intent, profile, false)
+	if err == nil && out.Status == StatusRunning {
+		go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
+	}
+	return out, err
+}
+
 func (s *Service) GetAgentLogs(ctx context.Context, in LogsInput) (LogsOutput, error) {
 	meta, err := s.lookupRun(in.RunID)
 	if err != nil {
@@ -1179,7 +1289,9 @@ func (s *Service) CleanupRun(ctx context.Context, in RunInput) (StatusOutput, er
 	}
 	containerIDs := []string{meta.ContainerID}
 	if meta.Provenance != nil {
-		containerIDs = append([]string{meta.PreparationContainerID, meta.ExecutionContainerID, meta.RecoveryContainerID}, meta.DeliveryContainerIDs...)
+		containerIDs = append(append([]string{}, meta.PreparationContainerIDs...), meta.ExecutionContainerID, meta.RecoveryContainerID)
+		containerIDs = append(containerIDs, meta.PreparationContainerID)
+		containerIDs = append(containerIDs, meta.DeliveryContainerIDs...)
 		containerIDs = append(containerIDs, meta.DeliveryContainerID)
 		if s.codexIssuer != nil {
 			if err := s.codexIssuer.Cleanup(meta.RunID); err != nil {
@@ -1631,6 +1743,10 @@ func (s *Service) watchTimeout(parent context.Context, runID string, deadline ti
 	<-timer.C
 	ctx, cancel := context.WithTimeout(parent, s.cfg.StopGrace.Duration+5*time.Second)
 	defer cancel()
+	meta, err := s.lookupRun(runID)
+	if err != nil || meta.Status != StatusRunning || !meta.Deadline.Equal(deadline) {
+		return
+	}
 	if _, _, err := s.finalizeTerminalRun(ctx, runID, finalizeReasonDeadline, terminalSourceTimedOut, func(meta RunMetadata) RunMetadata {
 		return s.markTimedOut(ctx, meta)
 	}); err != nil {
@@ -1996,15 +2112,16 @@ func (s *Service) statusOutput(meta RunMetadata) StatusOutput {
 		ended = &meta.EndedAt
 	}
 	out := StatusOutput{
-		RunID:       meta.RunID,
-		Status:      meta.Status,
-		Branch:      meta.Branch,
-		Repo:        meta.Repo,
-		ExitCode:    meta.ExitCode,
-		Error:       meta.Error,
-		Deadline:    meta.Deadline,
-		EndedAt:     ended,
-		Diagnostics: s.readFailureDiagnostics(meta),
+		RunID:        meta.RunID,
+		Status:       meta.Status,
+		Branch:       meta.Branch,
+		Repo:         meta.Repo,
+		ExitCode:     meta.ExitCode,
+		Error:        meta.Error,
+		Deadline:     meta.Deadline,
+		EndedAt:      ended,
+		Diagnostics:  s.readFailureDiagnostics(meta),
+		ExternalWait: meta.ExternalWait,
 	}
 	return out
 }

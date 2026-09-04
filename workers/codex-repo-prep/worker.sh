@@ -9,9 +9,39 @@ readonly issue_comment_limit=30
 readonly repair_log_item_limit=32
 readonly repair_log_total_byte_limit=$((64 * 1024 * 1024))
 stage='initializing'
+readonly broker_error_file=/tmp/codex-preparation-broker-error.json
 
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
 require_env() { [[ -n "${!1:-}" ]] || fail "missing required environment variable: $1"; }
+
+record_github_wait() {
+  local operation=$1 reason
+  [[ -f "$broker_error_file" ]] || return 1
+  reason=$(jq -r '
+    if .version != "broker-client-error/v1" then empty
+    elif .code == "github_rate_limited" and .status_code == 429 then "rate_limited"
+    elif (.code == "github_timeout" and .status_code == 504) or
+         (.code == "github_error" and .status_code == 502) then "unavailable"
+    else empty end
+  ' "$broker_error_file")
+  [[ -n "$reason" ]] || return 1
+  jq -n --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" \
+    --arg operation "$operation" --arg reason "$reason" \
+    '{version:"github-external-wait/v1",status:"waiting_external",run_id:$run,repository:$repo,
+      branch:$branch,service:"github",phase:"preparation",operation:$operation,reason:$reason}' \
+    > /output/external-wait.json
+  exit 75
+}
+
+broker_read() {
+  local operation=$1 output=$2
+  shift 2
+  rm -f -- "$broker_error_file"
+  if ! BROKER_ERROR_FILE="$broker_error_file" gh-agent-broker-cli "$@" > "$output"; then
+    record_github_wait "$operation"
+    return 1
+  fi
+}
 
 on_exit() {
   local status=$?
@@ -128,8 +158,8 @@ check_dependency_manifest() {
 ingest_issue() {
   local issue_number
   issue_number=$(jq -r '.parameters.issue_number' /input/task.json)
-  gh-agent-broker-cli issue -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$issue_number" > /work/prepared/issue.json
-  gh-agent-broker-cli issue-comments -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$issue_number" > /work/prepared/comments.json
+  broker_read issue.read /work/prepared/issue.json issue -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$issue_number"
+  broker_read issue_comments.read /work/prepared/comments.json issue-comments -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$issue_number"
   jq -e '
     type == "object" and .is_pull_request != true and .state == "open" and
     (.number | type == "number" and . > 0) and (.title | type == "string" and length > 0) and
@@ -158,7 +188,7 @@ prepare_repair_pull() {
   validate_repair_contract
   number=$(jq -r '.parameters.repair_pr_number' /input/task.json)
   expected=$(jq -r '.parameters.expected_head_sha' /input/task.json)
-  gh-agent-broker-cli pull -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number" > /work/prepared/pull.json
+  broker_read pull.read /work/prepared/pull.json pull -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number"
   jq -e --arg expected "$expected" '
     .state == "open" and (.number | type == "number" and . > 0) and
     (.head_ref | type == "string" and length > 0) and .head_sha == $expected and
@@ -167,10 +197,13 @@ prepare_repair_pull() {
   head_ref=$(jq -r .head_ref /work/prepared/pull.json)
   head_sha=$(jq -r .head_sha /work/prepared/pull.json)
   git check-ref-format --branch "$head_ref" >/dev/null || fail 'pull request head branch is invalid'
-  git fetch --quiet origin "refs/heads/${head_ref}"
+  if ! git fetch --quiet origin "refs/heads/${head_ref}"; then
+    broker_read pull.read /tmp/codex-preparation-pull-probe.json pull -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number"
+    fail 'broker Git fetch of the admitted pull request head failed while GitHub REST remained available'
+  fi
   [[ "$(git rev-parse FETCH_HEAD)" == "$head_sha" ]] || fail 'broker checkout does not match admitted pull request head'
   git checkout --quiet -B "$AGENT_BRANCH" FETCH_HEAD
-  gh-agent-broker-cli ci-observation -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number" -head-sha "$expected" > /work/prepared/ci-observation.json
+  broker_read ci.observe /work/prepared/ci-observation.json ci-observation -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$number" -head-sha "$expected"
   jq -e --arg expected "$expected" '.requested_head_sha == $expected and .pull.head_sha == $expected' /work/prepared/ci-observation.json >/dev/null ||
     fail 'authoritative CI observation no longer matches admitted pull request head'
   mapfile -t failed_jobs < <(jq -r '
@@ -180,8 +213,8 @@ prepare_repair_pull() {
   mkdir -p /work/prepared/actions-logs
   local total_log_bytes=0 log_size
   for job_id in "${failed_jobs[@]}"; do
-    gh-agent-broker-cli actions-job-log -broker "$BROKER_URL" -repo "$AGENT_REPO" -job-id "$job_id" \
-      > "/work/prepared/actions-logs/${job_id}.json"
+    broker_read actions_job_log.read "/work/prepared/actions-logs/${job_id}.json" actions-job-log \
+      -broker "$BROKER_URL" -repo "$AGENT_REPO" -job-id "$job_id"
     jq -e --argjson job "$job_id" '.job_id == $job and (.text | type == "string") and (.size_bytes | type == "number" and . >= 0) and (.byte_limit | type == "number" and . > 0) and (.size_bytes <= .byte_limit) and (.sha256 | test("^[a-f0-9]{64}$"))' \
       "/work/prepared/actions-logs/${job_id}.json" >/dev/null || fail 'bounded Actions log response is malformed'
     log_size=$(jq -r .size_bytes "/work/prepared/actions-logs/${job_id}.json")
@@ -211,7 +244,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   git check-ref-format --branch "$AGENT_BASE_BRANCH" >/dev/null || fail 'invalid base branch'
   git remote add origin placeholder
   gh-agent-broker-cli configure -broker "$BROKER_URL" -repo "$AGENT_REPO" -remote origin > /output/broker-remote.txt
-  git fetch --quiet origin "$AGENT_BASE_BRANCH"
+  if ! git fetch --quiet origin "$AGENT_BASE_BRANCH"; then
+    issue_number=$(jq -r '.parameters.issue_number' /input/task.json)
+    broker_read issue.read /tmp/codex-preparation-issue-probe.json issue -broker "$BROKER_URL" -repo "$AGENT_REPO" -number "$issue_number"
+    fail 'broker Git fetch of the base branch failed while GitHub REST remained available'
+  fi
   git checkout --quiet -B "$AGENT_BRANCH" FETCH_HEAD
   git config user.name "${GIT_AUTHOR_NAME:-Codex Repository Task Worker}"
   git config user.email "${GIT_AUTHOR_EMAIL:-codex-repo-task-worker@users.noreply.github.com}"

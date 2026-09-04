@@ -9,6 +9,8 @@ stage='initializing'
 verification_status='not_run'
 manifest_status='match'
 readonly repair_recovery_limit=1
+readonly broker_error_file=/tmp/codex-delivery-broker-error.json
+reconcile_read_succeeded=0
 
 if [[ -r "$worker_result_lib_path" ]]; then
   source "$worker_result_lib_path"
@@ -17,6 +19,35 @@ else
 fi
 fail() { printf '%s: %s\n' "$worker_name" "$*" >&2; exit 1; }
 require_env() { [[ -n "${!1:-}" ]] || fail "missing required environment variable: $1"; }
+
+record_github_wait() {
+  local operation=$1 reason
+  [[ -f "$broker_error_file" ]] || return 1
+  reason=$(jq -r '
+    if .version != "broker-client-error/v1" then empty
+    elif .code == "github_rate_limited" and .status_code == 429 then "rate_limited"
+    elif (.code == "github_timeout" and .status_code == 504) or
+         (.code == "github_error" and .status_code == 502) then "unavailable"
+    else empty end
+  ' "$broker_error_file")
+  [[ -n "$reason" ]] || return 1
+  jq -n --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" \
+    --arg operation "$operation" --arg reason "$reason" \
+    '{version:"github-external-wait/v1",status:"waiting_external",run_id:$run,repository:$repo,
+      branch:$branch,service:"github",phase:"delivery",operation:$operation,reason:$reason}' \
+    > /output/external-wait.json
+  exit 75
+}
+
+broker_read() {
+  local operation=$1 output=$2
+  shift 2
+  rm -f -- "$broker_error_file"
+  if ! BROKER_ERROR_FILE="$broker_error_file" gh-agent-broker-cli "$@" > "$output"; then
+    record_github_wait "$operation"
+    return 1
+  fi
+}
 trusted_git() {
   local -a git_environment=(
     "PATH=$PATH" HOME=/nonexistent LANG=C LC_ALL=C GIT_CONFIG_NOSYSTEM=1
@@ -107,7 +138,7 @@ seal_repository_git_config() {
 }
 
 restore_repository_authority() {
-  local expected_head git_dir expected_git_dir current_refs
+  local expected_head git_dir expected_git_dir current_refs current_head current_tree sealed_tree
   if [[ -f /work/recovery/recovery-validation.json ]]; then
     jq -e --arg run "$AGENT_RUN_ID" --arg repo "$AGENT_REPO" --arg branch "$AGENT_BRANCH" '
       .version == "codex-recovery-validation/v1" and .status == "passed" and .run_id == $run and .repository == $repo and .branch == $branch and
@@ -121,12 +152,24 @@ restore_repository_authority() {
     return
   fi
   expected_head=$(jq -r .workspace_head /work/prepared/preparation.json)
+  current_head=$(trusted_git -C /work/repo rev-parse HEAD)
+  current_tree=$(trusted_git -C /work/repo rev-parse 'HEAD^{tree}')
+  sealed_tree=$(jq -r .validated_tree_sha /work/execution/execution.json)
   seal_repository_git_config /work/repo
   git_dir=$(trusted_git -C /work/repo rev-parse --absolute-git-dir)
   expected_git_dir="$(cd /work/repo && pwd -P)/.git"
   [[ "$git_dir" == "$expected_git_dir" && -d "$git_dir" && ! -L "$git_dir" &&
     -f "$git_dir/HEAD" && ! -L "$git_dir/HEAD" ]] ||
     fail 'workspace Git directory or HEAD is not an ordinary trusted path'
+  if [[ "$current_head" != "$expected_head" ]]; then
+    [[ "$current_tree" == "$sealed_tree" ]] || fail 'resumed delivery candidate tree differs from the sealed validated tree'
+    [[ "$(trusted_git -C /work/repo rev-parse "${current_head}^")" == "$expected_head" ]] ||
+      fail 'resumed delivery candidate is not based on the admitted head'
+    [[ -z "$(trusted_git -C /work/repo status --porcelain)" ]] || fail 'resumed delivery candidate workspace is dirty'
+    trusted_git -C /work/repo remote add origin placeholder
+    (cd /work/repo && trusted_broker_configure) > /output/broker-remote.txt
+    return
+  fi
   [[ "$(trusted_git -C /work/repo rev-parse HEAD)" == "$expected_head" ]] || fail 'workspace HEAD changed after preparation'
   [[ "$(trusted_git -C /work/repo symbolic-ref --short HEAD)" == "$AGENT_BRANCH" ]] || fail 'workspace branch changed after preparation'
   current_refs=$(trusted_git -C /work/repo for-each-ref --format='%(refname) %(objectname) %(symref)' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
@@ -170,9 +213,9 @@ repair_target() {
 # state. The expected lease is admitted initially and the recovery winner on
 # the one permitted retry.
 authoritative_repair_pull() {
-  local expected=$1 output=$delivery_output_path/repair-pull.json
-  gh-agent-broker-cli pull -broker "$BROKER_URL" -repo "$AGENT_REPO" \
-    -number "$(jq -r .pull_number /input/repair-authority.json)" > "$output"
+  local expected=$1 operation=${2:-pull.read} output=$delivery_output_path/repair-pull.json
+  broker_read "$operation" "$output" pull -broker "$BROKER_URL" -repo "$AGENT_REPO" \
+    -number "$(jq -r .pull_number /input/repair-authority.json)" || return 1
   jq -e --arg head "$(jq -r .head_ref /input/repair-authority.json)" --arg expected "$expected" '
     .state == "open" and .head_ref == $head and .head_sha == $expected and
     (.number | type == "number" and . > 0)
@@ -220,8 +263,10 @@ record_stale_repair_lease() {
 
 reconcile_pull_request() {
   local marker=$1 list="$delivery_output_path/pull-request-reconcile.json" count
-  gh-agent-broker-cli pulls -broker "$BROKER_URL" -repo "$AGENT_REPO" -state all \
-    -head-prefix "$AGENT_BRANCH" -body-marker "$marker" > "$list"
+  reconcile_read_succeeded=0
+  broker_read pull.reconcile "$list" pulls -broker "$BROKER_URL" -repo "$AGENT_REPO" -state all \
+    -head-prefix "$AGENT_BRANCH" -body-marker "$marker" || return 1
+  reconcile_read_succeeded=1
   jq --arg head "$AGENT_BRANCH" --arg base "$AGENT_BASE_BRANCH" --arg marker "$marker" \
     '[.[] | select(.head_ref == $head and .base_ref == $base and (.body | contains($marker)))]' \
     "$list" > "$list.exact"
@@ -240,12 +285,14 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     AGENT_BRANCH AGENT_RUN_ID; do require_env "$name"; done
   trap on_exit EXIT
   [[ "$delivery_output_path" == /output ]] || fail 'delivery output path is fixed by the reviewed template'
+  rm -f -- /output/external-wait.json
   reject_codex_authority
   validate_results
   restore_repository_authority
   verification_status='passed'
   cd /work/repo
-  if trusted_git diff --no-ext-diff --quiet &&
+  if [[ "$(trusted_git rev-parse HEAD)" == "$(jq -r .workspace_head /work/prepared/preparation.json)" ]] &&
+    trusted_git diff --no-ext-diff --quiet &&
     trusted_git diff --no-ext-diff --cached --quiet &&
     [[ -z "$(trusted_git status --porcelain)" ]]; then
     stage='completed without changes'
@@ -258,8 +305,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     candidate_head_sha=$(jq -r .candidate_head_sha /work/recovery/recovery-validation.json)
     validated_tree_sha=$(jq -r .validated_tree_sha /work/recovery/recovery-validation.json)
   else
-    trusted_git add --all
-    trusted_git commit --quiet -m "Implement Codex issue task ${AGENT_RUN_ID}"
+    if [[ -n "$(trusted_git status --porcelain)" ]]; then
+      trusted_git add --all
+      trusted_git commit --quiet -m "Implement Codex issue task ${AGENT_RUN_ID}"
+    fi
     candidate_head_sha=$(trusted_git rev-parse HEAD)
     validated_tree_sha=$(jq -r .validated_tree_sha /work/execution/execution.json)
   fi
@@ -272,22 +321,38 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
       candidate_head_sha=$(jq -r .candidate_head_sha /work/recovery/recovery-validation.json)
     fi
     stage='leased repair push'
-	 authoritative_repair_pull "$expected_head" >/dev/null || fail 'authoritative repair pull no longer matches the leased head'
+    if authoritative_repair_pull "$candidate_head_sha" >/dev/null; then
+      delivered_head_sha="$candidate_head_sha"
+      expected_old_head_sha="$expected_head"
+      delivered_tree_sha=$(trusted_git rev-parse 'HEAD^{tree}')
+      [[ "$delivered_tree_sha" == "$validated_tree_sha" ]] || fail 'delivered tree differs from validated tree'
+      delivered_branch="$repair_head"
+      pull_request=$(jq '{number,html_url,url}' "$delivery_output_path/repair-pull.json")
+      stage='completed reconciled repair'
+      write_result ready_for_review 'Codex CI repair was already delivered to the existing pull request at the validated candidate tree' "$pull_request"
+      cp /output/codex-final.txt /output/final-summary.md
+      exit 0
+    fi
+    authoritative_repair_pull "$expected_head" >/dev/null || fail 'authoritative repair pull no longer matches the leased head'
     push_error=/tmp/codex-repair-push.stderr
     if ! trusted_git push --quiet --force-with-lease="refs/heads/${repair_head}:${expected_head}" \
       origin "HEAD:refs/heads/${repair_head}" 2>"$push_error"; then
-      (( repair_recovery_limit == 1 )) || fail 'stale repair recovery bound is invalid'
-      if record_stale_repair_lease "$repair_head" "$expected_head" "$push_error"; then
-        fail 'stale repair lease requires credential-free recovery validation'
+      # A dropped response can hide a successful update. Reconcile the exact
+      # candidate before interpreting any push failure or considering recovery.
+      if ! authoritative_repair_pull "$candidate_head_sha" git.push >/dev/null; then
+        (( repair_recovery_limit == 1 )) || fail 'stale repair recovery bound is invalid'
+        if record_stale_repair_lease "$repair_head" "$expected_head" "$push_error"; then
+          fail 'stale repair lease requires credential-free recovery validation'
+        fi
+        fail 'repair leased push failed (not a positively identified stale lease)'
       fi
-      fail 'repair leased push failed (not a positively identified stale lease)'
     fi
     delivered_head_sha=$(trusted_git rev-parse HEAD)
-	 expected_old_head_sha="$expected_head"
-	 delivered_tree_sha=$(trusted_git rev-parse 'HEAD^{tree}')
-	 [[ "$delivered_tree_sha" == "$validated_tree_sha" ]] || fail 'delivered tree differs from validated tree'
+    expected_old_head_sha="$expected_head"
+    delivered_tree_sha=$(trusted_git rev-parse 'HEAD^{tree}')
+    [[ "$delivered_tree_sha" == "$validated_tree_sha" ]] || fail 'delivered tree differs from validated tree'
     delivered_branch="$repair_head"
-	 authoritative_repair_pull "$delivered_head_sha" >/dev/null || fail 'authoritative repair pull did not advance to delivered head'
+    authoritative_repair_pull "$delivered_head_sha" >/dev/null || fail 'authoritative repair pull did not advance to delivered head'
     pull_request=$(jq '{number,html_url,url}' "$delivery_output_path/repair-pull.json")
     stage='completed repair'
     write_result ready_for_review 'Codex CI repair was delivered to the existing pull request after validation of the exact candidate tree' "$pull_request"
@@ -296,23 +361,36 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   fi
   trusted_git push --quiet origin "HEAD:${AGENT_BRANCH}"
   delivered_head_sha=$(trusted_git rev-parse HEAD)
-	 expected_old_head_sha=$(jq -r .workspace_head /work/prepared/preparation.json)
-	 delivered_tree_sha=$(trusted_git rev-parse 'HEAD^{tree}')
-	 [[ "$delivered_tree_sha" == "$validated_tree_sha" ]] || fail 'delivered tree differs from validated tree'
+  expected_old_head_sha=$(jq -r .workspace_head /work/prepared/preparation.json)
+  delivered_tree_sha=$(trusted_git rev-parse 'HEAD^{tree}')
+  [[ "$delivered_tree_sha" == "$validated_tree_sha" ]] || fail 'delivered tree differs from validated tree'
   delivered_branch="$AGENT_BRANCH"
   marker="<!-- gh-agent-broker-codex-run:${AGENT_RUN_ID} -->"
   stage='pull request reconciliation'
   if ! reconcile_pull_request "$marker"; then
+    (( reconcile_read_succeeded == 1 )) || fail 'authoritative pull request reconciliation failed'
     pr_title="${AGENT_PR_TITLE:-Codex issue implementation}"
     pr_body="${AGENT_PR_BODY:-Codex issue task completed for run ${AGENT_RUN_ID}.}"
     pr_body="${pr_body}"$'\n\n'"${marker}"
     stage='pull request creation'
-    if ! gh-agent-broker-cli pr -broker "$BROKER_URL" -repo "$AGENT_REPO" -title "$pr_title" \
+    rm -f -- "$broker_error_file"
+    if ! BROKER_ERROR_FILE="$broker_error_file" gh-agent-broker-cli pr -broker "$BROKER_URL" -repo "$AGENT_REPO" -title "$pr_title" \
       -head "$AGENT_BRANCH" -base "$AGENT_BASE_BRANCH" -body "$pr_body" \
       -metadata "Agent-Id=${BROKER_AGENT_ID}" -metadata "Run-Id=${AGENT_RUN_ID}" \
       > /output/pull-request.json; then
+      create_error=/tmp/codex-delivery-create-error.json
+      [[ ! -f "$broker_error_file" ]] || cp -- "$broker_error_file" "$create_error"
       stage='ambiguous pull request reconciliation'
-      reconcile_pull_request "$marker" || fail 'pull request creation failed and exact reconciliation found no match'
+      if ! reconcile_pull_request "$marker"; then
+        if (( reconcile_read_succeeded == 0 )); then
+          record_github_wait pull.reconcile
+          fail 'pull request creation failed and authoritative reconciliation was unavailable'
+        fi
+        [[ ! -f "$create_error" ]] || mv -f -- "$create_error" "$broker_error_file"
+        record_github_wait pull.create
+        fail 'pull request creation failed and exact reconciliation found no match'
+      fi
+      rm -f -- "$create_error"
     fi
   fi
   pull_request=$(read_pull_request) || fail 'broker pull request response is invalid'

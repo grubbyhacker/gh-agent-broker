@@ -559,6 +559,16 @@ func doRequest(method, broker, path, agentID, secret string, body interface{}) {
 }
 
 func doRequestWithHeaders(method, broker, path, agentID, secret string, body interface{}, headers map[string]string) {
+	errorFile := os.Getenv("BROKER_ERROR_FILE")
+	if errorFile != "" {
+		if errorFile != "/tmp/codex-preparation-broker-error.json" && errorFile != "/tmp/codex-delivery-broker-error.json" {
+			fatal(fmt.Errorf("BROKER_ERROR_FILE is not a reviewed worker diagnostic path"))
+		}
+		// #nosec G703 -- errorFile is restricted to the two exact reviewed paths above.
+		if err := os.Remove(errorFile); err != nil && !os.IsNotExist(err) {
+			fatal(err)
+		}
+	}
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -592,10 +602,38 @@ func doRequestWithHeaders(method, broker, path, agentID, secret string, body int
 		fatal(err)
 	}
 	if resp.StatusCode >= 300 {
+		if err := writeBrokerErrorFile(errorFile, resp.StatusCode, b); err != nil {
+			fatal(err)
+		}
 		fmt.Fprintln(os.Stderr, string(b))
 		os.Exit(1)
 	}
 	fmt.Println(string(b))
+}
+
+func writeBrokerErrorFile(path string, statusCode int, body []byte) error {
+	if path == "" {
+		return nil
+	}
+	var response struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return fmt.Errorf("decode broker error response: %w", err)
+	}
+	if response.Code == "" {
+		return fmt.Errorf("broker error response omitted code")
+	}
+	payload, err := json.Marshal(struct {
+		Version    string `json:"version"`
+		StatusCode int    `json:"status_code"`
+		Code       string `json:"code"`
+	}{Version: "broker-client-error/v1", StatusCode: statusCode, Code: response.Code})
+	if err != nil {
+		return err
+	}
+	// #nosec G703 -- callers restrict path to reviewed worker paths; direct tests use a test-owned temporary path.
+	return os.WriteFile(path, append(payload, '\n'), 0o600)
 }
 
 func idempotencyHeaders(key string) map[string]string {

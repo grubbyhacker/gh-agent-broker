@@ -46,6 +46,165 @@ func TestWriteRepairAuthorityIsReadableByContainerUID(t *testing.T) {
 	}
 }
 
+func TestCodexPreparationGitHubWaitResumesSameRunWithoutModelCharge(t *testing.T) {
+	cfg := codexWorkflowTestConfig(t)
+	cfg.ApplyDefaults()
+	cfg.StampLoaded(time.Now().UTC())
+	runtime := newFakeRuntime()
+	store, err := OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close launch intent store: %v", err)
+		}
+	})
+	service := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	issuer := &fakeCodexIssuer{}
+	service.SetCodexCredentialIssuer(issuer)
+	in := cfg.LaunchProfiles["terra-medium-v1"].LaunchAgentInput
+	in.Profile = "terra-medium-v1"
+	in.Parameters = map[string]any{"issue_number": 42, "source_delivery_id": "delivery-42"}
+	out, err := service.LaunchProfile(context.Background(), "signal-plane", "terra-medium-v1", "launch-key", "launch-fingerprint", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := githubExternalWaitReport{
+		Version: "github-external-wait/v1", Status: StatusWaitingExternal, RunID: out.RunID,
+		Repository: in.Repo, Branch: out.Branch, Service: "github", Phase: "preparation",
+		Operation: "ci.observe", Reason: "unavailable",
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.RunsDir, out.RunID, "output", "external-wait.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime.finish(out.RunID+"-prep", 75, "")
+	waitFor(t, func() bool {
+		status, statusErr := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
+		return statusErr == nil && status.Status == StatusWaitingExternal
+	})
+	status, err := service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil || status.ExternalWait == nil || status.ExternalWait.Operation != "ci.observe" || status.EndedAt != nil {
+		t.Fatalf("waiting status=%+v err=%v", status, err)
+	}
+	service.watchTimeout(context.Background(), out.RunID, time.Now().Add(10*time.Millisecond))
+	status, err = service.GetAgentStatus(context.Background(), RunInput{RunID: out.RunID})
+	if err != nil || status.Status != StatusWaitingExternal {
+		t.Fatalf("inactive deadline terminalized external wait: status=%+v err=%v", status, err)
+	}
+	recovered := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	recovered.SetCodexCredentialIssuer(issuer)
+	if err := recovered.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	if len(runtime.specs) != 1 {
+		t.Fatalf("restart advanced waiting run: specs=%+v", runtime.specs)
+	}
+	runtime.mu.Unlock()
+	service = recovered
+	issuer.mu.Lock()
+	if issuer.issues != 0 {
+		t.Fatalf("preparation wait charged model execution: issues=%d", issuer.issues)
+	}
+	issuer.mu.Unlock()
+	canonical := []byte(`{"max_runtime_seconds":30}`)
+	resumed, err := service.ResumeRun(context.Background(), "signal-plane", "resume-key", resumeRequestFingerprint(canonical), ResumeRunInput{RunID: out.RunID, MaxRuntimeSeconds: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.RunID != out.RunID || resumed.Status != StatusRunning || resumed.Replay {
+		t.Fatalf("resume=%+v", resumed)
+	}
+	runtime.mu.Lock()
+	if len(runtime.specs) != 2 || runtime.specs[1].RunID != out.RunID+"-prep-2" {
+		t.Fatalf("resume specs=%+v", runtime.specs)
+	}
+	runtime.mu.Unlock()
+	replayed, err := service.ResumeRun(context.Background(), "signal-plane", "resume-key", resumeRequestFingerprint(canonical), ResumeRunInput{RunID: out.RunID, MaxRuntimeSeconds: 30})
+	if err != nil || !replayed.Replay || replayed.RunID != out.RunID {
+		t.Fatalf("replay=%+v err=%v", replayed, err)
+	}
+}
+
+func TestCodexDeliveryResumeReusesSealedPhaseAndNeverStartsCodex(t *testing.T) {
+	cfg := codexWorkflowTestConfig(t)
+	cfg.ApplyDefaults()
+	cfg.StampLoaded(time.Now().UTC())
+	runtime := newFakeRuntime()
+	store, err := OpenLaunchIntentStore(context.Background(), cfg.LaunchIntentStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close launch intent store: %v", err)
+		}
+	})
+	service := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	issuer := &fakeCodexIssuer{}
+	service.SetCodexCredentialIssuer(issuer)
+	in := cfg.LaunchProfiles["terra-medium-v1"].LaunchAgentInput
+	in.Profile = "terra-medium-v1"
+	in.Parameters = map[string]any{"issue_number": 42, "source_delivery_id": "delivery-42"}
+	out, err := service.LaunchProfile(context.Background(), "signal-plane", "terra-medium-v1", "delivery-launch", "delivery-fingerprint", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, found, err := store.LookupRun(context.Background(), out.RunID)
+	if err != nil || !found {
+		t.Fatalf("lookup intent found=%t err=%v", found, err)
+	}
+	intent.State = intentStateWaitingExternal
+	intent.Metadata.Status = StatusWaitingExternal
+	intent.Metadata.Phase = codexPhaseDeliveryTerm
+	intent.Metadata.DeliveryAttempt = 1
+	intent.Metadata.ExecutionStartedAt = time.Now().UTC()
+	intent.Metadata.ExternalWait = &ExternalWait{Service: "github", Phase: "delivery", Operation: "pull.read", Reason: "unavailable", Since: time.Now().UTC()}
+	if err := service.persistCodexIntent(context.Background(), &intent, intent.Metadata, intentStateWaitingExternal); err != nil {
+		t.Fatal(err)
+	}
+	canonical := []byte(`{"max_runtime_seconds":30}`)
+	resumed, err := service.ResumeRun(context.Background(), "signal-plane", "delivery-resume", resumeRequestFingerprint(canonical), ResumeRunInput{RunID: out.RunID, MaxRuntimeSeconds: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Status != StatusRunning {
+		t.Fatalf("resume=%+v", resumed)
+	}
+	runtime.mu.Lock()
+	if len(runtime.specs) != 2 || runtime.specs[1].RunID != out.RunID+"-deliver-2" {
+		t.Fatalf("delivery resume specs=%+v", runtime.specs)
+	}
+	runtime.mu.Unlock()
+	issuer.mu.Lock()
+	if issuer.issues != 0 || issuer.consumes != 0 {
+		t.Fatalf("delivery resume reran Codex: issues=%d consumes=%d", issuer.issues, issuer.consumes)
+	}
+	issuer.mu.Unlock()
+}
+
+func TestGitHubExternalWaitRejectsAuthAndLeaseFailures(t *testing.T) {
+	cfg := codexWorkflowTestConfig(t)
+	meta := RunMetadata{RunID: "20260903T000000Z-aaaaaaaaaaaaaaaa", Repo: "owner/repo", Branch: "agent/test"}
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	path := filepath.Join(cfg.RunsDir, meta.RunID, "output", "external-wait.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, reason := range []string{"authorization_denied", "stale_lease"} {
+		report := githubExternalWaitReport{Version: "github-external-wait/v1", Status: StatusWaitingExternal, RunID: meta.RunID, Repository: meta.Repo, Branch: meta.Branch, Service: "github", Phase: "delivery", Operation: "git.push", Reason: reason}
+		writeJSONFileForTest(t, path, report)
+		if _, err := service.readGitHubExternalWait(meta, "delivery"); err == nil {
+			t.Fatalf("accepted nonretryable reason %q", reason)
+		}
+	}
+}
+
 func (f *fakeCodexIssuer) Issue(_ context.Context, _, _ string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

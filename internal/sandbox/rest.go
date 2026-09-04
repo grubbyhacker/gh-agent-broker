@@ -238,6 +238,8 @@ func (h *restHandler) handleRunAction(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	switch parts[1] {
+	case "resume":
+		h.runResume(w, r, runID)
 	case "terminal-result":
 		h.runTerminalResult(w, r, runID)
 	case "logs":
@@ -253,6 +255,68 @@ func (h *restHandler) handleRunAction(w http.ResponseWriter, r *http.Request, re
 	default:
 		writeRESTError(w, http.StatusNotFound, "not_found")
 	}
+}
+
+func (h *restHandler) runResume(w http.ResponseWriter, r *http.Request, runID string) {
+	if r.Method != http.MethodPost {
+		writeRESTError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	const operation = "runs.resume"
+	identity, ok := h.authenticate(w, r, operation)
+	if !ok {
+		return
+	}
+	// Resume is continuation of the admitted launch identity, so it uses the
+	// existing launch permission rather than introducing a broader mutation.
+	if !h.authorizeAction(w, identity, "launch", operation) || !h.authorizeRunProfile(w, identity, runID, operation) {
+		return
+	}
+	key, err := parseIdempotencyKey(r, true)
+	if err != nil {
+		status, code := http.StatusBadRequest, "invalid_idempotency_key"
+		if errors.Is(err, errMissingIdempotencyKey) {
+			status, code = http.StatusPreconditionRequired, "idempotency_key_required"
+		}
+		writeRESTCodeError(w, status, code, err.Error())
+		return
+	}
+	canonical, err := canonicalizeRequestBody(r, h.service.cfg.MaxParameterBytes)
+	if err != nil {
+		writeRESTCodeError(w, http.StatusBadRequest, "validation_error", err.Error())
+		return
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(canonical, &raw); err != nil || len(raw) != 1 || raw["max_runtime_seconds"] == nil {
+		writeRESTCodeError(w, http.StatusBadRequest, "validation_error", "resume accepts exactly max_runtime_seconds")
+		return
+	}
+	var seconds int
+	if err := json.Unmarshal(raw["max_runtime_seconds"], &seconds); err != nil || seconds < 1 {
+		writeRESTCodeError(w, http.StatusBadRequest, "validation_error", "max_runtime_seconds must be a positive integer")
+		return
+	}
+	out, err := h.service.ResumeRun(r.Context(), identity.Name, key, resumeRequestFingerprint(canonical), ResumeRunInput{RunID: runID, MaxRuntimeSeconds: seconds})
+	if err != nil {
+		var conflict *intentConflictError
+		if errors.As(err, &conflict) {
+			status := http.StatusConflict
+			if conflict.Code == "run_not_found" {
+				status = http.StatusNotFound
+			}
+			writeRESTCodeError(w, status, conflict.Code, conflict.Message)
+			return
+		}
+		var validation *launchValidationError
+		if errors.As(err, &validation) {
+			writeRESTCodeError(w, http.StatusBadRequest, "validation_error", err.Error())
+			return
+		}
+		writeRESTCodeError(w, http.StatusInternalServerError, "resume_failed", "resume failed")
+		return
+	}
+	h.audit(operation, identity.Name, "", runID, "", out.Repo, out.Branch, "allow", nil, nil)
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *restHandler) runTerminalResult(w http.ResponseWriter, r *http.Request, runID string) {

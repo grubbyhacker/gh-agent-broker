@@ -107,7 +107,7 @@ func TestCodexRepoTaskWorkerTerminalResult(t *testing.T) {
 }
 
 func TestCodexRepoTaskWorkerSecurityBoundaries(t *testing.T) {
-	cmd := exec.Command("bash", "-n", "workers/codex-repo-task/worker.sh", "workers/codex-delivery/worker.sh")
+	cmd := exec.Command("bash", "-n", "workers/codex-repo-task/worker.sh", "workers/codex-repo-prep/worker.sh", "workers/codex-delivery/worker.sh")
 	cmd.Dir = "../.."
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("run Codex security boundary regression test: %v\n%s", err, output)
@@ -174,7 +174,8 @@ func TestCodexDeliveryWorkerOwnsOnlyDeterministicDelivery(t *testing.T) {
 	for _, required := range []string{
 		"reject_codex_authority", "validate_results", "restore_repository_authority",
 		"gh-agent-broker-cli pr -broker \"$BROKER_URL\"",
-		"gh-agent-broker-cli pulls", "gh-agent-broker-codex-run:", "ready_for_review",
+		"broker_read pull.reconcile", "gh-agent-broker-codex-run:", "ready_for_review",
+		"github-external-wait/v1", "authoritative_repair_pull \"$candidate_head_sha\"",
 	} {
 		if !strings.Contains(text, required) {
 			t.Errorf("delivery worker must contain %q", required)
@@ -205,6 +206,7 @@ func TestCodexPreparationWorkerContract(t *testing.T) {
 		"issue_comment_limit=30", "issue_context_byte_limit=24576",
 		"stale image: dependency/submodule manifest mismatch", "hydrate_baked_submodules",
 		"codex-preparation-result/v1", "source_delivery_id", "--slurpfile issue",
+		"github-external-wait/v1", "broker_read ci.observe",
 	} {
 		if !strings.Contains(text, required) {
 			t.Errorf("preparation worker must contain %q", required)
