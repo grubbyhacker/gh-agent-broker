@@ -25,12 +25,13 @@ and may set the sole reviewed deadline override:
 `source_delivery_id` identifies the admitted delivery, not a GitHub mutable
 object. `max_runtime_seconds`, when present, is a positive active-run budget no
 greater than the reviewed template cap; every other top-level override is
-denied. It does not impose an end-to-end wall-clock deadline across external
-GitHub unavailability. The Signal Plane durable attempt identity must include repository,
-pull number, admitted head SHA, model/profile, and attempt number. It may
-launch no more than two coding attempts for that model/profile before its own
-deadline. The broker runtime cap is enforcement for that launch, not a polling
-mechanism.
+denied. Waiting for GitHub or CI never ends the repair:
+`repair_reconciliation_wake` only schedules another check, while
+`repair_active_timeout` limits one active broker phase. The Signal Plane durable
+attempt identity must include repository, pull number, admitted head SHA,
+model/profile, and attempt number, and at most two model-started repair
+attempts may be charged. The broker runtime cap enforces that active phase; it
+is not a polling mechanism.
 
 Before launching, and on each relevant admitted check/status/pull-request
 event, Signal Plane calls:
@@ -39,7 +40,8 @@ event, Signal Plane calls:
 GET /v1/repos/{owner}/{repo}/pulls/{number}/ci-observation?head_sha={40-lower-hex}
 ```
 
-The response is a point-in-time authoritative GitHub observation containing
+The response has `version:"broker-ci-observation/v1"` and is a point-in-time
+authoritative GitHub observation containing
 the pull, complete bounded/paginated commit statuses and latest check runs,
 failed check annotations, Actions workflow runs and jobs for the head, plus
 the active branch rules (rulesets first through GitHub's branch-rules endpoint)
@@ -105,13 +107,16 @@ exact combinations become the nonterminal durable run status
 invalid worker or GitHub DTOs, policy denial, and stale/nonmatching leases do
 not qualify and retain their existing terminal failure behavior.
 
-`GET /v1/runs/{run_id}` projects this stable wait DTO:
+`GET /v1/runs/{run_id}` projects `version:"broker-run-status/v1"` and this
+stable wait DTO:
 
 ```json
 {
+  "version": "broker-run-status/v1",
   "run_id": "20260903T000000Z-0123456789abcdef",
   "status": "waiting_external",
   "external_wait": {
+    "version": "broker-external-wait/v1",
     "service": "github",
     "phase": "preparation",
     "operation": "ci.observe",
@@ -146,7 +151,8 @@ The request accepts exactly one positive integer field,
 `max_runtime_seconds`, bounded by the reviewed template maximum. Resume uses
 the existing `launch` action permission, allowed profile, and owned-run scope;
 the original launch principal must match. A successful response is the normal
-launch status DTO for the same `run_id`, with `replay:false` and a fresh active
+`version:"broker-run-launch/v1"` launch status DTO for the same `run_id`, with
+`replay:false` and a fresh active
 `deadline`. Replaying the same key and canonical body returns the same run with
 `replay:true`; reusing the key with another body returns `409
 idempotency_conflict`. A missing key returns `428
