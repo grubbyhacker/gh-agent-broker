@@ -1414,7 +1414,7 @@ func (s *Server) handleCIObservation(w http.ResponseWriter, r *http.Request, rep
 		if current.HeadSHA != expected {
 			return nil, staleHeadError{expected, current.HeadSHA}
 		}
-		return api.CIObservation{RequestedHeadSHA: expected, Pull: current, CommitStatus: status, CheckRuns: checks, WorkflowRuns: runs, WorkflowJobs: jobs, BranchProtection: protection, BranchRules: rules, RequiredCI: required, AggregateState: aggregateCI(required, status, checks, runs)}, nil
+		return api.CIObservation{Version: api.CIObservationVersion, RequestedHeadSHA: expected, Pull: current, CommitStatus: status, CheckRuns: checks, WorkflowRuns: runs, WorkflowJobs: jobs, BranchProtection: protection, BranchRules: rules, RequiredCI: required, AggregateState: aggregateCI(required, status, checks, runs)}, nil
 	})
 }
 

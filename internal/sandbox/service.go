@@ -32,6 +32,16 @@ const (
 )
 
 const (
+	// LaunchProjectionVersion identifies the launch and resume response DTO.
+	LaunchProjectionVersion = "broker-run-launch/v1"
+	// StatusProjectionVersion identifies the run status and list-item DTO.
+	StatusProjectionVersion = "broker-run-status/v1"
+	// ExternalWaitProjectionVersion identifies the bounded external-wait DTO
+	// nested in a run status response.
+	ExternalWaitProjectionVersion = "broker-external-wait/v1"
+)
+
+const (
 	finalizeReasonWorkerExit                = "worker_exit"
 	finalizeReasonStatusPollExited          = "status_poll_exited"
 	finalizeReasonStatusPollDeadline        = "status_poll_deadline"
@@ -161,6 +171,7 @@ type RunMetadata struct {
 // report that GitHub is temporarily unavailable. It is deliberately narrower
 // than arbitrary worker failure text.
 type ExternalWait struct {
+	Version    string    `json:"version,omitempty"`
 	Service    string    `json:"service"`
 	Phase      string    `json:"phase"`
 	Operation  string    `json:"operation"`
@@ -244,6 +255,7 @@ func (in *LaunchAgentInput) UnmarshalJSON(b []byte) error {
 }
 
 type LaunchAgentOutput struct {
+	Version       string    `json:"version"`
 	RunID         string    `json:"run_id"`
 	WorkerAgentID string    `json:"worker_agent_id"`
 	Repo          string    `json:"repo"`
@@ -310,6 +322,7 @@ type LogsOutput struct {
 }
 
 type StatusOutput struct {
+	Version      string              `json:"version"`
 	RunID        string              `json:"run_id"`
 	Status       string              `json:"status"`
 	Branch       string              `json:"branch,omitempty"`
@@ -490,6 +503,7 @@ func (s *Service) DryRunLaunch(ctx context.Context, in LaunchAgentInput) (Launch
 		return LaunchAgentOutput{}, err
 	}
 	return LaunchAgentOutput{
+		Version:       LaunchProjectionVersion,
 		RunID:         runID,
 		WorkerAgentID: workerAgentID(tmpl, runID),
 		Repo:          in.Repo,
@@ -679,7 +693,7 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 	s.audit.Log(s.auditEvent("launch_agent", meta, "allow", nil), redactor)
 	go s.watchTimeout(context.WithoutCancel(ctx), runID, deadline)
 	go s.watchExit(context.WithoutCancel(ctx), runID, info.ID)
-	return LaunchAgentOutput{RunID: runID, WorkerAgentID: meta.WorkerAgentID, Repo: meta.Repo, Branch: meta.Branch, Status: meta.Status, Deadline: meta.Deadline}, nil
+	return LaunchAgentOutput{Version: LaunchProjectionVersion, RunID: runID, WorkerAgentID: meta.WorkerAgentID, Repo: meta.Repo, Branch: meta.Branch, Status: meta.Status, Deadline: meta.Deadline}, nil
 }
 
 func (s *Service) LaunchProfile(ctx context.Context, principal, profile, rawKey, fingerprint string, in LaunchAgentInput) (LaunchAgentOutput, error) {
@@ -992,7 +1006,7 @@ func (s *Service) commitStartupFailureIntent(
 }
 
 func launchOutput(meta RunMetadata) LaunchAgentOutput {
-	return LaunchAgentOutput{RunID: meta.RunID, WorkerAgentID: meta.WorkerAgentID, Repo: meta.Repo, Branch: meta.Branch, Status: meta.Status, Deadline: meta.Deadline}
+	return LaunchAgentOutput{Version: LaunchProjectionVersion, RunID: meta.RunID, WorkerAgentID: meta.WorkerAgentID, Repo: meta.Repo, Branch: meta.Branch, Status: meta.Status, Deadline: meta.Deadline}
 }
 
 func (s *Service) lockLaunchIntent(scope string) func() {
@@ -2112,6 +2126,7 @@ func (s *Service) statusOutput(meta RunMetadata) StatusOutput {
 		ended = &meta.EndedAt
 	}
 	out := StatusOutput{
+		Version:      StatusProjectionVersion,
 		RunID:        meta.RunID,
 		Status:       meta.Status,
 		Branch:       meta.Branch,
@@ -2121,9 +2136,18 @@ func (s *Service) statusOutput(meta RunMetadata) StatusOutput {
 		Deadline:     meta.Deadline,
 		EndedAt:      ended,
 		Diagnostics:  s.readFailureDiagnostics(meta),
-		ExternalWait: meta.ExternalWait,
+		ExternalWait: versionedExternalWait(meta.ExternalWait),
 	}
 	return out
+}
+
+func versionedExternalWait(wait *ExternalWait) *ExternalWait {
+	if wait == nil {
+		return nil
+	}
+	out := *wait
+	out.Version = ExternalWaitProjectionVersion
+	return &out
 }
 
 func (s *Service) readFailureDiagnostics(meta RunMetadata) *FailureDiagnostics {

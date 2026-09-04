@@ -36,7 +36,7 @@ func TestRESTLaunchProfileAuthzAndLaunch(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if out.RunID == "" || out.Status != StatusRunning {
+	if out.Version != LaunchProjectionVersion || out.RunID == "" || out.Status != StatusRunning {
 		t.Fatalf("launch output = %+v", out)
 	}
 	if spec := runtime.lastSpec(); spec.RunID != out.RunID || spec.Env["SANDBOX_REPO"] != "owner/repo" {
@@ -505,14 +505,28 @@ func TestRunResumeRequiresIdempotencyAndPreservesLaunchAuthorization(t *testing.
 		t.Fatalf("resume status=%d body=%s", response.Code, response.Body.String())
 	}
 	var output LaunchAgentOutput
-	if err := json.Unmarshal(response.Body.Bytes(), &output); err != nil || output.RunID != launched.RunID || output.Replay {
+	if err := json.Unmarshal(response.Body.Bytes(), &output); err != nil || output.Version != LaunchProjectionVersion || output.RunID != launched.RunID || output.Replay {
 		t.Fatalf("resume output=%+v err=%v", output, err)
 	}
 	replay := restLaunchRequest("/v1/runs/"+launched.RunID+"/resume", "signal-secret", "resume-key", []byte(`{"max_runtime_seconds":30}`))
 	replayResponse := httptest.NewRecorder()
 	handler.ServeHTTP(replayResponse, replay)
-	if replayResponse.Code != http.StatusOK || !strings.Contains(replayResponse.Body.String(), `"replay":true`) {
+	if replayResponse.Code != http.StatusOK || !strings.Contains(replayResponse.Body.String(), `"version":"broker-run-launch/v1"`) || !strings.Contains(replayResponse.Body.String(), `"replay":true`) {
 		t.Fatalf("replay status=%d body=%s", replayResponse.Code, replayResponse.Body.String())
+	}
+}
+
+func TestStatusOutputVersionsExternalWaitProjection(t *testing.T) {
+	wait := &ExternalWait{Service: "github", Phase: "preparation", Operation: "ci.observe", Reason: "unavailable", Generation: 1, Since: time.Now().UTC()}
+	output := (&Service{}).statusOutput(RunMetadata{RunID: "run-1", Status: StatusWaitingExternal, ExternalWait: wait})
+	if output.Version != StatusProjectionVersion {
+		t.Fatalf("status version=%q want %q", output.Version, StatusProjectionVersion)
+	}
+	if output.ExternalWait == nil || output.ExternalWait.Version != ExternalWaitProjectionVersion {
+		t.Fatalf("external wait=%+v", output.ExternalWait)
+	}
+	if wait.Version != "" {
+		t.Fatalf("status projection mutated persisted external wait: %+v", wait)
 	}
 }
 

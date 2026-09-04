@@ -3,6 +3,11 @@ package api
 
 import "encoding/json"
 
+// CIObservationVersion identifies the stable CI observation projection consumed
+// by Signal Plane. New fields may be added within this version; a semantic
+// change to existing fields requires a new version.
+const CIObservationVersion = "broker-ci-observation/v1"
+
 type ErrorResponse struct {
 	Code            string           `json:"code"`
 	Message         string           `json:"message"`
@@ -257,6 +262,7 @@ type CheckAnnotation struct {
 // for one pull request head. GitHub remains authoritative: this DTO deliberately
 // does not calculate a separate required-check verdict.
 type CIObservation struct {
+	Version          string            `json:"version"`
 	RequestedHeadSHA string            `json:"requested_head_sha"`
 	Pull             PullSummary       `json:"pull"`
 	CommitStatus     CommitStatus      `json:"commit_status"`
