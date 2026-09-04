@@ -336,7 +336,7 @@ func (s *Service) PruneRuns(ctx context.Context, policy RetentionPolicy) (PruneR
 
 func hasActiveStatus(status string) bool {
 	switch status {
-	case StatusPending, StatusRunning:
+	case StatusPending, StatusRunning, StatusWaitingExternal:
 		return true
 	default:
 		return false

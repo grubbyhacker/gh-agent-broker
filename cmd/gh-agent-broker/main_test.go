@@ -321,6 +321,24 @@ func TestShellQuote(t *testing.T) {
 	}
 }
 
+func TestWriteBrokerErrorFileEmitsBoundedStructuredCode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broker-error.json")
+	if err := writeBrokerErrorFile(path, http.StatusGatewayTimeout, []byte(`{"code":"github_timeout","message":"sensitive upstream detail"}`)); err != nil {
+		t.Fatal(err)
+	}
+	// #nosec G304 -- path is a test-owned temporary file.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "{\"version\":\"broker-client-error/v1\",\"status_code\":504,\"code\":\"github_timeout\"}\n" {
+		t.Fatalf("diagnostic=%s", data)
+	}
+	if strings.Contains(string(data), "sensitive") {
+		t.Fatal("broker error file copied upstream failure detail")
+	}
+}
+
 func gitConfigGetURLMatch(t *testing.T, dir, key, url string) string {
 	t.Helper()
 	// #nosec G204 -- test invokes git with fixed option names and caller-provided test values only.

@@ -20,13 +20,15 @@ import (
 const (
 	launchIntentSchemaVersion = 1
 	launchFingerprintVersion  = "sandbox-rest-launch:v1"
+	resumeFingerprintVersion  = "sandbox-rest-resume:v1"
 
-	intentStateCreated       = "intent_created"
-	intentStateCreatePending = "create_pending"
-	intentStateContainerMade = "container_created"
-	intentStateStartPending  = "start_pending"
-	intentStateRunning       = "running"
-	intentStateTerminal      = "terminal"
+	intentStateCreated         = "intent_created"
+	intentStateCreatePending   = "create_pending"
+	intentStateContainerMade   = "container_created"
+	intentStateStartPending    = "start_pending"
+	intentStateRunning         = "running"
+	intentStateWaitingExternal = "waiting_external"
+	intentStateTerminal        = "terminal"
 )
 
 type LaunchIntentStore struct {
@@ -187,6 +189,11 @@ func requestFingerprint(canonical []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func resumeRequestFingerprint(canonical []byte) string {
+	sum := sha256.Sum256(append([]byte(resumeFingerprintVersion+"\n"), canonical...))
+	return hex.EncodeToString(sum[:])
+}
+
 func (s *LaunchIntentStore) Lookup(ctx context.Context, principal, profile, digest string) (launchIntent, bool, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT request_fingerprint, run_id, state, plan_json, metadata_json
 		FROM launch_intents WHERE principal=? AND profile=? AND key_digest=?`, principal, profile, digest)
@@ -279,6 +286,8 @@ func (s *LaunchIntentStore) RestoreMetadata(ctx context.Context, meta RunMetadat
 		state = intentStateTerminal
 	case meta.Status == StatusRunning:
 		state = intentStateRunning
+	case meta.Status == StatusWaitingExternal:
+		state = intentStateWaitingExternal
 	case meta.ContainerID != "":
 		state = intentStateStartPending
 	}
@@ -332,6 +341,8 @@ func (s *LaunchIntentStore) SaveMetadata(ctx context.Context, meta RunMetadata) 
 	state := intentStateRunning
 	if isTerminalStatus(meta.Status) {
 		state = intentStateTerminal
+	} else if meta.Status == StatusWaitingExternal {
+		state = intentStateWaitingExternal
 	}
 	_, err = s.db.ExecContext(ctx, `UPDATE launch_intents SET state=?, metadata_json=?, updated_at=? WHERE run_id=?`,
 		state, metadataJSON, time.Now().UTC().Format(time.RFC3339Nano), meta.RunID)

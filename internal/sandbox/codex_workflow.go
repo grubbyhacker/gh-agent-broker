@@ -90,6 +90,18 @@ type executionFailure struct {
 	StderrSHA256     string `json:"stderr_sha256"`
 }
 
+type githubExternalWaitReport struct {
+	Version    string `json:"version"`
+	Status     string `json:"status"`
+	RunID      string `json:"run_id"`
+	Repository string `json:"repository"`
+	Branch     string `json:"branch"`
+	Service    string `json:"service"`
+	Phase      string `json:"phase"`
+	Operation  string `json:"operation"`
+	Reason     string `json:"reason"`
+}
+
 type recoveryValidationResult struct {
 	Version          string `json:"version"`
 	Status           string `json:"status"`
@@ -115,6 +127,9 @@ func (s *Service) resumeCodexIssueWorkflow(
 	if isTerminalStatus(meta.Status) || intent.State == intentStateTerminal {
 		return launchOutput(meta), nil
 	}
+	if meta.Status == StatusWaitingExternal || intent.State == intentStateWaitingExternal {
+		return launchOutput(meta), nil
+	}
 	if s.codexIssuer == nil {
 		return s.failCodexIntent(ctx, intent, meta, "credential_issuance", fmt.Errorf("codex credential holder is unavailable"))
 	}
@@ -128,7 +143,9 @@ func (s *Service) resumeCodexIssueWorkflow(
 		if err := s.codexIssuer.Cleanup(meta.RunID); err != nil {
 			return LaunchAgentOutput{}, fmt.Errorf("clean legacy Codex capability: %w", err)
 		}
-		go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
+		if meta.Status == StatusRunning {
+			go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
+		}
 	}
 	if err := s.prepareDurableRun(meta, s.cfg.Templates[workflow.ExecutionTemplate]); err != nil {
 		return LaunchAgentOutput{}, err
@@ -252,7 +269,13 @@ func (s *Service) resumePreparation(
 	if err != nil {
 		return LaunchAgentOutput{}, err
 	}
+	if meta.PreparationAttempt == 0 {
+		meta.PreparationAttempt = 1
+	}
 	spec.RunID = meta.RunID + "-prep"
+	if meta.PreparationAttempt > 1 {
+		spec.RunID += "-" + strconv.Itoa(meta.PreparationAttempt)
+	}
 	spec.Labels["gh-agent-broker.parent_run_id"] = meta.RunID
 	spec.Labels["gh-agent-broker.run_id"] = spec.RunID
 	spec.Labels["gh-agent-broker.template"] = workflow.PreparationTemplate
@@ -268,6 +291,7 @@ func (s *Service) resumePreparation(
 			return s.failCodexIntent(ctx, intent, meta, "preparation_create", err)
 		}
 		meta.PreparationContainerID = info.ID
+		meta.PreparationContainerIDs = appendUniqueContainerID(meta.PreparationContainerIDs, info.ID)
 		meta.ContainerID = info.ID
 		meta.PreparationImageDigest = info.ImageDigest
 		meta.PreparationPlatform = info.Platform
@@ -335,6 +359,11 @@ func (s *Service) completePreparation(
 		return LaunchAgentOutput{}, err
 	}
 	if status.ExitCode == nil || *status.ExitCode != 0 {
+		if status.ExitCode != nil && *status.ExitCode == 75 {
+			if wait, err := s.readGitHubExternalWait(meta, "preparation"); err == nil {
+				return s.waitForGitHub(ctx, intent, meta, wait)
+			}
+		}
 		return s.failCodexIntent(ctx, intent, meta, "preparation", fmt.Errorf("credential-free preparation failed"))
 	}
 	result, err := s.readPreparationResult(meta)
@@ -658,6 +687,11 @@ func (s *Service) completeDelivery(
 		return LaunchAgentOutput{}, err
 	}
 	if status.ExitCode != nil && *status.ExitCode != 0 {
+		if *status.ExitCode == 75 {
+			if wait, err := s.readGitHubExternalWait(meta, "delivery"); err == nil {
+				return s.waitForGitHub(ctx, intent, meta, wait)
+			}
+		}
 		if stale, err := s.readStaleLease(meta); err == nil && meta.RecoveryCount == 0 {
 			meta.RecoveryExpectedHeadSHA = stale.ExpectedHeadSHA
 			meta.RecoveryWinnerHeadSHA = stale.WinnerHeadSHA
@@ -676,6 +710,48 @@ func (s *Service) completeDelivery(
 		return s.finalizeExitedRun(ctx, current, status)
 	})
 	return launchOutput(finalized), err
+}
+
+func (s *Service) waitForGitHub(ctx context.Context, intent *launchIntent, meta RunMetadata, report githubExternalWaitReport) (LaunchAgentOutput, error) {
+	now := time.Now().UTC()
+	meta.Status = StatusWaitingExternal
+	meta.Error = ""
+	meta.ExitCode = nil
+	meta.ExternalWait = &ExternalWait{
+		Service: report.Service, Phase: report.Phase, Operation: report.Operation,
+		Reason: report.Reason, Generation: meta.ResumeGeneration + 1, Since: now,
+	}
+	if err := s.persistCodexIntent(ctx, intent, meta, intentStateWaitingExternal); err != nil {
+		return LaunchAgentOutput{}, err
+	}
+	s.audit.Log(s.auditEvent("run_waiting_external", meta, "allow", nil), s.redactor(meta))
+	return launchOutput(meta), nil
+}
+
+func (s *Service) readGitHubExternalWait(meta RunMetadata, phase string) (githubExternalWaitReport, error) {
+	path := filepath.Join(s.runDir(meta.RunID), "output", "external-wait.json")
+	data, err := boundedRegularFile(path, 4096)
+	if err != nil {
+		return githubExternalWaitReport{}, err
+	}
+	var report githubExternalWaitReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		return githubExternalWaitReport{}, err
+	}
+	validOperation := false
+	switch phase {
+	case "preparation":
+		validOperation = contains([]string{"issue.read", "issue_comments.read", "pull.read", "ci.observe", "actions_job_log.read"}, report.Operation)
+	case "delivery":
+		validOperation = contains([]string{"pull.read", "pull.reconcile", "pull.create", "git.push"}, report.Operation)
+	}
+	if report.Version != "github-external-wait/v1" || report.Status != StatusWaitingExternal ||
+		report.RunID != meta.RunID || report.Repository != meta.Repo || report.Branch != meta.Branch ||
+		report.Service != "github" || report.Phase != phase || !validOperation ||
+		!contains([]string{"unavailable", "rate_limited"}, report.Reason) {
+		return githubExternalWaitReport{}, fmt.Errorf("invalid structured GitHub external-wait report")
+	}
+	return report, nil
 }
 
 func (s *Service) watchCodexPhase(runID, containerID string) {

@@ -392,6 +392,9 @@ func TestClassifyGitHubReadError(t *testing.T) {
 		{name: "forbidden", err: githubapp.APIError{StatusCode: http.StatusForbidden, Body: `{"message":"Forbidden"}`}, wantStatus: http.StatusForbidden, wantCode: "github_forbidden"},
 		{name: "rate limited status", err: githubapp.APIError{StatusCode: http.StatusTooManyRequests, Body: `{"message":"rate limit"}`}, wantStatus: http.StatusTooManyRequests, wantCode: "github_rate_limited"},
 		{name: "rate limited body", err: githubapp.APIError{StatusCode: http.StatusForbidden, Body: `{"message":"API rate limit exceeded"}`}, wantStatus: http.StatusTooManyRequests, wantCode: "github_rate_limited"},
+		{name: "unauthorized", err: githubapp.APIError{StatusCode: http.StatusUnauthorized, Body: `{"message":"Bad credentials"}`}, wantStatus: http.StatusBadGateway, wantCode: "github_unauthorized"},
+		{name: "validation rejected", err: githubapp.APIError{StatusCode: http.StatusUnprocessableEntity, Body: `{"message":"Validation failed"}`}, wantStatus: http.StatusBadGateway, wantCode: "github_rejected"},
+		{name: "upstream unavailable", err: githubapp.APIError{StatusCode: http.StatusServiceUnavailable, Body: `{"message":"Unavailable"}`}, wantStatus: http.StatusBadGateway, wantCode: "github_error"},
 		{name: "timeout", err: context.DeadlineExceeded, wantStatus: http.StatusGatewayTimeout, wantCode: "github_timeout"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

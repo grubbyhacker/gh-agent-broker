@@ -270,4 +270,14 @@ optional declarations but must be supplied together for repair, with partial
 pairs rejected before run creation. Parameterized requests may also carry the
 sole reviewed top-level `max_runtime_seconds` override when the profile
 allowlists it; applying the seconds override replaces the profile's minute
-default so Signal Plane can enforce its remaining durable deadline.
+default so Signal Plane can bound the active broker/model phase.
+
+External GitHub availability follow-up: credential-free preparation and
+credentialed delivery now emit one bounded structured diagnostic only for
+broker-classified GitHub timeout, rate-limit, or upstream errors. Such runs
+persist nonterminal `waiting_external` state and expose a phase/operation/
+reason/generation DTO. `POST /v1/runs/{run_id}/resume` requires the original
+launch authority, a new durable idempotency key for that wait generation, and
+an exact bounded `max_runtime_seconds` body. Preparation restarts without model
+issuance; delivery restarts from the sealed validated candidate without Codex,
+and reconciles an already-delivered candidate before retrying its exact lease.
