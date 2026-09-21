@@ -1,3 +1,11 @@
+> **STATUS: IMPLEMENTED — HISTORICAL PLAN.** The concrete hardening this listed
+> has largely landed in the current surface (strict hygiene gate via
+> `make check`, admin reload/config-validation tooling, commit-status/check-run
+> observation, receive-pack policy). The remaining bullets — mTLS/stronger agent
+> auth and SSH Git transport — were speculative "if needed" candidates and were
+> deliberately not built (agent auth is still HTTP Basic); they are not an active
+> committed plan.
+
 # Phase 2 Plan
 
 ## Goal

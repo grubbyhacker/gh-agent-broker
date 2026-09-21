@@ -1,3 +1,10 @@
+> **STATUS: IMPLEMENTED — HISTORICAL PLAN.** The compose topology described here
+> is realized in `docker-compose.production.example.yml`; deployment is now
+> automated through GitHub Actions + vps-ops Ansible (see `docs/deploy.md`), so
+> the "CI does not deploy to production / future workflow_dispatch with an
+> environment approval gate" note below is superseded — treat this as the
+> original design record.
+
 # Compose Production Deployment
 
 This plan is safe to keep in the public repo. Replace every placeholder in a

@@ -1,3 +1,8 @@
+> **STATUS: IMPLEMENTED — HISTORICAL PLAN.** The sandbox-broker REST launch
+> profiles described here are implemented in `internal/sandbox/rest.go` and the
+> `launch_profiles` config (`internal/sandbox/config.go`); this is the design
+> record, not outstanding work.
+
 # Operator REST Launch Profiles For Sandbox Jobs
 
 ## Summary

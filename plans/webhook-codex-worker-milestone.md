@@ -1,3 +1,7 @@
+> **STATUS: RETIRED.** This milestone is explicitly retired (see the Status
+> section below); it defines no active production route. Do not restore its
+> dispatcher principal, repository authorization, webhook admission, or profile.
+
 # Retired Webhook-Derived Codex Worker Proof
 
 ## Status

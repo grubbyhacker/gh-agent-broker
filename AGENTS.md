@@ -56,7 +56,18 @@ Build a GitHub Agent Access Broker that lets agent containers use GitHub App acc
 ## Deployment
 
 - Production deploys through GitHub Actions on pushes to `main`, after CI passes.
-- The production deployment workflow has an environment approval gate; deployment requires approval before production changes are applied.
+- There is no human approval gate on the deploy. A `production` GitHub
+  Environment exists and scopes the deployment secrets, but it configures no
+  required reviewers, so a deploy never pauses for a human click. Do not add a
+  required reviewer or an approving-review count expecting it to gate the
+  deploy.
+- The real release control is a reviewed image promotion, not a click:
+  `.github/workflows/deploy-production.yml` deploys only the exact
+  `sha-<sha>@sha256:<digest>` that appears in
+  `vps-ops/config/release-contracts/gh-agent-broker.yml`. A `workflow_run`
+  deploy for a non-promoted image intentionally skips; a `workflow_dispatch` for
+  a non-promoted image fails. Promoting the digest in `vps-ops` is the human
+  gate.
 - Ansible runs from the `grubbyhacker/vps-ops` repository over SSH to `hermes-vps` (`srv1656293.hstgr.cloud`).
 - The production deploy user is `github-deployer`.
 - Agents must not SSH directly to `hermes-vps` for production changes. All production changes must go through the GitHub Actions deployment pipeline.

@@ -1,3 +1,8 @@
+> **STATUS: IMPLEMENTED — HISTORICAL PLAN.** The Codex-compatible surface
+> described here now exists in `internal/proxy/proxy.go` (`/v1/responses`,
+> `codex_allowed_models`, run-ID budgeting); this is the original design record,
+> not outstanding work.
+
 # Codex-Compatible Proxy Surface For YKM Curator
 
 ## Summary

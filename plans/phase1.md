@@ -1,3 +1,8 @@
+> **STATUS: IMPLEMENTED — HISTORICAL PLAN.** The v1 broker (config, agent auth,
+> deny-by-default policy, GitHub App JWT/token exchange, Git smart-HTTP proxy,
+> CLI, Dockerfile/compose) shipped and is the current production surface; this
+> is the original v1 scope record.
+
 # Phase 1 Plan
 
 ## Goal
