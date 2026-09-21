@@ -1,3 +1,7 @@
+> **STATUS: CURRENT HANDOFF.** This is the living handoff context that
+> `AGENTS.md` requires be kept current before handing off; treat it as the most
+> recent state-of-the-work note, not as a forward plan.
+
 # Agent handoff
 
 The durable architectural invariant is: **“The broker owns durable side

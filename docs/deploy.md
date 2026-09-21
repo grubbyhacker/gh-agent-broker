@@ -36,15 +36,29 @@ Configure these as repository secrets before enabling production deploys:
 
 Do not commit secret values to this repository or to `vps-ops`.
 
-## Production Approval Gate
+## Release Gate
 
-The deploy job runs in the GitHub Actions `production` environment. Configure
-that environment with required reviewers so a human must approve before the job
-can proceed.
+The deploy job runs in the GitHub Actions `production` environment. That
+environment scopes the deployment secrets listed above, but it configures **no
+required reviewers** — so the deploy does **not** pause for a human approval
+click. Do not add a required reviewer (or an approving-review count on a branch
+ruleset) expecting it to gate the deploy; those are separate controls that do
+not gate this workflow.
 
-The approval gate pauses the deploy job before it runs production steps. After
-approval, the runner can access the configured secrets and execute the Ansible
-playbook against the production inventory.
+The real release control is a **reviewed image promotion**, enforced by
+`.github/workflows/deploy-production.yml`: the deploy proceeds only for the
+exact `sha-<sha>@sha256:<digest>` recorded in
+`vps-ops/config/release-contracts/gh-agent-broker.yml`. A `workflow_run` deploy
+for an image that has not been promoted **intentionally skips**; a
+`workflow_dispatch` for a non-promoted image **fails**. Promoting a digest in
+that `vps-ops` release contract — a reviewed change — is the meaningful human
+gate on what reaches production.
+
+A separate `deploy-watchdog.yml` reruns a failed deploy **once** — only on the
+first attempt (`run_attempt == 1`), on `main`, and only when the logs match the
+known TCP/443 SSH-timeout signature caused by intermittently blocked Hostinger
+runner egress (a fresh runner clears it). It is a single bounded retry for that
+one transient failure, not a general retry loop.
 
 ## Manual Redeploy
 

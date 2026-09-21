@@ -1,3 +1,8 @@
+> **STATUS: IMPLEMENTED — HISTORICAL PLAN.** The sandbox broker described here
+> exists as `cmd/sandbox-broker` + `internal/sandbox` (MCP contract, run
+> lifecycle, credential bundles, Docker backend); this is the v1 design record,
+> not outstanding work.
+
 # Sandbox MCP V1 Design
 
 ## Summary
