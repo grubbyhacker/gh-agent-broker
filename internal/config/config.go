@@ -18,7 +18,34 @@ type Config struct {
 	MutationLimits MutationLimitsConfig `yaml:"mutation_limits"`
 	Idempotency    IdempotencyConfig    `yaml:"idempotency"`
 	PushTripwire   PushTripwireConfig   `yaml:"push_tripwire"`
+	Correlation    CorrelationConfig    `yaml:"correlation"`
 	Agents         []Agent              `yaml:"agents"`
+}
+
+// CorrelationConfig enables authenticated run-to-PR correlation on pull.create.
+// It is OPT-IN: when store_path and a capability API (url + token) are all set,
+// pull.create requires a verified per-run capability handle, records the
+// correlation + outbox event atomically after GitHub returns, and fails closed
+// on a missing/invalid/revoked/expired handle. When unset, pull.create keeps its
+// legacy behavior and records nothing.
+//
+// capability_api_url is the broker's PRIVATE capability API base (the sandbox
+// broker that mounts /v1/capabilities/*). capability_api_token is the
+// deployment-owned token that authenticates the broker to that API — it is held
+// ONLY by the broker, is never a run's handle, and is never placed in a launched
+// run's environment, metadata, log, or audit.
+type CorrelationConfig struct {
+	StorePath             string `yaml:"store_path"`
+	CapabilityAPIURL      string `yaml:"capability_api_url"`
+	CapabilityAPIToken    string `yaml:"capability_api_token"`
+	CapabilityAPITokenEnv string `yaml:"capability_api_token_env"`
+}
+
+// Enabled reports whether authenticated correlation is fully configured.
+func (c CorrelationConfig) Enabled() bool {
+	return strings.TrimSpace(c.StorePath) != "" &&
+		strings.TrimSpace(c.CapabilityAPIURL) != "" &&
+		strings.TrimSpace(c.CapabilityAPIToken) != ""
 }
 
 type PushTripwireConfig struct {
@@ -206,6 +233,9 @@ func (c *Config) resolveSecrets() error {
 	if c.PushTripwire.ScannerSecret == "" && c.PushTripwire.ScannerSecretEnv != "" {
 		c.PushTripwire.ScannerSecret = os.Getenv(c.PushTripwire.ScannerSecretEnv)
 	}
+	if c.Correlation.CapabilityAPIToken == "" && c.Correlation.CapabilityAPITokenEnv != "" {
+		c.Correlation.CapabilityAPIToken = os.Getenv(c.Correlation.CapabilityAPITokenEnv)
+	}
 	for i := range c.Agents {
 		if c.Agents[i].Secret == "" && c.Agents[i].SecretEnv != "" {
 			c.Agents[i].Secret = os.Getenv(c.Agents[i].SecretEnv)
@@ -335,11 +365,45 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Sprintf("agent %q branch_lifecycle_guard: %v", a.ID, err))
 		}
 	}
+	errs = append(errs, c.Correlation.validationErrors()...)
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
 }
+
+// validationErrors reports correlation misconfiguration. Correlation is all or
+// nothing: a store without a capability API (or vice versa) would silently
+// fail to enforce authenticated identity, so a partial configuration is
+// rejected rather than half-enabled.
+func (c CorrelationConfig) validationErrors() []string {
+	store := strings.TrimSpace(c.StorePath)
+	url := strings.TrimSpace(c.CapabilityAPIURL)
+	token := strings.TrimSpace(c.CapabilityAPIToken)
+	tokenEnv := strings.TrimSpace(c.CapabilityAPITokenEnv)
+	var errs []string
+	anySet := store != "" || url != "" || token != "" || tokenEnv != ""
+	if !anySet {
+		return nil
+	}
+	if store != "" && !isAbsPath(store) {
+		errs = append(errs, "correlation.store_path must be an absolute path")
+	}
+	if store == "" {
+		errs = append(errs, "correlation.capability_api_* is set without correlation.store_path")
+	}
+	if url == "" {
+		errs = append(errs, "correlation requires correlation.capability_api_url")
+	} else if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		errs = append(errs, "correlation.capability_api_url must be an http(s) URL")
+	}
+	if token == "" {
+		errs = append(errs, "correlation requires correlation.capability_api_token or capability_api_token_env")
+	}
+	return errs
+}
+
+func isAbsPath(p string) bool { return strings.HasPrefix(p, "/") }
 
 func (c *Config) AgentByID(id string) (Agent, bool) {
 	for _, a := range c.Agents {

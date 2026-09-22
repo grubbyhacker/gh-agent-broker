@@ -1,27 +1,22 @@
-// Package correlation is an INERT foundation for the broker's future run-to-PR
-// correlation and its transactional outbox for Signal Plane.
+// Package correlation is the broker's run-to-PR correlation and its
+// transactional outbox for Signal Plane.
 //
-// It is deliberately NOT wired into any live request path. Semantic review of
-// the first attempt established that today's authenticated pull.create carries
-// no run capability: principal.ID + a broker operation id + caller-supplied
-// metadata cannot establish the design's originating WorkItem/AgentType
-// correlation, and caller metadata is not authority. Wiring this store to a
-// pull.create that lacks those fields would have invented authority the broker
-// does not yet hold.
+// As of Stage 4 it is wired into pull.create behind opt-in configuration
+// (config.CorrelationConfig): when a store path and a capability API are
+// configured, the server verifies a per-run capability handle, derives
+// agent_type/mode/run_id/work_item_id from the verified claims and the broker
+// operation id from the broker, and calls Record after GitHub returns the PR
+// number. When correlation is not configured, pull.create keeps its legacy
+// behavior and this package is not exercised outside tests.
 //
-// This package therefore ships the durable machinery only — schema, atomic
-// record+outbox transaction, idempotency, bounded versioned payload, and a
-// claim/ack reader API — with an Identity that REQUIRES the broker-authenticated
-// capability fields a future Stage 4 will provide: agent_type, mode, run_id,
-// work_item_id, and the broker operation id, plus the repo + PR number GitHub
-// returns. Record refuses any call missing one of these, so there is no path to
-// persist a correlation from caller metadata. No config enables it, no handler
-// calls it, and no events are emitted until Stage 4 supplies a verified
-// capability. See plans/agent-handoff.md.
+// The Identity a correlation binds to REQUIRES the broker-authenticated
+// capability fields: agent_type, mode, run_id, work_item_id, and the broker
+// operation id, plus the repo + PR number GitHub returned. Record refuses any
+// call missing one of these, so there is no path to persist a correlation from
+// caller-supplied metadata — caller metadata is never authority.
 //
-// When Record does run (in tests, and later behind a Stage-4-authenticated
-// caller), two rows are written in ONE transaction so a correlation cannot
-// exist without its outbox event and the event cannot exist without the
+// When Record runs, two rows are written in ONE transaction so a correlation
+// cannot exist without its outbox event and the event cannot exist without the
 // correlation:
 //
 //   - pr_correlations: the durable association (capability identity, repo, PR).
@@ -274,8 +269,8 @@ func (s *Store) Close() error {
 // event, so a retry after a crash between GitHub and commit converges on one
 // event.
 //
-// NOTE: no live handler calls this yet — see the package doc. It is exercised by
-// tests and awaits a Stage 4 caller that can supply a verified capability.
+// NOTE: called from pull.create when correlation is configured (see
+// internal/server); otherwise exercised only by tests.
 func (s *Store) Record(ctx context.Context, id Identity, repo string, prNumber int64) (Correlation, error) {
 	if !id.valid() {
 		return Correlation{}, fmt.Errorf("correlation requires a complete broker-authenticated capability (agent_type, mode, run_id, work_item_id, operation_id)")
@@ -345,6 +340,17 @@ func (s *Store) GetByPR(ctx context.Context, repo string, prNumber int64) (Corre
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, agent_type, mode, run_id, work_item_id, operation_id, repo, pr_number, created_at
 		 FROM pr_correlations WHERE repo = ? AND pr_number = ?`, repo, prNumber)
+	return scanCorrelation(row)
+}
+
+// GetByOperation resolves a correlation by the broker operation id. A caller
+// reconciling an ambiguous retry uses this to learn whether the correlation for
+// this operation was already recorded before a crash; ErrNotFound means it was
+// not, so the operation may still need its GitHub side effect reconciled.
+func (s *Store) GetByOperation(ctx context.Context, operationID string) (Correlation, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, agent_type, mode, run_id, work_item_id, operation_id, repo, pr_number, created_at
+		 FROM pr_correlations WHERE operation_id = ?`, operationID)
 	return scanCorrelation(row)
 }
 

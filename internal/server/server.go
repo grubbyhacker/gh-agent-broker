@@ -27,6 +27,7 @@ import (
 	"gh-agent-broker/internal/audit"
 	"gh-agent-broker/internal/auth"
 	"gh-agent-broker/internal/config"
+	"gh-agent-broker/internal/correlation"
 	"gh-agent-broker/internal/githubapp"
 	"gh-agent-broker/internal/idempotency"
 	"gh-agent-broker/internal/ids"
@@ -46,6 +47,8 @@ type Server struct {
 	http       *http.Client
 	tripwire   *pushtripwire.Store
 	fence      pushtripwire.FenceAdapter
+	corr       *correlation.Store
+	capVerify  *capVerifier
 }
 
 var issueCommentMutationMu sync.Mutex
@@ -71,14 +74,23 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 			return nil, err
 		}
 	}
-	return &Server{
+	srv := &Server{
 		configPath: configPath,
 		cfg:        cfg,
 		gh:         gh,
 		audit:      auditLog,
 		http:       &http.Client{Timeout: 10 * time.Minute},
 		tripwire:   tripwire,
-	}, nil
+	}
+	if cfg.Correlation.Enabled() {
+		corr, cerr := correlation.Open(context.Background(), cfg.Correlation.StorePath)
+		if cerr != nil {
+			return nil, fmt.Errorf("open correlation store: %w", cerr)
+		}
+		srv.corr = corr
+		srv.capVerify = newCapVerifier(cfg.Correlation.CapabilityAPIURL, cfg.Correlation.CapabilityAPIToken, 10*time.Second, nil)
+	}
+	return srv, nil
 }
 
 func (s *Server) InstallSignalReload() {
@@ -108,6 +120,15 @@ func (s *Server) Reload() error {
 	}
 	if cfg.PushTripwire.Enabled != oldTripwireEnabled || cfg.PushTripwire.StatePath != oldTripwirePath {
 		return errors.New("push_tripwire enabled state and state_path cannot change on reload; restart is required")
+	}
+	s.mu.RLock()
+	oldCorr := s.cfg.Correlation
+	s.mu.RUnlock()
+	if cfg.Correlation.Enabled() != oldCorr.Enabled() ||
+		cfg.Correlation.StorePath != oldCorr.StorePath ||
+		cfg.Correlation.CapabilityAPIURL != oldCorr.CapabilityAPIURL ||
+		cfg.Correlation.CapabilityAPIToken != oldCorr.CapabilityAPIToken {
+		return errors.New("correlation store_path and capability API settings cannot change on reload; restart is required")
 	}
 	s.mu.Lock()
 	s.cfg = cfg
@@ -273,6 +294,15 @@ func (s *Server) snapshot() (*config.Config, *githubapp.Client) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.cfg, s.gh
+}
+
+// correlationSnapshot returns the correlation store and capability verifier when
+// authenticated correlation is enabled, or (nil, nil) when it is not. Both are
+// constructed once in New and never swapped on reload.
+func (s *Server) correlationSnapshot() (*correlation.Store, *capVerifier) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.corr, s.capVerify
 }
 
 // blockUnsafeEgress is deliberately called after authentication/policy but
@@ -1920,6 +1950,14 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 	if !s.reserveMutation(w, opID, principal.ID, "pull.create", repo, req.Head, req.Metadata) {
 		return
 	}
+	if corr, verifier := s.correlationSnapshot(); corr != nil && verifier != nil {
+		s.pullCreateWithCorrelation(w, r, pullCreateCtx{
+			opID: opID, cfg: cfg, gh: gh, principal: principal, req: req,
+			repo: repo, appName: appName, inst: inst, body: body, result: result,
+			corr: corr, verifier: verifier,
+		})
+		return
+	}
 	ghResult, err := gh.CreatePull(appName, repo, inst, req.Title, req.Head, req.Base, body, req.Draft)
 	if err != nil {
 		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.create", Repo: repo, Branch: req.Head, RequestedPermissions: req.Permissions, Decision: result.Decision, Error: err.Error()})
@@ -1928,6 +1966,274 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 	}
 	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.create", Repo: repo, Branch: req.Head, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: ghResult.HTMLURL, Result: "ok"})
 	writeJSON(w, http.StatusCreated, ghResult)
+}
+
+// pullCreateMu serializes the complete external mutation + record per broker
+// process for one operation. Together with the durable idempotency reservation
+// it prevents two concurrent identical retries from both creating a PR or from
+// racing the reconcile/record.
+var pullCreateMu sync.Mutex
+
+type pullCreateCtx struct {
+	opID      string
+	cfg       *config.Config
+	gh        *githubapp.Client
+	principal auth.Principal
+	req       api.PullCreateRequest
+	repo      string
+	appName   string
+	inst      int64
+	body      string
+	result    policy.Result
+	corr      *correlation.Store
+	verifier  *capVerifier
+}
+
+// pullCreateWithCorrelation runs pull.create under authenticated correlation.
+//
+// Identity: the run's opaque handle in X-Agent-Capability is verified against
+// the broker's private capability API; agent_type/mode/run_id/work_item_id come
+// only from the verified claims and operation_id only from the broker. Any
+// caller-supplied run_id/identity in metadata is ignored, and a caller metadata
+// field that disagrees with a verified claim is rejected.
+//
+// Crash seam: the design does NOT claim cross-system atomicity. Instead it makes
+// the operation bounded-recoverable with the broker's existing durable
+// primitives plus a broker-derived stable marker embedded in the PR metadata:
+//
+//  1. A stable operation_id is derived from the caller's Idempotency-Key digest,
+//     so every retry of the same logical request maps to the same operation and
+//     the created PR carries that stable broker marker.
+//  2. A durable idempotency reservation is written BEFORE GitHub. A completed
+//     reservation replays the stored response (no second CreatePull). A pending
+//     reservation means a prior attempt was interrupted around the GitHub call.
+//  3. On a pending replay we RECONCILE rather than blindly re-create: if a
+//     correlation already exists for this operation_id, the record is complete;
+//     otherwise only an open PR matching head, base, title, and the exact stable
+//     operation marker may be adopted. An unrelated PR sharing the head is never
+//     authoritative.
+//  4. After GitHub returns the PR number, Record persists the correlation and
+//     its outbox event in ONE transaction, idempotent on operation_id — so a
+//     crash between GitHub success and Record is repaired on the next retry
+//     without a duplicate PR or a conflicting correlation, and the outbox event
+//     is never dropped or best-effort.
+func (s *Server) pullCreateWithCorrelation(w http.ResponseWriter, r *http.Request, c pullCreateCtx) {
+	ctx := r.Context()
+	// Verify the run capability. Fail closed on missing/invalid/revoked/expired.
+	handle := strings.TrimSpace(r.Header.Get(capHeader))
+	if handle == "" {
+		s.audit.Log(audit.Event{OperationID: c.opID, AgentID: c.principal.ID, Operation: "pull.create", Repo: c.repo, Branch: c.req.Head, Decision: policy.DecisionDeny, Error: "capability_required"})
+		writeJSON(w, http.StatusUnauthorized, api.ErrorResponse{Code: "capability_required", Message: "a per-run capability handle is required for pull.create when correlation is enabled", OperationID: c.opID, Decision: policy.DecisionDeny})
+		return
+	}
+	claims, err := c.verifier.verify(ctx, handle)
+	if err != nil {
+		status, code := capStatus(err)
+		s.audit.Log(audit.Event{OperationID: c.opID, AgentID: c.principal.ID, Operation: "pull.create", Repo: c.repo, Branch: c.req.Head, Decision: policy.DecisionDeny, Error: code})
+		writeJSON(w, status, api.ErrorResponse{Code: code, Message: "capability verification failed", OperationID: c.opID, Decision: policy.DecisionDeny})
+		return
+	}
+	// Stop trusting caller identity: a metadata field that disagrees with a
+	// verified claim is rejected, never overridden. (Absent caller fields are
+	// fine — identity comes from the verified claims regardless.)
+	if mismatch := spoofedIdentityField(c.req.Metadata, claims); mismatch != "" {
+		s.audit.Log(audit.Event{OperationID: c.opID, AgentID: c.principal.ID, Operation: "pull.create", Repo: c.repo, Branch: c.req.Head, Decision: policy.DecisionDeny, Error: "identity_spoof:" + mismatch})
+		writeJSON(w, http.StatusForbidden, api.ErrorResponse{Code: "identity_mismatch", Message: "caller-supplied " + mismatch + " does not match the verified capability", OperationID: c.opID, Decision: policy.DecisionDeny})
+		return
+	}
+
+	// Idempotency-Key is required so retries converge on one PR + one correlation.
+	key := idempotencyHeader(r)
+	if key == "" {
+		s.audit.Log(audit.Event{OperationID: c.opID, AgentID: c.principal.ID, Operation: "pull.create", Repo: c.repo, Branch: c.req.Head, Decision: policy.DecisionDeny, Error: "idempotency_key_required"})
+		writeJSON(w, http.StatusBadRequest, api.ErrorResponse{Code: "idempotency_key_required", Message: "Idempotency-Key header is required for pull.create when correlation is enabled", OperationID: c.opID, Decision: policy.DecisionDeny})
+		return
+	}
+	keyDigest := idempotencyKeyDigest(key)
+	// Stable, deterministic broker operation id for this logical request. It is
+	// the correlation's idempotency key and is derived without retaining the
+	// caller's raw Idempotency-Key.
+	stableOpID := pullCreateOperationID(c.principal.ID, c.repo, c.req.Head, c.req.Base, keyDigest)
+	// Correlated requests render the broker metadata block with the STABLE
+	// operation id, not the per-attempt audit id. That broker-derived marker is
+	// what makes an ambiguous post-GitHub retry exactly reconcilable.
+	enriched := metadata.WithBrokerFields(c.req.Metadata, c.principal.ID, stableOpID, c.inst)
+	c.body = c.req.Body + metadata.RenderBlock(enriched)
+	// Bind retries to the exact request; a reused key with different content is a
+	// conflict rather than a silent replay of the wrong PR.
+	requestDigest := pullCreateRequestDigest(c.repo, c.req)
+	scopedKey := "pull.create:" + c.principal.ID + ":" + c.repo + ":" + keyDigest
+	extra := map[string]interface{}{"pull_number": nil, "idempotency_key_digest": keyDigest, "operation_id_correlation": stableOpID}
+
+	pullCreateMu.Lock()
+	defer pullCreateMu.Unlock()
+
+	record, found, conflict, reserveErr := idempotency.ReserveExact(c.cfg.Idempotency, scopedKey, "pull.create", requestDigest, "")
+	if reserveErr != nil {
+		s.audit.Log(audit.Event{OperationID: c.opID, AgentID: c.principal.ID, Operation: "pull.create", Repo: c.repo, Branch: c.req.Head, Decision: policy.DecisionDeny, Error: reserveErr.Error(), Extra: extra})
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "idempotency_error", Message: audit.Redact(reserveErr.Error()), OperationID: c.opID, Decision: policy.DecisionDeny})
+		return
+	}
+	if conflict {
+		writeJSON(w, http.StatusConflict, api.ErrorResponse{Code: "idempotency_key_conflict", Message: "Idempotency-Key was already used for a different pull.create request", OperationID: c.opID, Decision: policy.DecisionDeny})
+		return
+	}
+	if found && !record.Pending {
+		// Completed prior attempt: replay the exact stored response.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(record.Status)
+		if _, err := w.Write(record.Body); err != nil {
+			return
+		}
+		return
+	}
+
+	identity := correlation.Identity{
+		AgentType: claims.AgentType, Mode: claims.Mode, RunID: claims.RunID,
+		WorkItemID: claims.WorkItemID, OperationID: stableOpID,
+	}
+
+	// Reconcile an interrupted prior attempt before creating anything.
+	ghResult, reconciled, rerr := s.reconcileOrCreatePull(ctx, c, identity, found && record.Pending)
+	if rerr != nil {
+		s.audit.Log(audit.Event{OperationID: c.opID, AgentID: c.principal.ID, Operation: "pull.create", Repo: c.repo, Branch: c.req.Head, RunID: claims.RunID, Decision: c.result.Decision, Error: audit.Redact(rerr.Error()), Extra: extra})
+		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(rerr.Error()), OperationID: c.opID, Decision: c.result.Decision, Warnings: c.result.Warnings})
+		return
+	}
+
+	// Atomically persist correlation + outbox, idempotent on operation_id.
+	if _, err := c.corr.Record(ctx, identity, c.repo, int64(ghResult.Number)); err != nil {
+		s.audit.Log(audit.Event{OperationID: c.opID, AgentID: c.principal.ID, Operation: "pull.create", Repo: c.repo, Branch: c.req.Head, RunID: claims.RunID, Decision: c.result.Decision, Error: audit.Redact(err.Error()), Extra: extra})
+		// The PR exists but the correlation did not commit. Do NOT store a
+		// completed idempotency record: the pending reservation stays, so a retry
+		// re-enters reconcile, finds the open PR, and records the correlation.
+		writeJSON(w, http.StatusInternalServerError, api.ErrorResponse{Code: "correlation_error", Message: audit.Redact(err.Error()), OperationID: c.opID, Decision: c.result.Decision})
+		return
+	}
+
+	result := "ok"
+	if reconciled {
+		result = "reconciled"
+	}
+	s.audit.Log(audit.Event{OperationID: c.opID, AgentID: c.principal.ID, Operation: "pull.create", Repo: c.repo, Branch: c.req.Head, RunID: claims.RunID, Decision: c.result.Decision, GitHubURL: ghResult.HTMLURL, Result: result, Extra: map[string]interface{}{"pull_number": ghResult.Number, "work_item_id": claims.WorkItemID, "operation_id_correlation": stableOpID}})
+	if err := writeExactIdempotentJSON(w, c.cfg.Idempotency, scopedKey, "pull.create", requestDigest, http.StatusCreated, ghResult); err != nil {
+		return
+	}
+}
+
+// reconcileOrCreatePull returns the PR to correlate. A completed correlation is
+// replayed by operation id. Only a PENDING retry may search for an existing PR,
+// and it adopts only an exact head/base/title match carrying this operation's
+// broker-derived stable metadata marker. Fresh requests never pre-adopt. If a
+// fresh CreatePull returns an ambiguous error, the same exact-marker search may
+// recover a PR GitHub accepted before the transport failed.
+func (s *Server) reconcileOrCreatePull(ctx context.Context, c pullCreateCtx, identity correlation.Identity, pendingReplay bool) (*api.GitHubResult, bool, error) {
+	if existing, err := c.corr.GetByOperation(ctx, identity.OperationID); err == nil {
+		pull, getErr := c.gh.GetPull(c.appName, c.repo, c.inst, int(existing.PRNumber))
+		if getErr != nil {
+			return nil, false, getErr
+		}
+		return &api.GitHubResult{Number: pull.Number, URL: pull.URL, HTMLURL: pull.HTMLURL}, true, nil
+	} else if !errors.Is(err, correlation.ErrNotFound) {
+		return nil, false, err
+	}
+	if pendingReplay {
+		if openPR, ok, err := s.openPullForOperation(c.gh, c.appName, c.repo, c.inst, c.req.Head, c.req.Base, c.req.Title, identity.OperationID); err != nil {
+			return nil, false, err
+		} else if ok {
+			return openPR, true, nil
+		}
+	}
+	ghResult, err := c.gh.CreatePull(c.appName, c.repo, c.inst, c.req.Title, c.req.Head, c.req.Base, c.body, c.req.Draft)
+	if err != nil {
+		// GitHub may accept a PR and lose the response. Reconcile only the exact
+		// stable marker and request shape; never adopt an arbitrary head PR.
+		if openPR, ok, lerr := s.openPullForOperation(c.gh, c.appName, c.repo, c.inst, c.req.Head, c.req.Base, c.req.Title, identity.OperationID); lerr == nil && ok {
+			return openPR, true, nil
+		}
+		return nil, false, err
+	}
+	return ghResult, false, nil
+}
+
+// openPullForOperation finds an OPEN PR matching this exact logical request and
+// carrying the broker-derived stable operation marker. It returns the lowest-
+// numbered exact match so recovery is deterministic, and refuses unrelated PRs
+// even when they share a head branch.
+func (s *Server) openPullForOperation(gh *githubapp.Client, appName, repo string, inst int64, head, base, title, operationID string) (*api.GitHubResult, bool, error) {
+	branch := strings.TrimPrefix(head, "refs/heads/")
+	base = strings.TrimPrefix(base, "refs/heads/")
+	if branch == "" || base == "" || title == "" || operationID == "" {
+		return nil, false, nil
+	}
+	owner, _, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" {
+		return nil, false, nil
+	}
+	query := url.Values{}
+	query.Set("state", "open")
+	query.Set("head", owner+":"+branch)
+	query.Set("base", base)
+	query.Set("per_page", "100")
+	pulls, err := gh.ListPulls(appName, repo, inst, query)
+	if err != nil {
+		return nil, false, err
+	}
+	marker := "operation_id: " + operationID
+	var best *api.PullSummary
+	for i := range pulls {
+		p := &pulls[i]
+		if strings.TrimPrefix(p.HeadRef, "refs/heads/") != branch ||
+			strings.TrimPrefix(p.BaseRef, "refs/heads/") != base ||
+			p.Title != title || !strings.Contains(p.Body, marker) {
+			continue
+		}
+		if best == nil || p.Number < best.Number {
+			best = p
+		}
+	}
+	if best == nil {
+		return nil, false, nil
+	}
+	return &api.GitHubResult{Number: best.Number, URL: best.URL, HTMLURL: best.HTMLURL}, true, nil
+}
+
+// spoofedIdentityField returns the name of a caller-supplied metadata identity
+// field that DISAGREES with the verified capability, or "" when none conflicts.
+// Caller metadata is never authority; this only rejects an active spoof attempt.
+func spoofedIdentityField(md map[string]string, claims verifiedCapability) string {
+	check := func(key, verified string) string {
+		if v, ok := md[key]; ok && strings.TrimSpace(v) != "" && strings.TrimSpace(v) != verified {
+			return key
+		}
+		return ""
+	}
+	for _, m := range []string{
+		check("run_id", claims.RunID),
+		check("agent_type", claims.AgentType),
+		check("work_item_id", claims.WorkItemID),
+		check("mode", claims.Mode),
+	} {
+		if m != "" {
+			return m
+		}
+	}
+	return ""
+}
+
+// pullCreateOperationID derives a stable broker operation id for a logical
+// pull.create request from broker-side values and the idempotency-key digest.
+// It never contains the raw Idempotency-Key.
+func pullCreateOperationID(agentID, repo, head, base, keyDigest string) string {
+	sum := sha256.Sum256([]byte("pull.create\x00" + agentID + "\x00" + repo + "\x00" + head + "\x00" + base + "\x00" + keyDigest))
+	return "op_" + hex.EncodeToString(sum[:])
+}
+
+// pullCreateRequestDigest fingerprints the request so a reused Idempotency-Key
+// with different content is a conflict rather than a wrong-PR replay.
+func pullCreateRequestDigest(repo string, req api.PullCreateRequest) string {
+	sum := sha256.Sum256([]byte(repo + "\x00" + req.Title + "\x00" + req.Head + "\x00" + req.Base + "\x00" + req.Body + "\x00" + strconv.FormatBool(req.Draft)))
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Server) handleIssueCreate(w http.ResponseWriter, r *http.Request, repo string) {
