@@ -59,8 +59,11 @@ func TestValidateDockerArtifactRejectsBuildxConfigDigestMismatch(t *testing.T) {
 
 func dockerArchiveForTest(t *testing.T, configName string, config []byte) []byte {
 	t.Helper()
+	layer := bytes.Repeat([]byte("x"), 1024*1024+1)
+	layerSum := sha256.Sum256(layer)
+	layerName := "blobs/sha256/" + hex.EncodeToString(layerSum[:])
 	manifest, err := json.Marshal([]dockerArchiveManifest{{
-		Config: configName, RepoTags: []string{"youknowme-curator:test"}, Layers: []string{},
+		Config: configName, RepoTags: []string{"youknowme-curator:test"}, Layers: []string{layerName},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +73,7 @@ func dockerArchiveForTest(t *testing.T, configName string, config []byte) []byte
 	for _, entry := range []struct {
 		name string
 		body []byte
-	}{{"manifest.json", manifest}, {configName, config}} {
+	}{{layerName, layer}, {"manifest.json", manifest}, {configName, config}} {
 		if err := tw.WriteHeader(&tar.Header{Name: entry.name, Mode: 0o600, Size: int64(len(entry.body))}); err != nil {
 			t.Fatal(err)
 		}

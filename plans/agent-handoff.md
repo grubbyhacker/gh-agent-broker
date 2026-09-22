@@ -3,10 +3,13 @@
 > recent state-of-the-work note, not as a forward plan.
 
 AgentRelease Docker archive validation accepts both canonical config member
-layouts: legacy `<sha256>.json` and Buildx `blobs/sha256/<sha256>`. In both cases
-the path is strictly matched, the config bytes must hash to the member identity,
-and platform validation remains fail closed. This closes the production seam
-exposed by Curator release run 35701334065 without accepting arbitrary OCI paths.
+layouts: legacy `<sha256>.json` and Buildx `blobs/sha256/<sha256>`. Validation
+uses two targeted passes—first `manifest.json`, then its exact config member—so
+large Buildx layer blobs are skipped rather than parsed as metadata. In both
+cases the path is strictly matched, the config bytes must hash to the member
+identity, and platform validation remains fail closed. This closes the
+production seams exposed by Curator release runs 35701334065 and 35703566509
+without accepting arbitrary OCI paths.
 
 AgentType-backed sandbox templates may omit `image`: config validation now
 requires a static image only when `agent_type` is absent, and applies the

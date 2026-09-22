@@ -38,6 +38,8 @@ trusted protected-main CI. The separate `release_artifact_byte_limit` applies to
 this binary upload. Docker archives may identify the image config using either
 the legacy `<sha256>.json` member or Buildx's `blobs/sha256/<sha256>` member;
 both names are path-validated and the config bytes must hash to that identity.
+Validation uses two targeted archive passes: first `manifest.json`, then only its
+exact config member. Buildx layer blobs are never buffered or parsed as metadata.
 
 `release.verify` and `release.acquire` are not public routes or caller actions.
 The broker derives provenance fields and accepted platforms from deployment-owned
