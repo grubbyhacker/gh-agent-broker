@@ -57,10 +57,10 @@ func promoted(t *testing.T, store *Store, reference string) Release {
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	if err := store.Verify(ctx, item.Generation, testRequirements(), actor); err != nil {
+	if err := store.verify(ctx, item.Generation, testRequirements(), actor); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if err := store.MarkAvailable(ctx, item.Generation, true, actor); err != nil {
+	if err := store.markAvailable(ctx, item.Generation, true, actor); err != nil {
 		t.Fatalf("mark available: %v", err)
 	}
 	if err := store.Promote(ctx, item.Generation, actor); err != nil {
@@ -114,14 +114,14 @@ func TestPromotionRequiresVerificationAndAvailability(t *testing.T) {
 		t.Fatalf("unverified release must not promote, got %v", err)
 	}
 
-	if err := store.Verify(ctx, item.Generation, testRequirements(), actor); err != nil {
+	if err := store.verify(ctx, item.Generation, testRequirements(), actor); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 	if err := store.Promote(ctx, item.Generation, actor); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("unacquired release must not promote, got %v", err)
 	}
 
-	if err := store.MarkAvailable(ctx, item.Generation, true, actor); err != nil {
+	if err := store.markAvailable(ctx, item.Generation, true, actor); err != nil {
 		t.Fatalf("mark available: %v", err)
 	}
 	if err := store.Promote(ctx, item.Generation, actor); err != nil {
@@ -139,7 +139,7 @@ func TestVerifyEnforcesRequirements(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	if err := store.Verify(ctx, item.Generation, testRequirements(), actor); err == nil {
+	if err := store.verify(ctx, item.Generation, testRequirements(), actor); err == nil {
 		t.Fatal("missing provenance field must fail verification")
 	}
 
@@ -149,7 +149,7 @@ func TestVerifyEnforcesRequirements(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	if err := store.Verify(ctx, other.Generation, testRequirements(), actor); err == nil {
+	if err := store.verify(ctx, other.Generation, testRequirements(), actor); err == nil {
 		t.Fatal("unsupported platform must fail verification")
 	}
 }
@@ -231,7 +231,7 @@ func TestRollbackRefusesUnavailableTarget(t *testing.T) {
 	first := promoted(t, store, refA)
 	promoted(t, store, refB)
 
-	if err := store.MarkAvailable(ctx, first.Generation, false, actor); err != nil {
+	if err := store.markAvailable(ctx, first.Generation, false, actor); err != nil {
 		t.Fatalf("evict: %v", err)
 	}
 	if err := store.Rollback(ctx, agentType, first.Generation, actor); !errors.Is(err, ErrUnavailable) {
@@ -249,7 +249,7 @@ func TestResolveFailsClosedWhenImageIsAbsent(t *testing.T) {
 	}
 
 	// Simulate a prune or a restore onto a host without the image.
-	if err := store.MarkAvailable(ctx, item.Generation, false, actor); err != nil {
+	if err := store.markAvailable(ctx, item.Generation, false, actor); err != nil {
 		t.Fatalf("evict: %v", err)
 	}
 	if _, err := store.Resolve(ctx, agentType); !errors.Is(err, ErrUnavailable) {
@@ -321,10 +321,10 @@ func TestOperationsRequireAnActor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	if err := store.Verify(ctx, item.Generation, testRequirements(), ""); err == nil {
+	if err := store.verify(ctx, item.Generation, testRequirements(), ""); err == nil {
 		t.Fatal("verify without an actor must fail")
 	}
-	if err := store.MarkAvailable(ctx, item.Generation, true, ""); err == nil {
+	if err := store.markAvailable(ctx, item.Generation, true, ""); err == nil {
 		t.Fatal("availability change without an actor must fail")
 	}
 	if err := store.Promote(ctx, item.Generation, ""); err == nil {
@@ -357,10 +357,10 @@ func TestAgentTypesAreIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	if err := store.Verify(ctx, other.Generation, testRequirements(), actor); err != nil {
+	if err := store.verify(ctx, other.Generation, testRequirements(), actor); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if err := store.MarkAvailable(ctx, other.Generation, true, actor); err != nil {
+	if err := store.markAvailable(ctx, other.Generation, true, actor); err != nil {
 		t.Fatalf("mark available: %v", err)
 	}
 	if err := store.Promote(ctx, other.Generation, actor); err != nil {

@@ -608,6 +608,25 @@ func (d *DockerBackend) ImageAvailable(ctx context.Context, reference, digest st
 	return out.ID == digest, nil
 }
 
+// LoadImage imports a trusted, validated Docker archive through the Engine.
+func (d *DockerBackend) LoadImage(ctx context.Context, artifact io.Reader) error {
+	return d.doWithContentType(ctx, http.MethodPost, "/images/load?quiet=1", artifact, nil, "application/x-tar")
+}
+
+// ImageIdentity returns Docker's immutable local image ID and platform for a
+// release imported from a Docker archive.
+func (d *DockerBackend) ImageIdentity(ctx context.Context, image string) (string, string, error) {
+	var out struct {
+		ID           string `json:"Id"`
+		Architecture string `json:"Architecture"`
+		OS           string `json:"Os"`
+	}
+	if err := d.doJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(image)+"/json", nil, &out); err != nil {
+		return "", "", err
+	}
+	return out.ID, strings.Trim(strings.TrimSpace(out.OS)+"/"+strings.TrimSpace(out.Architecture), "/"), nil
+}
+
 func (d *DockerBackend) imageIdentity(ctx context.Context, image string) (string, string, error) {
 	var out struct {
 		ID           string   `json:"Id"`

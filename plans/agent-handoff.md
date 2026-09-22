@@ -2,17 +2,22 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
-PR #174 repairs a Codex workflow test cleanup race by making service-owned
-Codex watchers cancellable and joinable through `Service.Close`. The restart
-adoption test now waits for the initial `execution_running` state before
-simulating a crash, then closes each replaced service just as a real process
-restart would. This preserves its `consumeCount == 3` assertion: initial
-acceptance, accepted-phase recovery, and post-consume crash recovery; it does
-not permit credential reissue or reinjection. Stress evidence: the focused
-test passed 50 times normally and under `-race`, and `./internal/sandbox`
-passed five times at CPU settings 1, 2, and 4. `make test` passed; local
-`make check` is blocked only by an unchanged gosec G706 finding in
-`internal/sandbox/service.go`, while the corresponding CI lint run was clean.
+The AgentRelease publish boundary gives external callers `release.publish` only:
+the former public verify/acquire routes and actions are gone. Trusted protected-main
+CI submits a bounded `docker-archive/v1` artifact and provenance. Broker code derives
+Docker's immutable image ID from the archive, checks deployment-owned platform and
+provenance requirements, loads it through the Docker Engine, and observes the exact
+local ID and platform before internal verifier/acquirer actors record availability.
+A missing, mismatched, or load-failed image stays non-promotable. No registry pull
+credential or third-party import helper is required.
+
+PR #176 exposes publish, promote, and separately authorized rollback. The
+authentication seam yields a credential-free verified principal before authorization,
+so a future OIDC verifier replaces only authentication. `release.publish` and
+`release.promote` principals each hold exactly one action; rollback remains independent.
+The branch also JSON-encodes the request-tainted fallback finalization log record,
+fixing CI's real G706 log-injection finding rather than suppressing it. `make check` is
+the delivery gate.
 
 # Agent handoff
 
@@ -298,12 +303,12 @@ an exact bounded `max_runtime_seconds` body. Preparation restarts without model
 issuance; delivery restarts from the sealed validated candidate without Codex,
 and reconciles an already-delivered candidate before retrying its exact lease.
 
-AgentRelease promotion is exposed at `/v1/releases` with the action-scoped
-operator vocabulary `release.publish`, `release.verify`, `release.acquire`,
-`release.promote`, and `release.rollback`. A `PromoterAuthenticator` verifies
-the request into a credential-free `VerifiedPromoter` before the handler checks
-the action and calls the registry, so a future OIDC verifier replaces only that
-authentication implementation. The configured-token implementation records the
-principal name as every registry audit actor. Configuration rejects a principal
-that combines `release.promote` with `launch` or `dry_run`; rollback remains a
-separate explicit action. `make check` passed locally.
+AgentRelease publication and activation are exposed at `/v1/releases` with the
+action-scoped operator vocabulary `release.publish`, `release.promote`, and
+`release.rollback`. Verification and acquisition are internal broker transitions.
+A `PromoterAuthenticator` verifies the request into a credential-free
+`VerifiedPromoter` before the handler checks the action and calls the registry, so a
+future OIDC verifier replaces only that authentication implementation. The
+configured-token implementation records the principal name as every caller audit
+actor. Configuration requires publish and promote principals to hold no other action;
+rollback remains separate. `make check` passed locally.
