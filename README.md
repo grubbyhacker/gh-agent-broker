@@ -147,6 +147,44 @@ not store the broker secret in Git config. Standard Git credential helpers and
 Do not put GitHub tokens, GitHub App private keys, GitHub App JWTs, or
 installation tokens inside the agent container.
 
+## Release Publishing (CI)
+
+Trusted protected-main CI publishes and promotes AgentReleases through the CLI.
+These commands use operator bearer tokens under distinct authority — a publisher
+may publish a candidate but not promote; a promoter may promote a verified
+generation but not publish or roll back. Tokens are read from flags or
+environment and are never printed or logged.
+
+`release-publish` uploads a single-image Docker archive (`docker save` output)
+plus provenance using the versioned `docker-archive/v1` multipart protocol. The
+broker derives the immutable local image ID, verifies deployment-owned platform
+and provenance policy, loads the archive, and assigns a monotonic generation.
+The command prints `generation=`, `ready=`, and `state=` lines for GitHub
+Actions to consume (the release is ready when `state=verified` and
+`available=true`), and can append the same keys to `$GITHUB_OUTPUT`:
+
+```sh
+export BROKER_PUBLISHER_TOKEN=replace-me-publisher-token
+gh-agent-broker-cli release-publish \
+  -broker "$BROKER_URL" \
+  -agent-type coder \
+  -archive image.tar \
+  -source-revision "$GITHUB_SHA" \
+  -platform linux/amd64 \
+  -github-output
+```
+
+`release-promote` promotes a broker-assigned generation. It accepts only a
+positive `-generation`, never an image reference, and never performs rollback
+(rollback is a separate, independently authorized operation):
+
+```sh
+export BROKER_PROMOTER_TOKEN=replace-me-promoter-token
+gh-agent-broker-cli release-promote \
+  -broker "$BROKER_URL" \
+  -generation 7
+```
+
 ## HTTP API
 
 Unauthenticated discovery routes:
