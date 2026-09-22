@@ -39,6 +39,19 @@ type Config struct {
 	MaxResponseBytes    int64              `yaml:"max_response_bytes"`
 	Timeout             Duration           `yaml:"timeout"`
 	LogPrompts          bool               `yaml:"log_prompts"`
+
+	// Capability enforcement (opt-in). When capability_api_url and a nonempty
+	// capability_api_token (normally via capability_api_token_env) are both set,
+	// every model-proxy call must present a valid per-run opaque capability
+	// handle as its Bearer credential. The proxy VERIFIES the handle and
+	// ATOMICALLY RESERVES budget against the broker's private capability API,
+	// deriving run_id/work_item_id/agent_type/mode/allowed_models/budgets from
+	// the verified claims — never from caller-supplied fields. When unset, the
+	// proxy keeps its legacy static-token behavior (identity trusted from the
+	// caller), so this is a safe additive rollout slice.
+	CapabilityAPIURL      string `yaml:"capability_api_url"`
+	CapabilityAPIToken    string `yaml:"capability_api_token"`
+	CapabilityAPITokenEnv string `yaml:"capability_api_token_env"`
 }
 
 type CodexModelConfig struct {
@@ -88,6 +101,7 @@ type Service struct {
 	cfg   Config
 	http  *http.Client
 	audit *auditLogger
+	caps  *capClient
 	mu    sync.Mutex
 }
 
@@ -116,7 +130,8 @@ type Usage struct {
 }
 
 type openAIResponseRequest struct {
-	Model string `json:"model"`
+	Model           string `json:"model"`
+	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
 }
 
 func Load(path string) (Config, error) {
@@ -171,6 +186,16 @@ func (c *Config) ResolveSecrets() {
 	if c.CodexUpstreamKey == "" && c.CodexUpstreamKeyEnv != "" {
 		c.CodexUpstreamKey = os.Getenv(c.CodexUpstreamKeyEnv)
 	}
+	if c.CapabilityAPIToken == "" && c.CapabilityAPITokenEnv != "" {
+		c.CapabilityAPIToken = os.Getenv(c.CapabilityAPITokenEnv)
+	}
+}
+
+// capabilityEnabled reports whether capability enforcement is configured. Both
+// the API URL and a nonempty token are required; a partial configuration is
+// rejected by Validate rather than silently disabling enforcement.
+func (c Config) capabilityEnabled() bool {
+	return strings.TrimSpace(c.CapabilityAPIURL) != "" && strings.TrimSpace(c.CapabilityAPIToken) != ""
 }
 
 func (c Config) Validate() error {
@@ -213,6 +238,20 @@ func (c Config) Validate() error {
 	if c.MaxRequestBytes < 1 || c.MaxResponseBytes < 1 {
 		errs = append(errs, "request and response byte limits must be positive")
 	}
+	// Capability enforcement is all-or-nothing: a URL with no token (or a token
+	// with no URL) would silently fail to enforce, so reject the partial state.
+	capURL := strings.TrimSpace(c.CapabilityAPIURL)
+	capToken := strings.TrimSpace(c.CapabilityAPIToken)
+	capTokenEnv := strings.TrimSpace(c.CapabilityAPITokenEnv)
+	if capURL != "" && capToken == "" {
+		errs = append(errs, "capability_api_url requires capability_api_token or capability_api_token_env")
+	}
+	if capURL == "" && (capToken != "" || capTokenEnv != "") {
+		errs = append(errs, "capability_api_token is set without capability_api_url; capability enforcement would not activate")
+	}
+	if capURL != "" && !strings.HasPrefix(capURL, "http://") && !strings.HasPrefix(capURL, "https://") {
+		errs = append(errs, "capability_api_url must be an http(s) URL")
+	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
 	}
@@ -224,7 +263,11 @@ func NewService(cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{cfg: cfg, http: &http.Client{Timeout: cfg.Timeout.Duration}, audit: audit}, nil
+	svc := &Service{cfg: cfg, http: &http.Client{Timeout: cfg.Timeout.Duration}, audit: audit}
+	if cfg.capabilityEnabled() {
+		svc.caps = newCapClient(cfg.CapabilityAPIURL, cfg.CapabilityAPIToken, cfg.Timeout.Duration, nil)
+	}
+	return svc, nil
 }
 
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -243,6 +286,10 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleModelCall(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.capabilityEnabled() {
+		s.handleModelCallCapability(w, r)
+		return
+	}
 	if !s.authOK(r) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="gh-agent-proxy"`)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
@@ -275,6 +322,67 @@ func (s *Service) handleModelCall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit.Log(auditEvent{RunID: in.RunID, Model: in.Model, Decision: "allow", Tokens: usage.TotalTokens})
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleModelCallCapability serves /v1/model/call under capability enforcement.
+// It authenticates the run by its opaque handle, verifies immutable claims,
+// derives run_id from the verified claims (never the caller's body field),
+// handleModelCallCapability authenticates the run, enforces the allowed model,
+// and atomically reserves one call plus a conservative token upper bound BEFORE
+// forwarding. The bound is request bytes + caller-declared max output tokens;
+// token count cannot exceed the UTF-8 byte count of the serialized request, so
+// this may over-reserve but cannot authorize an over-budget upstream call.
+func (s *Service) handleModelCallCapability(w http.ResponseWriter, r *http.Request) {
+	body, err := readLimited(r.Body, s.cfg.MaxRequestBytes)
+	if err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+		return
+	}
+	var in ModelCallRequest
+	if err := json.Unmarshal(body, &in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+	// callerRunID (in.RunID) is used ONLY to reject a mismatch; the real run id
+	// comes from the verified claims below.
+	auth, err := s.authenticateCapability(r.Context(), r, in.RunID)
+	if err != nil {
+		status, code := capStatus(err)
+		s.audit.Log(auditEvent{Model: in.Model, Decision: "deny", Error: capAuditError(err)})
+		if status == http.StatusUnauthorized {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="gh-agent-proxy"`)
+		}
+		writeJSON(w, status, map[string]string{"error": code})
+		return
+	}
+	runID := auth.claims.RunID
+	if len(in.Messages) == 0 {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "deny", Error: "messages_required"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "messages_required"})
+		return
+	}
+	tokenBound, ok := preflightTokenBound(len(body), in.MaxTokens)
+	if !ok {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "deny", Error: "max_tokens_required"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max_tokens_required"})
+		return
+	}
+	if err := s.reserveCapabilityBudget(r.Context(), auth, in.Model, tokenBound); err != nil {
+		status, code := capStatus(err)
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "deny", Tokens: int(tokenBound), Error: capAuditError(err)})
+		writeJSON(w, status, map[string]string{"error": code})
+		return
+	}
+	// Forward with the VERIFIED run id, not the caller's asserted value.
+	in.RunID = runID
+	out, usage, err := s.forward(in)
+	if err != nil {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "deny", Error: "upstream_error"})
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream_error"})
+		return
+	}
+	s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "allow", Tokens: usage.TotalTokens})
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -327,6 +435,14 @@ func (s *Service) handleCodexResponses(w http.ResponseWriter, r *http.Request) {
 		auditEndpoint    = "/v1/responses"
 		upstreamEndpoint = "/responses"
 	)
+	// Capability-enforced path: the run authenticates with its opaque handle,
+	// run_id is derived from verified claims, and budget/model are reserved and
+	// enforced by the broker. Legacy static-token path is preserved below when
+	// enforcement is not configured.
+	if s.cfg.capabilityEnabled() {
+		s.handleCodexResponsesCapability(w, r, auditEndpoint, upstreamEndpoint)
+		return
+	}
 	if !s.codexAuthOK(r) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="gh-agent-proxy-codex"`)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
@@ -394,6 +510,97 @@ func (s *Service) handleCodexResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "budget_exhausted", "message": err.Error()})
 		return
 	}
+	s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "allow", Tokens: usage.TotalTokens})
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if _, err := w.Write(respBody); err != nil {
+		return
+	}
+}
+
+// handleCodexResponsesCapability serves /v1/responses under capability
+// enforcement. The run authenticates with its opaque handle (Bearer), run_id is
+// derived from the verified claims, the requested alias must be in the verified
+// allowed_models, and one call plus a conservative token upper bound are
+// atomically reserved BEFORE forwarding. The caller-provided X-GH-Agent-Run-ID
+// header is used only to reject a mismatch, never trusted. Fails closed; never logs the handle.
+func (s *Service) handleCodexResponsesCapability(w http.ResponseWriter, r *http.Request, auditEndpoint, upstreamEndpoint string) {
+	callerRunID := strings.TrimSpace(r.Header.Get("X-GH-Agent-Run-ID"))
+	auth, err := s.authenticateCapability(r.Context(), r, callerRunID)
+	if err != nil {
+		status, code := capStatus(err)
+		s.audit.Log(auditEvent{Endpoint: auditEndpoint, Decision: "deny", Error: capAuditError(err)})
+		if status == http.StatusUnauthorized {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="gh-agent-proxy-codex"`)
+		}
+		writeJSON(w, status, map[string]string{"error": code})
+		return
+	}
+	runID := auth.claims.RunID
+	body, err := readLimited(r.Body, s.cfg.MaxRequestBytes)
+	if err != nil {
+		s.audit.Log(auditEvent{RunID: runID, Endpoint: auditEndpoint, Decision: "deny", Error: "request_too_large"})
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+		return
+	}
+	var in openAIResponseRequest
+	if err := json.Unmarshal(body, &in); err != nil {
+		s.audit.Log(auditEvent{RunID: runID, Endpoint: auditEndpoint, Decision: "deny", Error: "invalid_json"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+	// Map the alias to the upstream model. The alias (in.Model) is what the
+	// capability grants; the allowed-model enforcement below is against the
+	// alias, not the upstream id.
+	upstreamModel, err := s.codexUpstreamModel(in.Model)
+	if err != nil {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: "model_denied"})
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "capability_denied"})
+		return
+	}
+	body, err = rewriteJSONModel(body, upstreamModel)
+	if err != nil {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: "invalid_json"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+	tokenBound, ok := preflightTokenBound(len(body), in.MaxOutputTokens)
+	if !ok {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: "max_output_tokens_required"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max_output_tokens_required"})
+		return
+	}
+	// Reserve the model, one call, and the complete conservative token bound in
+	// one broker transaction before any upstream request or stream begins.
+	if err := s.reserveCapabilityBudget(r.Context(), auth, in.Model, tokenBound); err != nil {
+		status, code := capStatus(err)
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Tokens: int(tokenBound), Error: capAuditError(err)})
+		writeJSON(w, status, map[string]string{"error": code})
+		return
+	}
+	resp, err := s.forwardCodex(upstreamEndpoint, body, r)
+	if err != nil {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: "upstream_error"})
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream_error"})
+		return
+	}
+	defer closeBody(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: fmt.Sprintf("upstream status %d", resp.StatusCode)})
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream_error"})
+		return
+	}
+	if isEventStream(resp.Header.Get("Content-Type")) {
+		s.streamCodexResponseCapability(w, resp, runID, in.Model, auditEndpoint)
+		return
+	}
+	respBody, err := readLimited(resp.Body, s.cfg.MaxResponseBytes)
+	if err != nil {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: "upstream_response_too_large"})
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream_response_too_large"})
+		return
+	}
+	usage := usageFromJSON(respBody)
 	s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "allow", Tokens: usage.TotalTokens})
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -534,6 +741,45 @@ func (s *Service) streamCodexResponse(w http.ResponseWriter, resp *http.Response
 	if err := s.reserveTokens(runID, usage.TotalTokens); err != nil {
 		s.audit.Log(auditEvent{RunID: runID, Model: model, Endpoint: endpoint, Decision: "deny", Tokens: usage.TotalTokens, Error: err.Error()})
 		return
+	}
+	s.audit.Log(auditEvent{RunID: runID, Model: model, Endpoint: endpoint, Decision: "allow", Tokens: usage.TotalTokens})
+}
+
+// streamCodexResponseCapability streams an SSE response after the model, call,
+// and conservative token bound were atomically reserved. Observed usage is
+// audit evidence only; it is never used as late authorization after bytes are
+// already on the wire.
+func (s *Service) streamCodexResponseCapability(w http.ResponseWriter, resp *http.Response, runID, model, endpoint string) {
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	flusher, canFlush := w.(http.Flusher)
+	reader := bufio.NewReader(resp.Body)
+	var total int64
+	var usage Usage
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			total += int64(len(line))
+			if total > s.cfg.MaxResponseBytes {
+				s.audit.Log(auditEvent{RunID: runID, Model: model, Endpoint: endpoint, Decision: "deny", Tokens: usage.TotalTokens, Error: "upstream response exceeded byte limit"})
+				return
+			}
+			usage = mergeUsage(usage, usageFromSSELine(line))
+			if _, writeErr := w.Write(line); writeErr != nil {
+				s.audit.Log(auditEvent{RunID: runID, Model: model, Endpoint: endpoint, Decision: "deny", Tokens: usage.TotalTokens, Error: "client_write_error"})
+				return
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.audit.Log(auditEvent{RunID: runID, Model: model, Endpoint: endpoint, Decision: "deny", Tokens: usage.TotalTokens, Error: "upstream_stream_error"})
+				return
+			}
+			break
+		}
 	}
 	s.audit.Log(auditEvent{RunID: runID, Model: model, Endpoint: endpoint, Decision: "allow", Tokens: usage.TotalTokens})
 }
