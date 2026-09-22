@@ -17,13 +17,14 @@ import (
 )
 
 const (
-	defaultListen                  = "127.0.0.1:8091"
-	defaultMCPPath                 = "/mcp"
-	defaultRunsDir                 = "/srv/hermes-sandbox-broker/runs"
-	defaultMaxTaskBytes            = 64 * 1024
-	defaultMaxParamBytes           = 16 * 1024
-	defaultLogByteLimit            = 128 * 1024
-	defaultTerminalResultByteLimit = 32 * 1024
+	defaultListen                   = "127.0.0.1:8091"
+	defaultMCPPath                  = "/mcp"
+	defaultRunsDir                  = "/srv/hermes-sandbox-broker/runs"
+	defaultMaxTaskBytes             = 64 * 1024
+	defaultMaxParamBytes            = 16 * 1024
+	defaultLogByteLimit             = 128 * 1024
+	defaultTerminalResultByteLimit  = 32 * 1024
+	defaultReleaseArtifactByteLimit = 256 * 1024 * 1024
 )
 
 // agentTypePattern mirrors the release registry's agent-type contract
@@ -31,32 +32,40 @@ const (
 var agentTypePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 type Config struct {
-	Listen                  string                       `yaml:"listen"`
-	MCPPath                 string                       `yaml:"mcp_path"`
-	AuthToken               string                       `yaml:"auth_token"`
-	AuthTokenEnv            string                       `yaml:"auth_token_env"`
-	RunsDir                 string                       `yaml:"runs_dir"`
-	LaunchIntentStore       string                       `yaml:"launch_intent_store_path"`
-	ReleaseStore            string                       `yaml:"release_store_path"`
-	BrokerURL               string                       `yaml:"broker_url"`
-	Production              bool                         `yaml:"production"`
-	Repositories            []string                     `yaml:"repositories"`
-	Networks                map[string]NetworkPolicy     `yaml:"network_policies"`
-	Bundles                 map[string]CredentialBundle  `yaml:"credential_bundles"`
-	Templates               map[string]Template          `yaml:"templates"`
-	LaunchProfiles          map[string]LaunchProfile     `yaml:"launch_profiles"`
-	ModelPolicies           map[string]ModelPolicy       `yaml:"model_policies"`
-	CodexHolder             CodexHolderConfig            `yaml:"codex_holder"`
-	OperatorPrincipals      map[string]OperatorPrincipal `yaml:"operator_principals"`
-	Audit                   SandboxAuditConfig           `yaml:"audit"`
-	MaxTaskBytes            int                          `yaml:"max_task_bytes"`
-	MaxParameterBytes       int                          `yaml:"max_parameter_bytes"`
-	LogByteLimit            int                          `yaml:"log_byte_limit"`
-	TerminalResultByteLimit int                          `yaml:"terminal_result_byte_limit"`
-	StopGrace               Duration                     `yaml:"stop_grace"`
-	ResolvedPaths           map[string]CredentialBundle  `yaml:"-"`
-	ConfigLoadedAt          time.Time                    `yaml:"-"`
-	ConfigVersion           string                       `yaml:"-"`
+	Listen                   string                        `yaml:"listen"`
+	MCPPath                  string                        `yaml:"mcp_path"`
+	AuthToken                string                        `yaml:"auth_token"`
+	AuthTokenEnv             string                        `yaml:"auth_token_env"`
+	RunsDir                  string                        `yaml:"runs_dir"`
+	LaunchIntentStore        string                        `yaml:"launch_intent_store_path"`
+	ReleaseStore             string                        `yaml:"release_store_path"`
+	BrokerURL                string                        `yaml:"broker_url"`
+	Production               bool                          `yaml:"production"`
+	Repositories             []string                      `yaml:"repositories"`
+	Networks                 map[string]NetworkPolicy      `yaml:"network_policies"`
+	Bundles                  map[string]CredentialBundle   `yaml:"credential_bundles"`
+	Templates                map[string]Template           `yaml:"templates"`
+	LaunchProfiles           map[string]LaunchProfile      `yaml:"launch_profiles"`
+	ModelPolicies            map[string]ModelPolicy        `yaml:"model_policies"`
+	CodexHolder              CodexHolderConfig             `yaml:"codex_holder"`
+	OperatorPrincipals       map[string]OperatorPrincipal  `yaml:"operator_principals"`
+	AgentReleasePolicies     map[string]AgentReleasePolicy `yaml:"agent_release_policies"`
+	Audit                    SandboxAuditConfig            `yaml:"audit"`
+	MaxTaskBytes             int                           `yaml:"max_task_bytes"`
+	MaxParameterBytes        int                           `yaml:"max_parameter_bytes"`
+	LogByteLimit             int                           `yaml:"log_byte_limit"`
+	TerminalResultByteLimit  int                           `yaml:"terminal_result_byte_limit"`
+	ReleaseArtifactByteLimit int                           `yaml:"release_artifact_byte_limit"`
+	StopGrace                Duration                      `yaml:"stop_grace"`
+	ResolvedPaths            map[string]CredentialBundle   `yaml:"-"`
+	ConfigLoadedAt           time.Time                     `yaml:"-"`
+	ConfigVersion            string                        `yaml:"-"`
+}
+
+// AgentReleasePolicy is deployment-owned verification policy for one agent type.
+type AgentReleasePolicy struct {
+	ProvenanceFields []string `yaml:"provenance_fields"`
+	Platforms        []string `yaml:"platforms"`
 }
 
 type SandboxAuditConfig struct {
@@ -249,6 +258,9 @@ func (c *Config) ApplyDefaults() {
 	if c.TerminalResultByteLimit == 0 {
 		c.TerminalResultByteLimit = defaultTerminalResultByteLimit
 	}
+	if c.ReleaseArtifactByteLimit == 0 {
+		c.ReleaseArtifactByteLimit = defaultReleaseArtifactByteLimit
+	}
 	if c.StopGrace.Duration == 0 {
 		c.StopGrace.Duration = 10 * time.Second
 	}
@@ -297,6 +309,17 @@ func (c *Config) Validate() error {
 	}
 	if c.LogByteLimit < 1 {
 		errs = append(errs, "log_byte_limit must be positive")
+	}
+	if c.ReleaseArtifactByteLimit < 0 {
+		errs = append(errs, "release_artifact_byte_limit must not be negative")
+	}
+	for agentType, policy := range c.AgentReleasePolicies {
+		if !agentTypePattern.MatchString(agentType) {
+			errs = append(errs, fmt.Sprintf("agent_release_policy %q must use a kebab-case agent type", agentType))
+		}
+		if len(policy.Platforms) == 0 {
+			errs = append(errs, fmt.Sprintf("agent_release_policy %q must declare at least one platform", agentType))
+		}
 	}
 	if len(c.Repositories) == 0 {
 		errs = append(errs, "repositories must not be empty")
@@ -839,7 +862,7 @@ func (c Config) validateOperatorPrincipal(name string, principal OperatorPrincip
 func validOperatorAction(action string) bool {
 	switch action {
 	case "launch", "dry_run", "status", "logs", "artifacts", "terminal_result", "stop", "cleanup",
-		"release.publish", "release.verify", "release.acquire", "release.promote", "release.rollback":
+		"release.publish", "release.promote", "release.rollback":
 		return true
 	default:
 		return false

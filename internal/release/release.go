@@ -324,8 +324,9 @@ func (s *Store) PublishCandidate(ctx context.Context, agentType, imageReference 
 	}, nil
 }
 
-// Verify checks a candidate against the agent type's declared requirements.
-func (s *Store) Verify(ctx context.Context, generation int64, requirements Requirements, actor string) error {
+// verify checks a candidate against deployment-owned requirements. It is kept
+// internal so callers cannot separately authorize verification.
+func (s *Store) verify(ctx context.Context, generation int64, requirements Requirements, actor string) error {
 	if actor == "" {
 		return fmt.Errorf("verify requires an actor")
 	}
@@ -391,9 +392,9 @@ func checkRequirements(item Release, requirements Requirements) error {
 	return nil
 }
 
-// MarkAvailable records that the image is present locally, which is what an
-// authenticated acquire step reports. Promotion requires it.
-func (s *Store) MarkAvailable(ctx context.Context, generation int64, available bool, actor string) error {
+// markAvailable records an observed local image state. It is internal so no
+// caller can assert availability.
+func (s *Store) markAvailable(ctx context.Context, generation int64, available bool, actor string) error {
 	if actor == "" {
 		return fmt.Errorf("availability change requires an actor")
 	}
@@ -425,6 +426,23 @@ func (s *Store) MarkAvailable(ctx context.Context, generation int64, available b
 		return fmt.Errorf("commit availability update: %w", err)
 	}
 	return nil
+}
+
+// VerifyAndMarkAvailable is the broker's single internal acquisition boundary.
+// Verification is committed before acquire runs; a failed acquisition leaves a
+// verified but unavailable candidate, which remains non-promotable.
+func (s *Store) VerifyAndMarkAvailable(ctx context.Context, generation int64, requirements Requirements, verifier, acquirer string, acquire func(context.Context, Release) error) error {
+	if err := s.verify(ctx, generation, requirements, verifier); err != nil {
+		return err
+	}
+	item, err := s.load(ctx, generation)
+	if err != nil {
+		return err
+	}
+	if err := acquire(ctx, item); err != nil {
+		return err
+	}
+	return s.markAvailable(ctx, generation, true, acquirer)
 }
 
 // Promote activates a verified, locally available generation. It refuses any
@@ -638,7 +656,7 @@ func (s *Store) Reconcile(ctx context.Context, check AvailabilityCheck, actor st
 		if available == item.Available {
 			continue
 		}
-		if err := s.MarkAvailable(ctx, item.Generation, available, actor); err != nil {
+		if err := s.markAvailable(ctx, item.Generation, available, actor); err != nil {
 			return nil, err
 		}
 		if !available {
@@ -752,6 +770,15 @@ func loadTx(ctx context.Context, tx *sql.Tx, generation int64) (Release, error) 
 	row := tx.QueryRowContext(ctx,
 		`SELECT generation, agent_type, image_reference, image_digest, provenance_json, state, available, created_at, updated_at
 		 FROM agent_releases WHERE generation = ?`, generation)
+	item, err := scan(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Release{}, fmt.Errorf("%w: generation %d", ErrNotFound, generation)
+	}
+	return item, err
+}
+
+func (s *Store) load(ctx context.Context, generation int64) (Release, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT generation, agent_type, image_reference, image_digest, provenance_json, state, available, created_at, updated_at FROM agent_releases WHERE generation = ?`, generation)
 	item, err := scan(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Release{}, fmt.Errorf("%w: generation %d", ErrNotFound, generation)

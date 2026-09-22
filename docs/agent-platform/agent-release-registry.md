@@ -19,7 +19,7 @@ configuration delivered by someone else's deploy. `internal/release` is that reg
 
 ## Authority split
 
-- a **publisher** may publish a candidate; it cannot promote and cannot launch;
+- a **publisher** may publish one validated OCI candidate; it cannot promote and cannot launch;
 - a **promoter** may promote a verified, acquired generation; it cannot launch;
 - the **broker** resolves the active generation and is the sole runtime authority;
 - **callers** name an agent type — never an image, release, or generation.
@@ -29,10 +29,24 @@ mutating operation takes an `actor` string, recorded in the audit trail, and ref
 an empty one. Binding those operations to authenticated identities is the next piece
 of work (see below).
 
-## The five operations
+## Publish and broker-owned acquisition
 
-`publish` → `verify` → `acquire` → `promote`, with `rollback` as a separate,
-audited operation. Availability changes are recorded as `acquire` / `evict`.
+The sole caller-facing artifact endpoint is `POST /v1/releases/publish`, guarded
+by `release.publish`. It accepts the versioned `oci-layout-tar/v1` multipart
+protocol, with candidate metadata and exactly one bounded OCI-layout tar. The
+separate `release_artifact_byte_limit` applies to this binary upload.
+
+`release.verify` and `release.acquire` are not public routes or caller actions.
+The broker derives provenance fields and accepted platforms from deployment-owned
+`agent_release_policies` in sandbox configuration. It validates the tar without
+extracting it (no traversal, links, duplicate paths, or multi-platform indexes),
+checks the declared digest and platform, imports it through Docker Engine, then
+observes the exact local digest and platform. Only then does it mark the candidate
+available. Verification and acquisition carry distinct internal audit actors.
+
+`publish` → internal `verify` → internal `acquire` → `promote`, with `rollback`
+as a separate, audited operation. A failed validation or Docker load leaves a
+candidate non-promotable.
 
 Two properties are load-bearing.
 
@@ -70,9 +84,9 @@ are logged loudly instead.
 ## What this deliberately does not do
 
 **The authenticated promotion HTTP surface uses action-scoped operator principals.**
-`/v1/releases` exposes `release.publish`, `release.verify`, `release.acquire`,
-`release.promote`, and `release.rollback`; each mutation records the verified
-principal name as its registry audit actor. The current verifier compares a dedicated
+`/v1/releases` exposes `release.publish`, `release.promote`, and
+`release.rollback`; only the latter two are action-scoped operator transitions.
+The current verifier compares a dedicated
 promoter bearer token with the configured `OperatorPrincipal`, while protected-main
 CI is the trust anchor for issuing that credential.
 

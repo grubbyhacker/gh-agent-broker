@@ -7,6 +7,9 @@ broker_url: "http://broker:8080"
 production: false
 max_task_bytes: 65536
 max_parameter_bytes: 16384
+# Bounded independently from request parameters because OCI layouts are binary
+# release artifacts, not agent-supplied launch parameters.
+release_artifact_byte_limit: 268435456
 log_byte_limit: 131072
 # Each terminal worker file is complete-or-rejected at this bound; terminal
 # reporting never serves logs or silently truncates work-product text.
@@ -88,6 +91,13 @@ operator_principals:
       - "stop"
       - "cleanup"
     run_scope: "profile"
+
+# Deployment-owned release policy. A release publisher submits provenance but
+# cannot choose the requirements used to verify it.
+# agent_release_policies:
+#   coder:
+#     provenance_fields: ["source_revision", "platform"]
+#     platforms: ["linux/amd64"]
 
 network_policies:
   worker-net:

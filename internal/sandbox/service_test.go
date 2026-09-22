@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -687,11 +688,12 @@ func baseTestConfig(t *testing.T) Config {
 		Templates: map[string]Template{
 			"worker": testTemplate("example.com/worker@sha256:1111111111111111111111111111111111111111111111111111111111111111"),
 		},
-		MaxTaskBytes:      1024,
-		MaxParameterBytes: 1024,
-		LogByteLimit:      1024,
-		StopGrace:         Duration{Duration: time.Second},
-		Audit:             SandboxAuditConfig{Path: filepath.Join(root, "audit", "sandbox.jsonl")},
+		MaxTaskBytes:             1024,
+		MaxParameterBytes:        1024,
+		ReleaseArtifactByteLimit: 1024 * 1024,
+		LogByteLimit:             1024,
+		StopGrace:                Duration{Duration: time.Second},
+		Audit:                    SandboxAuditConfig{Path: filepath.Join(root, "audit", "sandbox.jsonl")},
 	}
 	tmpl := cfg.Templates["worker"]
 	tmpl.KnowledgeSnapshots = []string{knowledge}
@@ -800,6 +802,17 @@ func newFakeRuntime() *fakeRuntime {
 		injections: map[string][]byte{}, injectionCalls: map[string]int{}, paths: map[string]bool{},
 		waiters: map[string]chan struct{}{}, waitClosed: map[string]bool{}, acceptInjected: true,
 	}
+}
+
+func (f *fakeRuntime) LoadImage(_ context.Context, artifact io.Reader) error {
+	_, err := io.Copy(io.Discard, artifact)
+	return err
+}
+
+func (f *fakeRuntime) ImageAvailable(context.Context, string, string) (bool, error) { return true, nil }
+
+func (f *fakeRuntime) ImageIdentity(_ context.Context, reference string) (string, string, error) {
+	return reference[strings.LastIndex(reference, "@")+1:], "linux/amd64", nil
 }
 
 func (f *fakeRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {

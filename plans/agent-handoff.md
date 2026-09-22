@@ -2,6 +2,14 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
+The AgentRelease publish boundary now gives external callers `release.publish`
+only: the former public verify/acquire routes and actions are gone. Publish uses
+a bounded `oci-layout-tar/v1` multipart artifact; broker code validates its safe
+single-platform OCI layout, derives requirements from deployment-owned sandbox
+`agent_release_policies`, imports through Docker, and observes exact digest and
+platform before internal verifier/acquirer actors record availability. A failed,
+malformed, absent, mismatched, or load-failed image stays non-promotable.
+
 PR #176 exposes the broker-owned AgentRelease registry through authenticated,
 action-scoped REST operations: publish, verify, acquire, promote, and separately
 authorized rollback. The authentication seam yields a credential-free verified

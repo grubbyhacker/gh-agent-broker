@@ -7,8 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"gh-agent-broker/internal/release"
@@ -18,8 +19,7 @@ import (
 // Authentication is intentionally not part of this interface.
 type ReleaseRegistry interface {
 	PublishCandidate(context.Context, string, string, release.Provenance, string) (release.Release, error)
-	Verify(context.Context, int64, release.Requirements, string) error
-	MarkAvailable(context.Context, int64, bool, string) error
+	VerifyAndMarkAvailable(context.Context, int64, release.Requirements, string, string, func(context.Context, release.Release) error) error
 	Promote(context.Context, int64, string) error
 	Rollback(context.Context, string, int64, string) error
 }
@@ -28,10 +28,6 @@ type publishReleaseRequest struct {
 	AgentType      string             `json:"agent_type"`
 	ImageReference string             `json:"image_reference"`
 	Provenance     release.Provenance `json:"provenance"`
-}
-
-type verifyReleaseRequest struct {
-	Requirements release.Requirements `json:"requirements"`
 }
 
 type rollbackReleaseRequest struct {
@@ -53,20 +49,10 @@ func (h *restHandler) handleRelease(w http.ResponseWriter, r *http.Request, path
 		h.handleReleaseRollback(w, r, parts[1])
 		return
 	}
-	if len(parts) == 2 {
-		generation, err := strconv.ParseInt(parts[0], 10, 64)
-		if err == nil && generation > 0 {
-			switch parts[1] {
-			case "verify":
-				h.handleReleaseVerify(w, r, generation)
-				return
-			case "acquire":
-				h.handleReleaseAcquire(w, r, generation)
-				return
-			case "promote":
-				h.handleReleasePromote(w, r, generation)
-				return
-			}
+	if len(parts) == 2 && parts[1] == "promote" {
+		if generation, err := parseReleaseGeneration(parts[0]); err == nil && generation > 0 {
+			h.handleReleasePromote(w, r, generation)
+			return
 		}
 	}
 	writeRESTError(w, http.StatusNotFound, "not_found")
@@ -81,8 +67,22 @@ func (h *restHandler) handleReleasePublish(w http.ResponseWriter, r *http.Reques
 	if !ok || !h.authorizePromoterAction(w, promoter, operation) {
 		return
 	}
-	var input publishReleaseRequest
-	if !decodeReleaseRequest(w, r, h.service.cfg.MaxParameterBytes, &input) {
+	input, artifact, ok := decodeReleasePublishRequest(w, r, h.service.cfg.ReleaseArtifactByteLimit)
+	if !ok {
+		return
+	}
+	policy, policyFound := h.service.cfg.AgentReleasePolicies[input.AgentType]
+	if !policyFound {
+		h.writeReleaseError(w, operation, promoter.Name, errors.New("agent type has no deployment-owned release policy"))
+		return
+	}
+	digest, ok := imageReferenceDigest(input.ImageReference)
+	if !ok {
+		h.writeReleaseError(w, operation, promoter.Name, errors.New("image reference must be digest-pinned"))
+		return
+	}
+	if err := validateOCIArtifact(artifact, digest, input.Provenance.Platform); err != nil {
+		h.writeReleaseError(w, operation, promoter.Name, err)
 		return
 	}
 	item, err := h.releases.PublishCandidate(r.Context(), input.AgentType, input.ImageReference, input.Provenance, promoter.Name)
@@ -90,49 +90,102 @@ func (h *restHandler) handleReleasePublish(w http.ResponseWriter, r *http.Reques
 		h.writeReleaseError(w, operation, promoter.Name, err)
 		return
 	}
+	importer, importerOK := h.releaseImporter()
+	if !importerOK {
+		h.writeReleaseError(w, operation, promoter.Name, errors.New("release artifact importer is unavailable"))
+		return
+	}
+	requirements := release.Requirements{ProvenanceFields: policy.ProvenanceFields, Platforms: policy.Platforms}
+	if err := h.releases.VerifyAndMarkAvailable(r.Context(), item.Generation, requirements, "sandbox-broker-verifier", "sandbox-broker-acquirer", func(ctx context.Context, candidate release.Release) error {
+		return acquireOCIArtifact(ctx, importer, artifact, candidate)
+	}); err != nil {
+		h.writeReleaseError(w, operation, promoter.Name, err)
+		return
+	}
 	h.audit(operation, promoter.Name, "", "", "", "", "", "allow", nil, nil)
 	writeJSON(w, http.StatusCreated, item)
 }
 
-func (h *restHandler) handleReleaseVerify(w http.ResponseWriter, r *http.Request, generation int64) {
-	const operation = "release.verify"
-	if !requirePOST(w, r) {
-		return
+func imageReferenceDigest(reference string) (string, bool) {
+	index := strings.LastIndex(reference, "@")
+	if index < 1 || index == len(reference)-1 {
+		return "", false
 	}
-	promoter, ok := h.authenticatePromoter(w, r, operation)
-	if !ok || !h.authorizePromoterAction(w, promoter, operation) {
-		return
+	digest := reference[index+1:]
+	if len(digest) != len("sha256:")+64 || !strings.HasPrefix(digest, "sha256:") {
+		return "", false
 	}
-	var input verifyReleaseRequest
-	if !decodeReleaseRequest(w, r, h.service.cfg.MaxParameterBytes, &input) {
-		return
+	for _, character := range digest[len("sha256:"):] {
+		if character < '0' || character > 'f' || (character > '9' && character < 'a') {
+			return "", false
+		}
 	}
-	if err := h.releases.Verify(r.Context(), generation, input.Requirements, promoter.Name); err != nil {
-		h.writeReleaseError(w, operation, promoter.Name, err)
-		return
-	}
-	h.audit(operation, promoter.Name, "", "", "", "", "", "allow", nil, nil)
-	w.WriteHeader(http.StatusNoContent)
+	return digest, true
 }
 
-func (h *restHandler) handleReleaseAcquire(w http.ResponseWriter, r *http.Request, generation int64) {
-	const operation = "release.acquire"
-	if !requirePOST(w, r) {
-		return
+func parseReleaseGeneration(value string) (int64, error) {
+	var generation int64
+	_, err := fmt.Sscan(value, &generation)
+	return generation, err
+}
+
+func (h *restHandler) releaseImporter() (releaseArtifactImporter, bool) {
+	importer, ok := h.service.runtime.(releaseArtifactImporter)
+	return importer, ok
+}
+
+func decodeReleasePublishRequest(w http.ResponseWriter, r *http.Request, maxBytes int) (publishReleaseRequest, []byte, bool) {
+	defer closeBody(r.Body)
+	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "multipart/form-data" {
+		writeRESTError(w, http.StatusBadRequest, "release publish requires multipart/form-data")
+		return publishReleaseRequest{}, nil, false
 	}
-	promoter, ok := h.authenticatePromoter(w, r, operation)
-	if !ok || !h.authorizePromoterAction(w, promoter, operation) {
-		return
+	r.Body = http.MaxBytesReader(w, r.Body, int64(maxBytes)+1)
+	reader := multipart.NewReader(r.Body, params["boundary"])
+	var input publishReleaseRequest
+	var artifact []byte
+	seen := map[string]bool{}
+	for {
+		part, nextErr := reader.NextPart()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			writeRESTError(w, http.StatusBadRequest, nextErr.Error())
+			return publishReleaseRequest{}, nil, false
+		}
+		name := part.FormName()
+		if seen[name] || (name != "protocol" && name != "metadata" && name != "artifact") {
+			writeRESTError(w, http.StatusBadRequest, "release publish has duplicate or unknown part")
+			return publishReleaseRequest{}, nil, false
+		}
+		seen[name] = true
+		b, readErr := io.ReadAll(io.LimitReader(part, int64(maxBytes)+1))
+		if readErr != nil || len(b) > maxBytes {
+			writeRESTError(w, http.StatusBadRequest, "release artifact exceeds release_artifact_byte_limit")
+			return publishReleaseRequest{}, nil, false
+		}
+		switch name {
+		case "protocol":
+			if string(b) != releasePublishProtocol {
+				writeRESTError(w, http.StatusBadRequest, "unsupported release publish protocol")
+				return publishReleaseRequest{}, nil, false
+			}
+		case "metadata":
+			if json.Unmarshal(b, &input) != nil {
+				writeRESTError(w, http.StatusBadRequest, "invalid release publish metadata")
+				return publishReleaseRequest{}, nil, false
+			}
+		case "artifact":
+			artifact = b
+		}
 	}
-	if !decodeReleaseRequest(w, r, h.service.cfg.MaxParameterBytes, &struct{}{}) {
-		return
+	if !seen["protocol"] || !seen["metadata"] || !seen["artifact"] || len(artifact) == 0 {
+		writeRESTError(w, http.StatusBadRequest, "release publish requires protocol, metadata, and artifact")
+		return publishReleaseRequest{}, nil, false
 	}
-	if err := h.releases.MarkAvailable(r.Context(), generation, true, promoter.Name); err != nil {
-		h.writeReleaseError(w, operation, promoter.Name, err)
-		return
-	}
-	h.audit(operation, promoter.Name, "", "", "", "", "", "allow", nil, nil)
-	w.WriteHeader(http.StatusNoContent)
+	return input, artifact, true
 }
 
 func (h *restHandler) handleReleasePromote(w http.ResponseWriter, r *http.Request, generation int64) {
