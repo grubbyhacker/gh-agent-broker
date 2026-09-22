@@ -103,6 +103,7 @@ func runServerCommand(args []string) {
 	}()
 	backend := sandbox.NewDockerBackend(*dockerSocket)
 	service := sandbox.NewServiceWithLaunchIntents(cfg, backend, auditLog, intentStore)
+	var releaseRegistry *release.Store
 	if cfg.ReleaseStore != "" {
 		store, storeErr := release.Open(context.Background(), cfg.ReleaseStore)
 		if storeErr != nil {
@@ -115,6 +116,7 @@ func runServerCommand(args []string) {
 		}()
 		reconcileAgentReleases(context.Background(), store, backend)
 		service.SetReleaseResolver(&releaseResolver{store: store})
+		releaseRegistry = store
 	}
 	if cfg.CodexHolder.MasterAuthPath != "" {
 		holder, holderErr := codexauth.New(codexauth.Config{
@@ -159,7 +161,7 @@ func runServerCommand(args []string) {
 	mux.Handle(cfg.MCPPath, tokenAuth(cfg.AuthToken, mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		return mcpServer
 	}, &mcp.StreamableHTTPOptions{Stateless: true})))
-	mux.Handle("/v1/", sandbox.NewRESTHandler(service))
+	mux.Handle("/v1/", sandbox.NewRESTHandlerWithReleaseRegistry(service, releaseRegistry, nil))
 
 	log.Printf("sandbox broker listening on %s, mcp path %s", cfg.Listen, cfg.MCPPath)
 	httpServer := &http.Server{

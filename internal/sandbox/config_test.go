@@ -198,6 +198,20 @@ func TestConfigValidateLaunchProfilesAndOperatorPrincipals(t *testing.T) {
 	}
 }
 
+func TestConfigValidateRejectsPromoterWithLaunchAction(t *testing.T) {
+	cfg := baseTestConfig(t)
+	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+		"promoter": {
+			Token:          "promoter-secret",
+			AllowedActions: []string{"release.promote", "launch"},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cannot combine release.promote with launch actions") {
+		t.Fatalf("Validate() error = %v, want promote/launch rejection", err)
+	}
+}
+
 func TestConfigValidateLaunchProfileParameters(t *testing.T) {
 	cfg := baseTestConfig(t)
 	profile := testLaunchProfile()

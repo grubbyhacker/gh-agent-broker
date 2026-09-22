@@ -69,21 +69,28 @@ are logged loudly instead.
 
 ## What this deliberately does not do
 
-**There is no authenticated promotion HTTP surface.** The design defers the promoter
-identity — the exact GitHub OIDC claims and the broker token-exchange protocol — to
-implementation, and shipping an endpoint that can change which executable code runs
-in production before that authority is settled would be the wrong order.
+**The authenticated promotion HTTP surface uses action-scoped operator principals.**
+`/v1/releases` exposes `release.publish`, `release.verify`, `release.acquire`,
+`release.promote`, and `release.rollback`; each mutation records the verified
+principal name as its registry audit actor. The current verifier compares a dedicated
+promoter bearer token with the configured `OperatorPrincipal`, while protected-main
+CI is the trust anchor for issuing that credential.
 
-**Nothing resolves releases at launch yet.** The sandbox still uses its configured
-profile image. Switching the launch path to registry resolution is a separate change,
-reviewed separately, because it alters runtime behaviour.
+Authentication and authorization are deliberately separate. The REST handler asks a
+`PromoterAuthenticator` to verify a request into a `VerifiedPromoter`, then checks
+the requested action against that identity's `allowed_actions` before calling the
+registry. Replacing bearer verification with GitHub OIDC will therefore change only
+the authenticator implementation and its configuration, not registry operations or
+their audit records. There is no OIDC fallback or partial verifier.
 
-> **CI prerequisite for that change.** The `sandbox_e2e` path filter in
-> `.github/workflows/ci.yml` enumerates packages explicitly rather than matching
-> `internal/**`, and `internal/release/**` is deliberately absent while the registry is
-> inert. The change that puts resolution in the launch path **must add it**, or a
-> release-only change will silently skip the suite covering the code it feeds. This is
-> correct today and wrong the moment resolution lands.
+Binding is enforced at configuration load: a principal with `release.promote` cannot
+also hold either launch action (`launch` or `dry_run`), and `release.rollback` is a
+separate permission which promotion never implies.
+
+**Release resolution remains independently scoped.** The launch path resolves the
+active digest-pinned generation only for templates that declare an `agent_type`.
+The promotion API changes registry state but does not otherwise change launch
+behaviour or let callers choose an image, release, or generation.
 
 **The registry is not yet backed up.** The broker state backup allowlist admits
 `manifest.json`, `launch-intents.sqlite`, `runs/`, and `issuance/issuance.json`, and
