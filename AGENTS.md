@@ -53,6 +53,13 @@ Build a GitHub Agent Access Broker that lets agent containers use GitHub App acc
   - remove the task worktree,
   - verify clean/current repository state.
 
+## Agent platform design notes
+
+Design notes for the agent platform live in `docs/agent-platform/`. The cross-repo
+architecture they implement is `agent-infra-docs/design/agent-platform-coupling.md`
+and takes precedence: if implementation shows the architecture is wrong, correct it
+there first, then update the note here.
+
 ## Deployment
 
 - Production deploys through GitHub Actions on pushes to `main`, after CI passes.

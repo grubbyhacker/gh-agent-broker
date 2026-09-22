@@ -33,6 +33,7 @@ type Config struct {
 	AuthTokenEnv            string                       `yaml:"auth_token_env"`
 	RunsDir                 string                       `yaml:"runs_dir"`
 	LaunchIntentStore       string                       `yaml:"launch_intent_store_path"`
+	ReleaseStore            string                       `yaml:"release_store_path"`
 	BrokerURL               string                       `yaml:"broker_url"`
 	Production              bool                         `yaml:"production"`
 	Repositories            []string                     `yaml:"repositories"`
@@ -279,6 +280,9 @@ func (c *Config) Validate() error {
 	}
 	if c.LaunchIntentStore != "" && !filepath.IsAbs(c.LaunchIntentStore) {
 		errs = append(errs, "launch_intent_store_path must be an absolute path")
+	}
+	if c.ReleaseStore != "" && !filepath.IsAbs(c.ReleaseStore) {
+		errs = append(errs, "release_store_path must be an absolute path")
 	}
 	if c.MaxTaskBytes < 1 {
 		errs = append(errs, "max_task_bytes must be positive")
