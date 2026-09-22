@@ -19,15 +19,28 @@ plus `work_item_id`, added because the merged (inert) run-to-PR correlation
 outbox (`internal/correlation`) binds a correlation to its originating WorkItem.
 
 `Claims` has only unexported fields and copies its allowed-model set in and out,
-so a holder cannot mutate or widen a capability after construction. `NewClaims`
-enforces every claim as required with positive budgets and a non-zero expiry.
+so a holder cannot mutate or widen a capability after construction. The identity
+claims (agent_type, mode, run_id, work_item_id) and expiry are always required.
+Model access has exactly two coherent states, matching AgentType declarations
+like the deployed youknowme-curator `reconcile` mode (`model.access=false`):
+
+- **model-disabled** — `allowed_models` empty AND both budgets zero. Authorizes
+  identity-only broker operations; any model/call/token request is denied.
+- **model-enabled** — `allowed_models` non-empty AND both budgets positive.
+
+`NewClaims` rejects any mixed state (models without budget, budget without
+models, one budget zero and the other positive, a blank model, a negative
+budget).
 
 `PolicyEvaluator` implements the mechanism-independent `Validator` and
 `Authorizer` seams a consumer uses **instead of caller headers/body**: it checks
-well-formedness, expiry (not-before semantics), exact identity match on
-agent_type / mode / run_id / work_item_id, model membership in `allowed_models`,
-and call/token budget headroom. `cmd/capability-validate` is the offline
-claims-semantics validator.
+well-formedness, model-access coherence, expiry (a capability at or past its
+expiry instant is expired), exact identity match on
+agent_type / mode / run_id / work_item_id, and — for a model-enabled
+capability — model membership in `allowed_models` and call/token budget headroom.
+Against a model-disabled capability it allows an identity-only operation with
+zero reservation and denies any model, call, or token request.
+`cmd/capability-validate` is the offline claims-semantics validator.
 
 ## What is NOT decided, and therefore NOT implemented
 

@@ -9,9 +9,14 @@ token_budget, expiry` — plus `work_item_id` (the merged inert correlation outb
 binds a correlation to its originating WorkItem). `Claims` is immutable (unexported
 fields, allowed-model set copied in and out), and `PolicyEvaluator` implements the
 mechanism-independent `Validator`/`Authorizer` seams consumers use instead of
-caller headers/body: well-formedness, expiry (not-before), exact identity match on
-agent_type/mode/run_id/work_item_id, model membership, and call/token budget
-headroom. `cmd/capability-validate` is the offline claims-semantics validator.
+caller headers/body. Model access has exactly two coherent states: model-disabled
+(empty allowed_models, both budgets zero — the deployed youknowme-curator reconcile
+shape, model.access=false) and model-enabled (non-empty models, both budgets
+positive); mixed states are rejected. Authorize checks expiry, exact identity match
+on agent_type/mode/run_id/work_item_id, and — model-enabled only — model membership
+and call/token budget headroom; against a model-disabled capability it allows an
+identity-only op with zero reservation and denies any model/call/token request.
+`cmd/capability-validate` is the offline claims-semantics validator.
 
 The design does NOT decide how a minted capability is serialized, signed, and its
 keys managed for transport, so this package does not choose one: the broker-issuer

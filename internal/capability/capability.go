@@ -85,10 +85,18 @@ type ClaimsInput struct {
 	Expiry        time.Time
 }
 
-// NewClaims validates the input and returns immutable Claims. Every field is
-// required: the design's claims are all load-bearing, and an inert foundation
-// must not model a partial capability. Budgets must be positive; expiry must be
-// a non-zero instant; allowed_models must be non-empty with no blank entry.
+// NewClaims validates the input and returns immutable Claims. The identity claims
+// (agent_type, mode, run_id, work_item_id) and expiry are always required.
+//
+// Model access has exactly TWO coherent states, matching AgentType declarations
+// like the deployed youknowme-curator reconcile mode (model.access=false):
+//
+//   - model-DISABLED: allowed_models is empty AND both budgets are zero. The
+//     capability authorizes identity-only broker operations and no model access.
+//   - model-ENABLED: allowed_models is non-empty AND both budgets are positive.
+//
+// Any mixed state (models without budget, budget without models, one budget zero
+// and the other positive, a blank model entry, or a negative budget) is rejected.
 func NewClaims(in ClaimsInput) (Claims, error) {
 	if in.AgentType == "" {
 		return Claims{}, fmt.Errorf("%w: agent_type is required", ErrInvalidClaims)
@@ -102,17 +110,11 @@ func NewClaims(in ClaimsInput) (Claims, error) {
 	if in.WorkItemID == "" {
 		return Claims{}, fmt.Errorf("%w: work_item_id is required", ErrInvalidClaims)
 	}
-	if len(in.AllowedModels) == 0 {
-		return Claims{}, fmt.Errorf("%w: allowed_models must be non-empty", ErrInvalidClaims)
-	}
-	if in.CallBudget <= 0 {
-		return Claims{}, fmt.Errorf("%w: call_budget must be positive", ErrInvalidClaims)
-	}
-	if in.TokenBudget <= 0 {
-		return Claims{}, fmt.Errorf("%w: token_budget must be positive", ErrInvalidClaims)
-	}
 	if in.Expiry.IsZero() {
 		return Claims{}, fmt.Errorf("%w: expiry is required", ErrInvalidClaims)
+	}
+	if in.CallBudget < 0 || in.TokenBudget < 0 {
+		return Claims{}, fmt.Errorf("%w: budgets must not be negative", ErrInvalidClaims)
 	}
 	models := make(map[string]struct{}, len(in.AllowedModels))
 	for _, m := range in.AllowedModels {
@@ -120,6 +122,10 @@ func NewClaims(in ClaimsInput) (Claims, error) {
 			return Claims{}, fmt.Errorf("%w: allowed_models contains a blank entry", ErrInvalidClaims)
 		}
 		models[m] = struct{}{}
+	}
+	modelEnabled := len(models) > 0
+	if !coherentModelAccess(modelEnabled, in.CallBudget, in.TokenBudget) {
+		return Claims{}, fmt.Errorf("%w: model access is incoherent — model-enabled requires non-empty allowed_models with both budgets positive, model-disabled requires empty allowed_models with both budgets zero", ErrInvalidClaims)
 	}
 	return Claims{
 		agentType:     in.AgentType,
@@ -132,6 +138,11 @@ func NewClaims(in ClaimsInput) (Claims, error) {
 		expiry:        in.Expiry.UTC(),
 	}, nil
 }
+
+// ModelEnabled reports whether the capability grants any model access. When
+// false the capability is model-disabled: no allowed models, both budgets zero,
+// and any model/call/token request is denied by Authorize.
+func (c Claims) ModelEnabled() bool { return len(c.allowedModels) > 0 }
 
 // AgentType returns the agent type claim.
 func (c Claims) AgentType() string { return c.agentType }
@@ -240,12 +251,18 @@ var (
 	_ Authorizer = PolicyEvaluator{}
 )
 
-// Validate checks that the claims are still usable at now: well-formed (via the
-// same invariants NewClaims enforces) and not expired.
+// Validate checks that the claims are still usable at now: identity claims and
+// expiry present, model access in one of the two coherent states, and not yet
+// expired (a capability at or past its expiry instant is expired).
 func (PolicyEvaluator) Validate(claims Claims, now time.Time) error {
 	if claims.agentType == "" || claims.mode == "" || claims.runID == "" ||
-		claims.workItemID == "" || len(claims.allowedModels) == 0 ||
-		claims.callBudget <= 0 || claims.tokenBudget <= 0 || claims.expiry.IsZero() {
+		claims.workItemID == "" || claims.expiry.IsZero() {
+		return ErrInvalidClaims
+	}
+	if claims.callBudget < 0 || claims.tokenBudget < 0 {
+		return ErrInvalidClaims
+	}
+	if !coherentModelAccess(len(claims.allowedModels) > 0, claims.callBudget, claims.tokenBudget) {
 		return ErrInvalidClaims
 	}
 	if !now.UTC().Before(claims.expiry) {
@@ -254,9 +271,21 @@ func (PolicyEvaluator) Validate(claims Claims, now time.Time) error {
 	return nil
 }
 
-// Authorize permits req only when the capability is valid, unexpired, matches the
-// request's identity on every claim, allows the model (when one is named), and
-// has budget headroom for the requested increments.
+// coherentModelAccess reports whether the model-access state is one of the two
+// coherent states: model-enabled (models present, both budgets positive) or
+// model-disabled (no models, both budgets zero).
+func coherentModelAccess(modelEnabled bool, callBudget, tokenBudget int64) bool {
+	if modelEnabled {
+		return callBudget > 0 && tokenBudget > 0
+	}
+	return callBudget == 0 && tokenBudget == 0
+}
+
+// Authorize permits req only when the capability is valid, unexpired, and
+// matches the request's identity on every claim. For a model-DISABLED capability
+// any model, call, or token request is denied — only identity-only operations
+// with zero reservation are allowed. For a model-ENABLED capability the named
+// model must be allowed and the requested increments must fit the budgets.
 func (e PolicyEvaluator) Authorize(claims Claims, req Request, now time.Time) error {
 	if err := e.Validate(claims, now); err != nil {
 		return err
@@ -273,11 +302,24 @@ func (e PolicyEvaluator) Authorize(claims Claims, req Request, now time.Time) er
 	if req.WorkItemID != claims.workItemID {
 		return ErrWorkItemMismatch
 	}
-	if req.Model != "" && !claims.AllowsModel(req.Model) {
-		return fmt.Errorf("%w: %q", ErrModelDenied, req.Model)
-	}
 	if req.Calls < 0 || req.Tokens < 0 || req.ReservedCalls < 0 || req.ReservedTokens < 0 {
 		return fmt.Errorf("%w: negative reservation", ErrInvalidClaims)
+	}
+	if !claims.ModelEnabled() {
+		// Model-disabled: identity-only operations with zero reservation only.
+		if req.Model != "" {
+			return fmt.Errorf("%w: capability is model-disabled", ErrModelDenied)
+		}
+		if req.Calls > 0 || req.ReservedCalls > 0 {
+			return fmt.Errorf("%w: capability is model-disabled", ErrCallBudget)
+		}
+		if req.Tokens > 0 || req.ReservedTokens > 0 {
+			return fmt.Errorf("%w: capability is model-disabled", ErrTokenBudget)
+		}
+		return nil
+	}
+	if req.Model != "" && !claims.AllowsModel(req.Model) {
+		return fmt.Errorf("%w: %q", ErrModelDenied, req.Model)
 	}
 	if req.ReservedCalls+req.Calls > claims.callBudget {
 		return fmt.Errorf("%w: %d of %d", ErrCallBudget, req.ReservedCalls+req.Calls, claims.callBudget)

@@ -32,18 +32,17 @@ func okRequest() Request {
 	return Request{AgentType: "coder", Mode: "launch", RunID: "run-1", WorkItemID: "wi-1"}
 }
 
-func TestNewClaimsRejectsIncompleteInput(t *testing.T) {
+func TestNewClaimsRejectsMissingIdentityOrExpiry(t *testing.T) {
 	future := time.Now().Add(time.Hour)
 	cases := map[string]func(*ClaimsInput){
-		"no agent_type":     func(in *ClaimsInput) { in.AgentType = "" },
-		"no mode":           func(in *ClaimsInput) { in.Mode = "" },
-		"no run_id":         func(in *ClaimsInput) { in.RunID = "" },
-		"no work_item_id":   func(in *ClaimsInput) { in.WorkItemID = "" },
-		"no models":         func(in *ClaimsInput) { in.AllowedModels = nil },
-		"blank model":       func(in *ClaimsInput) { in.AllowedModels = []string{""} },
-		"zero call budget":  func(in *ClaimsInput) { in.CallBudget = 0 },
-		"zero token budget": func(in *ClaimsInput) { in.TokenBudget = 0 },
-		"zero expiry":       func(in *ClaimsInput) { in.Expiry = time.Time{} },
+		"no agent_type":   func(in *ClaimsInput) { in.AgentType = "" },
+		"no mode":         func(in *ClaimsInput) { in.Mode = "" },
+		"no run_id":       func(in *ClaimsInput) { in.RunID = "" },
+		"no work_item_id": func(in *ClaimsInput) { in.WorkItemID = "" },
+		"zero expiry":     func(in *ClaimsInput) { in.Expiry = time.Time{} },
+		"blank model":     func(in *ClaimsInput) { in.AllowedModels = []string{""} },
+		"negative call":   func(in *ClaimsInput) { in.CallBudget = -1 },
+		"negative token":  func(in *ClaimsInput) { in.TokenBudget = -1 },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -53,6 +52,84 @@ func TestNewClaimsRejectsIncompleteInput(t *testing.T) {
 				t.Fatalf("expected ErrInvalidClaims, got %v", err)
 			}
 		})
+	}
+}
+
+// modelDisabledInput is the deployed youknowme-curator reconcile shape:
+// model.access=false → no allowed models, both budgets zero.
+func modelDisabledInput(expiry time.Time) ClaimsInput {
+	return ClaimsInput{
+		AgentType:     "youknowme-curator",
+		Mode:          "reconcile",
+		RunID:         "run-1",
+		WorkItemID:    "wi-1",
+		AllowedModels: nil,
+		CallBudget:    0,
+		TokenBudget:   0,
+		Expiry:        expiry,
+	}
+}
+
+func TestModelDisabledClaimsAreValid(t *testing.T) {
+	claims, err := NewClaims(modelDisabledInput(time.Now().Add(time.Hour)))
+	if err != nil {
+		t.Fatalf("model-disabled reconcile claims rejected: %v", err)
+	}
+	if claims.ModelEnabled() {
+		t.Fatal("model-disabled claims report ModelEnabled=true")
+	}
+	if err := (PolicyEvaluator{}).Validate(claims, time.Now()); err != nil {
+		t.Fatalf("Validate model-disabled: %v", err)
+	}
+}
+
+func TestMixedModelStatesRejected(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+	cases := map[string]ClaimsInput{
+		"models without budget":         {AgentType: "a", Mode: "m", RunID: "r", WorkItemID: "w", AllowedModels: []string{"x"}, CallBudget: 0, TokenBudget: 0, Expiry: future},
+		"budget without models":         {AgentType: "a", Mode: "m", RunID: "r", WorkItemID: "w", AllowedModels: nil, CallBudget: 5, TokenBudget: 5, Expiry: future},
+		"call budget without models":    {AgentType: "a", Mode: "m", RunID: "r", WorkItemID: "w", AllowedModels: nil, CallBudget: 5, TokenBudget: 0, Expiry: future},
+		"token budget without models":   {AgentType: "a", Mode: "m", RunID: "r", WorkItemID: "w", AllowedModels: nil, CallBudget: 0, TokenBudget: 5, Expiry: future},
+		"models with call budget only":  {AgentType: "a", Mode: "m", RunID: "r", WorkItemID: "w", AllowedModels: []string{"x"}, CallBudget: 5, TokenBudget: 0, Expiry: future},
+		"models with token budget only": {AgentType: "a", Mode: "m", RunID: "r", WorkItemID: "w", AllowedModels: []string{"x"}, CallBudget: 0, TokenBudget: 5, Expiry: future},
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewClaims(in); !errors.Is(err, ErrInvalidClaims) {
+				t.Fatalf("expected ErrInvalidClaims for mixed state, got %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthorizeModelDisabledAllowsIdentityOnly(t *testing.T) {
+	claims := mustClaims(t, modelDisabledInput(time.Now().Add(time.Hour)))
+	e := PolicyEvaluator{}
+	now := time.Now()
+
+	// Identity-only operation with zero reservation is allowed.
+	identityReq := Request{AgentType: "youknowme-curator", Mode: "reconcile", RunID: "run-1", WorkItemID: "wi-1"}
+	if err := e.Authorize(claims, identityReq, now); err != nil {
+		t.Fatalf("identity-only op on model-disabled claims denied: %v", err)
+	}
+
+	// Any model request is denied.
+	modelReq := identityReq
+	modelReq.Model = "anything"
+	if err := e.Authorize(claims, modelReq, now); !errors.Is(err, ErrModelDenied) {
+		t.Fatalf("model request on model-disabled = %v, want ErrModelDenied", err)
+	}
+	// Any call reservation is denied.
+	callReq := identityReq
+	callReq.Calls = 1
+	if err := e.Authorize(claims, callReq, now); !errors.Is(err, ErrCallBudget) {
+		t.Fatalf("call request on model-disabled = %v, want ErrCallBudget", err)
+	}
+	// Any token reservation is denied.
+	tokenReq := identityReq
+	tokenReq.Tokens = 1
+	if err := e.Authorize(claims, tokenReq, now); !errors.Is(err, ErrTokenBudget) {
+		t.Fatalf("token request on model-disabled = %v, want ErrTokenBudget", err)
 	}
 }
 
@@ -77,7 +154,7 @@ func TestExpiry(t *testing.T) {
 	if err := e.Authorize(claims, okRequest(), now.Add(2*time.Minute)); !errors.Is(err, ErrExpired) {
 		t.Fatalf("expected ErrExpired, got %v", err)
 	}
-	// Exactly at expiry is expired (not-before semantics).
+	// A capability at or past its expiry instant is expired.
 	if err := e.Validate(claims, now.Add(time.Minute)); !errors.Is(err, ErrExpired) {
 		t.Fatalf("expected expiry at instant to be expired, got %v", err)
 	}
