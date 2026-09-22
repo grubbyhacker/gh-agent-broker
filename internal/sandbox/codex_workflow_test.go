@@ -823,6 +823,7 @@ func TestCodexWorkflowRestartAdoptsAcceptedExecutionWithoutReinjection(t *testin
 	})
 	issuer := &fakeCodexIssuer{}
 	service := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	t.Cleanup(service.Close)
 	service.SetCodexCredentialIssuer(issuer)
 	in := cfg.LaunchProfiles["terra-medium-v1"].LaunchAgentInput
 	in.Profile = "terra-medium-v1"
@@ -840,8 +841,12 @@ func TestCodexWorkflowRestartAdoptsAcceptedExecutionWithoutReinjection(t *testin
 		issuer.mu.Lock()
 		accepted := issuer.issues == 1 && issuer.consumes == 1
 		issuer.mu.Unlock()
-		return ready && accepted
+		intent, found, lookupErr := store.LookupRun(context.Background(), out.RunID)
+		return ready && accepted && lookupErr == nil && found && intent.Metadata.Phase == codexPhaseExecutionRunning
 	})
+	// A real restart stops the original process and its watcher before the
+	// durable phase is rewritten to simulate a crash.
+	service.Close()
 
 	intent, found, err := store.LookupRun(context.Background(), out.RunID)
 	if err != nil || !found {
@@ -860,10 +865,12 @@ func TestCodexWorkflowRestartAdoptsAcceptedExecutionWithoutReinjection(t *testin
 	issuer.mu.Unlock()
 
 	restarted := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	t.Cleanup(restarted.Close)
 	restarted.SetCodexCredentialIssuer(issuer)
 	if err := restarted.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	restarted.Close()
 	intent, found, err = store.LookupRun(context.Background(), out.RunID)
 	if err != nil || !found {
 		t.Fatalf("lookup accepted intent found=%t err=%v", found, err)
@@ -876,6 +883,7 @@ func TestCodexWorkflowRestartAdoptsAcceptedExecutionWithoutReinjection(t *testin
 		t.Fatal(err)
 	}
 	restartedAfterConsume := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	t.Cleanup(restartedAfterConsume.Close)
 	restartedAfterConsume.SetCodexCredentialIssuer(issuer)
 	if err := restartedAfterConsume.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
@@ -889,11 +897,22 @@ func TestCodexWorkflowRestartAdoptsAcceptedExecutionWithoutReinjection(t *testin
 	}
 	issuer.mu.Lock()
 	issueCount := issuer.issues
-	consumeCount := issuer.consumes
 	issuer.mu.Unlock()
 	if issueCount != 1 || injectionCount != 1 {
 		t.Fatalf("restart issued=%d injected=%d, want no replay after acceptance", issueCount, injectionCount)
 	}
+	// The post-consume recovery consume is produced by an adoption path that
+	// completes asynchronously, so await it rather than sampling immediately --
+	// every other asynchronous condition in this file is awaited the same way.
+	// The exact-count assertion below still holds, so a fourth consume fails.
+	waitFor(t, func() bool {
+		issuer.mu.Lock()
+		defer issuer.mu.Unlock()
+		return issuer.consumes >= 3
+	})
+	issuer.mu.Lock()
+	consumeCount := issuer.consumes
+	issuer.mu.Unlock()
 	if consumeCount != 3 {
 		t.Fatalf("consume calls=%d, want acceptance and post-consume crash recovery", consumeCount)
 	}
@@ -916,6 +935,7 @@ func TestCodexWorkflowRestartAdoptsAcceptedExecutionWithoutReinjection(t *testin
 		return len(runtime.specs) >= 3
 	})
 	restartedAgain := NewServiceWithLaunchIntents(cfg, runtime, testAudit(t), store)
+	t.Cleanup(restartedAgain.Close)
 	restartedAgain.SetCodexCredentialIssuer(issuer)
 	if err := restartedAgain.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
