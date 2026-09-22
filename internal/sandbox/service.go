@@ -73,6 +73,11 @@ type Service struct {
 	launchIntents       *LaunchIntentStore
 	intentLocksMu       sync.Mutex
 	intentLocks         map[string]*intentLock
+	backgroundCtx       context.Context
+	backgroundCancel    context.CancelFunc
+	backgroundMu        sync.Mutex
+	backgroundClosed    bool
+	backgroundWG        sync.WaitGroup
 	codexIssuer         CodexCredentialIssuer
 	releases            ReleaseResolver
 }
@@ -376,6 +381,7 @@ func NewServiceWithLaunchIntents(cfg Config, runtime RuntimeBackend, auditLog *A
 	if cfg.ConfigLoadedAt.IsZero() || cfg.ConfigVersion == "" {
 		cfg.StampLoaded(time.Now().UTC())
 	}
+	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
 	return &Service{
 		cfg:                 cfg,
 		runtime:             runtime,
@@ -385,7 +391,37 @@ func NewServiceWithLaunchIntents(cfg Config, runtime RuntimeBackend, auditLog *A
 		profileReservations: map[string]int{},
 		launchIntents:       store,
 		intentLocks:         map[string]*intentLock{},
+		backgroundCtx:       backgroundCtx,
+		backgroundCancel:    backgroundCancel,
 	}
+}
+
+// Close stops and waits for tracked background watchers. Callers must stop
+// accepting new work before closing the service.
+func (s *Service) Close() {
+	s.backgroundMu.Lock()
+	if s.backgroundClosed {
+		s.backgroundMu.Unlock()
+		return
+	}
+	s.backgroundClosed = true
+	s.backgroundCancel()
+	s.backgroundMu.Unlock()
+	s.backgroundWG.Wait()
+}
+
+func (s *Service) startBackground(fn func(context.Context)) {
+	s.backgroundMu.Lock()
+	if s.backgroundClosed {
+		s.backgroundMu.Unlock()
+		return
+	}
+	s.backgroundWG.Add(1)
+	s.backgroundMu.Unlock()
+	go func() {
+		defer s.backgroundWG.Done()
+		fn(s.backgroundCtx)
+	}()
 }
 
 func (s *Service) SetCodexCredentialIssuer(issuer CodexCredentialIssuer) {
@@ -1838,7 +1874,11 @@ func terminalSourceForStatus(status, fallback string) string {
 func (s *Service) watchTimeout(parent context.Context, runID string, deadline time.Time) {
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
-	<-timer.C
+	select {
+	case <-timer.C:
+	case <-parent.Done():
+		return
+	}
 	ctx, cancel := context.WithTimeout(parent, s.cfg.StopGrace.Duration+5*time.Second)
 	defer cancel()
 	meta, err := s.lookupRun(runID)

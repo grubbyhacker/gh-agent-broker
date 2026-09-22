@@ -144,7 +144,9 @@ func (s *Service) resumeCodexIssueWorkflow(
 			return LaunchAgentOutput{}, fmt.Errorf("clean legacy Codex capability: %w", err)
 		}
 		if meta.Status == StatusRunning {
-			go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
+			s.startBackground(func(background context.Context) {
+				s.watchTimeout(background, meta.RunID, meta.Deadline)
+			})
 		}
 	}
 	if err := s.prepareDurableRun(meta, s.cfg.Templates[workflow.ExecutionTemplate]); err != nil {
@@ -340,7 +342,9 @@ func (s *Service) resumePreparation(
 		return LaunchAgentOutput{}, err
 	}
 	if startDeadlineWatcher {
-		go s.watchTimeout(context.WithoutCancel(ctx), meta.RunID, meta.Deadline)
+		s.startBackground(func(background context.Context) {
+			s.watchTimeout(background, meta.RunID, meta.Deadline)
+		})
 	}
 	s.watchCodexPhase(meta.RunID, meta.PreparationContainerID)
 	return launchOutput(meta), nil
@@ -755,45 +759,48 @@ func (s *Service) readGitHubExternalWait(meta RunMetadata, phase string) (github
 }
 
 func (s *Service) watchCodexPhase(runID, containerID string) {
-	go func() {
-		status, err := s.runtime.Wait(context.Background(), containerID)
+	s.startBackground(func(ctx context.Context) {
+		status, err := s.runtime.Wait(ctx, containerID)
+		if ctx.Err() != nil {
+			return
+		}
 		unlock := s.lockLaunchIntent("codex\x00" + runID)
 		defer unlock()
-		intent, found, lookupErr := s.launchIntents.LookupRun(context.Background(), runID)
+		intent, found, lookupErr := s.launchIntents.LookupRun(ctx, runID)
 		if lookupErr != nil || !found || isTerminalStatus(intent.Metadata.Status) {
 			return
 		}
 		if err != nil {
-			if _, failErr := s.failCodexIntent(context.Background(), &intent, intent.Metadata, "container_wait", err); failErr != nil {
+			if _, failErr := s.failCodexIntent(ctx, &intent, intent.Metadata, "container_wait", err); failErr != nil {
 				s.auditFinalizeFailure(runID, "codex_container_wait_failed", "codex_container_wait", failErr)
 			}
 			return
 		}
 		profile := s.cfg.LaunchProfiles[intent.Profile]
 		if intent.Metadata.Phase == codexPhasePreparationRunning {
-			if _, completeErr := s.completePreparation(context.Background(), &intent, intent.Metadata, *profile.CodexIssueWorkflow, status); completeErr != nil {
+			if _, completeErr := s.completePreparation(ctx, &intent, intent.Metadata, *profile.CodexIssueWorkflow, status); completeErr != nil {
 				s.auditFinalizeFailure(runID, "codex_preparation_failed", "codex_preparation", completeErr)
 			}
 			return
 		}
 		if intent.Metadata.Phase == codexPhaseExecutionRunning {
-			if _, completeErr := s.completeExecution(context.Background(), &intent, intent.Metadata, status); completeErr != nil {
+			if _, completeErr := s.completeExecution(ctx, &intent, intent.Metadata, status); completeErr != nil {
 				s.auditFinalizeFailure(runID, "codex_execution_failed", "codex_execution", completeErr)
 			}
 			return
 		}
 		if intent.Metadata.Phase == codexPhaseRecoveryRunning {
-			if _, completeErr := s.completeRecoveryValidation(context.Background(), &intent, intent.Metadata, *profile.CodexIssueWorkflow, status); completeErr != nil {
+			if _, completeErr := s.completeRecoveryValidation(ctx, &intent, intent.Metadata, *profile.CodexIssueWorkflow, status); completeErr != nil {
 				s.auditFinalizeFailure(runID, "codex_recovery_validation_failed", "codex_recovery_validation", completeErr)
 			}
 			return
 		}
 		if intent.Metadata.Phase == codexPhaseDeliveryRunning {
-			if _, completeErr := s.completeDelivery(context.Background(), &intent, intent.Metadata, status); completeErr != nil {
+			if _, completeErr := s.completeDelivery(ctx, &intent, intent.Metadata, status); completeErr != nil {
 				s.auditFinalizeFailure(runID, "codex_delivery_failed", "codex_delivery", completeErr)
 			}
 		}
-	}()
+	})
 }
 
 func (s *Service) failCodexIntent(
