@@ -26,6 +26,10 @@ const (
 	defaultTerminalResultByteLimit = 32 * 1024
 )
 
+// agentTypePattern mirrors the release registry's agent-type contract
+// (kebab-case): a template's agent_type must be resolvable by that registry.
+var agentTypePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
 type Config struct {
 	Listen                  string                       `yaml:"listen"`
 	MCPPath                 string                       `yaml:"mcp_path"`
@@ -96,6 +100,7 @@ type CredentialBundle struct {
 
 type Template struct {
 	Image                string            `yaml:"image"`
+	AgentType            string            `yaml:"agent_type"`
 	Command              []string          `yaml:"command"`
 	User                 string            `yaml:"user"`
 	Resources            Resources         `yaml:"resources"`
@@ -412,6 +417,14 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 	}
 	if c.Production && !strings.Contains(tmpl.Image, "@sha256:") {
 		errs = append(errs, fmt.Sprintf("template %q image must be pinned by digest in production mode", name))
+	}
+	if tmpl.AgentType != "" {
+		if !agentTypePattern.MatchString(tmpl.AgentType) {
+			errs = append(errs, fmt.Sprintf("template %q agent_type %q must be kebab-case", name, tmpl.AgentType))
+		}
+		if strings.TrimSpace(c.ReleaseStore) == "" {
+			errs = append(errs, fmt.Sprintf("template %q sets agent_type %q but release_store_path is not configured; release resolution has no registry to read", name, tmpl.AgentType))
+		}
 	}
 	if len(tmpl.Command) == 0 {
 		errs = append(errs, fmt.Sprintf("template %q command is required", name))

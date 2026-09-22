@@ -67,6 +67,7 @@ jobs:
               - 'internal/limits/**'
               - 'internal/metadata/**'
               - 'internal/policy/**'
+              - 'internal/release/**'
               - 'internal/sandbox/**'
               - 'internal/server/**'
               - 'scripts/sandbox-e2e.sh'
