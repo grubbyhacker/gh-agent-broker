@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"gh-agent-broker/internal/capability"
 )
@@ -43,18 +44,22 @@ func mintsCapability(tmpl Template) bool {
 
 // deriveCapabilityClaims builds the immutable per-run capability claims strictly
 // from deployment-owned policy (tmpl.AgentType and tmpl.Capability) and the
-// broker-generated run identity carried on meta (RunID, and the broker-computed
-// StartedAt/Deadline). It NEVER reads caller-supplied launch input, parameters,
-// or any caller-asserted run_id/claims.
+// broker-frozen run/work identity carried on meta. It NEVER reads caller-supplied
+// launch input, parameters, or any caller-asserted run_id/claims.
 //
 //   - agent_type        <- tmpl.AgentType (deployment-owned)
 //   - mode              <- tmpl.Capability.Mode (deployment-owned)
 //   - allowed_models    <- tmpl.Capability.AllowedModels (deployment-owned)
 //   - call/token budget <- tmpl.Capability.CallBudget/TokenBudget (deployment-owned)
 //   - run_id            <- meta.RunID (broker-generated newRunID)
-//   - work_item_id      <- meta.RunID (broker run identity; the broker holds no
-//     separate upstream WorkItem source, so the run identity is the authority)
+//   - work_item_id      <- meta.WorkItemID (authoritative Signal Plane WorkItem
+//     identity, frozen at the authenticated control-plane launch boundary). It is
+//     a DISTINCT durable identity and is never equated with run_id.
 //   - expiry            <- meta.Deadline (broker-computed now+runtimeLimit)
+//
+// It fails closed when the authoritative WorkItemID is absent or was set equal to
+// the run id: an opt-in capability launch requires the WorkItem launcher to have
+// supplied a real, distinct WorkItem identity.
 //
 // The model-disabled state (ModelAccess=false: empty models, zero budgets) is
 // preserved: NewClaims accepts it as identity-only and rejects any mixed state.
@@ -68,6 +73,12 @@ func deriveCapabilityClaims(tmpl Template, meta RunMetadata) (capability.Claims,
 	if meta.RunID == "" {
 		return capability.Claims{}, fmt.Errorf("capability derivation requires a broker-generated run_id")
 	}
+	if strings.TrimSpace(meta.WorkItemID) == "" {
+		return capability.Claims{}, fmt.Errorf("capability derivation requires an authoritative work_item_id; the WorkItem launcher supplied none")
+	}
+	if meta.WorkItemID == meta.RunID {
+		return capability.Claims{}, fmt.Errorf("capability derivation refuses a work_item_id equal to run_id; WorkItem identity is a distinct Signal Plane identity")
+	}
 	if meta.Deadline.IsZero() {
 		return capability.Claims{}, fmt.Errorf("capability derivation requires a broker-computed deadline for expiry")
 	}
@@ -80,7 +91,7 @@ func deriveCapabilityClaims(tmpl Template, meta RunMetadata) (capability.Claims,
 		AgentType:     tmpl.AgentType,
 		Mode:          capability.Mode(pol.Mode),
 		RunID:         meta.RunID,
-		WorkItemID:    meta.RunID,
+		WorkItemID:    meta.WorkItemID,
 		AllowedModels: models,
 		CallBudget:    pol.CallBudget,
 		TokenBudget:   pol.TokenBudget,

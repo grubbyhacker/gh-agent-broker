@@ -488,16 +488,21 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 		if strings.TrimSpace(c.ReleaseStore) == "" {
 			errs = append(errs, fmt.Sprintf("template %q sets agent_type %q but release_store_path is not configured; release resolution has no registry to read", name, tmpl.AgentType))
 		}
-		if tmpl.Capability == nil {
-			errs = append(errs, fmt.Sprintf("template %q sets agent_type %q but declares no capability policy; a per-run capability cannot be derived", name, tmpl.AgentType))
-		} else {
-			if strings.TrimSpace(c.CapabilityStore) == "" {
-				errs = append(errs, fmt.Sprintf("template %q declares a capability policy but capability_store_path is not configured; launch would fail closed", name))
-			}
-			errs = append(errs, c.validateCapabilityPolicy(name, *tmpl.Capability)...)
+	}
+	// Capability minting is OPT-IN per template. A legacy AgentType template
+	// without a capability policy launches as before and mints nothing (no
+	// WorkItem is fabricated). A template that OPTS IN by declaring a capability
+	// policy must be AgentType-backed, must have a configured capability store,
+	// and its policy must be coherent; at launch it additionally requires an
+	// authoritative WorkItemID or the launch is denied.
+	if tmpl.Capability != nil {
+		if tmpl.AgentType == "" {
+			errs = append(errs, fmt.Sprintf("template %q declares a capability policy without agent_type; per-run capabilities are only minted for AgentType-backed launches", name))
 		}
-	} else if tmpl.Capability != nil {
-		errs = append(errs, fmt.Sprintf("template %q declares a capability policy without agent_type; per-run capabilities are only minted for AgentType-backed launches", name))
+		if strings.TrimSpace(c.CapabilityStore) == "" {
+			errs = append(errs, fmt.Sprintf("template %q declares a capability policy but capability_store_path is not configured; launch would fail closed", name))
+		}
+		errs = append(errs, c.validateCapabilityPolicy(name, *tmpl.Capability)...)
 	}
 	if len(tmpl.Command) == 0 {
 		errs = append(errs, fmt.Sprintf("template %q command is required", name))

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gh-agent-broker/internal/capability"
 )
 
 func TestRESTLaunchProfileAuthzAndLaunch(t *testing.T) {
@@ -560,4 +562,67 @@ func newRESTTestService(t *testing.T, cfg Config, runtime RuntimeBackend, audit 
 		}
 	})
 	return NewServiceWithLaunchIntents(cfg, runtime, audit, store)
+}
+
+// The authenticated control-plane launch is the ONLY place an authoritative
+// Signal Plane WorkItem identity is accepted. A capability-opt-in profile that
+// declares a work_item_id parameter freezes it onto the run before minting, and
+// the frozen id is distinct from the broker run id.
+func TestRESTLaunchFreezesAuthoritativeWorkItemID(t *testing.T) {
+	cfg := restTestConfig(t)
+	cfg.ReleaseStore = filepath.Join(filepath.Dir(cfg.RunsDir), "state", "releases.sqlite")
+	cfg.CapabilityStore = filepath.Join(filepath.Dir(cfg.RunsDir), "state", "capability.sqlite")
+	cfg.CapabilityAPIToken = "capability-secret"
+
+	tmpl := cfg.Templates["worker"]
+	tmpl.AgentType = "coder"
+	tmpl.Image = ""
+	tmpl.Capability = &CapabilityPolicy{
+		Mode: "implement", ModelAccess: true,
+		AllowedModels: []string{"gpt-5.6-terra"}, CallBudget: 64, TokenBudget: 200000,
+	}
+	cfg.Templates["worker"] = tmpl
+
+	profile := testLaunchProfile()
+	profile.Parameters = map[string]ParameterDeclaration{
+		"work_item_id": {Type: "string", Required: true, MaxLength: 64},
+	}
+	cfg.LaunchProfiles = map[string]LaunchProfile{"nightly": profile}
+
+	runtime := newFakeRuntime()
+	service := newRESTTestService(t, cfg, runtime, testAudit(t))
+	service.SetReleaseResolver(&fakeResolver{release: ResolvedRelease{Generation: 3, ImageReference: testResolvedRef, ImageDigest: testResolvedDigest}})
+	capStore, err := capability.OpenStore(context.Background(), cfg.CapabilityStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cerr := capStore.Close(); cerr != nil {
+			t.Errorf("close capability store: %v", cerr)
+		}
+	})
+	service.SetCapabilityMinter(capStore)
+	handler := NewRESTHandler(service)
+
+	req := restLaunchRequest("/v1/launch-profiles/nightly/launch", "timer-secret", "launch-wid-1",
+		[]byte(`{"parameters":{"work_item_id":"WI-777"}}`))
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("launch status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	var out LaunchAgentOutput
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	meta := lookupTestRun(t, service, out.RunID)
+	if meta.WorkItemID != "WI-777" {
+		t.Fatalf("frozen work_item_id = %q, want the authoritative WI-777", meta.WorkItemID)
+	}
+	if meta.WorkItemID == meta.RunID {
+		t.Fatal("frozen work_item_id must differ from run_id")
+	}
+	if handle, ok := runtime.lastSpec().Env[capabilityEnvKey]; !ok || len(handle) != 64 {
+		t.Fatalf("expected a minted capability handle injected into transport, got %q ok=%t", handle, ok)
+	}
 }

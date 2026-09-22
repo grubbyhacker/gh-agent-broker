@@ -460,19 +460,18 @@ func codexWorkflowTestConfig(t *testing.T) Config {
 	return cfg
 }
 
-func TestConfigValidateRejectsAgentTypeWithoutCapabilityPolicy(t *testing.T) {
+func TestConfigValidateAllowsAgentTypeWithoutCapabilityPolicy(t *testing.T) {
+	// Capability minting is opt-in: a legacy AgentType template with no capability
+	// policy is valid and mints nothing (no WorkItem fabricated).
 	cfg := baseTestConfig(t)
 	cfg.ReleaseStore = "/srv/releases.sqlite"
-	cfg.CapabilityStore = "/srv/capability.sqlite"
-	cfg.CapabilityAPIToken = "capability-secret"
 	tmpl := cfg.Templates["worker"]
 	tmpl.AgentType = "coder"
 	tmpl.Image = ""
 	tmpl.Capability = nil
 	cfg.Templates["worker"] = tmpl
-	err := cfg.Validate()
-	if err == nil || !strings.Contains(err.Error(), "no capability policy") {
-		t.Fatalf("Validate() error = %v, want a capability-policy requirement for an agent_type template", err)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() rejected a legacy AgentType template without a capability policy: %v", err)
 	}
 }
 

@@ -165,6 +165,15 @@ func (h *restHandler) handleLaunchProfileAction(w http.ResponseWriter, r *http.R
 		writeRESTError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Trust boundary: the authoritative Signal Plane WorkItem identity is accepted
+	// ONLY here, on the operator-authenticated control-plane launch, as the
+	// deployment-declared "work_item_id" profile parameter. It is frozen onto the
+	// launch input (never JSON-decoded from a caller) so the service can seal it
+	// into RunMetadata before minting. The unauthenticated launch_agent MCP path
+	// cannot set it (its UnmarshalJSON rejects unknown keys).
+	if wid, ok := params["work_item_id"].(string); ok {
+		in.WorkItemID = wid
+	}
 	if action == "preview" {
 		in.Profile = name
 		out, err := h.service.PreviewLaunch(r.Context(), in)

@@ -127,6 +127,7 @@ type runtimeFileWriter interface {
 
 type RunMetadata struct {
 	RunID                     string            `json:"run_id"`
+	WorkItemID                string            `json:"work_item_id,omitempty"`
 	Profile                   string            `json:"profile,omitempty"`
 	Principal                 string            `json:"principal,omitempty"`
 	IdempotencyKeyDigest      string            `json:"idempotency_key_digest,omitempty"`
@@ -246,6 +247,11 @@ type LaunchAgentInput struct {
 	Focus             string         `json:"focus,omitempty" yaml:"focus,omitempty" jsonschema:"optional constrained focus for the worker"`
 	Parameters        map[string]any `json:"parameters,omitempty" yaml:"-" jsonschema:"broker-resolved opaque profile parameters"`
 	Profile           string         `json:"-" yaml:"-"`
+	// WorkItemID is the authoritative Signal Plane WorkItem identity. It is set
+	// ONLY server-side at the authenticated control-plane launch boundary (never
+	// JSON-decoded from a caller: json:"-", and launch_agent's UnmarshalJSON
+	// rejects unknown keys), and it is DISTINCT from the broker run id.
+	WorkItemID string `json:"-" yaml:"-"`
 }
 
 func (in *LaunchAgentInput) UnmarshalJSON(b []byte) error {
@@ -544,6 +550,7 @@ func (s *Service) DryRunLaunch(ctx context.Context, in LaunchAgentInput) (Launch
 	deadline := now.Add(runtimeLimit)
 	meta := applyResolvedRelease(RunMetadata{
 		RunID:            runID,
+		WorkItemID:       in.WorkItemID,
 		Profile:          in.Profile,
 		Template:         in.Template,
 		Repo:             in.Repo,
@@ -585,6 +592,7 @@ func (s *Service) PreviewLaunch(ctx context.Context, in LaunchAgentInput) (Launc
 	now := time.Now().UTC()
 	meta := applyResolvedRelease(RunMetadata{
 		RunID:            runID,
+		WorkItemID:       in.WorkItemID,
 		Profile:          in.Profile,
 		Template:         in.Template,
 		Repo:             in.Repo,
@@ -648,6 +656,7 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 	deadline := now.Add(runtimeLimit)
 	meta := applyResolvedRelease(RunMetadata{
 		RunID:            runID,
+		WorkItemID:       in.WorkItemID,
 		Profile:          in.Profile,
 		Principal:        principal,
 		Template:         in.Template,
@@ -801,6 +810,7 @@ func (s *Service) LaunchProfile(ctx context.Context, principal, profile, rawKey,
 	now := time.Now().UTC()
 	meta := applyResolvedRelease(RunMetadata{
 		RunID: runID, Profile: profile, Principal: principal, IdempotencyKeyDigest: digest,
+		WorkItemID:         in.WorkItemID,
 		RequestFingerprint: fingerprint, LaunchConfigVersion: s.cfg.ConfigVersion,
 		Template: in.Template, Repo: in.Repo, BaseBranch: in.BaseBranch,
 		Branch: branch, Task: in.Task, VerificationTask: in.VerificationTask, Focus: in.Focus, WorkerAgentID: workerAgentID(tmpl, runID),

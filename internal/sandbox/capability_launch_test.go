@@ -12,6 +12,8 @@ import (
 	"gh-agent-broker/internal/capability"
 )
 
+const testWorkItemID = "WI-4821"
+
 // spyMinter records Issue/Revoke calls so a test can assert the launch path
 // mints and revokes without a real store. It returns a fixed sentinel handle.
 type spyMinter struct {
@@ -38,32 +40,60 @@ func (m *spyMinter) Revoke(_ context.Context, handle string) error {
 	return m.revokeErr
 }
 
+// agentTypeLaunchService returns a service whose "worker" template OPTS IN to a
+// per-run capability (agent_type + capability policy + configured store). The
+// mutate hook lets a test alter the policy (e.g. flip to model-disabled).
 func agentTypeLaunchService(t *testing.T, mutate func(*CapabilityPolicy)) (*Service, *fakeRuntime, Config) {
 	t.Helper()
 	cfg := releaseTestConfig(t, "coder")
-	if mutate != nil {
-		tmpl := cfg.Templates["worker"]
-		pol := *tmpl.Capability
-		mutate(&pol)
-		tmpl.Capability = &pol
-		cfg.Templates["worker"] = tmpl
+	cfg.CapabilityStore = filepath.Join(t.TempDir(), "capability.sqlite")
+	cfg.CapabilityAPIToken = "capability-secret"
+	tmpl := cfg.Templates["worker"]
+	pol := CapabilityPolicy{
+		Mode:          "implement",
+		ModelAccess:   true,
+		AllowedModels: []string{"gpt-5.6-terra"},
+		CallBudget:    64,
+		TokenBudget:   200000,
 	}
+	if mutate != nil {
+		mutate(&pol)
+	}
+	tmpl.Capability = &pol
+	cfg.Templates["worker"] = tmpl
 	runtime := newFakeRuntime()
 	service := NewService(cfg, runtime, testAudit(t))
 	service.SetReleaseResolver(&fakeResolver{release: ResolvedRelease{Generation: 5, ImageReference: testResolvedRef, ImageDigest: testResolvedDigest}})
 	return service, runtime, cfg
 }
 
-// The claims a launch mints are derived only from deployment-owned policy and
-// the broker-generated run identity. Caller-supplied run_id/claims are refused
-// at the input boundary (LaunchAgentInput rejects unknown fields), so the derived
-// claims can only reflect the template policy and the run the broker created.
+// launchOptIn simulates the authenticated control-plane launch: the WorkItem
+// launcher supplies a DISTINCT authoritative work_item_id, which the boundary
+// freezes onto the launch input. It is deliberately different from any run id.
+func launchOptIn(ctx context.Context, t *testing.T, service *Service) LaunchAgentOutput {
+	t.Helper()
+	out, err := service.LaunchAgent(ctx, LaunchAgentInput{
+		Template:   "worker",
+		Task:       "make the change",
+		Repo:       "owner/repo",
+		BaseBranch: "main",
+		WorkItemID: testWorkItemID,
+	})
+	if err != nil {
+		t.Fatalf("LaunchAgent() error = %v", err)
+	}
+	return out
+}
+
+// The claims a launch mints are derived only from deployment-owned policy and the
+// broker-frozen run/work identity. work_item_id is the authoritative Signal Plane
+// identity and is DISTINCT from run_id.
 func TestLaunchDerivesImmutableCapabilityClaims(t *testing.T) {
 	service, runtime, _ := agentTypeLaunchService(t, nil)
 	minter := &spyMinter{}
 	service.SetCapabilityMinter(minter)
 
-	out := launchWorker(context.Background(), t, service)
+	out := launchOptIn(context.Background(), t, service)
 
 	if len(minter.issued) != 1 {
 		t.Fatalf("Issue called %d times, want exactly one mint per launch", len(minter.issued))
@@ -73,11 +103,16 @@ func TestLaunchDerivesImmutableCapabilityClaims(t *testing.T) {
 		t.Fatalf("agent_type = %q, want the template's deployment-owned agent_type", claims.AgentType())
 	}
 	if claims.Mode() != "implement" {
-		t.Fatalf("mode = %q, want the policy mode", claims.Mode())
+		t.Fatalf("mode = %q, want the deployment-owned policy mode", claims.Mode())
 	}
-	// run_id and work_item_id are the broker-generated run identity, not caller input.
-	if claims.RunID() != out.RunID || claims.WorkItemID() != out.RunID {
-		t.Fatalf("run_id=%q work_item_id=%q, want the broker run id %q", claims.RunID(), claims.WorkItemID(), out.RunID)
+	if claims.RunID() != out.RunID {
+		t.Fatalf("run_id = %q, want the broker run id %q", claims.RunID(), out.RunID)
+	}
+	if claims.WorkItemID() != testWorkItemID {
+		t.Fatalf("work_item_id = %q, want the authoritative WorkItem id %q", claims.WorkItemID(), testWorkItemID)
+	}
+	if claims.WorkItemID() == claims.RunID() {
+		t.Fatal("work_item_id must never equal run_id")
 	}
 	if got := claims.AllowedModels(); len(got) != 1 || got[0] != "gpt-5.6-terra" {
 		t.Fatalf("allowed_models = %v, want the policy models", got)
@@ -85,21 +120,33 @@ func TestLaunchDerivesImmutableCapabilityClaims(t *testing.T) {
 	if claims.CallBudget() != 64 || claims.TokenBudget() != 200000 {
 		t.Fatalf("budgets = call %d token %d, want the policy budgets", claims.CallBudget(), claims.TokenBudget())
 	}
-	// The plaintext handle went into the container transport, not the run record.
-	spec := runtime.lastSpec()
-	if spec.Env[capabilityEnvKey] != minter.handle {
+	if spec := runtime.lastSpec(); spec.Env[capabilityEnvKey] != minter.handle {
 		t.Fatalf("capability handle env = %q, want the minted handle", spec.Env[capabilityEnvKey])
 	}
 }
 
-// Expiry is the broker-computed deadline (now + runtime limit), not a
-// caller-controlled or policy-static value.
+// The frozen WorkItemID is persisted on the run record, distinct from run_id.
+func TestLaunchPersistsDistinctWorkItemID(t *testing.T) {
+	service, _, _ := agentTypeLaunchService(t, nil)
+	service.SetCapabilityMinter(&spyMinter{})
+
+	out := launchOptIn(context.Background(), t, service)
+	meta := lookupTestRun(t, service, out.RunID)
+	if meta.WorkItemID != testWorkItemID {
+		t.Fatalf("recorded work_item_id = %q, want %q", meta.WorkItemID, testWorkItemID)
+	}
+	if meta.WorkItemID == meta.RunID {
+		t.Fatal("recorded work_item_id must differ from run_id")
+	}
+}
+
+// Expiry is the broker-computed deadline (now + runtime limit).
 func TestLaunchCapabilityExpiryIsRunDeadline(t *testing.T) {
 	service, _, _ := agentTypeLaunchService(t, nil)
 	minter := &spyMinter{}
 	service.SetCapabilityMinter(minter)
 
-	out := launchWorker(context.Background(), t, service)
+	out := launchOptIn(context.Background(), t, service)
 	meta := lookupTestRun(t, service, out.RunID)
 
 	if len(minter.issued) != 1 {
@@ -122,7 +169,7 @@ func TestLaunchModelDisabledCapabilityIsPreserved(t *testing.T) {
 	minter := &spyMinter{}
 	service.SetCapabilityMinter(minter)
 
-	launchWorker(context.Background(), t, service)
+	launchOptIn(context.Background(), t, service)
 
 	if len(minter.issued) != 1 {
 		t.Fatalf("Issue called %d times", len(minter.issued))
@@ -143,18 +190,15 @@ func TestLaunchModelDisabledCapabilityIsPreserved(t *testing.T) {
 // The plaintext handle must reach ONLY the container env: never the run metadata
 // on disk, the run status, or the audit log. Only the store holds its SHA-256.
 func TestLaunchCapabilityHandleIsNotPersistedOrLogged(t *testing.T) {
-	// Use a real store so the whole mint path runs; read the handle from the
-	// injected env, then prove that exact string appears nowhere durable.
 	service, runtime, cfg := agentTypeLaunchService(t, nil)
 	newTestCapabilityStore(t, service)
 
-	out := launchWorker(context.Background(), t, service)
+	out := launchOptIn(context.Background(), t, service)
 	handle := runtime.lastSpec().Env[capabilityEnvKey]
 	if len(handle) != 64 {
 		t.Fatalf("expected a 64-hex minted handle in transport, got %q", handle)
 	}
 
-	// Run metadata on disk must not contain the plaintext handle.
 	//nolint:gosec // G304: test reads generated metadata under this test's temp run dir.
 	metaBytes, err := os.ReadFile(filepath.Join(cfg.RunsDir, out.RunID, "metadata.json"))
 	if err != nil {
@@ -164,28 +208,45 @@ func TestLaunchCapabilityHandleIsNotPersistedOrLogged(t *testing.T) {
 		t.Fatal("plaintext capability handle leaked into run metadata.json")
 	}
 
-	// Audit log must not contain the plaintext handle.
 	if data, err := os.ReadFile(cfg.Audit.Path); err == nil { //nolint:gosec // G304: test's own temp audit path.
 		if strings.Contains(string(data), handle) {
 			t.Fatal("plaintext capability handle leaked into the audit log")
 		}
 	}
 
-	// The run status projection must not carry the handle either.
 	meta := lookupTestRun(t, service, out.RunID)
 	if strings.Contains(meta.Error, handle) || strings.Contains(meta.Task, handle) {
 		t.Fatal("plaintext capability handle leaked into run metadata fields")
 	}
 }
 
-// An AgentType-backed launch fails CLOSED when no capability minter is wired: the
-// launch is refused and no container is created.
+// An opt-in launch with no authoritative WorkItemID fails CLOSED: minting is
+// staged only for a launch that carries a distinct WorkItem identity, and the
+// launch is refused before any container is created.
+func TestLaunchFailsClosedWithoutWorkItemID(t *testing.T) {
+	service, runtime, _ := agentTypeLaunchService(t, nil)
+	service.SetCapabilityMinter(&spyMinter{})
+
+	_, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
+		Template: "worker", Task: "make the change", Repo: "owner/repo", BaseBranch: "main",
+		// WorkItemID intentionally omitted.
+	})
+	if err == nil || !strings.Contains(err.Error(), "work_item_id") {
+		t.Fatalf("LaunchAgent() error = %v, want fail-closed for missing authoritative work_item_id", err)
+	}
+	if spec := runtime.lastSpec(); spec.RunID != "" {
+		t.Fatalf("a refused launch created container %q; it must not create one", spec.RunID)
+	}
+}
+
+// An opt-in launch fails CLOSED when no capability minter is wired.
 func TestLaunchFailsClosedWithoutCapabilityStore(t *testing.T) {
 	service, runtime, _ := agentTypeLaunchService(t, nil)
 	// Deliberately do NOT wire a minter.
 
 	_, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
 		Template: "worker", Task: "make the change", Repo: "owner/repo", BaseBranch: "main",
+		WorkItemID: testWorkItemID,
 	})
 	if err == nil || !strings.Contains(err.Error(), "no capability store configured") {
 		t.Fatalf("LaunchAgent() error = %v, want fail-closed refusal for missing capability store", err)
@@ -205,6 +266,7 @@ func TestLaunchRevokesCapabilityOnCreateFailure(t *testing.T) {
 
 	_, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
 		Template: "worker", Task: "make the change", Repo: "owner/repo", BaseBranch: "main",
+		WorkItemID: testWorkItemID,
 	})
 	if err == nil {
 		t.Fatal("LaunchAgent() succeeded despite a create failure")
@@ -217,8 +279,27 @@ func TestLaunchRevokesCapabilityOnCreateFailure(t *testing.T) {
 	}
 }
 
-// A non-AgentType template mints no capability and injects no handle: the feature
-// is scoped to AgentType-backed launches and leaves the default path unchanged.
+// A legacy AgentType template that does NOT opt in (no capability policy) mints
+// nothing and fabricates no WorkItem: the pre-WorkItem launch path is preserved.
+func TestLegacyAgentTypeLaunchMintsNoCapability(t *testing.T) {
+	cfg := releaseTestConfig(t, "coder") // agent_type set, no capability policy
+	runtime := newFakeRuntime()
+	service := NewService(cfg, runtime, testAudit(t))
+	service.SetReleaseResolver(&fakeResolver{release: ResolvedRelease{Generation: 9, ImageReference: testResolvedRef, ImageDigest: testResolvedDigest}})
+	minter := &spyMinter{}
+	service.SetCapabilityMinter(minter)
+
+	launchWorker(context.Background(), t, service)
+
+	if len(minter.issued) != 0 {
+		t.Fatalf("Issue called %d times for a legacy AgentType template, want zero", len(minter.issued))
+	}
+	if _, ok := runtime.lastSpec().Env[capabilityEnvKey]; ok {
+		t.Fatal("a legacy AgentType launch injected a capability handle")
+	}
+}
+
+// A non-AgentType template mints no capability and injects no handle.
 func TestLaunchWithoutAgentTypeMintsNoCapability(t *testing.T) {
 	cfg := baseTestConfig(t)
 	runtime := newFakeRuntime()
@@ -236,10 +317,9 @@ func TestLaunchWithoutAgentTypeMintsNoCapability(t *testing.T) {
 	}
 }
 
-// deriveCapabilityClaims reads only deployment-owned policy and the broker run
-// identity; it never consults caller input. This exercises the derivation
-// directly for the identity/expiry binding.
-func TestDeriveCapabilityClaimsBindsRunIdentity(t *testing.T) {
+// deriveCapabilityClaims reads only deployment-owned policy and the broker-frozen
+// run/work identity; work_item_id is distinct and required.
+func TestDeriveCapabilityClaimsBindsDistinctWorkItem(t *testing.T) {
 	tmpl := Template{
 		AgentType: "coder",
 		Capability: &CapabilityPolicy{
@@ -248,24 +328,32 @@ func TestDeriveCapabilityClaimsBindsRunIdentity(t *testing.T) {
 		},
 	}
 	deadline := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
-	meta := RunMetadata{RunID: "run-xyz", Template: "worker", Deadline: deadline}
+	meta := RunMetadata{RunID: "run-xyz", WorkItemID: "WI-1", Template: "worker", Deadline: deadline}
 
 	claims, err := deriveCapabilityClaims(tmpl, meta)
 	if err != nil {
 		t.Fatalf("deriveCapabilityClaims: %v", err)
 	}
-	if claims.RunID() != "run-xyz" || claims.WorkItemID() != "run-xyz" {
-		t.Fatalf("run identity not bound: run_id=%q work_item_id=%q", claims.RunID(), claims.WorkItemID())
+	if claims.RunID() != "run-xyz" || claims.WorkItemID() != "WI-1" {
+		t.Fatalf("identity not bound: run_id=%q work_item_id=%q", claims.RunID(), claims.WorkItemID())
 	}
 	if !claims.Expiry().Equal(deadline) {
 		t.Fatalf("expiry = %s, want deadline %s", claims.Expiry(), deadline)
 	}
 
+	// Missing work_item_id fails closed.
+	if _, err := deriveCapabilityClaims(tmpl, RunMetadata{RunID: "run-xyz", Deadline: deadline}); err == nil {
+		t.Fatal("derivation accepted an empty work_item_id")
+	}
+	// work_item_id equal to run_id fails closed.
+	if _, err := deriveCapabilityClaims(tmpl, RunMetadata{RunID: "run-xyz", WorkItemID: "run-xyz", Deadline: deadline}); err == nil {
+		t.Fatal("derivation accepted work_item_id equal to run_id")
+	}
 	// Missing broker run id / deadline fail closed.
-	if _, err := deriveCapabilityClaims(tmpl, RunMetadata{Deadline: deadline}); err == nil {
+	if _, err := deriveCapabilityClaims(tmpl, RunMetadata{WorkItemID: "WI-1", Deadline: deadline}); err == nil {
 		t.Fatal("derivation accepted an empty run_id")
 	}
-	if _, err := deriveCapabilityClaims(tmpl, RunMetadata{RunID: "run-xyz"}); err == nil {
+	if _, err := deriveCapabilityClaims(tmpl, RunMetadata{RunID: "run-xyz", WorkItemID: "WI-1"}); err == nil {
 		t.Fatal("derivation accepted a zero deadline")
 	}
 }
