@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -18,6 +19,7 @@ type Config struct {
 	MutationLimits MutationLimitsConfig `yaml:"mutation_limits"`
 	Idempotency    IdempotencyConfig    `yaml:"idempotency"`
 	PushTripwire   PushTripwireConfig   `yaml:"push_tripwire"`
+	RunCorrelation RunCorrelationConfig `yaml:"run_correlation"`
 	Agents         []Agent              `yaml:"agents"`
 }
 
@@ -101,6 +103,16 @@ type MutationLimitsConfig struct {
 }
 
 type IdempotencyConfig struct {
+	StatePath string `yaml:"state_path"`
+}
+
+// RunCorrelationConfig configures the broker-authoritative run-to-PR
+// correlation outbox. When enabled, a successful authenticated pull.create
+// records the returned repository and PR number bound to the authenticated
+// broker identity, plus a transactional outbox event for Signal Plane. Disabled
+// and unset by default: the broker records nothing until an operator opts in.
+type RunCorrelationConfig struct {
+	Enabled   bool   `yaml:"enabled"`
 	StatePath string `yaml:"state_path"`
 }
 
@@ -301,6 +313,13 @@ func (c *Config) Validate() error {
 					errs = append(errs, fmt.Sprintf("push_tripwire repository %q has invalid ref pattern", repo))
 				}
 			}
+		}
+	}
+	if c.RunCorrelation.Enabled {
+		if c.RunCorrelation.StatePath == "" {
+			errs = append(errs, "run_correlation state_path is required")
+		} else if !filepath.IsAbs(c.RunCorrelation.StatePath) {
+			errs = append(errs, "run_correlation state_path must be absolute")
 		}
 	}
 	seen := map[string]bool{}

@@ -27,6 +27,7 @@ import (
 	"gh-agent-broker/internal/audit"
 	"gh-agent-broker/internal/auth"
 	"gh-agent-broker/internal/config"
+	"gh-agent-broker/internal/correlation"
 	"gh-agent-broker/internal/githubapp"
 	"gh-agent-broker/internal/idempotency"
 	"gh-agent-broker/internal/ids"
@@ -38,14 +39,15 @@ import (
 )
 
 type Server struct {
-	configPath string
-	mu         sync.RWMutex
-	cfg        *config.Config
-	gh         *githubapp.Client
-	audit      *audit.Logger
-	http       *http.Client
-	tripwire   *pushtripwire.Store
-	fence      pushtripwire.FenceAdapter
+	configPath  string
+	mu          sync.RWMutex
+	cfg         *config.Config
+	gh          *githubapp.Client
+	audit       *audit.Logger
+	http        *http.Client
+	tripwire    *pushtripwire.Store
+	fence       pushtripwire.FenceAdapter
+	correlation *correlation.Store
 }
 
 var issueCommentMutationMu sync.Mutex
@@ -71,13 +73,21 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 			return nil, err
 		}
 	}
+	var correlationStore *correlation.Store
+	if cfg.RunCorrelation.Enabled {
+		correlationStore, err = correlation.Open(context.Background(), cfg.RunCorrelation.StatePath)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &Server{
-		configPath: configPath,
-		cfg:        cfg,
-		gh:         gh,
-		audit:      auditLog,
-		http:       &http.Client{Timeout: 10 * time.Minute},
-		tripwire:   tripwire,
+		configPath:  configPath,
+		cfg:         cfg,
+		gh:          gh,
+		audit:       auditLog,
+		http:        &http.Client{Timeout: 10 * time.Minute},
+		tripwire:    tripwire,
+		correlation: correlationStore,
 	}, nil
 }
 
@@ -97,6 +107,8 @@ func (s *Server) Reload() error {
 	s.mu.RLock()
 	oldTripwireEnabled := s.cfg.PushTripwire.Enabled
 	oldTripwirePath := s.cfg.PushTripwire.StatePath
+	oldCorrelationEnabled := s.cfg.RunCorrelation.Enabled
+	oldCorrelationPath := s.cfg.RunCorrelation.StatePath
 	s.mu.RUnlock()
 	cfg, err := config.Load(s.configPath)
 	if err != nil {
@@ -108,6 +120,9 @@ func (s *Server) Reload() error {
 	}
 	if cfg.PushTripwire.Enabled != oldTripwireEnabled || cfg.PushTripwire.StatePath != oldTripwirePath {
 		return errors.New("push_tripwire enabled state and state_path cannot change on reload; restart is required")
+	}
+	if cfg.RunCorrelation.Enabled != oldCorrelationEnabled || cfg.RunCorrelation.StatePath != oldCorrelationPath {
+		return errors.New("run_correlation enabled state and state_path cannot change on reload; restart is required")
 	}
 	s.mu.Lock()
 	s.cfg = cfg
@@ -1927,7 +1942,41 @@ func (s *Server) handlePullCreate(w http.ResponseWriter, r *http.Request, repo s
 		return
 	}
 	s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "pull.create", Repo: repo, Branch: req.Head, RequestedPermissions: req.Permissions, Decision: result.Decision, GitHubURL: ghResult.HTMLURL, Result: "ok"})
+	s.recordRunPRCorrelation(opID, principal, repo, ghResult.Number, req.Metadata)
 	writeJSON(w, http.StatusCreated, ghResult)
+}
+
+// recordRunPRCorrelation persists the broker-authoritative run-to-PR
+// correlation and its transactional outbox event after the broker's OWN
+// authenticated pull.create succeeds. The binding derives entirely from broker
+// authority: the authenticated agent identity (principal.ID) and the broker
+// operation id, plus the GitHub-returned PR number. The run id is a descriptive
+// attribute read from the configured run metadata field, never authority; agent
+// output, branch names, and PR body markers are ignored. It is best-effort with
+// respect to the HTTP response — the outbox exists precisely so a failure here
+// is a bounded, logged, retryable gap rather than a lost correlation — but the
+// write itself is atomic (correlation + event in one transaction) and idempotent
+// on the operation id.
+func (s *Server) recordRunPRCorrelation(opID string, principal auth.Principal, repo string, prNumber int, requestMetadata map[string]string) {
+	s.mu.RLock()
+	store := s.correlation
+	runField := s.cfg.MutationLimits.RunMetadataField
+	s.mu.RUnlock()
+	if store == nil {
+		return // correlation outbox disabled; record nothing.
+	}
+	if prNumber <= 0 || principal.ID == "" || opID == "" {
+		// Unknown or unbound call: emit nothing rather than invent authority.
+		return
+	}
+	runID := ""
+	if runField != "" {
+		runID = strings.TrimSpace(requestMetadata[runField])
+	}
+	identity := correlation.Identity{AgentID: principal.ID, OperationID: opID, RunID: runID}
+	if _, err := store.Record(context.Background(), identity, repo, int64(prNumber)); err != nil {
+		s.audit.Log(audit.Event{OperationID: opID, AgentID: principal.ID, Operation: "run.correlation.record", Repo: repo, Decision: policy.DecisionAllow, Error: err.Error(), Extra: map[string]interface{}{"pr_number": prNumber}})
+	}
 }
 
 func (s *Server) handleIssueCreate(w http.ResponseWriter, r *http.Request, repo string) {

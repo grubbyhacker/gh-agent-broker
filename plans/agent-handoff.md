@@ -2,6 +2,24 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
+The broker now owns a run-to-PR correlation outbox (`internal/correlation`). When the
+broker's OWN authenticated `pull.create` succeeds, `handlePullCreate` records the
+returned repository + PR number bound to the authenticated broker identity
+(`principal.ID` + broker operation id) and appends a versioned `run-pr-correlation/v1`
+transactional outbox event — both rows in ONE transaction, so the correlation cannot
+exist without its event. Authority is broker-only: agent output, branch names, and PR
+body markers are never trusted; the run id is a descriptive attribute read from the
+configurable `mutation_limits.run_metadata_field`, never authority. Unknown/unbound
+calls (empty identity, non-positive PR) emit nothing. `Record` is idempotent on the
+broker operation id, so a crash between the GitHub response and commit converges on one
+event. The reader API (`ClaimPending`/`Ack`, claim-expiry reclaim, `PendingCount`) is
+for future Signal Plane consumption — NOT implemented here. Store uses the standard
+discipline (modernc sqlite, WAL, synchronous=FULL, quick_check, user_version, STRICT,
+single conn, 0600) with a v1 migration. `cmd/correlation-validate` is the offline
+validator. Gated behind `run_correlation.enabled` + absolute `state_path`; unset in
+production, inert until an operator opts in. Signal Plane consumption, deployment, and
+production config are deliberately out of scope. `make check` is the delivery gate.
+
 The AgentRelease publish boundary gives external callers `release.publish` only:
 the former public verify/acquire routes and actions are gone. Trusted protected-main
 CI submits a bounded `docker-archive/v1` artifact and provenance. Broker code derives
