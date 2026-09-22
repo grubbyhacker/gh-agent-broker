@@ -2,6 +2,20 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
+`.github/workflows/deploy-production.yml` now exports
+`VPS_OPS_GH_BROKER_RELEASE_PUBLISHER_OPERATOR_TOKEN` and
+`VPS_OPS_GH_BROKER_RELEASE_PROMOTER_OPERATOR_TOKEN` from same-named production
+environment secrets in BOTH the "Verify deployment secret prerequisites"
+preflight step and the "Deploy gh-agent-broker" step, alongside the other
+gh-agent-broker role secrets. This is the consumer-first side of the release
+publisher/promoter operator identities (the CLI added in #177): the workflow
+declares the exports so the vps-ops Doppler env-source wrapper can consume them
+once the values exist. The required-secret comment block and the deterministic
+deploy-contract tests (`internal/deploycontract/deploy_production_test.go`) were
+updated — a new test asserts each token is exported to exactly the two steps.
+No vps-ops edit, no secret creation, no deploy: the secret VALUES are provisioned
+separately. `make check` is the gate.
+
 The broker ships an INERT run-to-PR correlation outbox foundation
 (`internal/correlation`) — durable machinery only, wired into NO live path.
 Semantic review established the reason: today's authenticated `pull.create`
