@@ -35,14 +35,16 @@ func (f *fakeResolver) Resolve(_ context.Context, agentType string) (ResolvedRel
 	return f.release, nil
 }
 
-// releaseTestConfig extends baseTestConfig so a template can carry an agent_type
-// and release_store_path is set (which config validation now requires).
+// releaseTestConfig extends baseTestConfig with an AgentType-backed template and
+// release_store_path. The static image is deliberately empty: launch must resolve
+// the active release and must never retain a fallback image.
 func releaseTestConfig(t *testing.T, agentType string) Config {
 	t.Helper()
 	cfg := baseTestConfig(t)
 	cfg.ReleaseStore = filepath.Join(t.TempDir(), "releases.sqlite")
 	tmpl := cfg.Templates["worker"]
 	tmpl.AgentType = agentType
+	tmpl.Image = ""
 	cfg.Templates["worker"] = tmpl
 	return cfg
 }
@@ -148,6 +150,22 @@ func TestConfigValidateRejectsAgentTypeWithoutReleaseStore(t *testing.T) {
 	cfg.ReleaseStore = "/srv/releases.sqlite"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() with release_store_path set error = %v", err)
+	}
+}
+
+func TestConfigValidateAgentTypeReplacesStaticImageRequirement(t *testing.T) {
+	cfg := releaseTestConfig(t, "coder")
+	cfg.Production = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() AgentType-only production template error = %v", err)
+	}
+
+	legacy := baseTestConfig(t)
+	tmpl := legacy.Templates["worker"]
+	tmpl.Image = ""
+	legacy.Templates["worker"] = tmpl
+	if err := legacy.Validate(); err == nil || !strings.Contains(err.Error(), "image is required when agent_type is not set") {
+		t.Fatalf("Validate() static template error = %v, want image requirement", err)
 	}
 }
 
