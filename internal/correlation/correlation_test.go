@@ -280,3 +280,108 @@ func TestOpenRejectsRelativePath(t *testing.T) {
 		t.Fatal("Open accepted a relative path")
 	}
 }
+
+// TestReclaimReleasesClaimToPending verifies the explicit negative ack: a
+// consumer that claimed an event but cannot deliver it releases it straight
+// back to pending, immediately claimable by another consumer without waiting
+// out the TTL. The attempts counter is preserved across the round-trip.
+func TestReclaimReleasesClaimToPending(t *testing.T) {
+	store, _ := openTestStore(t)
+	ctx := context.Background()
+	if _, err := store.Record(ctx, cap("op-1"), "o/r", 1); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	claimed, err := store.ClaimPending(ctx, "consumer-1", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("claimed %d, want 1", len(claimed))
+	}
+	if err := store.Reclaim(ctx, claimed[0].ID, "consumer-1"); err != nil {
+		t.Fatalf("Reclaim: %v", err)
+	}
+	// Reclaimed events are still pending (not acked): the drain is not complete.
+	pending, err := store.PendingCount(ctx)
+	if err != nil {
+		t.Fatalf("PendingCount: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("after reclaim pending = %d, want 1", pending)
+	}
+	// A different consumer can claim it right away, without any TTL wait.
+	again, err := store.ClaimPending(ctx, "consumer-2", 1, time.Hour)
+	if err != nil {
+		t.Fatalf("second ClaimPending: %v", err)
+	}
+	if len(again) != 1 {
+		t.Fatalf("reclaimed event not immediately claimable: got %d", len(again))
+	}
+	// attempts: 1 (first claim) + 1 (second claim); reclaim preserved it.
+	if again[0].Attempts != 2 {
+		t.Fatalf("attempts = %d, want 2 (reclaim preserves the counter)", again[0].Attempts)
+	}
+	if again[0].ClaimToken != "consumer-2" {
+		t.Fatalf("claim token = %q, want consumer-2", again[0].ClaimToken)
+	}
+	if err := store.Validate(ctx); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+// TestReclaimRefusesWrongClaimToken verifies a stale consumer whose claim was
+// already reclaimed by another holder cannot release the new holder's claim.
+func TestReclaimRefusesWrongClaimToken(t *testing.T) {
+	store, _ := openTestStore(t)
+	ctx := context.Background()
+	if _, err := store.Record(ctx, cap("op-1"), "o/r", 1); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	claimed, err := store.ClaimPending(ctx, "consumer-1", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	if err := store.Reclaim(ctx, claimed[0].ID, "impostor"); !errors.Is(err, ErrClaimMismatch) {
+		t.Fatalf("Reclaim with wrong token = %v, want ErrClaimMismatch", err)
+	}
+	if err := store.Reclaim(ctx, claimed[0].ID, ""); err == nil {
+		t.Fatalf("Reclaim with empty token = nil, want error")
+	}
+}
+
+// TestReclaimRefusesUnclaimedOrAckedEvent verifies Reclaim is claim-gated at
+// both ends of the lifecycle: an already-acked (terminal) event and an
+// unclaimed pending event both refuse, and an unknown event id is not found.
+func TestReclaimRefusesUnclaimedOrAckedEvent(t *testing.T) {
+	store, _ := openTestStore(t)
+	ctx := context.Background()
+	if _, err := store.Record(ctx, cap("op-1"), "o/r", 1); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	claimed, err := store.ClaimPending(ctx, "consumer-1", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimPending: %v", err)
+	}
+	// Pending (unclaimed) after a reclaim: cannot be reclaimed again by anyone.
+	if err := store.Reclaim(ctx, claimed[0].ID, "consumer-1"); err != nil {
+		t.Fatalf("first Reclaim: %v", err)
+	}
+	if err := store.Reclaim(ctx, claimed[0].ID, "consumer-1"); !errors.Is(err, ErrClaimMismatch) {
+		t.Fatalf("Reclaim of pending event = %v, want ErrClaimMismatch", err)
+	}
+	// Acked (terminal): cannot be reclaimed.
+	reclaimed, err := store.ClaimPending(ctx, "consumer-2", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+	if err := store.Ack(ctx, reclaimed[0].ID, "consumer-2"); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if err := store.Reclaim(ctx, reclaimed[0].ID, "consumer-2"); !errors.Is(err, ErrClaimMismatch) {
+		t.Fatalf("Reclaim of acked event = %v, want ErrClaimMismatch", err)
+	}
+	// Unknown event id.
+	if err := store.Reclaim(ctx, 999999, "consumer-2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Reclaim of unknown id = %v, want ErrNotFound", err)
+	}
+}
