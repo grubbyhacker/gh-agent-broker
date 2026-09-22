@@ -765,7 +765,15 @@ func TestCodexPostStartStopFailureIsBoundedAndVisible(t *testing.T) {
 	runtime.finish(out.RunID+"-prep", 0, "")
 	waitFor(t, func() bool {
 		_, terminalErr := service.GetTerminalResult(context.Background(), RunInput{RunID: out.RunID})
-		return terminalErr == nil
+		if terminalErr != nil {
+			return false
+		}
+		for _, event := range readAuditEvents(t, auditPath) {
+			if event.Operation == "run_finalized" && event.RunID == out.RunID && event.Terminal {
+				return true
+			}
+		}
+		return false
 	})
 
 	executionID := "container-" + out.RunID + "-exec"

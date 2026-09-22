@@ -449,10 +449,11 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 	if name == "" {
 		errs = append(errs, "template name is required")
 	}
-	if strings.TrimSpace(tmpl.Image) == "" {
-		errs = append(errs, fmt.Sprintf("template %q image is required", name))
+	image := strings.TrimSpace(tmpl.Image)
+	if image == "" && tmpl.AgentType == "" {
+		errs = append(errs, fmt.Sprintf("template %q image is required when agent_type is not set", name))
 	}
-	if c.Production && !strings.Contains(tmpl.Image, "@sha256:") {
+	if c.Production && image != "" && !strings.Contains(image, "@sha256:") {
 		errs = append(errs, fmt.Sprintf("template %q image must be pinned by digest in production mode", name))
 	}
 	if tmpl.AgentType != "" {

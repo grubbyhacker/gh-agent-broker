@@ -2,6 +2,15 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
+AgentType-backed sandbox templates may omit `image`: config validation now
+requires a static image only when `agent_type` is absent, and applies the
+production digest-pin check only when a static image is present. Release-backed
+launch still fails closed unless `release_store_path` is configured and the
+resolver returns an active, locally available digest-pinned release. Regression
+tests clear the static image on every AgentType launch fixture and preserve the
+legacy image-required behavior for templates without `agent_type`. This closes
+the config seam exposed by the production Curator AgentRelease cutover.
+
 The capability signing decision is DECIDED (agent-infra-docs PR #19): a
 broker-verified opaque 256-bit handle, SHA-256 hashed at rest in durable SQLite,
 server-side claims, atomic verify+budget reservation, private API, broker as sole
