@@ -897,11 +897,22 @@ func TestCodexWorkflowRestartAdoptsAcceptedExecutionWithoutReinjection(t *testin
 	}
 	issuer.mu.Lock()
 	issueCount := issuer.issues
-	consumeCount := issuer.consumes
 	issuer.mu.Unlock()
 	if issueCount != 1 || injectionCount != 1 {
 		t.Fatalf("restart issued=%d injected=%d, want no replay after acceptance", issueCount, injectionCount)
 	}
+	// The post-consume recovery consume is produced by an adoption path that
+	// completes asynchronously, so await it rather than sampling immediately --
+	// every other asynchronous condition in this file is awaited the same way.
+	// The exact-count assertion below still holds, so a fourth consume fails.
+	waitFor(t, func() bool {
+		issuer.mu.Lock()
+		defer issuer.mu.Unlock()
+		return issuer.consumes >= 3
+	})
+	issuer.mu.Lock()
+	consumeCount := issuer.consumes
+	issuer.mu.Unlock()
 	if consumeCount != 3 {
 		t.Fatalf("consume calls=%d, want acceptance and post-consume crash recovery", consumeCount)
 	}
