@@ -180,7 +180,7 @@ func (s *Service) resumeCodexIssueWorkflow(
 // model execution or access the broker.
 func (s *Service) resumeRecoveryValidation(ctx context.Context, intent *launchIntent, meta RunMetadata, workflow CodexIssueWorkflow) (LaunchAgentOutput, error) {
 	template := s.cfg.Templates[workflow.RecoveryTemplate]
-	spec, _, err := s.runtimeSpec(meta, template)
+	spec, _, err := s.runtimeSpec(meta, template, "")
 	if err != nil {
 		return LaunchAgentOutput{}, err
 	}
@@ -267,7 +267,7 @@ func (s *Service) resumePreparation(
 	workflow CodexIssueWorkflow,
 ) (LaunchAgentOutput, error) {
 	template := s.cfg.Templates[workflow.PreparationTemplate]
-	spec, _, err := s.runtimeSpec(meta, template)
+	spec, _, err := s.runtimeSpec(meta, template, "")
 	if err != nil {
 		return LaunchAgentOutput{}, err
 	}
@@ -398,7 +398,7 @@ func (s *Service) resumeExecution(
 ) (LaunchAgentOutput, error) {
 	durablePhase := meta.Phase
 	template := s.cfg.Templates[workflow.ExecutionTemplate]
-	spec, _, err := s.runtimeSpec(meta, template)
+	spec, _, err := s.runtimeSpec(meta, template, "")
 	if err != nil {
 		return LaunchAgentOutput{}, err
 	}
@@ -599,7 +599,7 @@ func (s *Service) resumeDelivery(
 	workflow CodexIssueWorkflow,
 ) (LaunchAgentOutput, error) {
 	template := s.cfg.Templates[workflow.DeliveryTemplate]
-	spec, _, err := s.runtimeSpec(meta, template)
+	spec, _, err := s.runtimeSpec(meta, template, "")
 	if err != nil {
 		return LaunchAgentOutput{}, err
 	}

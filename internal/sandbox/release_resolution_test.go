@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"gh-agent-broker/internal/capability"
 	"gh-agent-broker/internal/release"
 )
 
@@ -42,9 +43,18 @@ func releaseTestConfig(t *testing.T, agentType string) Config {
 	t.Helper()
 	cfg := baseTestConfig(t)
 	cfg.ReleaseStore = filepath.Join(t.TempDir(), "releases.sqlite")
+	cfg.CapabilityStore = filepath.Join(t.TempDir(), "capability.sqlite")
+	cfg.CapabilityAPIToken = "capability-secret"
 	tmpl := cfg.Templates["worker"]
 	tmpl.AgentType = agentType
 	tmpl.Image = ""
+	tmpl.Capability = &CapabilityPolicy{
+		Mode:          "implement",
+		ModelAccess:   true,
+		AllowedModels: []string{"gpt-5.6-terra"},
+		CallBudget:    64,
+		TokenBudget:   200000,
+	}
 	cfg.Templates["worker"] = tmpl
 	return cfg
 }
@@ -61,6 +71,24 @@ func launchWorker(ctx context.Context, t *testing.T, service *Service) LaunchAge
 		t.Fatalf("LaunchAgent() error = %v", err)
 	}
 	return out
+}
+
+// newTestCapabilityStore opens a real capability store for launch-path tests and
+// wires it into the service as the minter, so an AgentType-backed launch mints a
+// per-run capability instead of failing closed on a missing store.
+func newTestCapabilityStore(t *testing.T, service *Service) *capability.Store {
+	t.Helper()
+	store, err := capability.OpenStore(context.Background(), filepath.Join(t.TempDir(), "capability.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	t.Cleanup(func() {
+		if cerr := store.Close(); cerr != nil {
+			t.Errorf("close capability store: %v", cerr)
+		}
+	})
+	service.SetCapabilityMinter(store)
+	return store
 }
 
 func lookupTestRun(t *testing.T, service *Service, runID string) RunMetadata {
@@ -110,6 +138,7 @@ func TestLaunchWithAgentTypeUsesResolvedReference(t *testing.T) {
 	service := NewService(cfg, runtime, auditLog)
 	resolver := &fakeResolver{release: ResolvedRelease{Generation: 42, ImageReference: testResolvedRef, ImageDigest: testResolvedDigest}}
 	service.SetReleaseResolver(resolver)
+	newTestCapabilityStore(t, service)
 
 	out := launchWorker(context.Background(), t, service)
 
@@ -139,6 +168,13 @@ func TestConfigValidateRejectsAgentTypeWithoutReleaseStore(t *testing.T) {
 	cfg := baseTestConfig(t)
 	tmpl := cfg.Templates["worker"]
 	tmpl.AgentType = "coder"
+	tmpl.Capability = &CapabilityPolicy{
+		Mode:          "implement",
+		ModelAccess:   true,
+		AllowedModels: []string{"gpt-5.6-terra"},
+		CallBudget:    64,
+		TokenBudget:   200000,
+	}
 	cfg.Templates["worker"] = tmpl
 	// release_store_path deliberately left unset.
 	err := cfg.Validate()
@@ -146,8 +182,10 @@ func TestConfigValidateRejectsAgentTypeWithoutReleaseStore(t *testing.T) {
 		t.Fatalf("Validate() error = %v, want release_store_path requirement", err)
 	}
 
-	// With release_store_path set, the same template validates.
+	// With release_store_path and a capability store set, the same template validates.
 	cfg.ReleaseStore = "/srv/releases.sqlite"
+	cfg.CapabilityStore = "/srv/capability.sqlite"
+	cfg.CapabilityAPIToken = "capability-secret"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() with release_store_path set error = %v", err)
 	}
@@ -260,6 +298,7 @@ func TestResolvedGenerationInRunRecordAndTerminalResult(t *testing.T) {
 	runtime := newFakeRuntime()
 	service := NewService(cfg, runtime, auditLog)
 	service.SetReleaseResolver(&fakeResolver{release: ResolvedRelease{Generation: 7, ImageReference: testResolvedRef, ImageDigest: testResolvedDigest}})
+	newTestCapabilityStore(t, service)
 
 	out := launchWorker(context.Background(), t, service)
 

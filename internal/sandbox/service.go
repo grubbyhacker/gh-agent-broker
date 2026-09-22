@@ -80,6 +80,7 @@ type Service struct {
 	backgroundWG        sync.WaitGroup
 	codexIssuer         CodexCredentialIssuer
 	releases            ReleaseResolver
+	capabilities        CapabilityMinter
 }
 
 // ReleaseResolver resolves the release a launch of an agent type must use. It is
@@ -702,14 +703,21 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 	if err := s.writeTaskInputs(meta); err != nil {
 		return LaunchAgentOutput{}, err
 	}
-	spec, redactor, err := s.runtimeSpec(meta, tmpl)
+	capabilityHandle, err := s.mintLaunchCapability(ctx, tmpl, meta)
 	if err != nil {
+		s.auditDeny("launch_agent", in, err)
+		return LaunchAgentOutput{}, err
+	}
+	spec, redactor, err := s.runtimeSpec(meta, tmpl, capabilityHandle)
+	if err != nil {
+		s.revokeLaunchCapability(ctx, capabilityHandle)
 		return LaunchAgentOutput{}, err
 	}
 	createStarted := time.Now()
 	info, err := s.runtime.Create(ctx, spec)
 	s.logSandboxCreation(meta, time.Since(createStarted), err)
 	if err != nil {
+		s.revokeLaunchCapability(ctx, capabilityHandle)
 		meta.Status = StatusFailed
 		meta.FinalizeReason = finalizeReasonLaunchCreateFailed
 		meta.TerminalSource = terminalSourceStartupFailure
@@ -729,6 +737,7 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 	meta.ContainerID = info.ID
 	meta.ImageDigest = info.ImageDigest
 	if err := s.runtime.Start(ctx, info.ID); err != nil {
+		s.revokeLaunchCapability(ctx, capabilityHandle)
 		meta.Status = StatusFailed
 		meta.FinalizeReason = finalizeReasonLaunchStartFailed
 		meta.TerminalSource = terminalSourceStartupFailure
@@ -905,8 +914,25 @@ func (s *Service) resumeLaunchIntent(ctx context.Context, intent *launchIntent, 
 	if err := s.prepareDurableRun(meta, tmpl); err != nil {
 		return LaunchAgentOutput{}, err
 	}
-	spec, redactor, err := s.runtimeSpec(meta, tmpl)
+	// Mint a per-run capability ONLY on a fresh create. On adoption of an
+	// already-created container (reconcile/resume), the original handle was
+	// injected into that container's environment at its first create and is not
+	// re-minted or re-injected: the plaintext is transport-only and never
+	// persisted, so a resume neither has nor needs it.
+	freshCreate := intent.State != intentStateContainerMade && intent.State != intentStateStartPending
+	var (
+		capabilityHandle string
+		err              error
+	)
+	if freshCreate {
+		capabilityHandle, err = s.mintLaunchCapability(ctx, tmpl, meta)
+		if err != nil {
+			return LaunchAgentOutput{}, err
+		}
+	}
+	spec, redactor, err := s.runtimeSpec(meta, tmpl, capabilityHandle)
 	if err != nil {
+		s.revokeLaunchCapability(ctx, capabilityHandle)
 		return LaunchAgentOutput{}, err
 	}
 	var info ContainerInfo
@@ -925,12 +951,14 @@ func (s *Service) resumeLaunchIntent(ctx context.Context, intent *launchIntent, 
 	} else {
 		intent.State = intentStateCreatePending
 		if err := s.launchIntents.Save(ctx, *intent); err != nil {
+			s.revokeLaunchCapability(ctx, capabilityHandle)
 			return LaunchAgentOutput{}, err
 		}
 		createStarted := time.Now()
 		info, err = s.runtime.Create(ctx, spec)
 		s.logSandboxCreation(meta, time.Since(createStarted), err)
 		if err != nil {
+			s.revokeLaunchCapability(ctx, capabilityHandle)
 			return s.commitStartupFailureIntent(
 				ctx, intent, meta, redactor, finalizeReasonLaunchCreateFailed, err,
 			)
@@ -962,6 +990,7 @@ func (s *Service) resumeLaunchIntent(ctx context.Context, intent *launchIntent, 
 		if inspectErr == nil && !status.StartedAt.IsZero() {
 			return s.commitExitedIntent(ctx, intent, meta, status)
 		}
+		s.revokeLaunchCapability(ctx, capabilityHandle)
 		return s.commitStartupFailureIntent(
 			ctx, intent, meta, redactor, finalizeReasonLaunchStartFailed, err,
 		)
@@ -1533,7 +1562,7 @@ func runtimeLimit(in LaunchAgentInput, tmpl Template) (time.Duration, error) {
 	return time.Duration(runtimeMinutes) * time.Minute, nil
 }
 
-func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Redactor, error) {
+func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template, capabilityHandle string) (RuntimeSpec, Redactor, error) {
 	runDir := s.runDir(meta.RunID)
 	// The effective image is the one recorded on the run at template selection.
 	// For a template with an agent_type that is the digest-pinned reference the
@@ -1568,6 +1597,12 @@ func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Red
 	env["AGENT_BRANCH"] = meta.Branch
 	env["AGENT_TASK"] = meta.Task
 	env["AGENT_VERIFY_TASK"] = meta.VerificationTask
+	if capabilityHandle != "" {
+		// Controlled transport: the plaintext per-run capability handle reaches
+		// only this container's environment. It is never persisted to
+		// RunMetadata, audit, status, or disk — only its SHA-256 is stored.
+		env[capabilityEnvKey] = capabilityHandle
+	}
 	if meta.RecoverySealSHA256 != "" {
 		env["AGENT_RECOVERY_SEAL_SHA256"] = meta.RecoverySealSHA256
 	}
@@ -1583,6 +1618,9 @@ func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Red
 		{Source: filepath.Join(runDir, "lessons"), Target: "/lessons", ReadOnly: false},
 	}
 	redactor := NewRedactor([]string{tmpl.BrokerAgentSecret})
+	if capabilityHandle != "" {
+		redactor.known = append(redactor.known, capabilityHandle)
+	}
 	if tmpl.CredentialBundle != "" {
 		bundle := s.cfg.Bundles[tmpl.CredentialBundle]
 		if !contains(bundle.AllowedTemplates, meta.Template) {
@@ -2155,7 +2193,7 @@ func (s *Service) writeCompletionStatus(ctx context.Context, meta RunMetadata) {
 		s.logCompletionStatusFailure(meta, err)
 		return
 	}
-	spec, _, err := s.runtimeSpec(meta, tmpl)
+	spec, _, err := s.runtimeSpec(meta, tmpl, "")
 	if err != nil {
 		s.logCompletionStatusFailure(meta, err)
 		return
@@ -2245,6 +2283,15 @@ func (s *Service) logSandboxCreation(meta RunMetadata, duration time.Duration, e
 		return
 	}
 	log.Print(string(b))
+}
+
+// logCapabilityRevokeFailure records that a best-effort revoke of a minted
+// per-run capability failed after a launch did not reach a running state. It
+// logs STATIC text only: the plaintext handle is never logged, and the store's
+// revoke errors carry only stored-hash identity, so no capability material can
+// leak here. The failure never masks the original launch error.
+func (s *Service) logCapabilityRevokeFailure(_ error) {
+	log.Print(`{"event":"capability_revoke","success":false,"error":"launch_capability_revoke_failed"}`)
 }
 
 func (s *Service) ensureFailureDiagnostics(meta RunMetadata, message string) error {

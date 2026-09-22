@@ -130,6 +130,31 @@ type Template struct {
 	CompletionStatusPath string            `yaml:"completion_status_path"`
 	StorageLimitMB       int64             `yaml:"storage_limit_mb"`
 	Tmpfs                map[string]int64  `yaml:"tmpfs"`
+	Capability           *CapabilityPolicy `yaml:"capability"`
+}
+
+// CapabilityPolicy is the deployment-owned declaration a per-run capability's
+// immutable claims are derived from at launch. It is the SOLE source of a
+// capability's mode, model access, allowed models, and budgets; the broker never
+// derives any of these from caller-supplied launch input. run_id, work_item_id,
+// and expiry are supplied by the broker-generated run identity and the
+// broker-computed deadline, not from this block.
+//
+// It exists only on an AgentType-backed template (agent_type set). Model access
+// has exactly two coherent states, matching internal/capability.NewClaims and
+// the deployed youknowme-curator reconcile mode (model.access=false):
+//
+//   - model-DISABLED (ModelAccess=false): AllowedModels MUST be empty and both
+//     budgets MUST be zero. The capability authorizes identity-only broker
+//     operations and no model access.
+//   - model-ENABLED (ModelAccess=true): AllowedModels MUST be non-empty and both
+//     budgets MUST be positive.
+type CapabilityPolicy struct {
+	Mode          string   `yaml:"mode"`
+	ModelAccess   bool     `yaml:"model_access"`
+	AllowedModels []string `yaml:"allowed_models"`
+	CallBudget    int64    `yaml:"call_budget"`
+	TokenBudget   int64    `yaml:"token_budget"`
 }
 
 type ExtraMount struct {
@@ -463,6 +488,16 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 		if strings.TrimSpace(c.ReleaseStore) == "" {
 			errs = append(errs, fmt.Sprintf("template %q sets agent_type %q but release_store_path is not configured; release resolution has no registry to read", name, tmpl.AgentType))
 		}
+		if tmpl.Capability == nil {
+			errs = append(errs, fmt.Sprintf("template %q sets agent_type %q but declares no capability policy; a per-run capability cannot be derived", name, tmpl.AgentType))
+		} else {
+			if strings.TrimSpace(c.CapabilityStore) == "" {
+				errs = append(errs, fmt.Sprintf("template %q declares a capability policy but capability_store_path is not configured; launch would fail closed", name))
+			}
+			errs = append(errs, c.validateCapabilityPolicy(name, *tmpl.Capability)...)
+		}
+	} else if tmpl.Capability != nil {
+		errs = append(errs, fmt.Sprintf("template %q declares a capability policy without agent_type; per-run capabilities are only minted for AgentType-backed launches", name))
 	}
 	if len(tmpl.Command) == 0 {
 		errs = append(errs, fmt.Sprintf("template %q command is required", name))
@@ -514,6 +549,41 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 	for target, sizeMB := range tmpl.Tmpfs {
 		if !filepath.IsAbs(target) || target == "/" || sizeMB < 1 {
 			errs = append(errs, fmt.Sprintf("template %q tmpfs entry %q must be an absolute non-root path with a positive MiB bound", name, target))
+		}
+	}
+	return errs
+}
+
+// validateCapabilityPolicy enforces the two coherent model-access states so a
+// deployment cannot declare a capability the store's NewClaims would later
+// reject. It mirrors internal/capability.NewClaims exactly.
+func (c Config) validateCapabilityPolicy(name string, pol CapabilityPolicy) []string {
+	var errs []string
+	if strings.TrimSpace(pol.Mode) == "" {
+		errs = append(errs, fmt.Sprintf("template %q capability policy mode is required", name))
+	}
+	if pol.CallBudget < 0 || pol.TokenBudget < 0 {
+		errs = append(errs, fmt.Sprintf("template %q capability budgets must not be negative", name))
+	}
+	for _, m := range pol.AllowedModels {
+		if strings.TrimSpace(m) == "" {
+			errs = append(errs, fmt.Sprintf("template %q capability allowed_models contains a blank entry", name))
+			break
+		}
+	}
+	if pol.ModelAccess {
+		if len(pol.AllowedModels) == 0 {
+			errs = append(errs, fmt.Sprintf("template %q capability policy enables model access but declares no allowed_models", name))
+		}
+		if pol.CallBudget <= 0 || pol.TokenBudget <= 0 {
+			errs = append(errs, fmt.Sprintf("template %q capability policy enables model access but a budget is not positive", name))
+		}
+	} else {
+		if len(pol.AllowedModels) != 0 {
+			errs = append(errs, fmt.Sprintf("template %q capability policy is model-disabled but declares allowed_models", name))
+		}
+		if pol.CallBudget != 0 || pol.TokenBudget != 0 {
+			errs = append(errs, fmt.Sprintf("template %q capability policy is model-disabled but a budget is non-zero", name))
 		}
 	}
 	return errs

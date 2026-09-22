@@ -2,6 +2,42 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
+Launch-time minting is now WIRED for AgentType-backed launches. The sandbox
+`Service` holds an optional `CapabilityMinter` (`SetCapabilityMinter`, satisfied
+by `*capability.Store`); `cmd/sandbox-broker` wires the same store it already
+opens for the private REST API. On a launch of a template with `agent_type` set,
+`launchAgent` and the durable `resumeLaunchIntent` (fresh-create branch only)
+derive ONE per-run capability's claims — `deriveCapabilityClaims` in
+`internal/sandbox/capability_launch.go` — strictly from deployment-owned policy
+plus broker-generated run identity: agent_type/mode/allowed_models/call_budget/
+token_budget from the template's new `capability:` block (`CapabilityPolicy`),
+run_id + work_item_id from the broker's `newRunID()`, expiry from the
+broker-computed run deadline. No caller-supplied run_id or claims are ever read
+(`LaunchAgentInput` already rejects unknown fields). `Store.Issue` mints the
+opaque 256-bit handle; only its SHA-256 is stored. The PLAINTEXT handle is
+injected solely into the launched container's env transport as
+`AGENT_CAPABILITY_TOKEN` (added to the run's `Redactor`), and is never written to
+RunMetadata, the audit log, run status, or disk. It fails CLOSED: an
+`agent_type`-backed template MUST declare a capability policy AND
+`capability_store_path` must be configured (both enforced in `Config.Validate`),
+and a launch with no minter wired is refused before any container is created. The
+model-disabled state (`model_access: false` ⇒ empty models + zero budgets, e.g.
+youknowme-curator reconcile) is preserved through `NewClaims`. On container
+create/start failure (both the direct and durable paths) the minted capability is
+Revoked best-effort; a resume/reconcile of an already-created container neither
+re-mints nor re-injects, since the plaintext is transport-only.
+
+The DOWNSTREAM TRANSPORT CONTRACT a consumer must honor: the run receives its
+opaque handle in the container environment variable `AGENT_CAPABILITY_TOKEN`
+(64 lowercase hex chars). A consumer presents it to the broker's private
+capability API (`POST /v1/capabilities/{verify,reserve}`) to obtain trusted
+server-side claims and reserve model budget; it must NOT trust any
+caller-asserted run_id/claims. STILL OUT OF SCOPE (unchanged this slice): the
+Codex issue-workflow multi-phase launch (`codex_workflow.go`) does not yet inject
+a capability — its runtimeSpec calls pass an empty handle; gh-agent-proxy, GitHub
+operations, and the correlation outbox are untouched; no model-proxy consumer
+verifies the handle yet; no production config or deploy. `make check` is the gate.
+
 Buildx Docker archives carry an OCI `index.json`; Docker exposes the index's
 single OCI manifest digest as the loaded image ID rather than the config digest.
 AgentRelease validation now verifies the complete index→manifest→config

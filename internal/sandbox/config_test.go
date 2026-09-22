@@ -459,3 +459,99 @@ func codexWorkflowTestConfig(t *testing.T) Config {
 	}
 	return cfg
 }
+
+func TestConfigValidateRejectsAgentTypeWithoutCapabilityPolicy(t *testing.T) {
+	cfg := baseTestConfig(t)
+	cfg.ReleaseStore = "/srv/releases.sqlite"
+	cfg.CapabilityStore = "/srv/capability.sqlite"
+	cfg.CapabilityAPIToken = "capability-secret"
+	tmpl := cfg.Templates["worker"]
+	tmpl.AgentType = "coder"
+	tmpl.Image = ""
+	tmpl.Capability = nil
+	cfg.Templates["worker"] = tmpl
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "no capability policy") {
+		t.Fatalf("Validate() error = %v, want a capability-policy requirement for an agent_type template", err)
+	}
+}
+
+func TestConfigValidateRejectsCapabilityPolicyWithoutAgentType(t *testing.T) {
+	cfg := baseTestConfig(t)
+	tmpl := cfg.Templates["worker"]
+	tmpl.Capability = &CapabilityPolicy{Mode: "implement"}
+	cfg.Templates["worker"] = tmpl
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "capability policy without agent_type") {
+		t.Fatalf("Validate() error = %v, want refusal of a capability policy on a non-AgentType template", err)
+	}
+}
+
+func TestConfigValidateRejectsCapabilityPolicyWithoutStore(t *testing.T) {
+	cfg := baseTestConfig(t)
+	cfg.ReleaseStore = "/srv/releases.sqlite"
+	// capability_store_path deliberately unset.
+	tmpl := cfg.Templates["worker"]
+	tmpl.AgentType = "coder"
+	tmpl.Image = ""
+	tmpl.Capability = &CapabilityPolicy{Mode: "implement", ModelAccess: true, AllowedModels: []string{"m"}, CallBudget: 1, TokenBudget: 1}
+	cfg.Templates["worker"] = tmpl
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "capability_store_path is not configured") {
+		t.Fatalf("Validate() error = %v, want fail-closed on missing capability_store_path", err)
+	}
+}
+
+func TestConfigValidateRejectsIncoherentCapabilityPolicy(t *testing.T) {
+	cases := []struct {
+		name string
+		pol  CapabilityPolicy
+		want string
+	}{
+		{"model enabled without models", CapabilityPolicy{Mode: "m", ModelAccess: true, CallBudget: 1, TokenBudget: 1}, "no allowed_models"},
+		{"model enabled zero budget", CapabilityPolicy{Mode: "m", ModelAccess: true, AllowedModels: []string{"x"}, CallBudget: 0, TokenBudget: 1}, "budget is not positive"},
+		{"model disabled with models", CapabilityPolicy{Mode: "m", ModelAccess: false, AllowedModels: []string{"x"}}, "declares allowed_models"},
+		{"model disabled with budget", CapabilityPolicy{Mode: "m", ModelAccess: false, CallBudget: 5}, "budget is non-zero"},
+		{"blank model entry", CapabilityPolicy{Mode: "m", ModelAccess: true, AllowedModels: []string{""}, CallBudget: 1, TokenBudget: 1}, "blank entry"},
+		{"missing mode", CapabilityPolicy{Mode: "", ModelAccess: false}, "mode is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseTestConfig(t)
+			cfg.ReleaseStore = "/srv/releases.sqlite"
+			cfg.CapabilityStore = "/srv/capability.sqlite"
+			cfg.CapabilityAPIToken = "capability-secret"
+			tmpl := cfg.Templates["worker"]
+			tmpl.AgentType = "coder"
+			tmpl.Image = ""
+			pol := tc.pol
+			tmpl.Capability = &pol
+			cfg.Templates["worker"] = tmpl
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate() error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestConfigValidateAcceptsCoherentCapabilityPolicies(t *testing.T) {
+	for _, pol := range []CapabilityPolicy{
+		{Mode: "implement", ModelAccess: true, AllowedModels: []string{"gpt-5.6-terra"}, CallBudget: 64, TokenBudget: 200000},
+		{Mode: "reconcile", ModelAccess: false},
+	} {
+		cfg := baseTestConfig(t)
+		cfg.ReleaseStore = "/srv/releases.sqlite"
+		cfg.CapabilityStore = "/srv/capability.sqlite"
+		cfg.CapabilityAPIToken = "capability-secret"
+		tmpl := cfg.Templates["worker"]
+		tmpl.AgentType = "coder"
+		tmpl.Image = ""
+		p := pol
+		tmpl.Capability = &p
+		cfg.Templates["worker"] = tmpl
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() coherent policy %+v error = %v", pol, err)
+		}
+	}
+}

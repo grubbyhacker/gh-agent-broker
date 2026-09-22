@@ -131,6 +131,7 @@ func runServerCommand(args []string) {
 			}
 		}()
 		capabilityHandler = capability.NewRESTHandler(capStore, cfg.CapabilityAPIToken)
+		service.SetCapabilityMinter(capStore)
 	}
 	if cfg.CodexHolder.MasterAuthPath != "" {
 		holder, holderErr := codexauth.New(codexauth.Config{
