@@ -41,49 +41,23 @@ type dockerImageConfig struct {
 // publisher's single-image Docker archive. It checks the parts that determine
 // release identity and eligibility; Docker remains the archive parser.
 func validateDockerArtifact(data []byte, expectedPlatform string) (string, error) {
-	tr := tar.NewReader(bytes.NewReader(data))
-	files := map[string][]byte{}
-	for {
-		header, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("read Docker archive: %w", err)
-		}
-		name := strings.TrimSuffix(header.Name, "/")
-		if name == "" || path.IsAbs(header.Name) || path.Clean(name) != name || strings.HasPrefix(name, "../") {
-			return "", fmt.Errorf("docker archive contains invalid path %q", header.Name)
-		}
-		if header.Typeflag == tar.TypeDir {
-			continue
-		}
-		if header.Typeflag != tar.TypeReg {
-			return "", fmt.Errorf("docker archive entry %q must be a regular file", header.Name)
-		}
-		if name != "manifest.json" && !dockerConfigPath.MatchString(name) {
-			continue
-		}
-		if _, exists := files[name]; exists {
-			return "", fmt.Errorf("docker archive contains duplicate %q", name)
-		}
-		contents, err := io.ReadAll(io.LimitReader(tr, 1024*1024+1))
-		if err != nil || len(contents) > 1024*1024 {
-			return "", fmt.Errorf("docker archive metadata %q is invalid", name)
-		}
-		files[name] = contents
+	manifestBytes, found, err := readDockerArchiveEntry(data, "manifest.json")
+	if err != nil {
+		return "", err
 	}
-
 	var manifests []dockerArchiveManifest
-	if err := json.Unmarshal(files["manifest.json"], &manifests); err != nil || len(manifests) != 1 {
+	if !found || json.Unmarshal(manifestBytes, &manifests) != nil || len(manifests) != 1 {
 		return "", fmt.Errorf("docker archive must contain exactly one image manifest")
 	}
 	manifest := manifests[0]
 	if !dockerConfigPath.MatchString(manifest.Config) {
 		return "", fmt.Errorf("docker archive manifest has invalid config identity")
 	}
-	configBytes, ok := files[manifest.Config]
-	if !ok {
+	configBytes, found, err := readDockerArchiveEntry(data, manifest.Config)
+	if err != nil {
+		return "", err
+	}
+	if !found {
 		return "", fmt.Errorf("docker archive config is missing")
 	}
 	configDigest := strings.TrimPrefix(manifest.Config, "blobs/sha256/")
@@ -101,6 +75,43 @@ func validateDockerArtifact(data []byte, expectedPlatform string) (string, error
 		return "", fmt.Errorf("docker image platform %q does not match %q", platform, expectedPlatform)
 	}
 	return "sha256:" + configDigest, nil
+}
+
+func readDockerArchiveEntry(data []byte, target string) ([]byte, bool, error) {
+	tr := tar.NewReader(bytes.NewReader(data))
+	var contents []byte
+	found := false
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, false, fmt.Errorf("read Docker archive: %w", err)
+		}
+		name := strings.TrimSuffix(header.Name, "/")
+		if name == "" || path.IsAbs(header.Name) || path.Clean(name) != name || strings.HasPrefix(name, "../") {
+			return nil, false, fmt.Errorf("docker archive contains invalid path %q", header.Name)
+		}
+		if header.Typeflag == tar.TypeDir {
+			continue
+		}
+		if header.Typeflag != tar.TypeReg {
+			return nil, false, fmt.Errorf("docker archive entry %q must be a regular file", header.Name)
+		}
+		if name != target {
+			continue
+		}
+		if found {
+			return nil, false, fmt.Errorf("docker archive contains duplicate %q", name)
+		}
+		contents, err = io.ReadAll(io.LimitReader(tr, 1024*1024+1))
+		if err != nil || len(contents) > 1024*1024 {
+			return nil, false, fmt.Errorf("docker archive metadata %q is invalid", name)
+		}
+		found = true
+	}
+	return contents, found, nil
 }
 
 func acquireDockerArtifact(
