@@ -4,7 +4,6 @@ package proxy
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -131,7 +130,8 @@ type Usage struct {
 }
 
 type openAIResponseRequest struct {
-	Model string `json:"model"`
+	Model           string `json:"model"`
+	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
 }
 
 func Load(path string) (Config, error) {
@@ -328,12 +328,19 @@ func (s *Service) handleModelCall(w http.ResponseWriter, r *http.Request) {
 // handleModelCallCapability serves /v1/model/call under capability enforcement.
 // It authenticates the run by its opaque handle, verifies immutable claims,
 // derives run_id from the verified claims (never the caller's body field),
-// enforces the allowed model, atomically reserves one call BEFORE forwarding,
-// then reserves observed tokens. It fails closed on every capability error and
-// never logs the handle.
+// handleModelCallCapability authenticates the run, enforces the allowed model,
+// and atomically reserves one call plus a conservative token upper bound BEFORE
+// forwarding. The bound is request bytes + caller-declared max output tokens;
+// token count cannot exceed the UTF-8 byte count of the serialized request, so
+// this may over-reserve but cannot authorize an over-budget upstream call.
 func (s *Service) handleModelCallCapability(w http.ResponseWriter, r *http.Request) {
+	body, err := readLimited(r.Body, s.cfg.MaxRequestBytes)
+	if err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+		return
+	}
 	var in ModelCallRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, s.cfg.MaxRequestBytes)).Decode(&in); err != nil {
+	if err := json.Unmarshal(body, &in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return
 	}
@@ -355,9 +362,15 @@ func (s *Service) handleModelCallCapability(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "messages_required"})
 		return
 	}
-	if err := s.reserveCapabilityCall(r.Context(), auth, in.Model); err != nil {
+	tokenBound, ok := preflightTokenBound(len(body), in.MaxTokens)
+	if !ok {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "deny", Error: "max_tokens_required"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max_tokens_required"})
+		return
+	}
+	if err := s.reserveCapabilityBudget(r.Context(), auth, in.Model, tokenBound); err != nil {
 		status, code := capStatus(err)
-		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "deny", Error: capAuditError(err)})
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "deny", Tokens: int(tokenBound), Error: capAuditError(err)})
 		writeJSON(w, status, map[string]string{"error": code})
 		return
 	}
@@ -367,12 +380,6 @@ func (s *Service) handleModelCallCapability(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "deny", Error: "upstream_error"})
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "upstream_error"})
-		return
-	}
-	if err := s.reserveCapabilityTokens(r.Context(), auth, usage.TotalTokens); err != nil {
-		status, code := capStatus(err)
-		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "deny", Tokens: usage.TotalTokens, Error: capAuditError(err)})
-		writeJSON(w, status, map[string]string{"error": code})
 		return
 	}
 	s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Decision: "allow", Tokens: usage.TotalTokens})
@@ -514,9 +521,9 @@ func (s *Service) handleCodexResponses(w http.ResponseWriter, r *http.Request) {
 // handleCodexResponsesCapability serves /v1/responses under capability
 // enforcement. The run authenticates with its opaque handle (Bearer), run_id is
 // derived from the verified claims, the requested alias must be in the verified
-// allowed_models, and one call is atomically reserved BEFORE forwarding with
-// tokens reserved after. The caller-provided X-GH-Agent-Run-ID header is used
-// only to reject a mismatch, never trusted. Fails closed; never logs the handle.
+// allowed_models, and one call plus a conservative token upper bound are
+// atomically reserved BEFORE forwarding. The caller-provided X-GH-Agent-Run-ID
+// header is used only to reject a mismatch, never trusted. Fails closed; never logs the handle.
 func (s *Service) handleCodexResponsesCapability(w http.ResponseWriter, r *http.Request, auditEndpoint, upstreamEndpoint string) {
 	callerRunID := strings.TrimSpace(r.Header.Get("X-GH-Agent-Run-ID"))
 	auth, err := s.authenticateCapability(r.Context(), r, callerRunID)
@@ -551,18 +558,24 @@ func (s *Service) handleCodexResponsesCapability(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "capability_denied"})
 		return
 	}
-	// Reserve one call and enforce the alias against the verified allowed_models
-	// atomically at the broker BEFORE forwarding.
-	if err := s.reserveCapabilityCall(r.Context(), auth, in.Model); err != nil {
-		status, code := capStatus(err)
-		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: capAuditError(err)})
-		writeJSON(w, status, map[string]string{"error": code})
-		return
-	}
 	body, err = rewriteJSONModel(body, upstreamModel)
 	if err != nil {
 		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: "invalid_json"})
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+	tokenBound, ok := preflightTokenBound(len(body), in.MaxOutputTokens)
+	if !ok {
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: "max_output_tokens_required"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max_output_tokens_required"})
+		return
+	}
+	// Reserve the model, one call, and the complete conservative token bound in
+	// one broker transaction before any upstream request or stream begins.
+	if err := s.reserveCapabilityBudget(r.Context(), auth, in.Model, tokenBound); err != nil {
+		status, code := capStatus(err)
+		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Tokens: int(tokenBound), Error: capAuditError(err)})
+		writeJSON(w, status, map[string]string{"error": code})
 		return
 	}
 	resp, err := s.forwardCodex(upstreamEndpoint, body, r)
@@ -578,7 +591,7 @@ func (s *Service) handleCodexResponsesCapability(w http.ResponseWriter, r *http.
 		return
 	}
 	if isEventStream(resp.Header.Get("Content-Type")) {
-		s.streamCodexResponseCapability(w, resp, auth, runID, in.Model, auditEndpoint)
+		s.streamCodexResponseCapability(w, resp, runID, in.Model, auditEndpoint)
 		return
 	}
 	respBody, err := readLimited(resp.Body, s.cfg.MaxResponseBytes)
@@ -588,12 +601,6 @@ func (s *Service) handleCodexResponsesCapability(w http.ResponseWriter, r *http.
 		return
 	}
 	usage := usageFromJSON(respBody)
-	if err := s.reserveCapabilityTokens(r.Context(), auth, usage.TotalTokens); err != nil {
-		status, code := capStatus(err)
-		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Tokens: usage.TotalTokens, Error: capAuditError(err)})
-		writeJSON(w, status, map[string]string{"error": code})
-		return
-	}
 	s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "allow", Tokens: usage.TotalTokens})
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -738,12 +745,11 @@ func (s *Service) streamCodexResponse(w http.ResponseWriter, resp *http.Response
 	s.audit.Log(auditEvent{RunID: runID, Model: model, Endpoint: endpoint, Decision: "allow", Tokens: usage.TotalTokens})
 }
 
-// streamCodexResponseCapability streams an SSE codex response under capability
-// enforcement, then reserves the observed tokens against the run's capability.
-// The call was already reserved before forwarding, so a token-budget failure
-// after streaming can only be audited (the bytes are already on the wire); it is
-// recorded as a deny so the overage is visible. The handle is never logged.
-func (s *Service) streamCodexResponseCapability(w http.ResponseWriter, resp *http.Response, auth capAuthResult, runID, model, endpoint string) {
+// streamCodexResponseCapability streams an SSE response after the model, call,
+// and conservative token bound were atomically reserved. Observed usage is
+// audit evidence only; it is never used as late authorization after bytes are
+// already on the wire.
+func (s *Service) streamCodexResponseCapability(w http.ResponseWriter, resp *http.Response, runID, model, endpoint string) {
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	flusher, canFlush := w.(http.Flusher)
@@ -774,10 +780,6 @@ func (s *Service) streamCodexResponseCapability(w http.ResponseWriter, resp *htt
 			}
 			break
 		}
-	}
-	if err := s.reserveCapabilityTokens(context.Background(), auth, usage.TotalTokens); err != nil {
-		s.audit.Log(auditEvent{RunID: runID, Model: model, Endpoint: endpoint, Decision: "deny", Tokens: usage.TotalTokens, Error: capAuditError(err)})
-		return
 	}
 	s.audit.Log(auditEvent{RunID: runID, Model: model, Endpoint: endpoint, Decision: "allow", Tokens: usage.TotalTokens})
 }

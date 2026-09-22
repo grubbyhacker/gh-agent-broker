@@ -69,10 +69,14 @@ Codex-compatible `POST /v1/responses`):
 - The run authenticates with its opaque handle as the `Bearer` credential. The
   plaintext handle travels only in the proxy→broker request body, and is never
   logged, audited, persisted, or echoed to the caller.
-- The proxy VERIFIES the handle against the broker, then ATOMICALLY RESERVES one
-  call (with the model checked) BEFORE forwarding, and reserves observed tokens
-  after. The broker's single-transaction `Reserve` is the only serialization
-  point, so concurrent calls across goroutines/instances cannot exceed a budget.
+- The proxy VERIFIES the handle, requires a caller-declared output-token cap,
+  then ATOMICALLY RESERVES one call plus a conservative token upper bound
+  (serialized request bytes + maximum output tokens) with the model checked,
+  all BEFORE forwarding. Request bytes safely over-bound input tokens without
+  trusting an upstream tokenizer. Observed response usage is audit evidence,
+  never late authorization after work or streamed bytes already occurred. The
+  broker's single-transaction `Reserve` is the only serialization point, so
+  concurrent calls across goroutines/instances cannot exceed either budget.
 - `run_id`, `work_item_id`, `agent_type`, and `mode` are derived from the
   verified claims. Caller-supplied identity is no longer trusted: a legacy body
   `run_id` or `X-GH-Agent-Run-ID` header that disagrees with the verified

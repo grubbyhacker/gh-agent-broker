@@ -168,7 +168,8 @@ func TestModelCallCapabilityHappyPathDerivesVerifiedRunID(t *testing.T) {
 	})
 	handle := f.issueEnabled(t, "run-verified", "wi-1", 3, 100, time.Now().Add(time.Hour), "gpt-test")
 	// Caller asserts NO run_id in body; identity is derived from the handle.
-	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+	requestBody := `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`
+	resp := modelCallWithHandle(f.svc, handle, requestBody)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
 	}
@@ -179,8 +180,9 @@ func TestModelCallCapabilityHappyPathDerivesVerifiedRunID(t *testing.T) {
 	if claims.RunID() != "run-verified" {
 		t.Fatalf("run id = %q", claims.RunID())
 	}
-	if res.Calls != 1 || res.Tokens != 5 {
-		t.Fatalf("reservation = %+v, want 1 call / 5 tokens", res)
+	wantTokens := int64(len(requestBody) + 10)
+	if res.Calls != 1 || res.Tokens != wantTokens {
+		t.Fatalf("reservation = %+v, want 1 call / %d preflight tokens", res, wantTokens)
 	}
 	audit := readTestFile(t, f.auditP)
 	if strings.Contains(audit, handle) {
@@ -195,7 +197,7 @@ func TestModelCallCapabilityRejectsSpoofedRunID(t *testing.T) {
 	f := newCapFixture(t, nil)
 	handle := f.issueEnabled(t, "run-real", "wi-1", 3, 100, time.Now().Add(time.Hour), "gpt-test")
 	// Caller supplies a DIFFERENT run_id than the handle's verified claim.
-	resp := modelCallWithHandle(f.svc, handle, `{"run_id":"run-attacker","model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+	resp := modelCallWithHandle(f.svc, handle, `{"run_id":"run-attacker","model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("spoofed run_id status = %d, want 403; body=%s", resp.Code, resp.Body.String())
 	}
@@ -214,7 +216,7 @@ func TestModelCallCapabilityRejectsSpoofedRunID(t *testing.T) {
 
 func TestModelCallCapabilityMissingHandle(t *testing.T) {
 	f := newCapFixture(t, nil)
-	resp := modelCallWithHandle(f.svc, "", `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+	resp := modelCallWithHandle(f.svc, "", `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
 	if resp.Code != http.StatusUnauthorized {
 		t.Fatalf("missing handle status = %d, want 401", resp.Code)
 	}
@@ -226,7 +228,7 @@ func TestModelCallCapabilityMissingHandle(t *testing.T) {
 func TestModelCallCapabilityModelDenied(t *testing.T) {
 	f := newCapFixture(t, nil)
 	handle := f.issueEnabled(t, "run-1", "wi-1", 3, 100, time.Now().Add(time.Hour), "gpt-test")
-	resp := modelCallWithHandle(f.svc, handle, `{"model":"forbidden-model","messages":[{"role":"user","content":"x"}]}`)
+	resp := modelCallWithHandle(f.svc, handle, `{"model":"forbidden-model","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("denied model status = %d, want 403", resp.Code)
 	}
@@ -239,7 +241,7 @@ func TestModelCallCapabilityModelDisabledDeniesAllCalls(t *testing.T) {
 	f := newCapFixture(t, nil)
 	// model-disabled capability: no models, zero budgets.
 	handle := f.issueEnabled(t, "run-id-only", "wi-1", 0, 0, time.Now().Add(time.Hour))
-	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("model-disabled status = %d, want 403", resp.Code)
 	}
@@ -248,10 +250,10 @@ func TestModelCallCapabilityModelDisabledDeniesAllCalls(t *testing.T) {
 func TestModelCallCapabilityCallBudgetExhausted(t *testing.T) {
 	f := newCapFixture(t, nil)
 	handle := f.issueEnabled(t, "run-1", "wi-1", 1, 100, time.Now().Add(time.Hour), "gpt-test")
-	if resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`); resp.Code != http.StatusOK {
+	if resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`); resp.Code != http.StatusOK {
 		t.Fatalf("first call status = %d", resp.Code)
 	}
-	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("budget-exhausted status = %d, want 403", resp.Code)
 	}
@@ -264,7 +266,7 @@ func TestModelCallCapabilityExpiredFailsClosed(t *testing.T) {
 	f := newCapFixture(t, nil)
 	handle := f.issueEnabled(t, "run-1", "wi-1", 3, 100, time.Now().Add(50*time.Millisecond), "gpt-test")
 	time.Sleep(80 * time.Millisecond)
-	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("expired status = %d, want 403", resp.Code)
 	}
@@ -276,7 +278,7 @@ func TestModelCallCapabilityRevokedFailsClosed(t *testing.T) {
 	if err := f.store.Revoke(context.Background(), handle); err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
-	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("revoked status = %d, want 403", resp.Code)
 	}
@@ -286,7 +288,7 @@ func TestModelCallCapabilityAPIUnavailableFailsClosed(t *testing.T) {
 	f := newCapFixture(t, nil)
 	handle := f.issueEnabled(t, "run-1", "wi-1", 3, 100, time.Now().Add(time.Hour), "gpt-test")
 	f.api.Close() // authority is now unreachable
-	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
 	if resp.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unavailable status = %d, want 503", resp.Code)
 	}
@@ -300,7 +302,7 @@ func TestModelCallCapabilityWrongAPITokenFailsClosed(t *testing.T) {
 	// Corrupt the client's API token: the private API returns 401 -> fail closed.
 	f.svc.caps.token = "wrong-token"
 	handle := f.issueEnabled(t, "run-1", "wi-1", 3, 100, time.Now().Add(time.Hour), "gpt-test")
-	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("bad api token status = %d, want 403", resp.Code)
 	}
@@ -329,7 +331,7 @@ func TestModelCallCapabilityConcurrentReservationRespectsBudget(t *testing.T) {
 	for i := 0; i < attempts; i++ {
 		go func() {
 			defer wg.Done()
-			resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+			resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
 			mu.Lock()
 			defer mu.Unlock()
 			switch resp.Code {
@@ -389,7 +391,8 @@ func TestCodexResponsesCapabilityDerivesRunIDAndReserves(t *testing.T) {
 		})
 	})
 	handle := f.issueEnabled(t, "run-codex", "wi-1", 3, 100, time.Now().Add(time.Hour), "ykm-codex-haiku")
-	resp := codexResponseWithHandle(f.svc, handle, `{"model":"ykm-codex-haiku","input":"x"}`, "")
+	requestBody := `{"model":"ykm-codex-haiku","max_output_tokens":10,"input":"x"}`
+	resp := codexResponseWithHandle(f.svc, handle, requestBody, "")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
 	}
@@ -400,15 +403,20 @@ func TestCodexResponsesCapabilityDerivesRunIDAndReserves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
-	if res.Calls != 1 || res.Tokens != 6 {
-		t.Fatalf("reservation = %+v, want 1 call / 6 tokens", res)
+	rewritten, err := rewriteJSONModel([]byte(requestBody), "anthropic/claude-haiku-4.5")
+	if err != nil {
+		t.Fatalf("rewriteJSONModel: %v", err)
+	}
+	wantTokens := int64(len(rewritten) + 10)
+	if res.Calls != 1 || res.Tokens != wantTokens {
+		t.Fatalf("reservation = %+v, want 1 call / %d preflight tokens", res, wantTokens)
 	}
 }
 
 func TestCodexResponsesCapabilityRejectsSpoofedRunID(t *testing.T) {
 	f := newCapFixture(t, nil)
 	handle := f.issueEnabled(t, "run-real", "wi-1", 3, 100, time.Now().Add(time.Hour), "ykm-codex-haiku")
-	resp := codexResponseWithHandle(f.svc, handle, `{"model":"ykm-codex-haiku","input":"x"}`, "run-attacker")
+	resp := codexResponseWithHandle(f.svc, handle, `{"model":"ykm-codex-haiku","max_output_tokens":10,"input":"x"}`, "run-attacker")
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("spoofed run id status = %d, want 403", resp.Code)
 	}
@@ -421,8 +429,63 @@ func TestCodexResponsesCapabilityModelDenied(t *testing.T) {
 	f := newCapFixture(t, nil)
 	// Handle grants ykm-codex-haiku, request a codex alias not in allowed_models.
 	handle := f.issueEnabled(t, "run-1", "wi-1", 3, 100, time.Now().Add(time.Hour), "ykm-codex-haiku")
-	resp := codexResponseWithHandle(f.svc, handle, `{"model":"ykm-codex-sonnet","input":"x"}`, "")
+	resp := codexResponseWithHandle(f.svc, handle, `{"model":"ykm-codex-sonnet","max_output_tokens":10,"input":"x"}`, "")
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("denied model status = %d, want 403; body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestModelCallCapabilityRequiresMaxTokensBeforeUpstream(t *testing.T) {
+	called := false
+	f := newCapFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		writeProxyTestJSON(t, w, map[string]string{"unexpected": "upstream call"})
+	})
+	handle := f.issueEnabled(t, "run-1", "wi-1", 1, 100, time.Now().Add(time.Hour), "gpt-test")
+	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","messages":[{"role":"user","content":"x"}]}`)
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "max_tokens_required") {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if called {
+		t.Fatal("upstream called without a pre-reserved output cap")
+	}
+	_, res, err := f.store.Verify(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if res.Calls != 0 || res.Tokens != 0 {
+		t.Fatalf("reservation = %+v, want zero", res)
+	}
+}
+
+func TestModelCallCapabilityTokenBudgetDeniedBeforeUpstream(t *testing.T) {
+	called := false
+	f := newCapFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		writeProxyTestJSON(t, w, map[string]string{"unexpected": "upstream call"})
+	})
+	handle := f.issueEnabled(t, "run-1", "wi-1", 1, 1, time.Now().Add(time.Hour), "gpt-test")
+	resp := modelCallWithHandle(f.svc, handle, `{"model":"gpt-test","max_tokens":10,"messages":[{"role":"user","content":"x"}]}`)
+	if resp.Code != http.StatusForbidden || !strings.Contains(resp.Body.String(), "capability_denied") {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if called {
+		t.Fatal("upstream called after preflight token-budget denial")
+	}
+}
+
+func TestCodexCapabilityRequiresMaxOutputTokensBeforeUpstream(t *testing.T) {
+	called := false
+	f := newCapFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		writeProxyTestJSON(t, w, map[string]string{"unexpected": "upstream call"})
+	})
+	handle := f.issueEnabled(t, "run-codex", "wi-1", 1, 100, time.Now().Add(time.Hour), "ykm-codex-haiku")
+	resp := codexResponseWithHandle(f.svc, handle, `{"model":"ykm-codex-haiku","input":"x"}`, "")
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "max_output_tokens_required") {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if called {
+		t.Fatal("upstream called without a pre-reserved Responses output cap")
 	}
 }

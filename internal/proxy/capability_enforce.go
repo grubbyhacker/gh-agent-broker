@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"strings"
 )
@@ -54,37 +55,38 @@ func (s *Service) authenticateCapability(ctx context.Context, r *http.Request, c
 	return capAuthResult{claims: claims, handle: handle}, nil
 }
 
-// reserveCapabilityCall atomically reserves exactly one call (and enforces the
-// model) against the run's capability BEFORE the upstream request is forwarded.
-// The broker performs the model check and the read-authorize-write in one
-// transaction, so this is the single point that both enforces the allowed model
-// under the verified policy and prevents concurrent calls from exceeding the
-// call budget. Fail closed on any error.
-func (s *Service) reserveCapabilityCall(ctx context.Context, res capAuthResult, model string) error {
-	// A model-disabled capability may not make any model call. Deny locally
-	// before contacting the API so the audit records model_denied, and so a
-	// blank/mismatched model never reaches the reserve transaction.
-	if !res.claims.modelEnabled() {
+// preflightTokenBound returns a conservative upper bound for one upstream call:
+// serialized request bytes plus the caller-declared maximum output tokens. A
+// model token cannot encode less than one UTF-8 byte, so request bytes safely
+// bound input tokens without depending on an upstream tokenizer. Capability-
+// enforced calls must declare a positive output cap; otherwise forwarding would
+// authorize unbounded model work. Overflow fails closed.
+func preflightTokenBound(requestBytes, maxOutputTokens int) (int64, bool) {
+	if requestBytes <= 0 || maxOutputTokens <= 0 {
+		return 0, false
+	}
+	requestBound := int64(requestBytes)
+	outputBound := int64(maxOutputTokens)
+	if requestBound > math.MaxInt64-outputBound {
+		return 0, false
+	}
+	return requestBound + outputBound, true
+}
+
+// reserveCapabilityBudget atomically reserves exactly one call and the complete
+// conservative token bound while enforcing the model BEFORE forwarding. The
+// broker performs model authorization and read-authorize-write in one
+// transaction, preventing concurrent calls or streams from exceeding either
+// budget. There is deliberately no post-response authorization: once an
+// upstream call starts (especially an SSE stream), its cost is already incurred.
+func (s *Service) reserveCapabilityBudget(ctx context.Context, res capAuthResult, model string, tokens int64) error {
+	if !res.claims.modelEnabled() || tokens <= 0 {
 		return errCapDenied
 	}
 	if model == "" || !res.claims.allowsModel(model) {
 		return errCapDenied
 	}
-	if _, err := s.caps.reserve(ctx, res.handle, model, 1, 0); err != nil {
-		return err
-	}
-	return nil
-}
-
-// reserveCapabilityTokens records post-response token usage against the run's
-// capability. It reserves zero calls (the call was already reserved) and the
-// observed token total. A non-nil error means the run exceeded its token budget;
-// the caller denies the response. Zero or negative usage is a no-op success.
-func (s *Service) reserveCapabilityTokens(ctx context.Context, res capAuthResult, tokens int) error {
-	if tokens <= 0 {
-		return nil
-	}
-	if _, err := s.caps.reserve(ctx, res.handle, "", 0, int64(tokens)); err != nil {
+	if _, err := s.caps.reserve(ctx, res.handle, model, 1, tokens); err != nil {
 		return err
 	}
 	return nil
