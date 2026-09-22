@@ -35,7 +35,9 @@ The sole caller-facing artifact endpoint is `POST /v1/releases/publish`, guarded
 by `release.publish`. It accepts the versioned `docker-archive/v1` multipart
 protocol: provenance plus one bounded, single-image Docker archive produced by
 trusted protected-main CI. The separate `release_artifact_byte_limit` applies to
-this binary upload.
+this binary upload. Docker archives may identify the image config using either
+the legacy `<sha256>.json` member or Buildx's `blobs/sha256/<sha256>` member;
+both names are path-validated and the config bytes must hash to that identity.
 
 `release.verify` and `release.acquire` are not public routes or caller actions.
 The broker derives provenance fields and accepted platforms from deployment-owned
