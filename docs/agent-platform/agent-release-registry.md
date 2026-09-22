@@ -78,6 +78,13 @@ in production before that authority is settled would be the wrong order.
 profile image. Switching the launch path to registry resolution is a separate change,
 reviewed separately, because it alters runtime behaviour.
 
+> **CI prerequisite for that change.** The `sandbox_e2e` path filter in
+> `.github/workflows/ci.yml` enumerates packages explicitly rather than matching
+> `internal/**`, and `internal/release/**` is deliberately absent while the registry is
+> inert. The change that puts resolution in the launch path **must add it**, or a
+> release-only change will silently skip the suite covering the code it feeds. This is
+> correct today and wrong the moment resolution lands.
+
 **The registry is not yet backed up.** The broker state backup allowlist admits
 `manifest.json`, `launch-intents.sqlite`, `runs/`, and `issuance/issuance.json`, and
 would reject a release registry. Extending that contract — and validating that a
