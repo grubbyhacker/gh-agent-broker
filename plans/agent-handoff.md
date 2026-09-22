@@ -2,6 +2,13 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
+Buildx Docker archives carry an OCI `index.json`; Docker exposes the index's
+single OCI manifest digest as the loaded image ID rather than the config digest.
+AgentRelease validation now verifies the complete index→manifest→config
+digest/size/platform chain and predicts that observed ID. Legacy archives without
+an index continue to use their verified config digest. Post-load Docker inspection
+still must match the predicted immutable identity before availability.
+
 AgentRelease Docker archive validation accepts both canonical config member
 layouts: legacy `<sha256>.json` and Buildx `blobs/sha256/<sha256>`. Validation
 uses two targeted passes—first `manifest.json`, then its exact config member—so

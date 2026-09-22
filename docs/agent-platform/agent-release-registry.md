@@ -40,6 +40,10 @@ the legacy `<sha256>.json` member or Buildx's `blobs/sha256/<sha256>` member;
 both names are path-validated and the config bytes must hash to that identity.
 Validation uses two targeted archive passes: first `manifest.json`, then only its
 exact config member. Buildx layer blobs are never buffered or parsed as metadata.
+When a Buildx `index.json` is present, the broker verifies its single
+index→manifest→config digest/size/platform chain and uses the OCI manifest digest
+that Docker exposes as the loaded image ID. Legacy archives without an index use
+the verified config digest as Docker's image ID.
 
 `release.verify` and `release.acquire` are not public routes or caller actions.
 The broker derives provenance fields and accepted platforms from deployment-owned
