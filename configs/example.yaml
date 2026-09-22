@@ -22,6 +22,16 @@ idempotency:
 #   store_path: "/var/log/gh-agent-broker/correlation.db"
 #   capability_api_url: "http://sandbox-broker:8080"
 #   capability_api_token_env: "GH_AGENT_CAPABILITY_API_TOKEN"
+#   # Private outbox consumer API (claim/ack/reclaim) that Signal Plane drains.
+#   # INERT until consumer_token is set; independent of correlation recording.
+#   # The consumer token is the deployment-owned secret Signal Plane PRESENTS to
+#   # the broker; it is NOT the capability_api_token and never enters a run.
+#   # Mounted on the broker's existing authenticated listener; no new listener,
+#   # port, or route is added. See docs/run-correlation-outbox-contract.md.
+#   outbox:
+#     consumer_token_env: "GH_AGENT_OUTBOX_CONSUMER_TOKEN"
+#     claim_ttl_seconds: 300   # 30..3600 (lease before an unacked claim is reclaimable)
+#     max_claim_batch: 100     # 1..1000 (hard cap on one claim call)
 
 github:
   api_base_url: "https://api.github.com"

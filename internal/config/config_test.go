@@ -217,3 +217,105 @@ func writeFile(t *testing.T, path, body string) {
 		t.Fatal(err)
 	}
 }
+
+func TestCorrelationOutboxIsInertByDefault(t *testing.T) {
+	// No outbox fields set: contributes no validation errors and is not enabled.
+	c := CorrelationConfig{}
+	if errs := c.outboxValidationErrors(); len(errs) != 0 {
+		t.Fatalf("empty outbox config produced errors: %v", errs)
+	}
+	if c.OutboxEnabled() {
+		t.Fatalf("empty outbox config reported enabled")
+	}
+	// Correlation recording configured but no outbox: still inert.
+	c = CorrelationConfig{
+		StorePath:          "/var/lib/broker/correlation.sqlite",
+		CapabilityAPIURL:   "https://cap.internal",
+		CapabilityAPIToken: "tok",
+	}
+	if c.OutboxEnabled() {
+		t.Fatalf("outbox reported enabled without a consumer token")
+	}
+	if errs := c.outboxValidationErrors(); len(errs) != 0 {
+		t.Fatalf("recording-only config produced outbox errors: %v", errs)
+	}
+}
+
+func TestCorrelationOutboxEnabledRequiresStoreAndToken(t *testing.T) {
+	// Consumer token set but no store: rejected.
+	c := CorrelationConfig{Outbox: OutboxAPIConfig{ConsumerToken: "sig-plane-secret"}}
+	errs := c.outboxValidationErrors()
+	if len(errs) != 1 || errs[0] != "correlation.outbox is set without correlation.store_path" {
+		t.Fatalf("errs = %v, want store_path error", errs)
+	}
+	if c.OutboxEnabled() {
+		t.Fatalf("OutboxEnabled true without a store")
+	}
+
+	// Store + token: enabled, no errors.
+	c = CorrelationConfig{
+		StorePath: "/var/lib/broker/correlation.sqlite",
+		Outbox:    OutboxAPIConfig{ConsumerToken: "sig-plane-secret"},
+	}
+	if !c.OutboxEnabled() {
+		t.Fatalf("OutboxEnabled false with store + token")
+	}
+	if errs := c.outboxValidationErrors(); len(errs) != 0 {
+		t.Fatalf("valid outbox config produced errors: %v", errs)
+	}
+
+	// Token via env-var reference alone (before resolution) still needs a store.
+	c = CorrelationConfig{Outbox: OutboxAPIConfig{ConsumerTokenEnv: "OUTBOX_TOKEN"}}
+	if errs := c.outboxValidationErrors(); len(errs) == 0 {
+		t.Fatalf("token_env without store produced no errors")
+	}
+}
+
+func TestCorrelationOutboxBounds(t *testing.T) {
+	base := func() CorrelationConfig {
+		return CorrelationConfig{
+			StorePath: "/var/lib/broker/correlation.sqlite",
+			Outbox:    OutboxAPIConfig{ConsumerToken: "sig-plane-secret"},
+		}
+	}
+	// TTL out of range.
+	c := base()
+	c.Outbox.ClaimTTLSeconds = 5
+	if errs := c.outboxValidationErrors(); len(errs) == 0 {
+		t.Fatalf("too-short claim_ttl_seconds accepted")
+	}
+	c.Outbox.ClaimTTLSeconds = maxOutboxClaimTTLSeconds + 1
+	if errs := c.outboxValidationErrors(); len(errs) == 0 {
+		t.Fatalf("too-long claim_ttl_seconds accepted")
+	}
+	// Batch out of range.
+	c = base()
+	c.Outbox.MaxClaimBatch = maxOutboxMaxClaimBatch + 1
+	if errs := c.outboxValidationErrors(); len(errs) == 0 {
+		t.Fatalf("too-large max_claim_batch accepted")
+	}
+	c.Outbox.MaxClaimBatch = -1
+	if errs := c.outboxValidationErrors(); len(errs) == 0 {
+		t.Fatalf("negative max_claim_batch accepted")
+	}
+	// In-range values validate clean and defaults apply when unset.
+	c = base()
+	c.Outbox.ClaimTTLSeconds = 120
+	c.Outbox.MaxClaimBatch = 50
+	if errs := c.outboxValidationErrors(); len(errs) != 0 {
+		t.Fatalf("in-range bounds produced errors: %v", errs)
+	}
+	if got := c.OutboxClaimTTLSeconds(); got != 120 {
+		t.Fatalf("OutboxClaimTTLSeconds = %d, want 120", got)
+	}
+	if got := c.OutboxMaxClaimBatch(); got != 50 {
+		t.Fatalf("OutboxMaxClaimBatch = %d, want 50", got)
+	}
+	def := base()
+	if got := def.OutboxClaimTTLSeconds(); got != DefaultOutboxClaimTTLSeconds {
+		t.Fatalf("default TTL = %d, want %d", got, DefaultOutboxClaimTTLSeconds)
+	}
+	if got := def.OutboxMaxClaimBatch(); got != DefaultOutboxMaxClaimBatch {
+		t.Fatalf("default batch = %d, want %d", got, DefaultOutboxMaxClaimBatch)
+	}
+}

@@ -39,6 +39,80 @@ type CorrelationConfig struct {
 	CapabilityAPIURL      string `yaml:"capability_api_url"`
 	CapabilityAPIToken    string `yaml:"capability_api_token"`
 	CapabilityAPITokenEnv string `yaml:"capability_api_token_env"`
+
+	// Outbox is the PRODUCTION-ACTIVATION contract for the private outbox
+	// claim/ack/reclaim API that Signal Plane consumes. It is a separate,
+	// independently-gated surface: correlation RECORDING (above) can be enabled
+	// without exposing the outbox API, and the outbox API is inert until its own
+	// token is configured. The token here is the deployment-owned bearer secret
+	// that Signal Plane PRESENTS TO the broker to drain the outbox — it is NOT
+	// the capability_api_token the broker presents to the sandbox broker, and it
+	// is NEVER injected into a launched run's env, metadata, log, or response.
+	Outbox OutboxAPIConfig `yaml:"outbox"`
+}
+
+// OutboxAPIConfig is the deployment-owned contract for the private outbox
+// consumer API. It is validated but NEVER auto-enabled: OutboxEnabled reports
+// true only when a store and a consumer token are both configured, and even
+// then the endpoints are mounted by the server only if correlation recording is
+// itself configured (a store with no recorder has nothing to drain).
+type OutboxAPIConfig struct {
+	// ConsumerToken authenticates the outbox consumer (Signal Plane) to the
+	// broker. Empty leaves the outbox API inert (unmounted). It is compared
+	// constant-time and never echoed.
+	ConsumerToken string `yaml:"consumer_token"`
+	// ConsumerTokenEnv names an environment variable the token is read from when
+	// ConsumerToken is empty. Deployment-owned; the raw secret stays out of the
+	// config file on disk.
+	ConsumerTokenEnv string `yaml:"consumer_token_env"`
+	// ClaimTTLSeconds bounds how long a claim is held before it is reclaimable by
+	// another consumer (crash recovery). Zero applies DefaultOutboxClaimTTL.
+	ClaimTTLSeconds int `yaml:"claim_ttl_seconds"`
+	// MaxClaimBatch bounds how many events one claim call may take. Zero applies
+	// DefaultOutboxMaxClaimBatch. It is a hard backstop against an unbounded
+	// claim; the consumer may always ask for fewer.
+	MaxClaimBatch int `yaml:"max_claim_batch"`
+}
+
+const (
+	// DefaultOutboxClaimTTL is the claim lease applied when ClaimTTLSeconds is 0.
+	DefaultOutboxClaimTTLSeconds = 300
+	// minOutboxClaimTTLSeconds / maxOutboxClaimTTLSeconds bound a configured
+	// lease: too short strands in-flight deliveries as reclaimable mid-flight,
+	// too long delays crash recovery.
+	minOutboxClaimTTLSeconds = 30
+	maxOutboxClaimTTLSeconds = 3600
+	// DefaultOutboxMaxClaimBatch is the batch cap applied when MaxClaimBatch is 0.
+	DefaultOutboxMaxClaimBatch = 100
+	// maxOutboxMaxClaimBatch is the hard ceiling on a configured claim batch.
+	maxOutboxMaxClaimBatch = 1000
+)
+
+// OutboxEnabled reports whether the private outbox consumer API is configured.
+// It requires the correlation store (there is nothing to drain otherwise) and a
+// consumer token. It is independent of whether correlation RECORDING is enabled;
+// the server additionally requires recording before mounting the endpoints.
+func (c CorrelationConfig) OutboxEnabled() bool {
+	return strings.TrimSpace(c.StorePath) != "" &&
+		strings.TrimSpace(c.Outbox.ConsumerToken) != ""
+}
+
+// OutboxClaimTTLSeconds returns the effective claim lease, applying the default
+// when unset.
+func (c CorrelationConfig) OutboxClaimTTLSeconds() int {
+	if c.Outbox.ClaimTTLSeconds <= 0 {
+		return DefaultOutboxClaimTTLSeconds
+	}
+	return c.Outbox.ClaimTTLSeconds
+}
+
+// OutboxMaxClaimBatch returns the effective claim batch cap, applying the
+// default when unset.
+func (c CorrelationConfig) OutboxMaxClaimBatch() int {
+	if c.Outbox.MaxClaimBatch <= 0 {
+		return DefaultOutboxMaxClaimBatch
+	}
+	return c.Outbox.MaxClaimBatch
 }
 
 // Enabled reports whether authenticated correlation is fully configured.
@@ -236,6 +310,9 @@ func (c *Config) resolveSecrets() error {
 	if c.Correlation.CapabilityAPIToken == "" && c.Correlation.CapabilityAPITokenEnv != "" {
 		c.Correlation.CapabilityAPIToken = os.Getenv(c.Correlation.CapabilityAPITokenEnv)
 	}
+	if c.Correlation.Outbox.ConsumerToken == "" && c.Correlation.Outbox.ConsumerTokenEnv != "" {
+		c.Correlation.Outbox.ConsumerToken = os.Getenv(c.Correlation.Outbox.ConsumerTokenEnv)
+	}
 	for i := range c.Agents {
 		if c.Agents[i].Secret == "" && c.Agents[i].SecretEnv != "" {
 			c.Agents[i].Secret = os.Getenv(c.Agents[i].SecretEnv)
@@ -399,6 +476,41 @@ func (c CorrelationConfig) validationErrors() []string {
 	}
 	if token == "" {
 		errs = append(errs, "correlation requires correlation.capability_api_token or capability_api_token_env")
+	}
+	errs = append(errs, c.outboxValidationErrors()...)
+	return errs
+}
+
+// outboxValidationErrors validates the outbox consumer-API activation contract.
+// The API is INERT by default: with no outbox fields set it contributes no
+// errors and mounts nothing. Once any outbox field is set the contract is
+// checked as a whole so a partial/misbounded activation is rejected rather than
+// half-enabled: a consumer token requires a store to drain, and the claim TTL /
+// batch bounds must sit inside supported limits. Validation NEVER enables or
+// deploys the API; it only refuses an incoherent configuration.
+func (c CorrelationConfig) outboxValidationErrors() []string {
+	store := strings.TrimSpace(c.StorePath)
+	consumerToken := strings.TrimSpace(c.Outbox.ConsumerToken)
+	consumerTokenEnv := strings.TrimSpace(c.Outbox.ConsumerTokenEnv)
+	ttl := c.Outbox.ClaimTTLSeconds
+	batch := c.Outbox.MaxClaimBatch
+
+	anySet := consumerToken != "" || consumerTokenEnv != "" || ttl != 0 || batch != 0
+	if !anySet {
+		return nil
+	}
+	var errs []string
+	if consumerToken == "" {
+		errs = append(errs, "correlation.outbox requires correlation.outbox.consumer_token or consumer_token_env")
+	}
+	if store == "" {
+		errs = append(errs, "correlation.outbox is set without correlation.store_path")
+	}
+	if ttl != 0 && (ttl < minOutboxClaimTTLSeconds || ttl > maxOutboxClaimTTLSeconds) {
+		errs = append(errs, fmt.Sprintf("correlation.outbox.claim_ttl_seconds must be between %d and %d", minOutboxClaimTTLSeconds, maxOutboxClaimTTLSeconds))
+	}
+	if batch != 0 && (batch < 1 || batch > maxOutboxMaxClaimBatch) {
+		errs = append(errs, fmt.Sprintf("correlation.outbox.max_claim_batch must be between 1 and %d", maxOutboxMaxClaimBatch))
 	}
 	return errs
 }

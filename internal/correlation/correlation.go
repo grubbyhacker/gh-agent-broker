@@ -448,6 +448,51 @@ func (s *Store) Ack(ctx context.Context, eventID int64, claimToken string) error
 	return nil
 }
 
+// Reclaim explicitly releases a claimed event back to pending so another
+// consumer (or the same one on its next poll) can claim it immediately, without
+// waiting out the claim TTL. It is the negative acknowledgement to Ack: a
+// consumer that claims an event but decides it cannot deliver it now — a
+// transient downstream failure, a graceful shutdown, a poison message it wants
+// to defer — calls Reclaim to hand the event straight back.
+//
+// Like Ack it is claim-token gated: it refuses (ErrClaimMismatch) unless the
+// event is still claimed by exactly this token, so a stale consumer whose claim
+// already expired and was reclaimed by another holder cannot release the new
+// holder's claim. It clears the claim token and claimed_at but PRESERVES the
+// attempts counter, so a repeatedly-reclaimed poison event is visible to the
+// offline validator and to any future dead-letter policy rather than looking
+// fresh. An already-acked event is terminal: Reclaim refuses it. Reclaiming an
+// already-pending (unclaimed) event is a claim mismatch, not a no-op, because
+// there is no claim of this token's to release.
+func (s *Store) Reclaim(ctx context.Context, eventID int64, claimToken string) error {
+	if claimToken == "" {
+		return fmt.Errorf("reclaim requires a non-empty claim token")
+	}
+	now := s.now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin outbox reclaim: %w", err)
+	}
+	defer rollback(tx)
+
+	event, err := outboxByID(ctx, tx, eventID)
+	if err != nil {
+		return err
+	}
+	if event.Status != statusClaimed || event.ClaimToken != claimToken {
+		return ErrClaimMismatch
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE outbox_events SET status = ?, claim_token = '', claimed_at = NULL, updated_at = ? WHERE id = ?`,
+		statusPending, formatTime(now), eventID); err != nil {
+		return fmt.Errorf("reclaim outbox event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit outbox reclaim: %w", err)
+	}
+	return nil
+}
+
 // PendingCount returns the number of outbox events not yet acked. Used by tests
 // and the offline validator to reason about drain state.
 func (s *Store) PendingCount(ctx context.Context) (int64, error) {

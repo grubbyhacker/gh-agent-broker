@@ -49,6 +49,7 @@ type Server struct {
 	fence      pushtripwire.FenceAdapter
 	corr       *correlation.Store
 	capVerify  *capVerifier
+	outbox     *outboxAPI
 }
 
 var issueCommentMutationMu sync.Mutex
@@ -89,6 +90,14 @@ func New(configPath string, cfg *config.Config, gh *githubapp.Client, auditLog *
 		}
 		srv.corr = corr
 		srv.capVerify = newCapVerifier(cfg.Correlation.CapabilityAPIURL, cfg.Correlation.CapabilityAPIToken, 10*time.Second, nil)
+		if cfg.Correlation.OutboxEnabled() {
+			srv.outbox = newOutboxAPI(
+				corr,
+				cfg.Correlation.Outbox.ConsumerToken,
+				time.Duration(cfg.Correlation.OutboxClaimTTLSeconds())*time.Second,
+				cfg.Correlation.OutboxMaxClaimBatch(),
+			)
+		}
 	}
 	return srv, nil
 }
@@ -129,6 +138,10 @@ func (s *Server) Reload() error {
 		cfg.Correlation.CapabilityAPIURL != oldCorr.CapabilityAPIURL ||
 		cfg.Correlation.CapabilityAPIToken != oldCorr.CapabilityAPIToken {
 		return errors.New("correlation store_path and capability API settings cannot change on reload; restart is required")
+	}
+	if cfg.Correlation.OutboxEnabled() != oldCorr.OutboxEnabled() ||
+		cfg.Correlation.Outbox != oldCorr.Outbox {
+		return errors.New("correlation.outbox settings cannot change on reload; restart is required")
 	}
 	s.mu.Lock()
 	s.cfg = cfg
@@ -361,6 +374,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleDryRun(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/repos/"):
 		s.handleRepoAPI(w, r)
+	case strings.HasPrefix(r.URL.Path, outboxPathPrefix):
+		s.handleOutbox(w, r)
 	case strings.HasPrefix(r.URL.Path, "/git/"):
 		s.handleGit(w, r)
 	default:
