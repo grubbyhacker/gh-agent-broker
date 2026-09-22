@@ -38,3 +38,21 @@ timeout: "2m"
 
 # Leave false in production; prompt and response bodies are private corpus data.
 log_prompts: false
+
+# Per-run capability enforcement (opt-in). When BOTH capability_api_url and a
+# nonempty capability_api_token are set, every model-proxy call must present the
+# run's opaque capability handle as its Bearer credential. The proxy verifies the
+# handle and atomically reserves call/token budget against the broker's PRIVATE
+# capability API, deriving run_id/agent_type/mode/allowed_models/budgets from the
+# verified claims and rejecting any caller-supplied run_id that disagrees. It
+# fails closed on API errors, expiry, revocation, budget, and model denial.
+#
+# Point this at the sandbox broker's private capability API base (the broker that
+# mounts /v1/capabilities/*, reachable only on the internal network). The token
+# here is the SAME deployment-owned capability_api_token the sandbox broker is
+# configured with — it is NOT any run's handle and is never placed in a run env.
+# max_calls_per_run / max_tokens_per_run above are ignored once enforcement is on;
+# budgets come from each capability's deployment-owned claims.
+#
+# capability_api_url: "http://sandbox-broker:8080"
+# capability_api_token_env: "GH_AGENT_CAPABILITY_API_TOKEN"

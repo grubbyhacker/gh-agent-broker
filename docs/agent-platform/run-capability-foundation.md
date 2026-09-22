@@ -59,6 +59,38 @@ The sandbox broker mounts them only when `capability_store_path` and a nonempty
 `capability_api_token` (normally via `capability_api_token_env`) are configured.
 The handle is accepted only in the request body and is never echoed or logged.
 
-This slice does **not** enable production, mint during launch, change the model
-proxy, validate GitHub operations, migrate static principals, or deploy. Those
-consumer integrations are separate rollout steps. `make check` is the gate.
+## Model-proxy consumer integration
+
+`internal/proxy` consumes the private capability API. When `capability_api_url`
+and a nonempty `capability_api_token` are configured, `gh-agent-proxy` enforces
+per-run capabilities on both model surfaces (`POST /v1/model/call` and the
+Codex-compatible `POST /v1/responses`):
+
+- The run authenticates with its opaque handle as the `Bearer` credential. The
+  plaintext handle travels only in the proxy→broker request body, and is never
+  logged, audited, persisted, or echoed to the caller.
+- The proxy VERIFIES the handle against the broker, then ATOMICALLY RESERVES one
+  call (with the model checked) BEFORE forwarding, and reserves observed tokens
+  after. The broker's single-transaction `Reserve` is the only serialization
+  point, so concurrent calls across goroutines/instances cannot exceed a budget.
+- `run_id`, `work_item_id`, `agent_type`, and `mode` are derived from the
+  verified claims. Caller-supplied identity is no longer trusted: a legacy body
+  `run_id` or `X-GH-Agent-Run-ID` header that disagrees with the verified
+  `run_id` is rejected rather than overridden.
+- The allowed model is enforced against the verified `allowed_models`; a
+  model-disabled capability may make no model call.
+- It FAILS CLOSED on a missing handle, an unreachable/erroring API, expiry,
+  revocation, budget exhaustion, and model denial.
+
+The proxy authenticates to the API with the deployment-owned
+`capability_api_token` (the same token the broker mounts the API with) — NOT any
+run's handle, and that token is never injected into a launched run. When
+`capability_api_url` is unset the proxy keeps its legacy static-token behavior,
+so this is a safe additive rollout slice. Publisher/promoter separation and the
+Codex alias→upstream mapping are unchanged.
+
+## Rollout state
+
+This line does **not** enable production, validate GitHub operations, migrate
+static principals, or deploy. Those remaining consumer integrations are separate
+rollout steps. `make check` is the gate.
