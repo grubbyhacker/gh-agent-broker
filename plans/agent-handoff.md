@@ -2,17 +2,15 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
-PR #174 repairs a Codex workflow test cleanup race by making service-owned
-Codex watchers cancellable and joinable through `Service.Close`. The restart
-adoption test now waits for the initial `execution_running` state before
-simulating a crash, then closes each replaced service just as a real process
-restart would. This preserves its `consumeCount == 3` assertion: initial
-acceptance, accepted-phase recovery, and post-consume crash recovery; it does
-not permit credential reissue or reinjection. Stress evidence: the focused
-test passed 50 times normally and under `-race`, and `./internal/sandbox`
-passed five times at CPU settings 1, 2, and 4. `make test` passed; local
-`make check` is blocked only by an unchanged gosec G706 finding in
-`internal/sandbox/service.go`, while the corresponding CI lint run was clean.
+PR #176 exposes the broker-owned AgentRelease registry through authenticated,
+action-scoped REST operations: publish, verify, acquire, promote, and separately
+authorized rollback. The authentication seam yields a credential-free verified
+principal before authorization, so OIDC could replace bearer-token verification
+without changing release operations or audit records. Configuration rejects a
+promote-capable principal that can launch; rollback remains an independent action.
+The latest branch commit JSON-encodes the request-tainted fallback finalization log
+record, fixing CI's real G706 log-injection finding rather than suppressing it.
+`make check` is the delivery gate.
 
 # Agent handoff
 
