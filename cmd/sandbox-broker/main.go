@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"gh-agent-broker/internal/capability"
 	"gh-agent-broker/internal/codexauth"
 	"gh-agent-broker/internal/release"
 	"gh-agent-broker/internal/sandbox"
@@ -118,6 +119,19 @@ func runServerCommand(args []string) {
 		service.SetReleaseResolver(&releaseResolver{store: store})
 		releaseRegistry = store
 	}
+	var capabilityHandler *capability.RESTHandler
+	if cfg.CapabilityStore != "" {
+		capStore, capErr := capability.OpenStore(context.Background(), cfg.CapabilityStore)
+		if capErr != nil {
+			log.Fatalf("open capability store: %v", capErr)
+		}
+		defer func() {
+			if closeErr := capStore.Close(); closeErr != nil {
+				log.Printf("close capability store: %v", closeErr)
+			}
+		}()
+		capabilityHandler = capability.NewRESTHandler(capStore, cfg.CapabilityAPIToken)
+	}
 	if cfg.CodexHolder.MasterAuthPath != "" {
 		holder, holderErr := codexauth.New(codexauth.Config{
 			MasterAuthPath: cfg.CodexHolder.MasterAuthPath,
@@ -162,6 +176,11 @@ func runServerCommand(args []string) {
 		return mcpServer
 	}, &mcp.StreamableHTTPOptions{Stateless: true})))
 	mux.Handle("/v1/", sandbox.NewRESTHandlerWithReleaseRegistry(service, releaseRegistry, nil))
+	if capabilityHandler != nil {
+		// More specific than "/v1/"; ServeMux longest-prefix match routes
+		// capability calls here. Private surface, enabled only when configured.
+		mux.Handle("/v1/capabilities/", capabilityHandler)
+	}
 
 	log.Printf("sandbox broker listening on %s, mcp path %s", cfg.Listen, cfg.MCPPath)
 	httpServer := &http.Server{

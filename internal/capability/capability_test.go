@@ -207,6 +207,11 @@ func TestCallBudgetBounds(t *testing.T) {
 	if err := e.Authorize(claims, req, now); !errors.Is(err, ErrCallBudget) {
 		t.Fatalf("expected ErrCallBudget, got %v", err)
 	}
+	req.ReservedCalls = 1
+	req.Calls = int64(1<<63 - 1)
+	if err := e.Authorize(claims, req, now); !errors.Is(err, ErrCallBudget) {
+		t.Fatalf("overflowing call increment = %v, want ErrCallBudget", err)
+	}
 }
 
 func TestTokenBudgetBounds(t *testing.T) {
@@ -223,6 +228,11 @@ func TestTokenBudgetBounds(t *testing.T) {
 	req.Tokens = 101 // 900+101=1001 > 1000
 	if err := e.Authorize(claims, req, now); !errors.Is(err, ErrTokenBudget) {
 		t.Fatalf("expected ErrTokenBudget, got %v", err)
+	}
+	req.ReservedTokens = 1
+	req.Tokens = int64(1<<63 - 1)
+	if err := e.Authorize(claims, req, now); !errors.Is(err, ErrTokenBudget) {
+		t.Fatalf("overflowing token increment = %v, want ErrTokenBudget", err)
 	}
 }
 

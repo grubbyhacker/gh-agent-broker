@@ -2,30 +2,25 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
-`internal/capability` is an INERT Stage-4 per-run capability policy foundation,
-wired into NO live path. It ships the immutable typed claims the coupling design
-commits to — `agent_type, mode, run_id, allowed_models, call_budget,
-token_budget, expiry` — plus `work_item_id` (the merged inert correlation outbox
-binds a correlation to its originating WorkItem). `Claims` is immutable (unexported
-fields, allowed-model set copied in and out), and `PolicyEvaluator` implements the
-mechanism-independent `Validator`/`Authorizer` seams consumers use instead of
-caller headers/body. Model access has exactly two coherent states: model-disabled
-(empty allowed_models, both budgets zero — the deployed youknowme-curator reconcile
-shape, model.access=false) and model-enabled (non-empty models, both budgets
-positive); mixed states are rejected. Authorize checks expiry, exact identity match
-on agent_type/mode/run_id/work_item_id, and — model-enabled only — model membership
-and call/token budget headroom; against a model-disabled capability it allows an
-identity-only op with zero reservation and denies any model/call/token request.
-`cmd/capability-validate` is the offline claims-semantics validator.
+The capability signing decision is DECIDED (agent-infra-docs PR #19): a
+broker-verified opaque 256-bit handle, SHA-256 hashed at rest in durable SQLite,
+server-side claims, atomic verify+budget reservation, private API, broker as sole
+mint authority. `internal/capability/store.go` implements it, reusing the merged
+`Claims`/`PolicyEvaluator`: `Issue` mints a crypto/rand 256-bit handle and returns
+the plaintext ONCE (only its SHA-256 is stored — never logged/audited/recoverable);
+`Verify` hashes+matches (constant-time, malformed rejected pre-lookup) and returns
+trusted claims + reservation, failing closed on malformed/unknown/revoked/expired;
+`Reserve` authorizes+records in one transaction against current durable totals so
+concurrency can't exceed budget; `Revoke` is idempotent. Storage discipline mirrors
+`internal/release` (WAL/FULL/quick_check/user_version/STRICT/single-conn/0600).
+`internal/capability/rest.go` is the PRIVATE POST /v1/capabilities/{verify,reserve,revoke}
+surface, bearer-authed (constant-time), mounted by cmd/sandbox-broker only when
+`capability_store_path` + `capability_api_token` are configured; the handle is
+never echoed. `cmd/capability-store-validate` is the offline validator.
 
-The design does NOT decide how a minted capability is serialized, signed, and its
-keys managed for transport, so this package does not choose one: the broker-issuer
-and consumer-verifier roles are explicit UNIMPLEMENTED seams (`Issuer.Issue`,
-`Verifier.Verify`, opaque `[]byte` token). The remaining Stage-4 decision — token
-format, key hierarchy, rotation/escrow — is documented in
-`docs/agent-platform/run-capability-foundation.md`; the claims/validation/evaluator
-do not depend on it and land now. No production config, launch wiring, model-proxy
-change, static-principal migration, or deploy. `make check` is the gate.
+STILL out of scope: launch minting is NOT wired (no launch path calls Issue), and
+the model proxy and GitHub broker consumers are unchanged. No production config or
+deploy. `make check` is the gate.
 
 `.github/workflows/deploy-production.yml` now exports
 `VPS_OPS_GH_BROKER_RELEASE_PUBLISHER_OPERATOR_TOKEN` and

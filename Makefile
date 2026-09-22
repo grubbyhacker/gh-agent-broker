@@ -43,7 +43,7 @@ vuln: $(TOOLS_DIR)/govulncheck
 	$(GO_PATH_ENV) $(TOOLS_DIR)/govulncheck $(PACKAGES)
 
 build:
-	$(GO) build ./cmd/broker ./cmd/gh-agent-broker ./cmd/broker-issue-reporter ./cmd/sandbox-broker ./cmd/gh-agent-proxy ./cmd/codex-subscription-relay ./cmd/correlation-validate ./cmd/capability-validate
+	$(GO) build ./cmd/broker ./cmd/gh-agent-broker ./cmd/broker-issue-reporter ./cmd/sandbox-broker ./cmd/gh-agent-proxy ./cmd/codex-subscription-relay ./cmd/correlation-validate ./cmd/capability-validate ./cmd/capability-store-validate
 
 smoke-container:
 	./scripts/container-smoke.sh
