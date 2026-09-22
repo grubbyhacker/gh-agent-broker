@@ -1999,19 +1999,19 @@ type pullCreateCtx struct {
 //
 // Crash seam: the design does NOT claim cross-system atomicity. Instead it makes
 // the operation bounded-recoverable with the broker's existing durable
-// primitives and GitHub's own single-open-PR-per-head invariant:
+// primitives plus a broker-derived stable marker embedded in the PR metadata:
 //
 //  1. A stable operation_id is derived from the caller's Idempotency-Key digest,
-//     so every retry of the same logical request maps to the same operation.
+//     so every retry of the same logical request maps to the same operation and
+//     the created PR carries that stable broker marker.
 //  2. A durable idempotency reservation is written BEFORE GitHub. A completed
 //     reservation replays the stored response (no second CreatePull). A pending
 //     reservation means a prior attempt was interrupted around the GitHub call.
 //  3. On a pending replay we RECONCILE rather than blindly re-create: if a
-//     correlation already exists for this operation_id, the record is complete
-//     and we return it; otherwise we look for an already-open PR on the head
-//     branch and reconcile to it. Only when neither exists do we call CreatePull.
-//     GitHub rejects a second PR for the same head->base (422), the ultimate
-//     duplicate backstop.
+//     correlation already exists for this operation_id, the record is complete;
+//     otherwise only an open PR matching head, base, title, and the exact stable
+//     operation marker may be adopted. An unrelated PR sharing the head is never
+//     authoritative.
 //  4. After GitHub returns the PR number, Record persists the correlation and
 //     its outbox event in ONE transaction, idempotent on operation_id — so a
 //     crash between GitHub success and Record is repaired on the next retry
@@ -2054,6 +2054,11 @@ func (s *Server) pullCreateWithCorrelation(w http.ResponseWriter, r *http.Reques
 	// the correlation's idempotency key and is derived without retaining the
 	// caller's raw Idempotency-Key.
 	stableOpID := pullCreateOperationID(c.principal.ID, c.repo, c.req.Head, c.req.Base, keyDigest)
+	// Correlated requests render the broker metadata block with the STABLE
+	// operation id, not the per-attempt audit id. That broker-derived marker is
+	// what makes an ambiguous post-GitHub retry exactly reconcilable.
+	enriched := metadata.WithBrokerFields(c.req.Metadata, c.principal.ID, stableOpID, c.inst)
+	c.body = c.req.Body + metadata.RenderBlock(enriched)
 	// Bind retries to the exact request; a reused key with different content is a
 	// conflict rather than a silent replay of the wrong PR.
 	requestDigest := pullCreateRequestDigest(c.repo, c.req)
@@ -2089,7 +2094,7 @@ func (s *Server) pullCreateWithCorrelation(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Reconcile an interrupted prior attempt before creating anything.
-	ghResult, reconciled, rerr := s.reconcileOrCreatePull(ctx, c, identity)
+	ghResult, reconciled, rerr := s.reconcileOrCreatePull(ctx, c, identity, found && record.Pending)
 	if rerr != nil {
 		s.audit.Log(audit.Event{OperationID: c.opID, AgentID: c.principal.ID, Operation: "pull.create", Repo: c.repo, Branch: c.req.Head, RunID: claims.RunID, Decision: c.result.Decision, Error: audit.Redact(rerr.Error()), Extra: extra})
 		writeJSON(w, http.StatusBadGateway, api.ErrorResponse{Code: "github_error", Message: audit.Redact(rerr.Error()), OperationID: c.opID, Decision: c.result.Decision, Warnings: c.result.Warnings})
@@ -2116,29 +2121,34 @@ func (s *Server) pullCreateWithCorrelation(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// reconcileOrCreatePull returns the PR to correlate. It first checks whether a
-// correlation already exists for this operation (a crash after Record); if so it
-// resolves that PR. Otherwise it looks for an already-open PR on the head branch
-// (a crash after CreatePull but before Record) and reconciles to it. Only when
-// neither exists does it call CreatePull. The reconciled bool reports whether an
-// existing PR was adopted rather than freshly created.
-func (s *Server) reconcileOrCreatePull(ctx context.Context, c pullCreateCtx, identity correlation.Identity) (*api.GitHubResult, bool, error) {
+// reconcileOrCreatePull returns the PR to correlate. A completed correlation is
+// replayed by operation id. Only a PENDING retry may search for an existing PR,
+// and it adopts only an exact head/base/title match carrying this operation's
+// broker-derived stable metadata marker. Fresh requests never pre-adopt. If a
+// fresh CreatePull returns an ambiguous error, the same exact-marker search may
+// recover a PR GitHub accepted before the transport failed.
+func (s *Server) reconcileOrCreatePull(ctx context.Context, c pullCreateCtx, identity correlation.Identity, pendingReplay bool) (*api.GitHubResult, bool, error) {
 	if existing, err := c.corr.GetByOperation(ctx, identity.OperationID); err == nil {
-		return &api.GitHubResult{Number: int(existing.PRNumber)}, true, nil
+		pull, getErr := c.gh.GetPull(c.appName, c.repo, c.inst, int(existing.PRNumber))
+		if getErr != nil {
+			return nil, false, getErr
+		}
+		return &api.GitHubResult{Number: pull.Number, URL: pull.URL, HTMLURL: pull.HTMLURL}, true, nil
 	} else if !errors.Is(err, correlation.ErrNotFound) {
 		return nil, false, err
 	}
-	if openPR, ok, err := s.openPullOnHead(c.gh, c.appName, c.repo, c.inst, c.req.Head); err != nil {
-		return nil, false, err
-	} else if ok {
-		return openPR, true, nil
+	if pendingReplay {
+		if openPR, ok, err := s.openPullForOperation(c.gh, c.appName, c.repo, c.inst, c.req.Head, c.req.Base, c.req.Title, identity.OperationID); err != nil {
+			return nil, false, err
+		} else if ok {
+			return openPR, true, nil
+		}
 	}
 	ghResult, err := c.gh.CreatePull(c.appName, c.repo, c.inst, c.req.Title, c.req.Head, c.req.Base, c.body, c.req.Draft)
 	if err != nil {
-		// A duplicate-head 422 from GitHub means a PR already exists; adopt it
-		// rather than failing, so a retry that lost its local reservation still
-		// converges on the single PR.
-		if openPR, ok, lerr := s.openPullOnHead(c.gh, c.appName, c.repo, c.inst, c.req.Head); lerr == nil && ok {
+		// GitHub may accept a PR and lose the response. Reconcile only the exact
+		// stable marker and request shape; never adopt an arbitrary head PR.
+		if openPR, ok, lerr := s.openPullForOperation(c.gh, c.appName, c.repo, c.inst, c.req.Head, c.req.Base, c.req.Title, identity.OperationID); lerr == nil && ok {
 			return openPR, true, nil
 		}
 		return nil, false, err
@@ -2146,11 +2156,14 @@ func (s *Server) reconcileOrCreatePull(ctx context.Context, c pullCreateCtx, ide
 	return ghResult, false, nil
 }
 
-// openPullOnHead finds an OPEN pull request whose head branch matches head. It
-// returns the lowest-numbered match so reconciliation is deterministic.
-func (s *Server) openPullOnHead(gh *githubapp.Client, appName, repo string, inst int64, head string) (*api.GitHubResult, bool, error) {
+// openPullForOperation finds an OPEN PR matching this exact logical request and
+// carrying the broker-derived stable operation marker. It returns the lowest-
+// numbered exact match so recovery is deterministic, and refuses unrelated PRs
+// even when they share a head branch.
+func (s *Server) openPullForOperation(gh *githubapp.Client, appName, repo string, inst int64, head, base, title, operationID string) (*api.GitHubResult, bool, error) {
 	branch := strings.TrimPrefix(head, "refs/heads/")
-	if branch == "" {
+	base = strings.TrimPrefix(base, "refs/heads/")
+	if branch == "" || base == "" || title == "" || operationID == "" {
 		return nil, false, nil
 	}
 	owner, _, ok := strings.Cut(repo, "/")
@@ -2160,24 +2173,29 @@ func (s *Server) openPullOnHead(gh *githubapp.Client, appName, repo string, inst
 	query := url.Values{}
 	query.Set("state", "open")
 	query.Set("head", owner+":"+branch)
+	query.Set("base", base)
 	query.Set("per_page", "100")
 	pulls, err := gh.ListPulls(appName, repo, inst, query)
 	if err != nil {
 		return nil, false, err
 	}
-	best := 0
-	for _, p := range pulls {
-		if strings.TrimPrefix(p.HeadRef, "refs/heads/") != branch {
+	marker := "operation_id: " + operationID
+	var best *api.PullSummary
+	for i := range pulls {
+		p := &pulls[i]
+		if strings.TrimPrefix(p.HeadRef, "refs/heads/") != branch ||
+			strings.TrimPrefix(p.BaseRef, "refs/heads/") != base ||
+			p.Title != title || !strings.Contains(p.Body, marker) {
 			continue
 		}
-		if best == 0 || p.Number < best {
-			best = p.Number
+		if best == nil || p.Number < best.Number {
+			best = p
 		}
 	}
-	if best == 0 {
+	if best == nil {
 		return nil, false, nil
 	}
-	return &api.GitHubResult{Number: best}, true, nil
+	return &api.GitHubResult{Number: best.Number, URL: best.URL, HTMLURL: best.HTMLURL}, true, nil
 }
 
 // spoofedIdentityField returns the name of a caller-supplied metadata identity

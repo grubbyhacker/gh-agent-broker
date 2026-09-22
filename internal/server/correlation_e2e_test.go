@@ -367,15 +367,17 @@ func TestPullCreateCorrelationConcurrentRetrySinglePR(t *testing.T) {
 func TestPullCreateCorrelationRecoversAfterCrashWithoutDuplicatePR(t *testing.T) {
 	f := newCorrelationBroker(t, okClaims)
 
-	// Stage the interrupted state: an open PR #200 on the head, and a durable
+	keyDigest := idempotencyKeyDigest("key-crash")
+	stableOpID := pullCreateOperationID("agent-1", "owner/repo", "agent/agent-1/feat", "main", keyDigest)
+	// Stage the interrupted state: the exact broker-marked PR #200 and a durable
 	// pending idempotency reservation for the same scoped key, with no
 	// correlation recorded.
 	*f.openPulls = append(*f.openPulls, map[string]interface{}{
 		"id": 200, "number": 200, "state": "open", "title": "t",
+		"body": "operation_id: " + stableOpID,
 		"head": map[string]string{"ref": "agent/agent-1/feat", "sha": "abc"},
 		"base": map[string]string{"ref": "main"},
 	})
-	keyDigest := idempotencyKeyDigest("key-crash")
 	scopedKey := "pull.create:agent-1:owner/repo:" + keyDigest
 	digest := pullCreateRequestDigest("owner/repo", api.PullCreateRequest{Title: "t", Head: "agent/agent-1/feat", Base: "main"})
 	if _, _, _, err := idempotency.ReserveExact(f.broker.cfg.Idempotency, scopedKey, "pull.create", digest, ""); err != nil {
@@ -423,4 +425,33 @@ func TestCorrelationConfigDisabledKeepsLegacyPath(t *testing.T) {
 		"title": "t", "head": "agent/agent-1/feat", "base": "main",
 	})
 	assertStatus(t, resp, http.StatusCreated)
+}
+
+func TestPullCreateCorrelationDoesNotAdoptUnmarkedHeadPR(t *testing.T) {
+	f := newCorrelationBroker(t, okClaims)
+	*f.openPulls = append(*f.openPulls, map[string]interface{}{
+		"id": 200, "number": 200, "state": "open", "title": "t",
+		"body": "unrelated pull request",
+		"head": map[string]string{"ref": "agent/agent-1/feat", "sha": "abc"},
+		"base": map[string]string{"ref": "main"},
+	})
+	keyDigest := idempotencyKeyDigest("key-unmarked")
+	scopedKey := "pull.create:agent-1:owner/repo:" + keyDigest
+	digest := pullCreateRequestDigest("owner/repo", api.PullCreateRequest{Title: "t", Head: "agent/agent-1/feat", Base: "main"})
+	if _, _, _, err := idempotency.ReserveExact(f.broker.cfg.Idempotency, scopedKey, "pull.create", digest, ""); err != nil {
+		t.Fatalf("stage pending reservation: %v", err)
+	}
+
+	resp := corrPullRequest(t, f, "good-handle", "key-unmarked", pullCreateBody())
+	assertStatus(t, resp, http.StatusCreated)
+	if got := atomic.LoadInt64(f.createN); got != 1 {
+		t.Fatalf("CreatePull calls = %d, want 1; unrelated head PR must not be adopted", got)
+	}
+	corr, err := f.corr.GetByOperation(context.Background(), pullCreateOperationID("agent-1", "owner/repo", "agent/agent-1/feat", "main", keyDigest))
+	if err != nil {
+		t.Fatalf("correlation not recorded: %v", err)
+	}
+	if corr.PRNumber == 200 {
+		t.Fatal("unmarked pre-existing PR was incorrectly correlated")
+	}
 }
