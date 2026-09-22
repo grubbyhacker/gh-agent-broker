@@ -292,3 +292,20 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
+
+func TestImageAvailableUsesImageIDForLocalAgentRelease(t *testing.T) {
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	backend := &DockerBackend{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodGet || !strings.Contains(req.URL.Path, digest) || strings.Contains(req.URL.Path, "local.agent") {
+			t.Fatalf("availability request = %s %s", req.Method, req.URL.Path)
+		}
+		return jsonResponse(`{"Id":"` + digest + `","RepoDigests":[]}`), nil
+	})}}
+	available, err := backend.ImageAvailable(context.Background(), "local.agent/youknowme-curator@"+digest, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !available {
+		t.Fatal("verified local archive image ID was reported unavailable")
+	}
+}

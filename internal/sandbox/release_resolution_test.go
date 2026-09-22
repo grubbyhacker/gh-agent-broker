@@ -326,3 +326,24 @@ func writeTerminalOutputs(t *testing.T, outputDir, runID string) {
 		t.Fatal(err)
 	}
 }
+
+func TestLaunchWithLocalAgentReleaseUsesVerifiedImageID(t *testing.T) {
+	cfg := releaseTestConfig(t, "youknowme-curator")
+	auditLog := testAudit(t)
+	defer closeTestAudit(t, auditLog)
+	runtime := newFakeRuntime()
+	service := NewService(cfg, runtime, auditLog)
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service.SetReleaseResolver(&fakeResolver{release: ResolvedRelease{
+		Generation: 3, ImageReference: "local.agent/youknowme-curator@" + digest, ImageDigest: digest,
+	}})
+
+	out := launchWorker(context.Background(), t, service)
+	if spec := runtime.lastSpec(); spec.Image != digest {
+		t.Fatalf("runtime image = %q, want local image ID %q", spec.Image, digest)
+	}
+	meta := lookupTestRun(t, service, out.RunID)
+	if meta.Image != digest || meta.ImageDigest != digest || meta.ResolvedReleaseGeneration != 3 {
+		t.Fatalf("run metadata = %+v", meta)
+	}
+}

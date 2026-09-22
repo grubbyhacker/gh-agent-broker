@@ -587,11 +587,18 @@ func (d *DockerBackend) MakeRemovable(ctx context.Context, image, path string) e
 // answer, not an error; a transport failure is an error, so a Docker hiccup is
 // never mistaken for absence.
 func (d *DockerBackend) ImageAvailable(ctx context.Context, reference, digest string) (bool, error) {
+	lookup := reference
+	// Archive-backed releases use a synthetic digest-pinned registry identity
+	// for durable policy records, but Docker loads them as content-addressed
+	// local images with no RepoDigest. Inspect the already-verified image ID.
+	if strings.HasPrefix(reference, "local.agent/") {
+		lookup = digest
+	}
 	var out struct {
 		ID          string   `json:"Id"`
 		RepoDigests []string `json:"RepoDigests"`
 	}
-	if err := d.doJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(reference)+"/json", nil, &out); err != nil {
+	if err := d.doJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(lookup)+"/json", nil, &out); err != nil {
 		if status, ok := DockerStatusCode(err); ok && status == http.StatusNotFound {
 			return false, nil
 		}

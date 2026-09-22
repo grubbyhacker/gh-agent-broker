@@ -1485,9 +1485,14 @@ func (s *Service) selectLaunchTemplate(ctx context.Context, in LaunchAgentInput)
 	if err != nil {
 		return Template{}, "", "", 0, nil, fmt.Errorf("policy denial: no runnable release for agent_type %q; launch refused: %w", tmpl.AgentType, err)
 	}
-	// Resolve once: pin the effective image on this template copy so every
-	// downstream tmpl.Image read uses the digest-pinned reference.
+	// Resolve once. Registry-backed releases launch by their OCI digest-pinned
+	// reference. Archive-backed local.agent releases have no Docker RepoDigest;
+	// the acquire boundary verified their content-addressed image ID, so Docker
+	// creation must use that immutable sha256 ID.
 	tmpl.Image = resolved.ImageReference
+	if strings.HasPrefix(resolved.ImageReference, "local.agent/") {
+		tmpl.Image = resolved.ImageDigest
+	}
 	release := resolved
 	return tmpl, runID, branch, runtimeLimit, &release, nil
 }
