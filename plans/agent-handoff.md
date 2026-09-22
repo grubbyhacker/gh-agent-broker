@@ -2,23 +2,26 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
-The broker now owns a run-to-PR correlation outbox (`internal/correlation`). When the
-broker's OWN authenticated `pull.create` succeeds, `handlePullCreate` records the
-returned repository + PR number bound to the authenticated broker identity
-(`principal.ID` + broker operation id) and appends a versioned `run-pr-correlation/v1`
-transactional outbox event — both rows in ONE transaction, so the correlation cannot
-exist without its event. Authority is broker-only: agent output, branch names, and PR
-body markers are never trusted; the run id is a descriptive attribute read from the
-configurable `mutation_limits.run_metadata_field`, never authority. Unknown/unbound
-calls (empty identity, non-positive PR) emit nothing. `Record` is idempotent on the
-broker operation id, so a crash between the GitHub response and commit converges on one
-event. The reader API (`ClaimPending`/`Ack`, claim-expiry reclaim, `PendingCount`) is
-for future Signal Plane consumption — NOT implemented here. Store uses the standard
-discipline (modernc sqlite, WAL, synchronous=FULL, quick_check, user_version, STRICT,
-single conn, 0600) with a v1 migration. `cmd/correlation-validate` is the offline
-validator. Gated behind `run_correlation.enabled` + absolute `state_path`; unset in
-production, inert until an operator opts in. Signal Plane consumption, deployment, and
-production config are deliberately out of scope. `make check` is the delivery gate.
+The broker ships an INERT run-to-PR correlation outbox foundation
+(`internal/correlation`) — durable machinery only, wired into NO live path.
+Semantic review established the reason: today's authenticated `pull.create`
+carries no run capability. `principal.ID` + a broker operation id +
+caller-supplied metadata cannot establish the design's originating
+WorkItem/AgentType correlation, and caller metadata is not authority, so wiring
+the store to that handler would invent authority the broker does not hold. There
+is therefore no `RunCorrelationConfig`, no Server field, and no pull.create
+recording — those were removed.
+
+What remains is the store: schema, an atomic correlation+outbox transaction,
+idempotency on the broker operation id, a bounded versioned payload
+(`run-pr-correlation/v2`), and a claim/ack/expiry-reclaim reader API, plus the
+offline `cmd/correlation-validate`. `Identity` now REQUIRES the broker-
+authenticated capability fields a future Stage 4 will supply: `agent_type`,
+`mode`, `run_id`, `work_item_id`, and the broker `operation_id`, plus the
+repo + PR number GitHub returns. `Record` fails closed if any capability field
+is empty — there is no caller-metadata path and nothing emits events until Stage
+4 supplies a verified capability. This foundation is NOT the design complete; it
+is scaffolding awaiting Stage 4 capability wiring. `make check` is the gate.
 
 The AgentRelease publish boundary gives external callers `release.publish` only:
 the former public verify/acquire routes and actions are gone. Trusted protected-main

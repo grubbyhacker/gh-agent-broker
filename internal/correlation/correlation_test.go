@@ -23,11 +23,23 @@ func openTestStore(t *testing.T) (*Store, string) {
 	return store, path
 }
 
+// cap returns a complete broker-authenticated capability identity for the given
+// operation id, standing in for the Stage 4 verified capability.
+func cap(operationID string) Identity {
+	return Identity{
+		AgentType:   "coder",
+		Mode:        "launch",
+		RunID:       "run-123",
+		WorkItemID:  "wi-1",
+		OperationID: operationID,
+	}
+}
+
 func TestRecordWritesCorrelationAndOutboxAtomically(t *testing.T) {
 	store, _ := openTestStore(t)
 	ctx := context.Background()
 
-	id := Identity{AgentID: "hermes-coder-01", OperationID: "op-1", RunID: "run-123"}
+	id := cap("op-1")
 	c, err := store.Record(ctx, id, "grubbyhacker/gh-agent-broker", 177)
 	if err != nil {
 		t.Fatalf("Record: %v", err)
@@ -40,7 +52,7 @@ func TestRecordWritesCorrelationAndOutboxAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByPR: %v", err)
 	}
-	if got.OperationID != "op-1" || got.RunID != "run-123" || got.AgentID != "hermes-coder-01" {
+	if got.OperationID != "op-1" || got.RunID != "run-123" || got.AgentType != "coder" || got.Mode != "launch" || got.WorkItemID != "wi-1" {
 		t.Fatalf("GetByPR = %+v", got)
 	}
 
@@ -66,10 +78,13 @@ func TestRecordFailsClosedOnUnboundCall(t *testing.T) {
 		repo string
 		pr   int64
 	}{
-		{"missing agent", Identity{OperationID: "op"}, "o/r", 1},
-		{"missing operation", Identity{AgentID: "a"}, "o/r", 1},
-		{"missing repo", Identity{AgentID: "a", OperationID: "op"}, "", 1},
-		{"nonpositive pr", Identity{AgentID: "a", OperationID: "op"}, "o/r", 0},
+		{"missing agent_type", Identity{Mode: "launch", RunID: "r", WorkItemID: "w", OperationID: "op"}, "o/r", 1},
+		{"missing mode", Identity{AgentType: "coder", RunID: "r", WorkItemID: "w", OperationID: "op"}, "o/r", 1},
+		{"missing run_id", Identity{AgentType: "coder", Mode: "launch", WorkItemID: "w", OperationID: "op"}, "o/r", 1},
+		{"missing work_item_id", Identity{AgentType: "coder", Mode: "launch", RunID: "r", OperationID: "op"}, "o/r", 1},
+		{"missing operation_id", Identity{AgentType: "coder", Mode: "launch", RunID: "r", WorkItemID: "w"}, "o/r", 1},
+		{"missing repo", cap("op"), "", 1},
+		{"nonpositive pr", cap("op"), "o/r", 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -90,7 +105,7 @@ func TestRecordFailsClosedOnUnboundCall(t *testing.T) {
 func TestRecordIsIdempotentOnOperationID(t *testing.T) {
 	store, _ := openTestStore(t)
 	ctx := context.Background()
-	id := Identity{AgentID: "a", OperationID: "op-dup", RunID: "run-1"}
+	id := cap("op-dup")
 
 	first, err := store.Record(ctx, id, "o/r", 5)
 	if err != nil {
@@ -115,7 +130,7 @@ func TestRecordIsIdempotentOnOperationID(t *testing.T) {
 func TestClaimAckDrainsOutbox(t *testing.T) {
 	store, _ := openTestStore(t)
 	ctx := context.Background()
-	if _, err := store.Record(ctx, Identity{AgentID: "a", OperationID: "op-1"}, "o/r", 1); err != nil {
+	if _, err := store.Record(ctx, cap("op-1"), "o/r", 1); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 
@@ -154,7 +169,7 @@ func TestClaimAckDrainsOutbox(t *testing.T) {
 func TestAckRefusesWrongClaimToken(t *testing.T) {
 	store, _ := openTestStore(t)
 	ctx := context.Background()
-	if _, err := store.Record(ctx, Identity{AgentID: "a", OperationID: "op-1"}, "o/r", 1); err != nil {
+	if _, err := store.Record(ctx, cap("op-1"), "o/r", 1); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 	claimed, err := store.ClaimPending(ctx, "consumer-1", 1, time.Minute)
@@ -169,7 +184,7 @@ func TestAckRefusesWrongClaimToken(t *testing.T) {
 func TestExpiredClaimIsReclaimable(t *testing.T) {
 	store, _ := openTestStore(t)
 	ctx := context.Background()
-	if _, err := store.Record(ctx, Identity{AgentID: "a", OperationID: "op-1"}, "o/r", 1); err != nil {
+	if _, err := store.Record(ctx, cap("op-1"), "o/r", 1); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 	// Consumer 1 claims, then crashes without acking (simulated by advancing now).
@@ -207,7 +222,7 @@ func TestCrashReplayReopensAndValidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := store.Record(ctx, Identity{AgentID: "a", OperationID: "op-crash", RunID: "run-9"}, "o/r", 42); err != nil {
+	if _, err := store.Record(ctx, cap("op-crash"), "o/r", 42); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 	// Simulate a crash: drop the handle without draining.
@@ -247,7 +262,7 @@ func TestCrashReplayReopensAndValidates(t *testing.T) {
 func TestValidateRejectsUnknownVersion(t *testing.T) {
 	store, _ := openTestStore(t)
 	ctx := context.Background()
-	c, err := store.Record(ctx, Identity{AgentID: "a", OperationID: "op-1"}, "o/r", 1)
+	c, err := store.Record(ctx, cap("op-1"), "o/r", 1)
 	if err != nil {
 		t.Fatalf("Record: %v", err)
 	}

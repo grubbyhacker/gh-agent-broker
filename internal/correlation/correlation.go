@@ -1,22 +1,35 @@
-// Package correlation owns the broker's durable run-to-PR correlation and its
-// transactional outbox for Signal Plane.
+// Package correlation is an INERT foundation for the broker's future run-to-PR
+// correlation and its transactional outbox for Signal Plane.
 //
-// The correlation is a broker-authoritative side effect: it is recorded only
-// when the broker's OWN authenticated pull.create succeeds, binding the returned
-// repository and PR number to the authenticated run capability/identity that
-// made the call. Agent output, branch names, and PR body markers are never
-// treated as authority — an unknown or unbound call records nothing.
+// It is deliberately NOT wired into any live request path. Semantic review of
+// the first attempt established that today's authenticated pull.create carries
+// no run capability: principal.ID + a broker operation id + caller-supplied
+// metadata cannot establish the design's originating WorkItem/AgentType
+// correlation, and caller metadata is not authority. Wiring this store to a
+// pull.create that lacks those fields would have invented authority the broker
+// does not yet hold.
 //
-// Two rows are written in ONE transaction so the correlation cannot exist
-// without its outbox event and the event cannot exist without the correlation:
+// This package therefore ships the durable machinery only — schema, atomic
+// record+outbox transaction, idempotency, bounded versioned payload, and a
+// claim/ack reader API — with an Identity that REQUIRES the broker-authenticated
+// capability fields a future Stage 4 will provide: agent_type, mode, run_id,
+// work_item_id, and the broker operation id, plus the repo + PR number GitHub
+// returns. Record refuses any call missing one of these, so there is no path to
+// persist a correlation from caller metadata. No config enables it, no handler
+// calls it, and no events are emitted until Stage 4 supplies a verified
+// capability. See plans/agent-handoff.md.
 //
-//   - pr_correlations: the durable association (identity, repo, PR number).
+// When Record does run (in tests, and later behind a Stage-4-authenticated
+// caller), two rows are written in ONE transaction so a correlation cannot
+// exist without its outbox event and the event cannot exist without the
+// correlation:
+//
+//   - pr_correlations: the durable association (capability identity, repo, PR).
 //   - outbox_events: a versioned event for Signal Plane to claim/ack.
 //
 // The outbox is required rather than a best-effort notification because the
 // correlation must survive a crash between the GitHub response and the event
-// being observed. Signal Plane consumption itself lives elsewhere; this package
-// only produces and exposes the durable events with a claim/ack/retry reader.
+// being observed. Signal Plane consumption itself lives elsewhere.
 package correlation
 
 import (
@@ -37,8 +50,9 @@ const (
 
 	// OutboxEventVersion is the versioned envelope kind Signal Plane consumes.
 	// The version is part of the persisted payload so a consumer can refuse an
-	// envelope shape it does not understand.
-	OutboxEventVersion = "run-pr-correlation/v1"
+	// envelope shape it does not understand. v2 requires the full broker
+	// capability (agent_type, mode, run_id, work_item_id, operation_id).
+	OutboxEventVersion = "run-pr-correlation/v2"
 
 	// maxPayloadBytes bounds a serialized outbox payload. The payload is
 	// broker-derived and small (identity + repo + PR number + timestamps); the
@@ -59,27 +73,37 @@ var (
 	ErrPayloadBounds = errors.New("outbox payload exceeds bounded size")
 )
 
-// Identity is the authenticated broker-owned identity a correlation binds to.
-// It is derived entirely from the broker's authentication and operation, never
-// from agent-supplied request content. RunID is an optional recorded attribute
-// read from the broker's configured run metadata field; it is descriptive, not
-// authority, and an empty RunID is valid (the binding still holds via AgentID
-// and OperationID).
+// Identity is the broker-authenticated run capability a correlation binds to.
+// Every field is REQUIRED and must originate from a future Stage 4 verified
+// capability — never from caller-supplied metadata, agent output, branch names,
+// or PR body markers. Record refuses if any field is empty, so there is no path
+// to synthesize an identity the broker cannot yet prove.
 type Identity struct {
-	// AgentID is the authenticated broker agent identity (deny-by-default).
-	AgentID string
+	// AgentType is the originating agent type from the verified capability.
+	AgentType string
+	// Mode is the capability's run mode (e.g. launch vs dry_run scope).
+	Mode string
+	// RunID is the originating run identity from the verified capability.
+	RunID string
+	// WorkItemID is the originating WorkItem identity the run belongs to.
+	WorkItemID string
 	// OperationID is the broker-assigned operation id for the pull.create call.
 	OperationID string
-	// RunID is an optional descriptive run correlation attribute; never authority.
-	RunID string
+}
+
+func (id Identity) valid() bool {
+	return id.AgentType != "" && id.Mode != "" && id.RunID != "" &&
+		id.WorkItemID != "" && id.OperationID != ""
 }
 
 // Correlation is one durable run-to-PR association.
 type Correlation struct {
 	ID          int64
-	AgentID     string
-	OperationID string
+	AgentType   string
+	Mode        string
 	RunID       string
+	WorkItemID  string
+	OperationID string
 	Repo        string
 	PRNumber    int64
 	CreatedAt   time.Time
@@ -98,13 +122,16 @@ type OutboxEvent struct {
 	UpdatedAt  time.Time
 }
 
-// eventPayload is the bounded, broker-derived envelope body. It is intentionally
-// flat and small.
+// eventPayload is the bounded, broker-derived envelope body. Every field
+// originates from the verified capability; there is no optional/descriptive
+// field, because an inert foundation must not model a caller-metadata path.
 type eventPayload struct {
 	Version     string `json:"version"`
-	AgentID     string `json:"agent_id"`
+	AgentType   string `json:"agent_type"`
+	Mode        string `json:"mode"`
+	RunID       string `json:"run_id"`
+	WorkItemID  string `json:"work_item_id"`
 	OperationID string `json:"operation_id"`
-	RunID       string `json:"run_id,omitempty"`
 	Repo        string `json:"repo"`
 	PRNumber    int64  `json:"pr_number"`
 	RecordedAt  string `json:"recorded_at"`
@@ -188,16 +215,18 @@ func (s *Store) migrateV1(ctx context.Context) error {
 	statements := []string{
 		`CREATE TABLE pr_correlations (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			agent_id TEXT NOT NULL,
-			operation_id TEXT NOT NULL,
+			agent_type TEXT NOT NULL,
+			mode TEXT NOT NULL,
 			run_id TEXT NOT NULL,
+			work_item_id TEXT NOT NULL,
+			operation_id TEXT NOT NULL,
 			repo TEXT NOT NULL,
 			pr_number INTEGER NOT NULL,
 			created_at TEXT NOT NULL,
 			UNIQUE (repo, pr_number),
 			UNIQUE (operation_id)
 		) STRICT`,
-		`CREATE INDEX pr_correlations_agent ON pr_correlations(agent_id)`,
+		`CREATE INDEX pr_correlations_work_item ON pr_correlations(work_item_id)`,
 		`CREATE TABLE outbox_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			correlation_id INTEGER NOT NULL REFERENCES pr_correlations(id),
@@ -233,18 +262,23 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// Record binds an authenticated broker pull.create success to its returned
-// repository and PR number, writing the correlation and its versioned outbox
-// event in a SINGLE transaction.
+// Record binds a broker-authenticated run capability to the repository and PR
+// number GitHub returned, writing the correlation and its versioned outbox event
+// in a SINGLE transaction.
 //
-// It fails closed on unknown or unbound calls: an empty AgentID or OperationID,
-// an empty repo, or a non-positive PR number records NOTHING and returns an
-// error. It is idempotent on the broker OperationID: replaying the same
-// operation returns the existing correlation without writing a second event, so
-// a retry after a crash between GitHub and commit converges on one event.
+// It fails closed on an incomplete capability: any empty capability field
+// (agent_type, mode, run_id, work_item_id, operation_id), an empty repo, or a
+// non-positive PR number records NOTHING and returns an error. There is no
+// caller-metadata path. It is idempotent on the broker OperationID: replaying
+// the same operation returns the existing correlation without writing a second
+// event, so a retry after a crash between GitHub and commit converges on one
+// event.
+//
+// NOTE: no live handler calls this yet — see the package doc. It is exercised by
+// tests and awaits a Stage 4 caller that can supply a verified capability.
 func (s *Store) Record(ctx context.Context, id Identity, repo string, prNumber int64) (Correlation, error) {
-	if id.AgentID == "" || id.OperationID == "" {
-		return Correlation{}, fmt.Errorf("correlation requires an authenticated broker identity")
+	if !id.valid() {
+		return Correlation{}, fmt.Errorf("correlation requires a complete broker-authenticated capability (agent_type, mode, run_id, work_item_id, operation_id)")
 	}
 	if repo == "" || prNumber <= 0 {
 		return Correlation{}, fmt.Errorf("correlation requires a repo and a positive PR number")
@@ -268,9 +302,9 @@ func (s *Store) Record(ctx context.Context, id Identity, repo string, prNumber i
 	}
 
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO pr_correlations (agent_id, operation_id, run_id, repo, pr_number, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		id.AgentID, id.OperationID, id.RunID, repo, prNumber, formatTime(now))
+		`INSERT INTO pr_correlations (agent_type, mode, run_id, work_item_id, operation_id, repo, pr_number, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		id.AgentType, id.Mode, id.RunID, id.WorkItemID, id.OperationID, repo, prNumber, formatTime(now))
 	if err != nil {
 		return Correlation{}, fmt.Errorf("insert correlation: %w", err)
 	}
@@ -294,9 +328,11 @@ func (s *Store) Record(ctx context.Context, id Identity, repo string, prNumber i
 	}
 	return Correlation{
 		ID:          correlationID,
-		AgentID:     id.AgentID,
-		OperationID: id.OperationID,
+		AgentType:   id.AgentType,
+		Mode:        id.Mode,
 		RunID:       id.RunID,
+		WorkItemID:  id.WorkItemID,
+		OperationID: id.OperationID,
 		Repo:        repo,
 		PRNumber:    prNumber,
 		CreatedAt:   now,
@@ -307,7 +343,7 @@ func (s *Store) Record(ctx context.Context, id Identity, repo string, prNumber i
 // later review webhook maps back to.
 func (s *Store) GetByPR(ctx context.Context, repo string, prNumber int64) (Correlation, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, agent_id, operation_id, run_id, repo, pr_number, created_at
+		`SELECT id, agent_type, mode, run_id, work_item_id, operation_id, repo, pr_number, created_at
 		 FROM pr_correlations WHERE repo = ? AND pr_number = ?`, repo, prNumber)
 	return scanCorrelation(row)
 }
@@ -451,7 +487,7 @@ func (s *Store) Validate(ctx context.Context) (err error) {
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT c.repo, c.pr_number, c.operation_id, e.version, e.payload
+		`SELECT c.repo, c.pr_number, c.operation_id, c.agent_type, c.mode, c.run_id, c.work_item_id, e.version, e.payload
 		 FROM outbox_events e JOIN pr_correlations c ON c.id = e.correlation_id`)
 	if err != nil {
 		return fmt.Errorf("scan events for validation: %w", err)
@@ -462,14 +498,17 @@ func (s *Store) Validate(ctx context.Context) (err error) {
 		}
 	}()
 	for rows.Next() {
-		var repo, operationID, version string
+		var repo, operationID, agentType, mode, runID, workItemID, version string
 		var prNumber int64
 		var payload []byte
-		if err := rows.Scan(&repo, &prNumber, &operationID, &version, &payload); err != nil {
+		if err := rows.Scan(&repo, &prNumber, &operationID, &agentType, &mode, &runID, &workItemID, &version, &payload); err != nil {
 			return fmt.Errorf("scan validation row: %w", err)
 		}
 		if version != OutboxEventVersion {
 			return fmt.Errorf("unknown outbox event version %q for %s#%d", version, repo, prNumber)
+		}
+		if agentType == "" || mode == "" || runID == "" || workItemID == "" || operationID == "" {
+			return fmt.Errorf("correlation for %s#%d is missing a required capability field", repo, prNumber)
 		}
 		if len(payload) > maxPayloadBytes {
 			return fmt.Errorf("%w: %s#%d payload is %d bytes", ErrPayloadBounds, repo, prNumber, len(payload))
@@ -478,7 +517,8 @@ func (s *Store) Validate(ctx context.Context) (err error) {
 		if err := json.Unmarshal(payload, &decoded); err != nil {
 			return fmt.Errorf("decode payload for %s#%d: %w", repo, prNumber, err)
 		}
-		if decoded.Repo != repo || decoded.PRNumber != prNumber || decoded.OperationID != operationID {
+		if decoded.Repo != repo || decoded.PRNumber != prNumber || decoded.OperationID != operationID ||
+			decoded.AgentType != agentType || decoded.Mode != mode || decoded.RunID != runID || decoded.WorkItemID != workItemID {
 			return fmt.Errorf("payload disagrees with correlation for %s#%d", repo, prNumber)
 		}
 		if decoded.Version != OutboxEventVersion {
@@ -491,9 +531,11 @@ func (s *Store) Validate(ctx context.Context) (err error) {
 func buildPayload(id Identity, repo string, prNumber int64, now time.Time) ([]byte, error) {
 	payload, err := json.Marshal(eventPayload{
 		Version:     OutboxEventVersion,
-		AgentID:     id.AgentID,
-		OperationID: id.OperationID,
+		AgentType:   id.AgentType,
+		Mode:        id.Mode,
 		RunID:       id.RunID,
+		WorkItemID:  id.WorkItemID,
+		OperationID: id.OperationID,
 		Repo:        repo,
 		PRNumber:    prNumber,
 		RecordedAt:  formatTime(now),
@@ -509,7 +551,7 @@ func buildPayload(id Identity, repo string, prNumber int64, now time.Time) ([]by
 
 func correlationByOperation(ctx context.Context, tx *sql.Tx, operationID string) (Correlation, error) {
 	row := tx.QueryRowContext(ctx,
-		`SELECT id, agent_id, operation_id, run_id, repo, pr_number, created_at
+		`SELECT id, agent_type, mode, run_id, work_item_id, operation_id, repo, pr_number, created_at
 		 FROM pr_correlations WHERE operation_id = ?`, operationID)
 	return scanCorrelation(row)
 }
@@ -552,7 +594,7 @@ type rowScanner interface {
 func scanCorrelation(row rowScanner) (Correlation, error) {
 	var c Correlation
 	var createdAt string
-	if err := row.Scan(&c.ID, &c.AgentID, &c.OperationID, &c.RunID, &c.Repo, &c.PRNumber, &createdAt); err != nil {
+	if err := row.Scan(&c.ID, &c.AgentType, &c.Mode, &c.RunID, &c.WorkItemID, &c.OperationID, &c.Repo, &c.PRNumber, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Correlation{}, ErrNotFound
 		}
