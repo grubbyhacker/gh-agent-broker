@@ -39,6 +39,9 @@ type Config struct {
 	RunsDir                  string                        `yaml:"runs_dir"`
 	LaunchIntentStore        string                        `yaml:"launch_intent_store_path"`
 	ReleaseStore             string                        `yaml:"release_store_path"`
+	CapabilityStore          string                        `yaml:"capability_store_path"`
+	CapabilityAPIToken       string                        `yaml:"capability_api_token"`
+	CapabilityAPITokenEnv    string                        `yaml:"capability_api_token_env"`
 	BrokerURL                string                        `yaml:"broker_url"`
 	Production               bool                          `yaml:"production"`
 	Repositories             []string                      `yaml:"repositories"`
@@ -270,6 +273,9 @@ func (c *Config) ResolveSecrets() {
 	if c.AuthToken == "" && c.AuthTokenEnv != "" {
 		c.AuthToken = os.Getenv(c.AuthTokenEnv)
 	}
+	if c.CapabilityAPIToken == "" && c.CapabilityAPITokenEnv != "" {
+		c.CapabilityAPIToken = os.Getenv(c.CapabilityAPITokenEnv)
+	}
 	for name, tmpl := range c.Templates {
 		if tmpl.BrokerAgentSecret == "" && tmpl.BrokerSecretEnv != "" {
 			tmpl.BrokerAgentSecret = os.Getenv(tmpl.BrokerSecretEnv)
@@ -300,6 +306,14 @@ func (c *Config) Validate() error {
 	}
 	if c.ReleaseStore != "" && !filepath.IsAbs(c.ReleaseStore) {
 		errs = append(errs, "release_store_path must be an absolute path")
+	}
+	if c.CapabilityStore != "" {
+		if !filepath.IsAbs(c.CapabilityStore) {
+			errs = append(errs, "capability_store_path must be an absolute path")
+		}
+		if strings.TrimSpace(c.CapabilityAPIToken) == "" {
+			errs = append(errs, "capability_store_path requires capability_api_token or capability_api_token_env")
+		}
 	}
 	if c.MaxTaskBytes < 1 {
 		errs = append(errs, "max_task_bytes must be positive")

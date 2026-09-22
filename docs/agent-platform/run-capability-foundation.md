@@ -67,3 +67,41 @@ No production config, no launch wiring, no model-proxy consumer change, no stati
 per-mode principal migration, no deploy. Static per-mode principals remain the
 design's migration fallback; nothing in this package migrates them. This is an
 inert foundation, not the design complete.
+
+## Durable store slice (broker-verified opaque handle)
+
+The signing/serialization decision the seams left open is now DECIDED
+(agent-infra-docs PR #19): a **broker-verified opaque 256-bit handle**, its
+**SHA-256 hash stored at rest** in durable SQLite, **server-side claims**, an
+**atomic verify+model-budget reservation**, a **private API**, and the broker as
+**sole mint authority**. `internal/capability/store.go` implements exactly that,
+reusing the merged immutable `Claims`/`PolicyEvaluator`:
+
+- `Issue(claims)` mints a `crypto/rand` 256-bit handle, returns the plaintext
+  **once**, and persists only its SHA-256. The plaintext is never stored, logged,
+  or audited and cannot be recovered from the store.
+- `Verify(handle)` hashes the presented handle, matches the stored hash (a
+  malformed handle is rejected before lookup; the digest compare is
+  constant-time), and returns trusted server-side `Claims` plus the current
+  reservation. It fails closed on malformed/unknown/revoked/expired.
+- `Reserve(handle, req)` authorizes and records a call/token reservation in ONE
+  transaction against the CURRENT durable reserved totals, so concurrent
+  reservations cannot exceed the budget. Model-disabled capabilities deny any
+  model/call/token reservation.
+- `Revoke(handle)` marks the capability revoked (idempotent); later
+  verify/reserve fail closed.
+
+Storage discipline matches `internal/release`: modernc sqlite, WAL,
+`synchronous=FULL`, `quick_check`, `user_version` migration, STRICT tables,
+single connection, absolute path, `0600`.
+
+`internal/capability/rest.go` is the **private** sandbox-broker surface —
+`POST /v1/capabilities/{verify,reserve,revoke}` — mounted by `cmd/sandbox-broker`
+only when `capability_store_path` is configured, and every request must carry the
+configured `capability_api_token` bearer (constant-time compared). The handle
+travels in the request body and never appears in a response, log, or error.
+`cmd/capability-store-validate` is the offline store validator.
+
+Still deliberately out of scope in this slice: launch minting is NOT wired (no
+launch path calls `Issue` yet), and neither the model proxy nor the GitHub broker
+consumers are changed. No production config or deploy.
