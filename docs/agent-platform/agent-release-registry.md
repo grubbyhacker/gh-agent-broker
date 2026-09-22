@@ -19,10 +19,10 @@ configuration delivered by someone else's deploy. `internal/release` is that reg
 
 ## Authority split
 
-- a **publisher** may publish one validated OCI candidate; it cannot promote and cannot launch;
+- a **publisher** may submit one Docker archive and provenance; it cannot promote or launch;
 - a **promoter** may promote a verified, acquired generation; it cannot launch;
-- the **broker** resolves the active generation and is the sole runtime authority;
-- **callers** name an agent type — never an image, release, or generation.
+- the **broker** derives the immutable local image ID, verifies policy, and records availability;
+- runtime callers name an agent type — never an image, release, or generation.
 
 The registry enforces the state machine. It does not authenticate principals: every
 mutating operation takes an `actor` string, recorded in the audit trail, and refuses
@@ -32,21 +32,23 @@ of work (see below).
 ## Publish and broker-owned acquisition
 
 The sole caller-facing artifact endpoint is `POST /v1/releases/publish`, guarded
-by `release.publish`. It accepts the versioned `oci-layout-tar/v1` multipart
-protocol, with candidate metadata and exactly one bounded OCI-layout tar. The
-separate `release_artifact_byte_limit` applies to this binary upload.
+by `release.publish`. It accepts the versioned `docker-archive/v1` multipart
+protocol: provenance plus one bounded, single-image Docker archive produced by
+trusted protected-main CI. The separate `release_artifact_byte_limit` applies to
+this binary upload.
 
 `release.verify` and `release.acquire` are not public routes or caller actions.
 The broker derives provenance fields and accepted platforms from deployment-owned
-`agent_release_policies` in sandbox configuration. It validates the tar without
-extracting it (no traversal, links, duplicate paths, or multi-platform indexes),
-checks the declared digest and platform, imports it through Docker Engine, then
-observes the exact local digest and platform. Only then does it mark the candidate
-available. Verification and acquisition carry distinct internal audit actors.
+`agent_release_policies`. It hashes the archive's image config to derive Docker's
+immutable local image ID, checks the image platform, loads the archive through the
+Docker Engine, then inspects that exact ID and platform locally. Only then does it
+mark the candidate available. The publisher cannot supply requirements, an image
+reference, or an availability assertion. Verification and acquisition carry
+distinct internal audit actors.
 
 `publish` → internal `verify` → internal `acquire` → `promote`, with `rollback`
-as a separate, audited operation. A failed validation or Docker load leaves a
-candidate non-promotable.
+as a separate, audited operation. A missing, mismatched, or load-failed image stays
+non-promotable.
 
 Two properties are load-bearing.
 

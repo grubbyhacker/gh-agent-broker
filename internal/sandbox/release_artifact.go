@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -16,105 +17,110 @@ import (
 	"gh-agent-broker/internal/release"
 )
 
-const releasePublishProtocol = "oci-layout-tar/v1"
+const releasePublishProtocol = "docker-archive/v1"
 
-var ociBlobPath = regexp.MustCompile(`^blobs/sha256/[0-9a-f]{64}$`)
+var dockerConfigPath = regexp.MustCompile(`^[0-9a-f]{64}\.json$`)
 
 type releaseArtifactImporter interface {
 	LoadImage(context.Context, io.Reader) error
-	ImageAvailable(context.Context, string, string) (bool, error)
 	ImageIdentity(context.Context, string) (string, string, error)
 }
 
-type ociIndex struct {
-	Manifests []struct {
-		Digest   string `json:"digest"`
-		Size     int64  `json:"size"`
-		Platform struct {
-			OS           string `json:"os"`
-			Architecture string `json:"architecture"`
-		} `json:"platform"`
-	} `json:"manifests"`
+type dockerArchiveManifest struct {
+	Config   string   `json:"Config"`
+	RepoTags []string `json:"RepoTags"`
+	Layers   []string `json:"Layers"`
 }
 
-func validateOCIArtifact(data []byte, digest, expectedPlatform string) error {
+type dockerImageConfig struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+}
+
+// validateDockerArtifact derives the immutable local image ID from a trusted
+// publisher's single-image Docker archive. It checks the parts that determine
+// release identity and eligibility; Docker remains the archive parser.
+func validateDockerArtifact(data []byte, expectedPlatform string) (string, error) {
 	tr := tar.NewReader(bytes.NewReader(data))
-	seen := map[string]bool{}
 	files := map[string][]byte{}
 	for {
-		h, err := tr.Next()
-		if err == io.EOF {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("read OCI tar: %w", err)
+			return "", fmt.Errorf("read Docker archive: %w", err)
 		}
-		name := strings.TrimSuffix(h.Name, "/")
-		if name == "" || path.IsAbs(h.Name) || path.Clean(name) != name || strings.HasPrefix(name, "../") || seen[name] {
-			return fmt.Errorf("OCI tar contains unsafe or duplicate path %q", h.Name)
+		name := strings.TrimSuffix(header.Name, "/")
+		if name == "" || path.IsAbs(header.Name) || path.Clean(name) != name || strings.HasPrefix(name, "../") {
+			return "", fmt.Errorf("docker archive contains invalid path %q", header.Name)
 		}
-		seen[name] = true
-		if h.Typeflag == tar.TypeDir {
+		if header.Typeflag == tar.TypeDir {
 			continue
 		}
-		if h.Typeflag != tar.TypeReg || h.Linkname != "" {
-			return fmt.Errorf("OCI tar entry %q must be a regular file or directory", h.Name)
+		if header.Typeflag != tar.TypeReg {
+			return "", fmt.Errorf("docker archive entry %q must be a regular file", header.Name)
 		}
-		if name != "oci-layout" && name != "index.json" && !ociBlobPath.MatchString(name) {
-			return fmt.Errorf("OCI tar contains unsupported path %q", h.Name)
+		if name != "manifest.json" && !dockerConfigPath.MatchString(name) {
+			continue
 		}
-		b, readErr := io.ReadAll(tr)
-		if readErr != nil {
-			return fmt.Errorf("read OCI tar entry %q: %w", h.Name, readErr)
+		if _, exists := files[name]; exists {
+			return "", fmt.Errorf("docker archive contains duplicate %q", name)
 		}
-		files[name] = b
+		contents, err := io.ReadAll(io.LimitReader(tr, 1024*1024+1))
+		if err != nil || len(contents) > 1024*1024 {
+			return "", fmt.Errorf("docker archive metadata %q is invalid", name)
+		}
+		files[name] = contents
 	}
-	if len(files["oci-layout"]) == 0 || len(files["index.json"]) == 0 {
-		return fmt.Errorf("OCI tar must contain oci-layout and index.json")
+
+	var manifests []dockerArchiveManifest
+	if err := json.Unmarshal(files["manifest.json"], &manifests); err != nil || len(manifests) != 1 {
+		return "", fmt.Errorf("docker archive must contain exactly one image manifest")
 	}
-	var index ociIndex
-	if err := json.Unmarshal(files["index.json"], &index); err != nil || len(index.Manifests) != 1 {
-		return fmt.Errorf("OCI tar must contain exactly one valid index manifest")
+	manifest := manifests[0]
+	if !dockerConfigPath.MatchString(manifest.Config) {
+		return "", fmt.Errorf("docker archive manifest has invalid config identity")
 	}
-	descriptor := index.Manifests[0]
-	if descriptor.Digest != digest || descriptor.Size < 1 || descriptor.Platform.OS == "" || descriptor.Platform.Architecture == "" {
-		return fmt.Errorf("OCI index descriptor does not match the requested digest and platform")
+	configBytes, ok := files[manifest.Config]
+	if !ok {
+		return "", fmt.Errorf("docker archive config is missing")
 	}
-	platform := descriptor.Platform.OS + "/" + descriptor.Platform.Architecture
+	configDigest := strings.TrimSuffix(manifest.Config, ".json")
+	sum := sha256.Sum256(configBytes)
+	if hex.EncodeToString(sum[:]) != configDigest {
+		return "", fmt.Errorf("docker archive config digest does not match its filename")
+	}
+	var config dockerImageConfig
+	if err := json.Unmarshal(configBytes, &config); err != nil {
+		return "", fmt.Errorf("docker archive config is invalid")
+	}
+	platform := strings.Trim(config.OS+"/"+config.Architecture, "/")
 	if platform != expectedPlatform {
-		return fmt.Errorf("OCI image platform %q does not match declared platform %q", platform, expectedPlatform)
+		return "", fmt.Errorf("docker image platform %q does not match %q", platform, expectedPlatform)
 	}
-	manifest, ok := files["blobs/sha256/"+strings.TrimPrefix(digest, "sha256:")]
-	if !ok || int64(len(manifest)) != descriptor.Size {
-		return fmt.Errorf("OCI manifest blob is missing or has the wrong size")
-	}
-	sum := sha256.Sum256(manifest)
-	if "sha256:"+hex.EncodeToString(sum[:]) != digest {
-		return fmt.Errorf("OCI manifest blob does not match its digest")
-	}
-	return nil
+	return "sha256:" + configDigest, nil
 }
 
-func acquireOCIArtifact(ctx context.Context, importer releaseArtifactImporter, artifact []byte, item release.Release) error {
+func acquireDockerArtifact(
+	ctx context.Context,
+	importer releaseArtifactImporter,
+	artifact []byte,
+	item release.Release,
+	expectedImageID string,
+) error {
 	if err := importer.LoadImage(ctx, bytes.NewReader(artifact)); err != nil {
-		return fmt.Errorf("load OCI image through Docker: %w", err)
+		return fmt.Errorf("load Docker image: %w", err)
 	}
-	available, err := importer.ImageAvailable(ctx, item.ImageReference, item.ImageDigest)
+	observedImageID, observedPlatform, err := importer.ImageIdentity(ctx, expectedImageID)
 	if err != nil {
-		return fmt.Errorf("inspect loaded OCI image availability: %w", err)
+		return fmt.Errorf("inspect loaded Docker image: %w", err)
 	}
-	if !available {
-		return fmt.Errorf("loaded OCI image is absent at requested digest")
-	}
-	observedDigest, observedPlatform, err := importer.ImageIdentity(ctx, item.ImageReference)
-	if err != nil {
-		return fmt.Errorf("inspect loaded OCI image identity: %w", err)
-	}
-	if observedDigest != item.ImageDigest && !strings.HasSuffix(observedDigest, "@"+item.ImageDigest) {
-		return fmt.Errorf("loaded OCI image digest %q does not match %q", observedDigest, item.ImageDigest)
+	if observedImageID != expectedImageID {
+		return fmt.Errorf("loaded Docker image ID %q does not match %q", observedImageID, expectedImageID)
 	}
 	if observedPlatform != item.Provenance.Platform {
-		return fmt.Errorf("loaded OCI image platform %q does not match %q", observedPlatform, item.Provenance.Platform)
+		return fmt.Errorf("loaded Docker image platform %q does not match %q", observedPlatform, item.Provenance.Platform)
 	}
 	return nil
 }

@@ -198,17 +198,22 @@ func TestConfigValidateLaunchProfilesAndOperatorPrincipals(t *testing.T) {
 	}
 }
 
-func TestConfigValidateRejectsPromoterWithLaunchAction(t *testing.T) {
-	cfg := baseTestConfig(t)
-	cfg.OperatorPrincipals = map[string]OperatorPrincipal{
-		"promoter": {
-			Token:          "promoter-secret",
-			AllowedActions: []string{"release.promote", "launch"},
-		},
-	}
-	err := cfg.Validate()
-	if err == nil || !strings.Contains(err.Error(), "cannot combine release.promote with launch actions") {
-		t.Fatalf("Validate() error = %v, want promote/launch rejection", err)
+func TestConfigValidateRejectsCombinedReleaseActions(t *testing.T) {
+	for _, actions := range [][]string{
+		{"release.promote", "launch"},
+		{"release.promote", "release.rollback"},
+		{"release.publish", "release.promote"},
+	} {
+		cfg := baseTestConfig(t)
+		cfg.OperatorPrincipals = map[string]OperatorPrincipal{
+			"release-actor": {
+				Token:          "release-secret",
+				AllowedActions: actions,
+			},
+		}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "no other action") {
+			t.Fatalf("Validate() actions=%v error=%v, want release action isolation", actions, err)
+		}
 	}
 }
 

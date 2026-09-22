@@ -850,8 +850,11 @@ func (c Config) validateOperatorPrincipal(name string, principal OperatorPrincip
 			errs = append(errs, fmt.Sprintf("operator principal %q has unsupported action %q", name, action))
 		}
 	}
-	if contains(principal.AllowedActions, "release.promote") && hasLaunchAction(principal.AllowedActions) {
-		errs = append(errs, fmt.Sprintf("operator principal %q cannot combine release.promote with launch actions", name))
+	if contains(principal.AllowedActions, "release.promote") && len(principal.AllowedActions) != 1 {
+		errs = append(errs, fmt.Sprintf("operator principal %q must grant release.promote and no other action", name))
+	}
+	if contains(principal.AllowedActions, "release.publish") && len(principal.AllowedActions) != 1 {
+		errs = append(errs, fmt.Sprintf("operator principal %q must grant release.publish and no other action", name))
 	}
 	if principal.RunScope != "" && principal.RunScope != "owned" && principal.RunScope != "profile" {
 		errs = append(errs, fmt.Sprintf("operator principal %q run_scope must be owned or profile", name))
@@ -867,10 +870,6 @@ func validOperatorAction(action string) bool {
 	default:
 		return false
 	}
-}
-
-func hasLaunchAction(actions []string) bool {
-	return contains(actions, "launch") || contains(actions, "dry_run")
 }
 
 func principalRequiresLaunchProfiles(actions []string) bool {

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -17,8 +18,6 @@ import (
 
 	"gh-agent-broker/internal/release"
 )
-
-const releaseTestReference = "example.com/coder@sha256:bafebd36189ad3688b7b3915ea55d461e0bfcfbdde11e54b0a123999fb6be50f"
 
 func TestRESTReleasePromoteUsesActionScopedPromoterAndAuditsIdentity(t *testing.T) {
 	registry := openRESTReleaseRegistry(t)
@@ -59,6 +58,69 @@ func TestRESTReleaseVerifyAndAcquireAreNotCallerRoutes(t *testing.T) {
 	}
 	if validOperatorAction("release.verify") || validOperatorAction("release.acquire") {
 		t.Fatal("caller verification/acquisition actions must not be valid")
+	}
+}
+
+func TestRESTReleaseImportFailureNeverBecomesPromotable(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*fakeRuntime)
+	}{
+		{
+			name: "image load fails",
+			configure: func(runtime *fakeRuntime) {
+				runtime.importImageErr = errors.New("image absent")
+			},
+		},
+		{
+			name: "loaded image ID differs",
+			configure: func(runtime *fakeRuntime) {
+				runtime.importedImageID = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+			},
+		},
+		{
+			name: "loaded image platform differs",
+			configure: func(runtime *fakeRuntime) {
+				runtime.importedPlatform = "linux/arm64"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			registry := openRESTReleaseRegistry(t)
+			runtime := newFakeRuntime()
+			test.configure(runtime)
+			handler := NewRESTHandlerWithReleaseRegistry(
+				newRESTTestService(t, releaseRESTConfig(t), runtime, testAudit(t)),
+				registry,
+				nil,
+			)
+
+			body, contentType := releasePublishBody(t)
+			request := restRequest(http.MethodPost, "/v1/releases/publish", "publisher-secret", body)
+			request.Header.Set("Content-Type", contentType)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code == http.StatusCreated {
+				t.Fatalf("failed import unexpectedly published a ready release: %s", response.Body.String())
+			}
+
+			item, err := registry.Get(context.Background(), 1)
+			if err != nil {
+				t.Fatalf("get failed candidate: %v", err)
+			}
+			if item.Available {
+				t.Fatalf("failed import became available: %+v", item)
+			}
+			promote := httptest.NewRecorder()
+			handler.ServeHTTP(
+				promote,
+				restRequest(http.MethodPost, "/v1/releases/1/promote", "promoter-secret", nil),
+			)
+			if promote.Code != http.StatusConflict {
+				t.Fatalf("failed import promotion status=%d body=%s", promote.Code, promote.Body.String())
+			}
+		})
 	}
 }
 
@@ -129,23 +191,23 @@ func publishRelease(t *testing.T, handler http.Handler, token string) string {
 	if err := json.NewDecoder(response.Body).Decode(&item); err != nil {
 		t.Fatal(err)
 	}
+	if item.State != release.StateVerified || !item.Available || !strings.HasPrefix(item.ImageDigest, "sha256:") {
+		t.Fatalf("published release is not ready: %+v", item)
+	}
 	return stringGeneration(item.Generation)
 }
 
 func releasePublishBody(t *testing.T) ([]byte, string) {
 	t.Helper()
-	manifest := []byte(`{"schemaVersion":2}`)
-	sum := sha256.Sum256(manifest)
-	digest := "sha256:" + hex.EncodeToString(sum[:])
-	if digest != releaseTestReference[strings.LastIndex(releaseTestReference, "@")+1:] {
-		t.Fatalf("test reference digest must match OCI manifest")
-	}
+	config := []byte(`{"os":"linux","architecture":"amd64","rootfs":{"type":"layers","diff_ids":[]}}`)
+	sum := sha256.Sum256(config)
+	configName := hex.EncodeToString(sum[:]) + ".json"
+	manifest := []byte(`[{"Config":"` + configName + `","RepoTags":["youknowme-curator:release"],"Layers":[]}]`)
 	var artifact bytes.Buffer
 	tw := tar.NewWriter(&artifact)
 	for name, contents := range map[string][]byte{
-		"oci-layout": []byte(`{"imageLayoutVersion":"1.0.0"}`),
-		"index.json": []byte(`{"schemaVersion":2,"manifests":[{"digest":"` + digest + `","size":` + strconv.Itoa(len(manifest)) + `,"platform":{"os":"linux","architecture":"amd64"}}]}`),
-		"blobs/sha256/" + strings.TrimPrefix(digest, "sha256:"): manifest,
+		"manifest.json": manifest,
+		configName:      config,
 	} {
 		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: int64(len(contents))}); err != nil {
 			t.Fatal(err)
@@ -159,7 +221,11 @@ func releasePublishBody(t *testing.T) ([]byte, string) {
 	}
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
-	for name, value := range map[string][]byte{"protocol": []byte(releasePublishProtocol), "metadata": []byte(`{"agent_type":"coder","image_reference":"` + releaseTestReference + `","provenance":{"source_revision":"abc123","platform":"linux/amd64"}}`), "artifact": artifact.Bytes()} {
+	for name, value := range map[string][]byte{
+		"protocol": []byte(releasePublishProtocol),
+		"metadata": []byte(`{"agent_type":"coder","provenance":{"source_revision":"abc123","platform":"linux/amd64"}}`),
+		"artifact": artifact.Bytes(),
+	} {
 		part, err := mw.CreateFormFile(name, name)
 		if err != nil {
 			t.Fatal(err)
@@ -202,6 +268,10 @@ func (r releaseErrorRegistry) PublishCandidate(context.Context, string, string, 
 
 func (r releaseErrorRegistry) VerifyAndMarkAvailable(context.Context, int64, release.Requirements, string, string, func(context.Context, release.Release) error) error {
 	return r.err
+}
+
+func (r releaseErrorRegistry) Get(context.Context, int64) (release.Release, error) {
+	return release.Release{}, r.err
 }
 func (r releaseErrorRegistry) Promote(context.Context, int64, string) error          { return r.err }
 func (r releaseErrorRegistry) Rollback(context.Context, string, int64, string) error { return r.err }

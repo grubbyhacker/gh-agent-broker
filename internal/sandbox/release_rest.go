@@ -20,14 +20,14 @@ import (
 type ReleaseRegistry interface {
 	PublishCandidate(context.Context, string, string, release.Provenance, string) (release.Release, error)
 	VerifyAndMarkAvailable(context.Context, int64, release.Requirements, string, string, func(context.Context, release.Release) error) error
+	Get(context.Context, int64) (release.Release, error)
 	Promote(context.Context, int64, string) error
 	Rollback(context.Context, string, int64, string) error
 }
 
 type publishReleaseRequest struct {
-	AgentType      string             `json:"agent_type"`
-	ImageReference string             `json:"image_reference"`
-	Provenance     release.Provenance `json:"provenance"`
+	AgentType  string             `json:"agent_type"`
+	Provenance release.Provenance `json:"provenance"`
 }
 
 type rollbackReleaseRequest struct {
@@ -76,16 +76,13 @@ func (h *restHandler) handleReleasePublish(w http.ResponseWriter, r *http.Reques
 		h.writeReleaseError(w, operation, promoter.Name, errors.New("agent type has no deployment-owned release policy"))
 		return
 	}
-	digest, ok := imageReferenceDigest(input.ImageReference)
-	if !ok {
-		h.writeReleaseError(w, operation, promoter.Name, errors.New("image reference must be digest-pinned"))
-		return
-	}
-	if err := validateOCIArtifact(artifact, digest, input.Provenance.Platform); err != nil {
+	imageID, err := validateDockerArtifact(artifact, input.Provenance.Platform)
+	if err != nil {
 		h.writeReleaseError(w, operation, promoter.Name, err)
 		return
 	}
-	item, err := h.releases.PublishCandidate(r.Context(), input.AgentType, input.ImageReference, input.Provenance, promoter.Name)
+	imageReference := "local.agent/" + input.AgentType + "@" + imageID
+	item, err := h.releases.PublishCandidate(r.Context(), input.AgentType, imageReference, input.Provenance, promoter.Name)
 	if err != nil {
 		h.writeReleaseError(w, operation, promoter.Name, err)
 		return
@@ -97,30 +94,18 @@ func (h *restHandler) handleReleasePublish(w http.ResponseWriter, r *http.Reques
 	}
 	requirements := release.Requirements{ProvenanceFields: policy.ProvenanceFields, Platforms: policy.Platforms}
 	if err := h.releases.VerifyAndMarkAvailable(r.Context(), item.Generation, requirements, "sandbox-broker-verifier", "sandbox-broker-acquirer", func(ctx context.Context, candidate release.Release) error {
-		return acquireOCIArtifact(ctx, importer, artifact, candidate)
+		return acquireDockerArtifact(ctx, importer, artifact, candidate, imageID)
 	}); err != nil {
 		h.writeReleaseError(w, operation, promoter.Name, err)
 		return
 	}
+	ready, err := h.releases.Get(r.Context(), item.Generation)
+	if err != nil {
+		h.writeReleaseError(w, operation, promoter.Name, err)
+		return
+	}
 	h.audit(operation, promoter.Name, "", "", "", "", "", "allow", nil, nil)
-	writeJSON(w, http.StatusCreated, item)
-}
-
-func imageReferenceDigest(reference string) (string, bool) {
-	index := strings.LastIndex(reference, "@")
-	if index < 1 || index == len(reference)-1 {
-		return "", false
-	}
-	digest := reference[index+1:]
-	if len(digest) != len("sha256:")+64 || !strings.HasPrefix(digest, "sha256:") {
-		return "", false
-	}
-	for _, character := range digest[len("sha256:"):] {
-		if character < '0' || character > 'f' || (character > '9' && character < 'a') {
-			return "", false
-		}
-	}
-	return digest, true
+	writeJSON(w, http.StatusCreated, ready)
 }
 
 func parseReleaseGeneration(value string) (int64, error) {

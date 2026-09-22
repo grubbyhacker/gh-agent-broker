@@ -794,6 +794,9 @@ type fakeRuntime struct {
 	stopGraces        []time.Duration
 	stopDeadline      time.Time
 	stopLeavesRunning bool
+	importImageErr    error
+	importedImageID   string
+	importedPlatform  string
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -806,13 +809,24 @@ func newFakeRuntime() *fakeRuntime {
 
 func (f *fakeRuntime) LoadImage(_ context.Context, artifact io.Reader) error {
 	_, err := io.Copy(io.Discard, artifact)
-	return err
+	if err != nil {
+		return err
+	}
+	return f.importImageErr
 }
 
 func (f *fakeRuntime) ImageAvailable(context.Context, string, string) (bool, error) { return true, nil }
 
 func (f *fakeRuntime) ImageIdentity(_ context.Context, reference string) (string, string, error) {
-	return reference[strings.LastIndex(reference, "@")+1:], "linux/amd64", nil
+	imageID := f.importedImageID
+	if imageID == "" {
+		imageID = reference
+	}
+	platform := f.importedPlatform
+	if platform == "" {
+		platform = "linux/amd64"
+	}
+	return imageID, platform, nil
 }
 
 func (f *fakeRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerInfo, error) {
