@@ -74,6 +74,25 @@ type Service struct {
 	intentLocksMu       sync.Mutex
 	intentLocks         map[string]*intentLock
 	codexIssuer         CodexCredentialIssuer
+	releases            ReleaseResolver
+}
+
+// ReleaseResolver resolves the release a launch of an agent type must use. It is
+// the launch-path consumer of the broker's AgentRelease registry
+// (internal/release). It is deliberately narrow: a caller names an agent type
+// and gets back the digest-pinned reference the broker has made active, or an
+// error. It never lets a caller name an image, release, or generation.
+type ReleaseResolver interface {
+	Resolve(ctx context.Context, agentType string) (ResolvedRelease, error)
+}
+
+// ResolvedRelease is the launch-path view of a resolved AgentRelease: enough to
+// pin the image and to make the run traceable to the exact generation that
+// produced it.
+type ResolvedRelease struct {
+	Generation     int64
+	ImageReference string
+	ImageDigest    string
 }
 
 type CodexCredentialIssuer interface {
@@ -120,6 +139,7 @@ type RunMetadata struct {
 	ContainerID               string            `json:"container_id,omitempty"`
 	Image                     string            `json:"image"`
 	ImageDigest               string            `json:"image_digest,omitempty"`
+	ResolvedReleaseGeneration int64             `json:"resolved_release_generation,omitempty"`
 	Status                    string            `json:"status"`
 	ExitCode                  *int              `json:"exit_code,omitempty"`
 	FinalizeReason            string            `json:"finalize_reason,omitempty"`
@@ -372,6 +392,14 @@ func (s *Service) SetCodexCredentialIssuer(issuer CodexCredentialIssuer) {
 	s.codexIssuer = issuer
 }
 
+// SetReleaseResolver installs the AgentRelease resolver used for templates that
+// declare an agent_type. When nil (the default, and the production default while
+// release_store_path is unset), templates resolve to their configured image and
+// behaviour is unchanged.
+func (s *Service) SetReleaseResolver(resolver ReleaseResolver) {
+	s.releases = resolver
+}
+
 func (s *Service) Reconcile(ctx context.Context) error {
 	entries, err := os.ReadDir(s.cfg.RunsDir)
 	if err != nil {
@@ -470,15 +498,14 @@ func (s *Service) Reconcile(ctx context.Context) error {
 }
 
 func (s *Service) DryRunLaunch(ctx context.Context, in LaunchAgentInput) (LaunchAgentOutput, error) {
-	_ = ctx
-	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
+	tmpl, runID, branch, runtimeLimit, release, err := s.selectLaunchTemplate(ctx, in)
 	if err != nil {
 		s.auditDeny("dry_run_launch", in, err)
 		return LaunchAgentOutput{}, err
 	}
 	now := time.Now().UTC()
 	deadline := now.Add(runtimeLimit)
-	meta := RunMetadata{
+	meta := applyResolvedRelease(RunMetadata{
 		RunID:            runID,
 		Profile:          in.Profile,
 		Template:         in.Template,
@@ -497,7 +524,7 @@ func (s *Service) DryRunLaunch(ctx context.Context, in LaunchAgentInput) (Launch
 		Parameters:       cloneParameters(in.Parameters),
 		StartedAt:        now,
 		Deadline:         deadline,
-	}
+	}, release)
 	if err := s.validateTaskContract(s.taskContract(meta)); err != nil {
 		s.auditDeny("dry_run_launch", in, err)
 		return LaunchAgentOutput{}, err
@@ -514,13 +541,12 @@ func (s *Service) DryRunLaunch(ctx context.Context, in LaunchAgentInput) (Launch
 }
 
 func (s *Service) PreviewLaunch(ctx context.Context, in LaunchAgentInput) (LaunchPreviewOutput, error) {
-	_ = ctx
-	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
+	tmpl, runID, branch, runtimeLimit, release, err := s.selectLaunchTemplate(ctx, in)
 	if err != nil {
 		return LaunchPreviewOutput{}, err
 	}
 	now := time.Now().UTC()
-	meta := RunMetadata{
+	meta := applyResolvedRelease(RunMetadata{
 		RunID:            runID,
 		Profile:          in.Profile,
 		Template:         in.Template,
@@ -538,7 +564,7 @@ func (s *Service) PreviewLaunch(ctx context.Context, in LaunchAgentInput) (Launc
 		Parameters:       cloneParameters(in.Parameters),
 		StartedAt:        now,
 		Deadline:         now.Add(runtimeLimit),
-	}
+	}, release)
 	contract := s.taskContract(meta)
 	if err := s.validateTaskContract(contract); err != nil {
 		return LaunchPreviewOutput{}, err
@@ -570,7 +596,7 @@ func (s *Service) LaunchAgent(ctx context.Context, in LaunchAgentInput) (LaunchA
 }
 
 func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAgentInput) (LaunchAgentOutput, error) {
-	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
+	tmpl, runID, branch, runtimeLimit, release, err := s.selectLaunchTemplate(ctx, in)
 	if err != nil {
 		s.auditDeny("launch_agent", in, err)
 		return LaunchAgentOutput{}, &launchValidationError{err: err}
@@ -583,7 +609,7 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 	defer releaseProfileSlot()
 	now := time.Now().UTC()
 	deadline := now.Add(runtimeLimit)
-	meta := RunMetadata{
+	meta := applyResolvedRelease(RunMetadata{
 		RunID:            runID,
 		Profile:          in.Profile,
 		Principal:        principal,
@@ -603,7 +629,7 @@ func (s *Service) launchAgent(ctx context.Context, principal string, in LaunchAg
 		Parameters:       cloneParameters(in.Parameters),
 		StartedAt:        now,
 		Deadline:         deadline,
-	}
+	}, release)
 	if err := s.validateTaskContract(s.taskContract(meta)); err != nil {
 		return LaunchAgentOutput{}, &launchValidationError{err: err}
 	}
@@ -723,12 +749,12 @@ func (s *Service) LaunchProfile(ctx context.Context, principal, profile, rawKey,
 		return out, err
 	}
 
-	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
+	tmpl, runID, branch, runtimeLimit, release, err := s.selectLaunchTemplate(ctx, in)
 	if err != nil {
 		return LaunchAgentOutput{}, &launchValidationError{err: err}
 	}
 	now := time.Now().UTC()
-	meta := RunMetadata{
+	meta := applyResolvedRelease(RunMetadata{
 		RunID: runID, Profile: profile, Principal: principal, IdempotencyKeyDigest: digest,
 		RequestFingerprint: fingerprint, LaunchConfigVersion: s.cfg.ConfigVersion,
 		Template: in.Template, Repo: in.Repo, BaseBranch: in.BaseBranch,
@@ -736,7 +762,7 @@ func (s *Service) LaunchProfile(ctx context.Context, principal, profile, rawKey,
 		BrokerAgentID: tmpl.BrokerAgentID, CredentialBundle: tmpl.CredentialBundle, Image: tmpl.Image,
 		Status: StatusPending, Deliverables: deliverables(in.Deliverables, tmpl.Deliverables),
 		Parameters: cloneParameters(in.Parameters), StartedAt: now, Deadline: now.Add(runtimeLimit),
-	}
+	}, release)
 	if workflow := s.cfg.LaunchProfiles[profile].CodexIssueWorkflow; workflow != nil {
 		deliveryTemplate := s.cfg.Templates[workflow.DeliveryTemplate]
 		meta.WorkerAgentID = workerAgentID(deliveryTemplate, runID)
@@ -1342,6 +1368,55 @@ func (s *Service) CleanupRun(ctx context.Context, in RunInput) (StatusOutput, er
 	return s.statusOutput(meta), nil
 }
 
+// applyResolvedRelease stamps the resolved AgentRelease onto run metadata so the
+// run is traceable to the exact generation and digest-pinned image that produced
+// it. It is a no-op when no release was resolved (template has no agent_type).
+func applyResolvedRelease(meta RunMetadata, release *ResolvedRelease) RunMetadata {
+	if release == nil {
+		return meta
+	}
+	meta.ResolvedReleaseGeneration = release.Generation
+	meta.ImageDigest = release.ImageDigest
+	return meta
+}
+
+// selectLaunchTemplate is the single point at which a template is selected for a
+// launch. It validates the request and then, when the template declares an
+// agent_type, resolves the effective image from the AgentRelease registry ONCE
+// here rather than at each downstream tmpl.Image site.
+//
+// When the template has no agent_type, behaviour is exactly as before: the
+// configured tmpl.Image is used and no release is resolved. This is the default,
+// so production is unchanged while release_store_path stays unset.
+//
+// It fails closed: if agent_type is set and resolution errors (no active
+// release, or the active image is not locally available), the launch is refused.
+// It never falls back to the configured tmpl.Image, because running a different
+// image than the one the registry pinned is the exact substitution this design
+// forbids. A template that declares an agent_type with no resolver configured is
+// a config-load error caught in Config.Validate, not here.
+func (s *Service) selectLaunchTemplate(ctx context.Context, in LaunchAgentInput) (Template, string, string, time.Duration, *ResolvedRelease, error) {
+	tmpl, runID, branch, runtimeLimit, err := s.validateLaunch(in)
+	if err != nil {
+		return Template{}, "", "", 0, nil, err
+	}
+	if tmpl.AgentType == "" {
+		return tmpl, runID, branch, runtimeLimit, nil, nil
+	}
+	if s.releases == nil {
+		return Template{}, "", "", 0, nil, fmt.Errorf("policy denial: template %q declares agent_type %q but no release registry is configured; launch refused", in.Template, tmpl.AgentType)
+	}
+	resolved, err := s.releases.Resolve(ctx, tmpl.AgentType)
+	if err != nil {
+		return Template{}, "", "", 0, nil, fmt.Errorf("policy denial: no runnable release for agent_type %q; launch refused: %w", tmpl.AgentType, err)
+	}
+	// Resolve once: pin the effective image on this template copy so every
+	// downstream tmpl.Image read uses the digest-pinned reference.
+	tmpl.Image = resolved.ImageReference
+	release := resolved
+	return tmpl, runID, branch, runtimeLimit, &release, nil
+}
+
 func (s *Service) validateLaunch(in LaunchAgentInput) (Template, string, string, time.Duration, error) {
 	tmpl, ok := s.cfg.Templates[in.Template]
 	if !ok {
@@ -1424,6 +1499,15 @@ func runtimeLimit(in LaunchAgentInput, tmpl Template) (time.Duration, error) {
 
 func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Redactor, error) {
 	runDir := s.runDir(meta.RunID)
+	// The effective image is the one recorded on the run at template selection.
+	// For a template with an agent_type that is the digest-pinned reference the
+	// AgentRelease registry resolved; otherwise it is the configured tmpl.Image.
+	// Using the recorded value keeps a resolved release authoritative across
+	// resume and reconcile, where tmpl is re-read from configuration.
+	effectiveImage := meta.Image
+	if effectiveImage == "" {
+		effectiveImage = tmpl.Image
+	}
 	env := map[string]string{
 		"SANDBOX_RUN_ID":      meta.RunID,
 		"SANDBOX_REPO":        meta.Repo,
@@ -1477,7 +1561,7 @@ func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template) (RuntimeSpec, Red
 	}
 	spec := RuntimeSpec{
 		RunID:          meta.RunID,
-		Image:          tmpl.Image,
+		Image:          effectiveImage,
 		Command:        tmpl.Command,
 		User:           tmpl.User,
 		Env:            env,
@@ -2018,7 +2102,7 @@ func (s *Service) writeCompletionStatus(ctx context.Context, meta RunMetadata) {
 		return
 	}
 	if writer, ok := s.runtime.(runtimeFileWriter); ok {
-		if err := writer.WriteFile(ctx, tmpl.Image, spec.Mounts, statusPath, b); err != nil {
+		if err := writer.WriteFile(ctx, spec.Image, spec.Mounts, statusPath, b); err != nil {
 			s.logCompletionStatusFailure(meta, err)
 		}
 		return

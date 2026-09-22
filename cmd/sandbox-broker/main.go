@@ -104,7 +104,17 @@ func runServerCommand(args []string) {
 	backend := sandbox.NewDockerBackend(*dockerSocket)
 	service := sandbox.NewServiceWithLaunchIntents(cfg, backend, auditLog, intentStore)
 	if cfg.ReleaseStore != "" {
-		reconcileAgentReleases(context.Background(), cfg.ReleaseStore, backend)
+		store, storeErr := release.Open(context.Background(), cfg.ReleaseStore)
+		if storeErr != nil {
+			log.Fatalf("open agent release registry: %v", storeErr)
+		}
+		defer func() {
+			if closeErr := store.Close(); closeErr != nil {
+				log.Printf("close agent release registry: %v", closeErr)
+			}
+		}()
+		reconcileAgentReleases(context.Background(), store, backend)
+		service.SetReleaseResolver(&releaseResolver{store: store})
 	}
 	if cfg.CodexHolder.MasterAuthPath != "" {
 		holder, holderErr := codexauth.New(codexauth.Config{
@@ -436,17 +446,7 @@ func tokenAuth(token string, next http.Handler) http.Handler {
 // Startup does not abort on a missing image: the service has other duties, and
 // refusing the affected launches is the correct blast radius. A missing image is
 // logged loudly instead.
-func reconcileAgentReleases(ctx context.Context, storePath string, backend *sandbox.DockerBackend) {
-	store, err := release.Open(ctx, storePath)
-	if err != nil {
-		log.Fatalf("open agent release registry: %v", err)
-	}
-	defer func() {
-		if closeErr := store.Close(); closeErr != nil {
-			log.Printf("close agent release registry: %v", closeErr)
-		}
-	}()
-
+func reconcileAgentReleases(ctx context.Context, store *release.Store, backend *sandbox.DockerBackend) {
 	missing, err := store.Reconcile(ctx, backend.ImageAvailable, "sandbox-broker-startup")
 	if err != nil {
 		log.Printf("reconcile agent releases: %v", err)
@@ -460,4 +460,25 @@ func reconcileAgentReleases(ctx context.Context, storePath string, backend *sand
 	if len(missing) == 0 {
 		log.Printf("agent release registry reconciled: all active releases are locally available")
 	}
+}
+
+// releaseResolver adapts the release.Store to the sandbox launch path's
+// ReleaseResolver. It is the only launch-path consumer of the registry: it maps
+// an agent type to the digest-pinned reference of the active, locally available
+// release, and surfaces the registry's fail-closed errors unchanged so the
+// launch path refuses rather than substituting a different image.
+type releaseResolver struct {
+	store *release.Store
+}
+
+func (r *releaseResolver) Resolve(ctx context.Context, agentType string) (sandbox.ResolvedRelease, error) {
+	resolved, err := r.store.Resolve(ctx, agentType)
+	if err != nil {
+		return sandbox.ResolvedRelease{}, err
+	}
+	return sandbox.ResolvedRelease{
+		Generation:     resolved.Generation,
+		ImageReference: resolved.ImageReference,
+		ImageDigest:    resolved.ImageDigest,
+	}, nil
 }

@@ -20,25 +20,26 @@ const (
 // TerminalResult is the only worker-produced output available to the terminal
 // reporter. It intentionally excludes logs and arbitrary artifacts.
 type TerminalResult struct {
-	Version               string              `json:"version"`
-	RunID                 string              `json:"run_id"`
-	Profile               string              `json:"profile"`
-	Repo                  string              `json:"repo"`
-	Branch                string              `json:"branch,omitempty"`
-	Status                string              `json:"status"`
-	Outcome               string              `json:"outcome"`
-	FinalizeReason        string              `json:"finalize_reason,omitempty"`
-	TerminalSource        string              `json:"terminal_source,omitempty"`
-	IdempotencyKeyDigest  string              `json:"idempotency_key_digest,omitempty"`
-	RequestFingerprint    string              `json:"request_fingerprint,omitempty"`
-	LaunchConfigVersion   string              `json:"launch_config_version,omitempty"`
-	Result                map[string]any      `json:"result,omitempty"`
-	FinalSummary          string              `json:"final_summary"`
-	FailureStage          string              `json:"failure_stage,omitempty"`
-	FailureReason         string              `json:"failure_reason,omitempty"`
-	ModelExecutionStarted bool                `json:"model_execution_started"`
-	FailureClass          string              `json:"failure_class,omitempty"`
-	Provenance            *TerminalProvenance `json:"provenance,omitempty"`
+	Version                   string              `json:"version"`
+	RunID                     string              `json:"run_id"`
+	Profile                   string              `json:"profile"`
+	Repo                      string              `json:"repo"`
+	Branch                    string              `json:"branch,omitempty"`
+	Status                    string              `json:"status"`
+	Outcome                   string              `json:"outcome"`
+	FinalizeReason            string              `json:"finalize_reason,omitempty"`
+	TerminalSource            string              `json:"terminal_source,omitempty"`
+	IdempotencyKeyDigest      string              `json:"idempotency_key_digest,omitempty"`
+	RequestFingerprint        string              `json:"request_fingerprint,omitempty"`
+	LaunchConfigVersion       string              `json:"launch_config_version,omitempty"`
+	ResolvedReleaseGeneration int64               `json:"resolved_release_generation,omitempty"`
+	Result                    map[string]any      `json:"result,omitempty"`
+	FinalSummary              string              `json:"final_summary"`
+	FailureStage              string              `json:"failure_stage,omitempty"`
+	FailureReason             string              `json:"failure_reason,omitempty"`
+	ModelExecutionStarted     bool                `json:"model_execution_started"`
+	FailureClass              string              `json:"failure_class,omitempty"`
+	Provenance                *TerminalProvenance `json:"provenance,omitempty"`
 }
 
 type TerminalProvenance struct {
@@ -107,8 +108,9 @@ func (s *Service) projectTerminalResult(meta RunMetadata) TerminalResult {
 		Repo: meta.Repo, Branch: meta.Branch, Status: meta.Status,
 		FinalizeReason: meta.FinalizeReason, TerminalSource: meta.TerminalSource,
 		IdempotencyKeyDigest: meta.IdempotencyKeyDigest, RequestFingerprint: meta.RequestFingerprint,
-		LaunchConfigVersion:   meta.LaunchConfigVersion,
-		ModelExecutionStarted: !meta.ExecutionStartedAt.IsZero(),
+		LaunchConfigVersion:       meta.LaunchConfigVersion,
+		ResolvedReleaseGeneration: meta.ResolvedReleaseGeneration,
+		ModelExecutionStarted:     !meta.ExecutionStartedAt.IsZero(),
 	}
 	if meta.Provenance != nil {
 		result.Provenance = s.terminalProvenance(meta)
