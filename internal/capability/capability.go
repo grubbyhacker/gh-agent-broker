@@ -1,32 +1,15 @@
-// Package capability is an INERT Stage-4 foundation for broker-issued per-run
-// capabilities.
+// Package capability implements broker-issued per-run capability claims, policy,
+// durable opaque-handle storage, and the private verification/reservation API.
 //
-// The authoritative design (agent-infra-docs/design/agent-platform-coupling.md,
-// "Per-mode authority must be enforced at call time") COMMITS to broker-issued
-// per-run capabilities as the mechanism: the execution class promises no
-// standing credentials, so a capability binds immutable claims minted by the
-// broker at launch and expiring with the run, and consumers must derive or
-// validate those claims from the capability rather than trusting a request body
-// or header — in particular the model proxy must stop accepting a
-// caller-asserted run_id.
-//
-// This package ships the strongly-typed, immutable claims and the
-// validation/authorization evaluator interfaces consumers will use instead of
-// caller headers/body. It is deliberately NOT wired into any live path: no
-// handler mints or verifies a capability, no config enables it, no launch or
-// model-proxy consumer is changed, and no static per-mode principal is migrated.
-//
-// What the design does NOT decide, and this package therefore does NOT choose:
-// the signing / token serialization / key-management mechanism by which a minted
-// capability travels from the broker (issuer) to a consumer (verifier). Those
-// two roles are represented here as explicit seams — the Issuer and Verifier
-// interfaces — with NO implementation. Picking a concrete mechanism (a signed
-// token format, a key hierarchy, rotation) is the remaining Stage-4 decision;
-// see plans/agent-handoff.md. The Claims themselves, their validation, and the
-// authorization evaluator do not depend on that choice, so they can land now.
+// The authoritative design uses a random 256-bit bearer handle, stores only its
+// SHA-256 digest with server-side claims, and requires consumers to verify or
+// reserve through the broker instead of trusting caller-supplied identity. Launch
+// minting and consumer integration remain separate rollout slices; merely
+// configuring this package does not grant a caller authority.
 package capability
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -224,22 +207,21 @@ type Authorizer interface {
 	Authorize(claims Claims, req Request, now time.Time) error
 }
 
-// Issuer is the broker-side seam that MINTS a capability for a run. Its concrete
-// mechanism — how the minted capability is serialized and signed for transport —
-// is the undecided Stage-4 decision and is intentionally unimplemented here.
+// Issuer is the broker-side minting seam. The plaintext opaque handle is returned
+// once; implementations persist only its digest with the claims.
 type Issuer interface {
-	// Issue mints a transportable capability carrying these claims. The return
-	// type is intentionally opaque ([]byte) so this seam does not prejudge the
-	// serialization/signing format.
-	Issue(claims Claims) ([]byte, error)
+	Issue(context.Context, Claims) (string, error)
 }
 
-// Verifier is the consumer-side seam that VERIFIES a transported capability back
-// into trusted Claims, replacing caller-asserted ids. Its concrete mechanism is
-// the same undecided decision as Issuer and is intentionally unimplemented here.
+// Verifier authenticates an opaque handle into broker-owned claims and current
+// reservation state, replacing caller-asserted identity.
 type Verifier interface {
-	// Verify parses and authenticates a transported capability into Claims.
-	Verify(token []byte) (Claims, error)
+	Verify(context.Context, string) (Claims, Reservation, error)
+}
+
+// Reserver atomically authorizes and records model budget usage for a handle.
+type Reserver interface {
+	Reserve(context.Context, string, Request) (Reservation, error)
 }
 
 // PolicyEvaluator is the default, mechanism-independent implementation of
@@ -321,11 +303,13 @@ func (e PolicyEvaluator) Authorize(claims Claims, req Request, now time.Time) er
 	if req.Model != "" && !claims.AllowsModel(req.Model) {
 		return fmt.Errorf("%w: %q", ErrModelDenied, req.Model)
 	}
-	if req.ReservedCalls+req.Calls > claims.callBudget {
-		return fmt.Errorf("%w: %d of %d", ErrCallBudget, req.ReservedCalls+req.Calls, claims.callBudget)
+	// Subtract before comparing so hostile int64 increments cannot overflow and
+	// wrap negative to bypass either budget.
+	if req.ReservedCalls > claims.callBudget || req.Calls > claims.callBudget-req.ReservedCalls {
+		return fmt.Errorf("%w: %d requested with %d reserved against %d", ErrCallBudget, req.Calls, req.ReservedCalls, claims.callBudget)
 	}
-	if req.ReservedTokens+req.Tokens > claims.tokenBudget {
-		return fmt.Errorf("%w: %d of %d", ErrTokenBudget, req.ReservedTokens+req.Tokens, claims.tokenBudget)
+	if req.ReservedTokens > claims.tokenBudget || req.Tokens > claims.tokenBudget-req.ReservedTokens {
+		return fmt.Errorf("%w: %d requested with %d reserved against %d", ErrTokenBudget, req.Tokens, req.ReservedTokens, claims.tokenBudget)
 	}
 	return nil
 }

@@ -92,6 +92,33 @@ func TestVerifyReturnsTrustedClaims(t *testing.T) {
 	}
 }
 
+func TestAllowedModelsRoundTripWithoutDelimiterWidening(t *testing.T) {
+	store, _ := openTestCapabilityStore(t)
+	ctx := context.Background()
+	claims, err := NewClaims(ClaimsInput{
+		AgentType: "coder", Mode: "launch", RunID: "run-model-comma", WorkItemID: "wi-model-comma",
+		AllowedModels: []string{"provider/model,variant"}, CallBudget: 1, TokenBudget: 1,
+		Expiry: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("NewClaims: %v", err)
+	}
+	handle, err := store.Issue(ctx, claims)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	verified, _, err := store.Verify(ctx, handle)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !verified.AllowsModel("provider/model,variant") {
+		t.Fatal("stored model identifier did not round-trip")
+	}
+	if verified.AllowsModel("provider/model") || verified.AllowsModel("variant") {
+		t.Fatal("model serialization widened the allowed-model set")
+	}
+}
+
 func TestVerifyRejectsMalformedUnknownRevokedExpired(t *testing.T) {
 	store, _ := openTestCapabilityStore(t)
 	ctx := context.Background()

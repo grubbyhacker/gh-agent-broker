@@ -7,11 +7,11 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -52,6 +52,12 @@ type Store struct {
 	now  func() time.Time
 	eval PolicyEvaluator
 }
+
+var (
+	_ Issuer   = (*Store)(nil)
+	_ Verifier = (*Store)(nil)
+	_ Reserver = (*Store)(nil)
+)
 
 // Reservation is the running per-run accounting the store maintains atomically.
 type Reservation struct {
@@ -176,6 +182,10 @@ func (s *Store) Issue(ctx context.Context, claims Claims) (handle string, err er
 	}
 	handle = hex.EncodeToString(raw)
 	digest := hashHandle(handle)
+	modelsJSON, err := json.Marshal(claims.AllowedModels())
+	if err != nil {
+		return "", fmt.Errorf("encode capability allowed models: %w", err)
+	}
 	now := s.now().UTC()
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO capabilities
@@ -183,7 +193,7 @@ func (s *Store) Issue(ctx context.Context, claims Claims) (handle string, err er
 		  call_budget, token_budget, expiry, state, reserved_calls, reserved_tokens, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`,
 		digest, claims.agentType, string(claims.mode), claims.runID, claims.workItemID,
-		strings.Join(claims.AllowedModels(), ","), claims.callBudget, claims.tokenBudget,
+		string(modelsJSON), claims.callBudget, claims.tokenBudget,
 		formatStoreTime(claims.expiry), stateActive, formatStoreTime(now), formatStoreTime(now)); err != nil {
 		return "", fmt.Errorf("persist capability: %w", err)
 	}
@@ -321,9 +331,9 @@ func scanCapabilityTx(ctx context.Context, tx *sql.Tx, digest string) (capabilit
 	if err != nil {
 		return capabilityRow{}, err
 	}
-	var allowedModels []string
-	if models != "" {
-		allowedModels = strings.Split(models, ",")
+	allowedModels, err := decodeAllowedModels(models)
+	if err != nil {
+		return capabilityRow{}, err
 	}
 	claims, err := NewClaims(ClaimsInput{
 		AgentType:     agentType,
@@ -364,6 +374,14 @@ func digestOf(handle string) (string, error) {
 }
 
 func formatStoreTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+
+func decodeAllowedModels(value string) ([]string, error) {
+	var models []string
+	if err := json.Unmarshal([]byte(value), &models); err != nil {
+		return nil, fmt.Errorf("decode stored allowed_models: %w", err)
+	}
+	return models, nil
+}
 
 func parseStoreTime(value string) (time.Time, error) {
 	t, err := time.Parse(time.RFC3339Nano, value)
@@ -421,9 +439,9 @@ func (s *Store) Validate(ctx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
-		var allowedModels []string
-		if models != "" {
-			allowedModels = strings.Split(models, ",")
+		allowedModels, err := decodeAllowedModels(models)
+		if err != nil {
+			return fmt.Errorf("capability for run %s has invalid allowed_models: %w", runID, err)
 		}
 		if _, err := NewClaims(ClaimsInput{
 			AgentType: agentType, Mode: Mode(mode), RunID: runID, WorkItemID: workItemID,
