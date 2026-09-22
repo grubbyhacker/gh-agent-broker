@@ -8,6 +8,21 @@ audit:
 idempotency:
   state_path: "/var/log/gh-agent-broker/idempotency.json"
 
+# Authenticated run-to-PR correlation (opt-in). When store_path and a capability
+# API (url + token) are all set, pull.create REQUIRES a verified per-run
+# capability handle in the X-Agent-Capability header, records the correlation +
+# Signal Plane outbox event atomically after GitHub returns the PR number, and
+# fails closed on a missing/invalid/revoked/expired handle. Leave unset to keep
+# legacy pull.create behavior.
+#
+# capability_api_url is the broker's PRIVATE capability API base (the sandbox
+# broker that mounts /v1/capabilities/*). The token is deployment-owned, held
+# only by the broker, and never placed in a launched run.
+# correlation:
+#   store_path: "/var/log/gh-agent-broker/correlation.db"
+#   capability_api_url: "http://sandbox-broker:8080"
+#   capability_api_token_env: "GH_AGENT_CAPABILITY_API_TOKEN"
+
 github:
   api_base_url: "https://api.github.com"
   git_base_url: "https://github.com"
