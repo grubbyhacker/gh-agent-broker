@@ -36,6 +36,8 @@ func TestProductionDeploySecretExports(t *testing.T) {
 		"VPS_OPS_GH_BROKER_GH_AGENT_CODEX_PROXY_TOKEN",
 		"VPS_OPS_SIGNAL_PLANE_DISPATCHER_BROKER_TOKEN",
 		"VPS_OPS_SIGNAL_PLANE_TERMINAL_REPORTER_BROKER_TOKEN",
+		"VPS_OPS_GH_BROKER_RELEASE_PUBLISHER_OPERATOR_TOKEN",
+		"VPS_OPS_GH_BROKER_RELEASE_PROMOTER_OPERATOR_TOKEN",
 	} {
 		pattern := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(secretName) + `:\s*\$\{\{\s*secrets\.` + regexp.QuoteMeta(secretName) + `\s*\}\}\s*$`)
 		if !pattern.Match(workflow) {
@@ -57,6 +59,26 @@ func TestProductionDeployPreflightsDispatcherBrokerToken(t *testing.T) {
 	pattern := regexp.MustCompile(`(?m)^\s*` + secretName + `:\s*\$\{\{\s*secrets\.` + secretName + `\s*\}\}\s*$`)
 	if matches := pattern.FindAll(workflow, -1); len(matches) != 2 {
 		t.Fatalf("dispatcher broker token must be exported to preflight and deploy steps, got %d exports", len(matches))
+	}
+}
+
+func TestProductionDeployPreflightsReleaseOperatorTokens(t *testing.T) {
+	t.Parallel()
+
+	workflow, err := os.ReadFile("../../.github/workflows/deploy-production.yml")
+	if err != nil {
+		t.Fatalf("read production deploy workflow: %v", err)
+	}
+
+	//nolint:gosec // These are workflow variable names, not credential values.
+	for _, secretName := range []string{
+		"VPS_OPS_GH_BROKER_RELEASE_PUBLISHER_OPERATOR_TOKEN",
+		"VPS_OPS_GH_BROKER_RELEASE_PROMOTER_OPERATOR_TOKEN",
+	} {
+		pattern := regexp.MustCompile(`(?m)^\s*` + secretName + `:\s*\$\{\{\s*secrets\.` + secretName + `\s*\}\}\s*$`)
+		if matches := pattern.FindAll(workflow, -1); len(matches) != 2 {
+			t.Errorf("release operator token %s must be exported to preflight and deploy steps, got %d exports", secretName, len(matches))
+		}
 	}
 }
 
