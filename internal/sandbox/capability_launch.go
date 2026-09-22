@@ -25,19 +25,20 @@ type CapabilityMinter interface {
 }
 
 // SetCapabilityMinter wires the broker's capability store into the launch path.
-// When set, an AgentType-backed launch mints one opaque per-run capability whose
-// claims are derived only from the template's deployment-owned capability policy
-// and the broker-generated run identity, and injects the plaintext handle into
-// the launched run's controlled transport. It is optional: a broker configured
-// without a capability store launches non-AgentType templates unchanged.
+// When an AgentType-backed template opts in with a capability policy, the
+// authenticated profile launch freezes a distinct authoritative WorkItem ID,
+// derives the remaining claims from deployment-owned policy and broker-generated
+// run identity, and injects the plaintext handle into the launched run's
+// controlled transport. A broker without a capability store may launch only
+// templates that have not opted in.
 func (s *Service) SetCapabilityMinter(minter CapabilityMinter) {
 	s.capabilities = minter
 }
 
-// mintsCapability reports whether a launch of tmpl must mint a per-run
-// capability. Only AgentType-backed templates do; that is the sole launch shape
-// the design scopes, and validateTemplate guarantees such a template carries a
-// capability policy and that capability_store_path is configured.
+// mintsCapability reports whether a template has opted into per-run capability
+// minting. Legacy AgentType templates without a capability policy remain valid
+// and mint nothing; once a policy is declared, configuration and launch checks
+// require the store and an authoritative WorkItem ID and fail closed otherwise.
 func mintsCapability(tmpl Template) bool {
 	return tmpl.AgentType != "" && tmpl.Capability != nil
 }
