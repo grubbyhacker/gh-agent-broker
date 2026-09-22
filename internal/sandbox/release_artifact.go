@@ -19,7 +19,39 @@ import (
 
 const releasePublishProtocol = "docker-archive/v1"
 
-var dockerConfigPath = regexp.MustCompile(`^(?:[0-9a-f]{64}\.json|blobs/sha256/[0-9a-f]{64})$`)
+var (
+	dockerConfigPath = regexp.MustCompile(`^(?:[0-9a-f]{64}\.json|blobs/sha256/[0-9a-f]{64})$`)
+	sha256Digest     = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+)
+
+const (
+	ociIndexMediaType    = "application/vnd.oci.image.index.v1+json"
+	ociManifestMediaType = "application/vnd.oci.image.manifest.v1+json"
+)
+
+type ociPlatform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+}
+
+type ociDescriptor struct {
+	MediaType string      `json:"mediaType"`
+	Digest    string      `json:"digest"`
+	Size      int64       `json:"size"`
+	Platform  ociPlatform `json:"platform"`
+}
+
+type dockerArchiveIndex struct {
+	SchemaVersion int             `json:"schemaVersion"`
+	MediaType     string          `json:"mediaType"`
+	Manifests     []ociDescriptor `json:"manifests"`
+}
+
+type ociImageManifest struct {
+	SchemaVersion int           `json:"schemaVersion"`
+	MediaType     string        `json:"mediaType"`
+	Config        ociDescriptor `json:"config"`
+}
 
 type releaseArtifactImporter interface {
 	LoadImage(context.Context, io.Reader) error
@@ -74,7 +106,53 @@ func validateDockerArtifact(data []byte, expectedPlatform string) (string, error
 	if platform != expectedPlatform {
 		return "", fmt.Errorf("docker image platform %q does not match %q", platform, expectedPlatform)
 	}
-	return "sha256:" + configDigest, nil
+	legacyImageID := "sha256:" + configDigest
+	indexBytes, found, err := readDockerArchiveEntry(data, "index.json")
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return legacyImageID, nil
+	}
+	return validateBuildxImageIdentity(data, indexBytes, legacyImageID, expectedPlatform)
+}
+
+func validateBuildxImageIdentity(data, indexBytes []byte, configID, expectedPlatform string) (string, error) {
+	var index dockerArchiveIndex
+	if json.Unmarshal(indexBytes, &index) != nil || index.SchemaVersion != 2 ||
+		index.MediaType != ociIndexMediaType || len(index.Manifests) != 1 {
+		return "", fmt.Errorf("docker archive index must contain exactly one OCI image manifest")
+	}
+	descriptor := index.Manifests[0]
+	if descriptor.MediaType != ociManifestMediaType || !sha256Digest.MatchString(descriptor.Digest) {
+		return "", fmt.Errorf("docker archive index has invalid image manifest identity")
+	}
+	platform := strings.Trim(descriptor.Platform.OS+"/"+descriptor.Platform.Architecture, "/")
+	if platform != expectedPlatform {
+		return "", fmt.Errorf("docker archive index platform %q does not match %q", platform, expectedPlatform)
+	}
+	manifestName := "blobs/sha256/" + strings.TrimPrefix(descriptor.Digest, "sha256:")
+	manifestBytes, found, err := readDockerArchiveEntry(data, manifestName)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", fmt.Errorf("docker archive indexed image manifest is missing")
+	}
+	if descriptor.Size != int64(len(manifestBytes)) || digestBytes(manifestBytes) != descriptor.Digest {
+		return "", fmt.Errorf("docker archive indexed image manifest digest or size does not match")
+	}
+	var manifest ociImageManifest
+	if json.Unmarshal(manifestBytes, &manifest) != nil || manifest.SchemaVersion != 2 ||
+		manifest.MediaType != ociManifestMediaType || manifest.Config.Digest != configID {
+		return "", fmt.Errorf("docker archive indexed image manifest has invalid config identity")
+	}
+	return descriptor.Digest, nil
+}
+
+func digestBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func readDockerArchiveEntry(data []byte, target string) ([]byte, bool, error) {
