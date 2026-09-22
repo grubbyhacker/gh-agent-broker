@@ -13,7 +13,9 @@ import (
 )
 
 type restHandler struct {
-	service *Service
+	service      *Service
+	releases     ReleaseRegistry
+	promoterAuth PromoterAuthenticator
 }
 
 type operatorIdentity struct {
@@ -40,7 +42,16 @@ type restError struct {
 }
 
 func NewRESTHandler(service *Service) http.Handler {
-	return &restHandler{service: service}
+	return NewRESTHandlerWithReleaseRegistry(service, nil, nil)
+}
+
+// NewRESTHandlerWithReleaseRegistry adds the AgentRelease registry surface to
+// the sandbox REST API. A nil registry leaves release routes unavailable.
+func NewRESTHandlerWithReleaseRegistry(service *Service, registry ReleaseRegistry, authenticator PromoterAuthenticator) http.Handler {
+	if authenticator == nil {
+		authenticator = tokenPromoterAuthenticator{principals: service.cfg.OperatorPrincipals}
+	}
+	return &restHandler{service: service, releases: registry, promoterAuth: authenticator}
 }
 
 func (h *restHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +65,8 @@ func (h *restHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleRuns(w, r)
 	case strings.HasPrefix(path, "runs/"):
 		h.handleRunAction(w, r, strings.TrimPrefix(path, "runs/"))
+	case path == "releases" || strings.HasPrefix(path, "releases/"):
+		h.handleRelease(w, r, strings.TrimPrefix(path, "releases/"))
 	default:
 		writeRESTError(w, http.StatusNotFound, "not_found")
 	}

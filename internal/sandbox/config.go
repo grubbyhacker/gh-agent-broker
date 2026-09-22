@@ -811,7 +811,7 @@ func (c Config) validateOperatorPrincipal(name string, principal OperatorPrincip
 	if strings.TrimSpace(principal.Token) == "" {
 		errs = append(errs, fmt.Sprintf("operator principal %q token or token_env is required", name))
 	}
-	if len(principal.AllowedProfiles) == 0 {
+	if principalRequiresLaunchProfiles(principal.AllowedActions) && len(principal.AllowedProfiles) == 0 {
 		errs = append(errs, fmt.Sprintf("operator principal %q allowed_profiles must not be empty", name))
 	}
 	for _, profile := range principal.AllowedProfiles {
@@ -827,6 +827,9 @@ func (c Config) validateOperatorPrincipal(name string, principal OperatorPrincip
 			errs = append(errs, fmt.Sprintf("operator principal %q has unsupported action %q", name, action))
 		}
 	}
+	if contains(principal.AllowedActions, "release.promote") && hasLaunchAction(principal.AllowedActions) {
+		errs = append(errs, fmt.Sprintf("operator principal %q cannot combine release.promote with launch actions", name))
+	}
 	if principal.RunScope != "" && principal.RunScope != "owned" && principal.RunScope != "profile" {
 		errs = append(errs, fmt.Sprintf("operator principal %q run_scope must be owned or profile", name))
 	}
@@ -835,11 +838,25 @@ func (c Config) validateOperatorPrincipal(name string, principal OperatorPrincip
 
 func validOperatorAction(action string) bool {
 	switch action {
-	case "launch", "dry_run", "status", "logs", "artifacts", "terminal_result", "stop", "cleanup":
+	case "launch", "dry_run", "status", "logs", "artifacts", "terminal_result", "stop", "cleanup",
+		"release.publish", "release.verify", "release.acquire", "release.promote", "release.rollback":
 		return true
 	default:
 		return false
 	}
+}
+
+func hasLaunchAction(actions []string) bool {
+	return contains(actions, "launch") || contains(actions, "dry_run")
+}
+
+func principalRequiresLaunchProfiles(actions []string) bool {
+	for _, action := range actions {
+		if !strings.HasPrefix(action, "release.") {
+			return true
+		}
+	}
+	return false
 }
 
 func launchOverrideFieldAllowed(field string) bool {

@@ -297,3 +297,13 @@ launch authority, a new durable idempotency key for that wait generation, and
 an exact bounded `max_runtime_seconds` body. Preparation restarts without model
 issuance; delivery restarts from the sealed validated candidate without Codex,
 and reconciles an already-delivered candidate before retrying its exact lease.
+
+AgentRelease promotion is exposed at `/v1/releases` with the action-scoped
+operator vocabulary `release.publish`, `release.verify`, `release.acquire`,
+`release.promote`, and `release.rollback`. A `PromoterAuthenticator` verifies
+the request into a credential-free `VerifiedPromoter` before the handler checks
+the action and calls the registry, so a future OIDC verifier replaces only that
+authentication implementation. The configured-token implementation records the
+principal name as every registry audit actor. Configuration rejects a principal
+that combines `release.promote` with `launch` or `dry_run`; rollback remains a
+separate explicit action. `make check` passed locally.

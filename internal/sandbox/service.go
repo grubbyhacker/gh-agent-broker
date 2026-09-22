@@ -1846,8 +1846,33 @@ func (s *Service) auditTerminalEvent(meta RunMetadata, reason, source string, er
 func (s *Service) auditFinalizeFailure(runID, reason, source string, err error) {
 	meta, lookupErr := s.lookupRun(runID)
 	if lookupErr != nil {
-		log.Printf(`{"event":"run_finalized","job_id":%q,"success":false,"finalize_reason":%q,"terminal_source":%q,"error":%q}`,
-			runID, reason, source, err.Error())
+		// The run metadata is unavailable, so this cannot go through the audit
+		// logger. Encode the record with encoding/json instead of formatting JSON
+		// by hand: every value here reaches this path from request-controlled
+		// input, and interpolating untrusted strings into a hand-built JSON line
+		// is a log-injection vector -- a crafted identifier could forge a
+		// separate log record.
+		record := struct {
+			Event          string `json:"event"`
+			JobID          string `json:"job_id"`
+			Success        bool   `json:"success"`
+			FinalizeReason string `json:"finalize_reason"`
+			TerminalSource string `json:"terminal_source"`
+			Error          string `json:"error"`
+		}{
+			Event:          "run_finalized",
+			JobID:          runID,
+			Success:        false,
+			FinalizeReason: reason,
+			TerminalSource: source,
+			Error:          err.Error(),
+		}
+		encoded, marshalErr := json.Marshal(record)
+		if marshalErr != nil {
+			log.Print(`{"event":"run_finalized","success":false,"error":"finalize failure could not be encoded"}`)
+			return
+		}
+		log.Print(string(encoded))
 		return
 	}
 	ev := s.auditEvent("run_finalized", meta, "deny", err)
