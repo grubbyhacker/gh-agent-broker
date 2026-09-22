@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"gh-agent-broker/internal/codexauth"
+	"gh-agent-broker/internal/release"
 	"gh-agent-broker/internal/sandbox"
 	"gh-agent-broker/internal/server"
 
@@ -100,7 +101,11 @@ func runServerCommand(args []string) {
 			log.Printf("close durable launch intent store: %v", err)
 		}
 	}()
-	service := sandbox.NewServiceWithLaunchIntents(cfg, sandbox.NewDockerBackend(*dockerSocket), auditLog, intentStore)
+	backend := sandbox.NewDockerBackend(*dockerSocket)
+	service := sandbox.NewServiceWithLaunchIntents(cfg, backend, auditLog, intentStore)
+	if cfg.ReleaseStore != "" {
+		reconcileAgentReleases(context.Background(), cfg.ReleaseStore, backend)
+	}
 	if cfg.CodexHolder.MasterAuthPath != "" {
 		holder, holderErr := codexauth.New(codexauth.Config{
 			MasterAuthPath: cfg.CodexHolder.MasterAuthPath,
@@ -417,4 +422,42 @@ func tokenAuth(token string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// reconcileAgentReleases re-checks every active AgentRelease against local image
+// availability at startup.
+//
+// The release registry is durable and backed up; Docker image state is not. So a
+// host recovery, an image prune, or a state restore can leave an active release
+// pointing at an image that is not present. Reconciliation marks those releases
+// unavailable so resolution fails closed rather than attempting a launch, and
+// reports them so they can be reacquired by digest.
+//
+// Startup does not abort on a missing image: the service has other duties, and
+// refusing the affected launches is the correct blast radius. A missing image is
+// logged loudly instead.
+func reconcileAgentReleases(ctx context.Context, storePath string, backend *sandbox.DockerBackend) {
+	store, err := release.Open(ctx, storePath)
+	if err != nil {
+		log.Fatalf("open agent release registry: %v", err)
+	}
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			log.Printf("close agent release registry: %v", closeErr)
+		}
+	}()
+
+	missing, err := store.Reconcile(ctx, backend.ImageAvailable, "sandbox-broker-startup")
+	if err != nil {
+		log.Printf("reconcile agent releases: %v", err)
+		return
+	}
+	for _, item := range missing {
+		log.Printf(
+			"agent release image unavailable: agent_type=%s generation=%d digest=%s reference=%s; launches for this agent type will fail closed until it is reacquired",
+			item.AgentType, item.Generation, item.ImageDigest, item.ImageReference)
+	}
+	if len(missing) == 0 {
+		log.Printf("agent release registry reconciled: all active releases are locally available")
+	}
 }

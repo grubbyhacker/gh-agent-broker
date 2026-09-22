@@ -580,6 +580,34 @@ func (d *DockerBackend) MakeRemovable(ctx context.Context, image, path string) e
 	}
 }
 
+// ImageAvailable reports whether the image is present locally AND carries the
+// expected digest. The reference alone is not sufficient: a tag can point at a
+// different digest than the one a release pins, and the sandbox launches an
+// already-present image rather than pulling. A missing image is a negative
+// answer, not an error; a transport failure is an error, so a Docker hiccup is
+// never mistaken for absence.
+func (d *DockerBackend) ImageAvailable(ctx context.Context, reference, digest string) (bool, error) {
+	var out struct {
+		ID          string   `json:"Id"`
+		RepoDigests []string `json:"RepoDigests"`
+	}
+	if err := d.doJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(reference)+"/json", nil, &out); err != nil {
+		if status, ok := DockerStatusCode(err); ok && status == http.StatusNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	if digest == "" {
+		return out.ID != "", nil
+	}
+	for _, repoDigest := range out.RepoDigests {
+		if repoDigest == digest || strings.HasSuffix(repoDigest, "@"+digest) {
+			return true, nil
+		}
+	}
+	return out.ID == digest, nil
+}
+
 func (d *DockerBackend) imageIdentity(ctx context.Context, image string) (string, string, error) {
 	var out struct {
 		ID           string   `json:"Id"`
