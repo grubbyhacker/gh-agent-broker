@@ -2,6 +2,27 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
+The broker ships an INERT run-to-PR correlation outbox foundation
+(`internal/correlation`) — durable machinery only, wired into NO live path.
+Semantic review established the reason: today's authenticated `pull.create`
+carries no run capability. `principal.ID` + a broker operation id +
+caller-supplied metadata cannot establish the design's originating
+WorkItem/AgentType correlation, and caller metadata is not authority, so wiring
+the store to that handler would invent authority the broker does not hold. There
+is therefore no `RunCorrelationConfig`, no Server field, and no pull.create
+recording — those were removed.
+
+What remains is the store: schema, an atomic correlation+outbox transaction,
+idempotency on the broker operation id, a bounded versioned payload
+(`run-pr-correlation/v2`), and a claim/ack/expiry-reclaim reader API, plus the
+offline `cmd/correlation-validate`. `Identity` now REQUIRES the broker-
+authenticated capability fields a future Stage 4 will supply: `agent_type`,
+`mode`, `run_id`, `work_item_id`, and the broker `operation_id`, plus the
+repo + PR number GitHub returns. `Record` fails closed if any capability field
+is empty — there is no caller-metadata path and nothing emits events until Stage
+4 supplies a verified capability. This foundation is NOT the design complete; it
+is scaffolding awaiting Stage 4 capability wiring. `make check` is the gate.
+
 The AgentRelease publish boundary gives external callers `release.publish` only:
 the former public verify/acquire routes and actions are gone. Trusted protected-main
 CI submits a bounded `docker-archive/v1` artifact and provenance. Broker code derives
