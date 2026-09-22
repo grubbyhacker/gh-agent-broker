@@ -98,6 +98,10 @@ func main() {
 		cmdActionsRunJobs(os.Args[2:])
 	case "comment":
 		cmdComment(os.Args[2:])
+	case "release-publish":
+		cmdReleasePublish(os.Args[2:])
+	case "release-promote":
+		cmdReleasePromote(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -105,7 +109,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|reload|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|ci-observation|actions-job-log|actions-run-jobs|dismiss-review|resolve-review-thread|add-label|remove-label|issues|issue|issue-comments|commit-status|check-runs|comment> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gh-agent-broker-cli <health|config-check|reload|configure|whoami|probe|dry-run|pr|pulls|pull|pull-files|pull-comments|pull-reviews|pull-review-comments|pull-review-threads|ci-observation|actions-job-log|actions-run-jobs|dismiss-review|resolve-review-thread|add-label|remove-label|issues|issue|issue-comments|commit-status|check-runs|comment|release-publish|release-promote> [flags]")
 }
 
 func commonFlags(fs *flag.FlagSet) (broker, agentID, secret *string) {

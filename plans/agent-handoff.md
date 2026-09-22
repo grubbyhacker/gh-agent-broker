@@ -19,6 +19,16 @@ The branch also JSON-encodes the request-tainted fallback finalization log recor
 fixing CI's real G706 log-injection finding rather than suppressing it. `make check` is
 the delivery gate.
 
+`gh-agent-broker-cli` now exposes the merged release API deterministically for
+protected-main CI: `release-publish` uploads a single-image Docker archive plus
+`{agent_type, provenance}` over the `docker-archive/v1` multipart protocol and
+prints the broker-assigned `generation`/`ready`/`state` (also to `$GITHUB_OUTPUT`),
+and `release-promote` promotes a positive generation only. Publisher and promoter
+use distinct token flags/env (`BROKER_PUBLISHER_TOKEN` / `BROKER_PROMOTER_TOKEN`)
+sent as bearer tokens, never logged. Rollback stays a separate operation and is
+deliberately absent from the promoter command. HTTP contract tests live in
+`cmd/gh-agent-broker/release_test.go`.
+
 # Agent handoff
 
 The durable architectural invariant is: **“The broker owns durable side
