@@ -19,7 +19,7 @@ import (
 
 const releasePublishProtocol = "docker-archive/v1"
 
-var dockerConfigPath = regexp.MustCompile(`^[0-9a-f]{64}\.json$`)
+var dockerConfigPath = regexp.MustCompile(`^(?:[0-9a-f]{64}\.json|blobs/sha256/[0-9a-f]{64})$`)
 
 type releaseArtifactImporter interface {
 	LoadImage(context.Context, io.Reader) error
@@ -86,7 +86,8 @@ func validateDockerArtifact(data []byte, expectedPlatform string) (string, error
 	if !ok {
 		return "", fmt.Errorf("docker archive config is missing")
 	}
-	configDigest := strings.TrimSuffix(manifest.Config, ".json")
+	configDigest := strings.TrimPrefix(manifest.Config, "blobs/sha256/")
+	configDigest = strings.TrimSuffix(configDigest, ".json")
 	sum := sha256.Sum256(configBytes)
 	if hex.EncodeToString(sum[:]) != configDigest {
 		return "", fmt.Errorf("docker archive config digest does not match its filename")
