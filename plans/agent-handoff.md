@@ -2,6 +2,57 @@
 > `AGENTS.md` requires be kept current before handing off; treat it as the most
 > recent state-of-the-work note, not as a forward plan.
 
+Launch-time minting is now WIRED, and it is OPT-IN per template. The sandbox
+`Service` holds an optional `CapabilityMinter` (`SetCapabilityMinter`, satisfied
+by `*capability.Store`); `cmd/sandbox-broker` wires the same store it already
+opens for the private REST API. A template opts in by declaring a `capability:`
+block (`CapabilityPolicy`) alongside its `agent_type`. A LEGACY pre-WorkItem
+AgentType template with no `capability:` block launches exactly as before and
+mints nothing — no WorkItem is fabricated. `deriveCapabilityClaims`
+(`internal/sandbox/capability_launch.go`) derives ONE per-run capability's claims
+strictly from deployment-owned policy plus broker-frozen run/work identity:
+agent_type/mode/allowed_models/call_budget/token_budget from the `capability:`
+block (deployment-owned), run_id from the broker's `newRunID()`, expiry from the
+broker-computed run deadline.
+
+TRUST BOUNDARY for the WorkItem identity: `work_item_id` is the authoritative
+Signal Plane WorkItem identity, a DISTINCT durable identity that is NEVER equated
+with run_id. It is accepted ONLY at the authenticated control-plane launch — the
+operator-token-authenticated `POST /v1/launch-profiles/{name}/launch` handler —
+as the deployment-declared `work_item_id` profile parameter, and is frozen onto
+`RunMetadata.WorkItemID` before minting. It is carried on `LaunchAgentInput` as a
+server-set field (`json:"-"`), and the unauthenticated `launch_agent` MCP tool
+cannot set it (its `UnmarshalJSON` rejects unknown keys). Derivation reads
+`meta.WorkItemID` and fails CLOSED if it is empty or equal to run_id.
+
+Because only the authenticated profile path supplies a WorkItemID, minting is
+effectively STAGED to that path: an opt-in template launched via the direct
+`launchAgent` (no profile, no authoritative WorkItemID) is refused before any
+container is created rather than widening trust. Config-load enforces that a
+`capability:` block requires `agent_type` and a configured `capability_store_path`
+and is coherent; a launch of an opt-in template with a missing WorkItemID or an
+unwired minter is denied at launch. `Store.Issue` mints the opaque 256-bit handle;
+only its SHA-256 is stored. The PLAINTEXT handle is injected solely into the
+launched container's env transport as `AGENT_CAPABILITY_TOKEN` (added to the run's
+`Redactor`), and is never written to RunMetadata, the audit log, run status, or
+disk. mode and the whole policy are deployment-owned. The model-disabled state
+(`model_access: false` ⇒ empty models + zero budgets, e.g. youknowme-curator
+reconcile) is preserved through `NewClaims`. On container create/start failure
+(both the direct and durable paths) the minted capability is Revoked best-effort;
+a resume/reconcile of an already-created container neither re-mints nor re-injects,
+since the plaintext is transport-only.
+
+The DOWNSTREAM TRANSPORT CONTRACT a consumer must honor: the run receives its
+opaque handle in the container environment variable `AGENT_CAPABILITY_TOKEN`
+(64 lowercase hex chars). A consumer presents it to the broker's private
+capability API (`POST /v1/capabilities/{verify,reserve}`) to obtain trusted
+server-side claims and reserve model budget; it must NOT trust any
+caller-asserted run_id/claims. STILL OUT OF SCOPE (unchanged this slice): the
+Codex issue-workflow multi-phase launch (`codex_workflow.go`) does not yet inject
+a capability — its runtimeSpec calls pass an empty handle; gh-agent-proxy, GitHub
+operations, and the correlation outbox are untouched; no model-proxy consumer
+verifies the handle yet; no production config or deploy. `make check` is the gate.
+
 Buildx Docker archives carry an OCI `index.json`; Docker exposes the index's
 single OCI manifest digest as the loaded image ID rather than the config digest.
 AgentRelease validation now verifies the complete index→manifest→config

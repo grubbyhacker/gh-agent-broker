@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"gh-agent-broker/internal/capability"
 	"gh-agent-broker/internal/release"
 )
 
@@ -61,6 +62,24 @@ func launchWorker(ctx context.Context, t *testing.T, service *Service) LaunchAge
 		t.Fatalf("LaunchAgent() error = %v", err)
 	}
 	return out
+}
+
+// newTestCapabilityStore opens a real capability store for launch-path tests and
+// wires it into the service as the minter, so an AgentType-backed launch mints a
+// per-run capability instead of failing closed on a missing store.
+func newTestCapabilityStore(t *testing.T, service *Service) *capability.Store {
+	t.Helper()
+	store, err := capability.OpenStore(context.Background(), filepath.Join(t.TempDir(), "capability.sqlite"))
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	t.Cleanup(func() {
+		if cerr := store.Close(); cerr != nil {
+			t.Errorf("close capability store: %v", cerr)
+		}
+	})
+	service.SetCapabilityMinter(store)
+	return store
 }
 
 func lookupTestRun(t *testing.T, service *Service, runID string) RunMetadata {
@@ -146,7 +165,8 @@ func TestConfigValidateRejectsAgentTypeWithoutReleaseStore(t *testing.T) {
 		t.Fatalf("Validate() error = %v, want release_store_path requirement", err)
 	}
 
-	// With release_store_path set, the same template validates.
+	// With release_store_path set, a legacy AgentType template (no capability
+	// policy, minting opt-out) validates.
 	cfg.ReleaseStore = "/srv/releases.sqlite"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() with release_store_path set error = %v", err)

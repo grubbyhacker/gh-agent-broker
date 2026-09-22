@@ -797,6 +797,7 @@ type fakeRuntime struct {
 	importImageErr    error
 	importedImageID   string
 	importedPlatform  string
+	createErr         error
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -833,6 +834,9 @@ func (f *fakeRuntime) Create(ctx context.Context, spec RuntimeSpec) (ContainerIn
 	_ = ctx
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.createErr != nil {
+		return ContainerInfo{}, f.createErr
+	}
 	for _, existing := range f.specs {
 		if existing.RunID == spec.RunID {
 			containerID := "container-" + spec.RunID
