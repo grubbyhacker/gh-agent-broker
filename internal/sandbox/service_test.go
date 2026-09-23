@@ -1072,7 +1072,8 @@ func TestLaunchAgentWritesDeclaredWorkItemInput(t *testing.T) {
 
 	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
 		Template: "worker", Repo: "owner/repo", BaseBranch: "main",
-		Task: `{"schema_version":"1","run_id":"${SANDBOX_RUN_ID}","mode":"process_intake","enabled_actions":["plan_uploads"]}`,
+		Task:       `{"schema_version":"1","run_id":"${SANDBOX_RUN_ID}","mode":"process_intake","enabled_actions":["plan_uploads"]}`,
+		Parameters: map[string]any{"work_item_id": "work-123", "upload_ids": []any{"upl_123"}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1089,6 +1090,13 @@ func TestLaunchAgentWritesDeclaredWorkItemInput(t *testing.T) {
 	}
 	if workItem["run_id"] != out.RunID || workItem["mode"] != "process_intake" {
 		t.Fatalf("work item = %#v", workItem)
+	}
+	uploadIDs, ok := workItem["upload_ids"].([]any)
+	if !ok || len(uploadIDs) != 1 || uploadIDs[0] != "upl_123" {
+		t.Fatalf("work item upload_ids = %#v", workItem["upload_ids"])
+	}
+	if _, exists := workItem["work_item_id"]; exists {
+		t.Fatalf("authoritative identity parameter leaked into worker task: %#v", workItem)
 	}
 }
 
