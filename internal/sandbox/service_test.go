@@ -1056,3 +1056,48 @@ func (f *fakeRuntime) stopContainerLocked(containerID string) {
 	}
 	f.closeWaiterLocked(containerID)
 }
+
+func TestLaunchAgentWritesDeclaredWorkItemInput(t *testing.T) {
+	cfg := baseTestConfig(t)
+	tmpl := cfg.Templates["worker"]
+	tmpl.WorkItemInputPath = "/input/work-item.json"
+	cfg.Templates["worker"] = tmpl
+	auditLog := testAudit(t)
+	defer closeTestAudit(t, auditLog)
+	service := NewService(cfg, newFakeRuntime(), auditLog)
+
+	out, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
+		Template: "worker", Repo: "owner/repo", BaseBranch: "main",
+		Task: `{"schema_version":"1","run_id":"${SANDBOX_RUN_ID}","mode":"process_intake","enabled_actions":["plan_uploads"]}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(cfg.RunsDir, out.RunID, "input", "work-item.json")
+	var workItem map[string]any
+	//nolint:gosec // test reads broker-generated input under the test run directory.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &workItem); err != nil {
+		t.Fatal(err)
+	}
+	if workItem["run_id"] != out.RunID || workItem["mode"] != "process_intake" {
+		t.Fatalf("work item = %#v", workItem)
+	}
+}
+
+func TestLaunchAgentRejectsMalformedDeclaredWorkItemInput(t *testing.T) {
+	cfg := baseTestConfig(t)
+	tmpl := cfg.Templates["worker"]
+	tmpl.WorkItemInputPath = "/input/work-item.json"
+	cfg.Templates["worker"] = tmpl
+	service := NewService(cfg, newFakeRuntime(), testAudit(t))
+	_, err := service.LaunchAgent(context.Background(), LaunchAgentInput{
+		Template: "worker", Repo: "owner/repo", BaseBranch: "main", Task: `{"mode":"process_intake"}`,
+	})
+	if err == nil || !strings.Contains(err.Error(), "run_id") {
+		t.Fatalf("error = %v", err)
+	}
+}

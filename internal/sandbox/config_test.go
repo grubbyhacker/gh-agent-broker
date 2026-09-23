@@ -554,3 +554,18 @@ func TestConfigValidateAcceptsCoherentCapabilityPolicies(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigValidateWorkItemInputPath(t *testing.T) {
+	cfg := baseTestConfig(t)
+	tmpl := cfg.Templates["worker"]
+	tmpl.WorkItemInputPath = "/input/work-item.json"
+	cfg.Templates["worker"] = tmpl
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid work item input path rejected: %v", err)
+	}
+	tmpl.WorkItemInputPath = "/input/arbitrary.json"
+	cfg.Templates["worker"] = tmpl
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "work_item_input_path") {
+		t.Fatalf("invalid work item input path error = %v", err)
+	}
+}

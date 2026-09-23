@@ -128,6 +128,7 @@ type Template struct {
 	Environment          map[string]string `yaml:"environment"`
 	ExtraMounts          []ExtraMount      `yaml:"extra_mounts"`
 	CompletionStatusPath string            `yaml:"completion_status_path"`
+	WorkItemInputPath    string            `yaml:"work_item_input_path"`
 	StorageLimitMB       int64             `yaml:"storage_limit_mb"`
 	Tmpfs                map[string]int64  `yaml:"tmpfs"`
 	Capability           *CapabilityPolicy `yaml:"capability"`
@@ -547,6 +548,9 @@ func (c Config) validateTemplate(name string, tmpl Template) []string {
 	}
 	if tmpl.CompletionStatusPath != "" {
 		errs = append(errs, validateCompletionStatusPath(name, tmpl)...)
+	}
+	if tmpl.WorkItemInputPath != "" && tmpl.WorkItemInputPath != "/input/work-item.json" {
+		errs = append(errs, fmt.Sprintf("template %q work_item_input_path must be /input/work-item.json", name))
 	}
 	if tmpl.StorageLimitMB < 0 {
 		errs = append(errs, fmt.Sprintf("template %q storage_limit_mb must not be negative", name))
