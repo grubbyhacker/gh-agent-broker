@@ -35,6 +35,7 @@ type RuntimeBackend interface {
 type RuntimeSpec struct {
 	RunID          string
 	Image          string
+	Entrypoint     []string
 	Command        []string
 	User           string
 	Env            map[string]string
@@ -119,6 +120,7 @@ func (d *DockerBackend) Create(ctx context.Context, spec RuntimeSpec) (Container
 	}
 	reqBody := dockerCreateRequest{
 		Image:      spec.Image,
+		Entrypoint: spec.Entrypoint,
 		Cmd:        spec.Command,
 		User:       spec.User,
 		Env:        envList(spec.Env),

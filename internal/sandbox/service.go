@@ -312,6 +312,7 @@ type LaunchPreviewOutput struct {
 
 type TemplatePreview struct {
 	Image            string    `json:"image"`
+	Entrypoint       []string  `json:"entrypoint,omitempty"`
 	Command          []string  `json:"command,omitempty"`
 	User             string    `json:"user"`
 	NetworkPolicy    string    `json:"network_policy"`
@@ -621,6 +622,7 @@ func (s *Service) PreviewLaunch(ctx context.Context, in LaunchAgentInput) (Launc
 		TaskContract:   contract,
 		Template: TemplatePreview{
 			Image:            tmpl.Image,
+			Entrypoint:       append([]string(nil), tmpl.Entrypoint...),
 			Command:          append([]string(nil), tmpl.Command...),
 			User:             tmpl.User,
 			NetworkPolicy:    tmpl.NetworkPolicy,
@@ -1651,6 +1653,7 @@ func (s *Service) runtimeSpec(meta RunMetadata, tmpl Template, capabilityHandle 
 	spec := RuntimeSpec{
 		RunID:          meta.RunID,
 		Image:          effectiveImage,
+		Entrypoint:     tmpl.Entrypoint,
 		Command:        tmpl.Command,
 		User:           tmpl.User,
 		Env:            env,

@@ -37,6 +37,9 @@ func TestLaunchAgentBuildsSandboxedRuntimeSpec(t *testing.T) {
 		t.Fatalf("generated branch = %q", out.Branch)
 	}
 	spec := runtime.lastSpec()
+	if strings.Join(spec.Entrypoint, " ") != "/bin/sh -ceu" {
+		t.Fatalf("runtime entrypoint = %q", spec.Entrypoint)
+	}
 	if spec.User == "" || spec.User == "root" || spec.User == "0" {
 		t.Fatalf("runtime user = %q", spec.User)
 	}
@@ -709,6 +712,7 @@ func baseTestConfig(t *testing.T) Config {
 func testTemplate(image string) Template {
 	return Template{
 		Image:             image,
+		Entrypoint:        []string{"/bin/sh", "-ceu"},
 		Command:           []string{"/usr/local/bin/worker", "--run"},
 		User:              "10000:10000",
 		NetworkPolicy:     "sandbox",

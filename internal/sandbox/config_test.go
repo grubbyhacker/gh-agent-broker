@@ -569,3 +569,14 @@ func TestConfigValidateWorkItemInputPath(t *testing.T) {
 		t.Fatalf("invalid work item input path error = %v", err)
 	}
 }
+
+func TestConfigVersionIncludesTemplateEntrypoint(t *testing.T) {
+	cfg := baseTestConfig(t)
+	before := cfg.versionDigest()
+	tmpl := cfg.Templates["worker"]
+	tmpl.Entrypoint = []string{"/usr/bin/env", "sh"}
+	cfg.Templates["worker"] = tmpl
+	if after := cfg.versionDigest(); after == before {
+		t.Fatal("template entrypoint change did not alter config version")
+	}
+}
