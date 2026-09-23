@@ -1756,6 +1756,21 @@ func (s *Service) writeTaskInputs(meta RunMetadata) error {
 	if err := writeJSONFile(filepath.Join(inputDir, "task.json"), contract, 0o644); err != nil {
 		return err
 	}
+	tmpl := s.cfg.Templates[meta.Template]
+	if tmpl.WorkItemInputPath != "" {
+		raw := strings.ReplaceAll(strings.TrimSpace(meta.Task), "${SANDBOX_RUN_ID}", meta.RunID)
+		var workItem map[string]any
+		if err := json.Unmarshal([]byte(raw), &workItem); err != nil {
+			return fmt.Errorf("policy denial: template %q work item task must be a JSON object: %w", meta.Template, err)
+		}
+		runID, ok := workItem["run_id"].(string)
+		if !ok || runID != meta.RunID {
+			return fmt.Errorf("policy denial: template %q work item run_id must resolve to the broker run id", meta.Template)
+		}
+		if err := writeJSONFile(filepath.Join(inputDir, filepath.Base(tmpl.WorkItemInputPath)), workItem, 0o644); err != nil {
+			return err
+		}
+	}
 	//nolint:gosec // G306: task inputs are mounted read-only and must be readable by the non-root worker.
 	if err := os.WriteFile(filepath.Join(inputDir, "task.md"), []byte(strings.TrimSpace(meta.Task)+"\n"), 0o644); err != nil {
 		return err
