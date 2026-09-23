@@ -1770,6 +1770,11 @@ func (s *Service) writeTaskInputs(meta RunMetadata) error {
 		if !ok || runID != meta.RunID {
 			return fmt.Errorf("policy denial: template %q work item run_id must resolve to the broker run id", meta.Template)
 		}
+		for name, value := range meta.Parameters {
+			if name != "work_item_id" {
+				workItem[name] = value
+			}
+		}
 		if err := writeJSONFile(filepath.Join(inputDir, filepath.Base(tmpl.WorkItemInputPath)), workItem, 0o644); err != nil {
 			return err
 		}
