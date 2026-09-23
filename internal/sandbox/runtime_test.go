@@ -32,6 +32,7 @@ func TestDockerCreateAppliesTmpfsStorageAndPrivateNetworkContract(t *testing.T) 
 	})}}
 	info, err := backend.Create(context.Background(), RuntimeSpec{
 		RunID: "run-exec", Image: "worker@sha256:digest", User: "1000:1000",
+		Entrypoint: []string{"/bin/sh", "-ceu"}, Command: []string{"exec curator run"},
 		Network: NetworkPolicy{
 			Network: "codex-execution-internal", PrivateBroker: true,
 			CodexRelay: true,
@@ -43,6 +44,10 @@ func TestDockerCreateAppliesTmpfsStorageAndPrivateNetworkContract(t *testing.T) 
 	}
 	if info.ImageDigest != "worker@sha256:digest" || info.Platform != "linux/amd64" {
 		t.Fatalf("image identity=%+v", info)
+	}
+	if strings.Join(create.Entrypoint, " ") != "/bin/sh -ceu" ||
+		strings.Join(create.Cmd, " ") != "exec curator run" {
+		t.Fatalf("container process entrypoint=%q command=%q", create.Entrypoint, create.Cmd)
 	}
 	if create.HostConfig.NetworkMode != "codex-execution-internal" ||
 		create.HostConfig.Tmpfs["/dev/shm"] != "rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=1000,gid=1000" ||

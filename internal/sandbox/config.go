@@ -113,6 +113,7 @@ type CredentialBundle struct {
 type Template struct {
 	Image                string            `yaml:"image"`
 	AgentType            string            `yaml:"agent_type"`
+	Entrypoint           []string          `yaml:"entrypoint"`
 	Command              []string          `yaml:"command"`
 	User                 string            `yaml:"user"`
 	Resources            Resources         `yaml:"resources"`
@@ -1138,6 +1139,7 @@ func (c Config) versionDigest() string {
 	for name, tmpl := range c.Templates {
 		templates[name] = map[string]any{
 			"image":               tmpl.Image,
+			"entrypoint":          tmpl.Entrypoint,
 			"command":             tmpl.Command,
 			"user":                tmpl.User,
 			"resources":           tmpl.Resources,
