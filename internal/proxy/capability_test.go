@@ -70,7 +70,7 @@ func newCapFixture(t *testing.T, upstreamHandler http.HandlerFunc) *capTestFixtu
 		UpstreamKey:        "upstream-secret",
 		CodexUpstreamKey:   "codex-upstream-secret",
 		AllowedModels:      []string{"gpt-test"},
-		CodexAllowedModels: []CodexModelConfig{{Name: "ykm-codex-haiku", UpstreamModel: "anthropic/claude-haiku-4.5"}, {Name: "ykm-codex-sonnet", UpstreamModel: "anthropic/claude-sonnet-4.5"}},
+		CodexAllowedModels: []CodexModelConfig{{Name: "ykm-codex-haiku", UpstreamModel: "anthropic/claude-haiku-4.5", MaxOutputTokens: 50}, {Name: "ykm-codex-sonnet", UpstreamModel: "anthropic/claude-sonnet-4.5", MaxOutputTokens: 50}},
 		StatePath:          filepath.Join(dir, "state.json"),
 		AuditPath:          auditP,
 		MaxCallsPerRun:     999, // legacy local budget must be unused under enforcement
@@ -474,18 +474,32 @@ func TestModelCallCapabilityTokenBudgetDeniedBeforeUpstream(t *testing.T) {
 	}
 }
 
-func TestCodexCapabilityRequiresMaxOutputTokensBeforeUpstream(t *testing.T) {
-	called := false
+func TestCodexCapabilityAppliesServerOutputCeilingBeforeUpstream(t *testing.T) {
+	var upstream struct {
+		Model           string `json:"model"`
+		MaxOutputTokens int    `json:"max_output_tokens"`
+	}
 	f := newCapFixture(t, func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		writeProxyTestJSON(t, w, map[string]string{"unexpected": "upstream call"})
+		decodeJSONBody(t, r, &upstream)
+		writeProxyTestJSON(t, w, map[string]interface{}{
+			"id": "resp-default-cap", "object": "response", "model": upstream.Model,
+			"usage": map[string]int{"total_tokens": 7},
+		})
 	})
-	handle := f.issueEnabled(t, "run-codex", "wi-1", 1, 100, time.Now().Add(time.Hour), "ykm-codex-haiku")
-	resp := codexResponseWithHandle(f.svc, handle, `{"model":"ykm-codex-haiku","input":"x"}`, "")
-	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "max_output_tokens_required") {
+	handle := f.issueEnabled(t, "run-codex", "wi-1", 1, 1000, time.Now().Add(time.Hour), "ykm-codex-haiku")
+	requestBody := `{"model":"ykm-codex-haiku","input":"x"}`
+	resp := codexResponseWithHandle(f.svc, handle, requestBody, "")
+	if resp.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
 	}
-	if called {
-		t.Fatal("upstream called without a pre-reserved Responses output cap")
+	if upstream.Model != "anthropic/claude-haiku-4.5" || upstream.MaxOutputTokens != 50 {
+		t.Fatalf("upstream request = %+v", upstream)
+	}
+	_, reservation, err := f.store.Verify(context.Background(), handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reservation.Calls != 1 || reservation.Tokens <= 50 {
+		t.Fatalf("reservation = %+v, want one call and request bytes plus 50 output tokens", reservation)
 	}
 }

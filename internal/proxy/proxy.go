@@ -55,8 +55,9 @@ type Config struct {
 }
 
 type CodexModelConfig struct {
-	Name          string `yaml:"name"`
-	UpstreamModel string `yaml:"upstream_model"`
+	Name            string `yaml:"name"`
+	UpstreamModel   string `yaml:"upstream_model"`
+	MaxOutputTokens int    `yaml:"max_output_tokens"`
 }
 
 func (m *CodexModelConfig) UnmarshalYAML(value *yaml.Node) error {
@@ -223,6 +224,9 @@ func (c Config) Validate() error {
 			}
 			if strings.TrimSpace(model.UpstreamModel) == "" {
 				errs = append(errs, fmt.Sprintf("codex_allowed_models[%d].upstream_model is required", i))
+			}
+			if c.capabilityEnabled() && model.MaxOutputTokens < 1 {
+				errs = append(errs, fmt.Sprintf("codex_allowed_models[%d].max_output_tokens must be positive when capability enforcement is enabled", i))
 			}
 		}
 	}
@@ -552,19 +556,23 @@ func (s *Service) handleCodexResponsesCapability(w http.ResponseWriter, r *http.
 	// Map the alias to the upstream model. The alias (in.Model) is what the
 	// capability grants; the allowed-model enforcement below is against the
 	// alias, not the upstream id.
-	upstreamModel, err := s.codexUpstreamModel(in.Model)
+	modelPolicy, err := s.codexModel(in.Model)
 	if err != nil {
 		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: "model_denied"})
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "capability_denied"})
 		return
 	}
-	body, err = rewriteJSONModel(body, upstreamModel)
+	effectiveMaxOutputTokens := in.MaxOutputTokens
+	if effectiveMaxOutputTokens == 0 {
+		effectiveMaxOutputTokens = modelPolicy.MaxOutputTokens
+	}
+	body, err = rewriteCodexRequest(body, modelPolicy.UpstreamModel, effectiveMaxOutputTokens)
 	if err != nil {
 		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: "invalid_json"})
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
 		return
 	}
-	tokenBound, ok := preflightTokenBound(len(body), in.MaxOutputTokens)
+	tokenBound, ok := preflightTokenBound(len(body), effectiveMaxOutputTokens)
 	if !ok {
 		s.audit.Log(auditEvent{RunID: runID, Model: in.Model, Endpoint: auditEndpoint, Decision: "deny", Error: "max_output_tokens_required"})
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max_output_tokens_required"})
@@ -671,16 +679,24 @@ func (s *Service) forward(in ModelCallRequest) (ModelCallResponse, Usage, error)
 	return ModelCallResponse{ID: raw.ID, Model: raw.Model, Content: content, Usage: raw.Usage, Raw: respBody}, raw.Usage, nil
 }
 
-func (s *Service) codexUpstreamModel(name string) (string, error) {
+func (s *Service) codexModel(name string) (CodexModelConfig, error) {
 	if strings.TrimSpace(name) == "" {
-		return "", fmt.Errorf("model is required")
+		return CodexModelConfig{}, fmt.Errorf("model is required")
 	}
 	for _, model := range s.cfg.CodexAllowedModels {
 		if model.Name == name {
-			return model.UpstreamModel, nil
+			return model, nil
 		}
 	}
-	return "", fmt.Errorf("model %q is not allowed", name)
+	return CodexModelConfig{}, fmt.Errorf("model %q is not allowed", name)
+}
+
+func (s *Service) codexUpstreamModel(name string) (string, error) {
+	model, err := s.codexModel(name)
+	if err != nil {
+		return "", err
+	}
+	return model.UpstreamModel, nil
 }
 
 func (s *Service) forwardCodex(endpoint string, body []byte, inbound *http.Request) (*http.Response, error) {
@@ -793,6 +809,16 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("body exceeds %d byte limit", limit)
 	}
 	return b, nil
+}
+
+func rewriteCodexRequest(body []byte, model string, maxOutputTokens int) ([]byte, error) {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	raw["model"] = model
+	raw["max_output_tokens"] = maxOutputTokens
+	return json.Marshal(raw)
 }
 
 func rewriteJSONModel(body []byte, model string) ([]byte, error) {
